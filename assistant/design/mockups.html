@@ -492,7 +492,7 @@ canvas.jar { display:block; }
     <span>100%</span><span>금 9:41</span></div>
   <div class="popover">
     <div class="hd">Azel <span class="foot" style="display:flex;gap:6px;align-items:center"><span class="dot"></span>연결됨</span></div>
-    <div class="hero"><canvas class="jar" data-state="idle" width="64" height="64"></canvas>
+    <div class="hero"><canvas class="jar" data-state="idle" data-sway width="64" height="64"></canvas>
       <span class="sub" style="font-size:13px;line-height:1.4">⌥ Space를 누른 채<br>말하세요</span>
       <span class="pbtn">전화</span></div>
     <div class="q"><span>오늘 브리핑</span><span>새 대화</span></div>
@@ -619,7 +619,7 @@ function wobble(state, th, t, L) {
     case 'listening': return L*(0.05*Math.sin(3*th + 2.1*t) + 0.03*Math.sin(5*th - 3.3*t));
     case 'thinking':  return 0.012*Math.sin(2*th + 1.2*t);
     case 'speaking':  return L*(0.07*Math.sin(2*th + 2.8*t) + 0.025*Math.sin(7*th + 5*t));
-    default:          return 0.008*Math.sin(2*th + 0.6*t);
+    default:          return 0.018*Math.sin(2*th + 0.45*t) + 0.010*Math.sin(3*th - 0.31*t + 1.3); // idle, §6.3
   }
 }
 // Simulated speech envelope: syllable-rate bumps with pauses.
@@ -634,7 +634,7 @@ const jars = [...document.querySelectorAll('canvas.jar')].map(c => {
   c.style.width = w + 'px'; c.style.height = h + 'px';
   c.width = w*dpr; c.height = h*dpr;
   const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
-  return { c, ctx, w, h, smooth:0, phase:Math.random()*10 };
+  return { c, ctx, w, h, smooth:0, phase:Math.random()*10, last:-1e9, drawn:false, shimAt:(2 + Math.random()*6)*1000 };
 });
 function path(ctx, cx, cy, R, state, t, L, sy=1) {
   ctx.beginPath();
@@ -649,26 +649,38 @@ function path(ctx, cx, cy, R, state, t, L, sy=1) {
 function draw(j, now) {
   const { ctx, w, h, c } = j, state = c.dataset.state;
   const still = reduce.matches;
-  const t = still ? 0 : now/1000 + j.phase;
+  // §6.3 battery: idle at 30 fps; Reduce Motion redraws only the idle glow fade (10 fps), others once
+  if (state === 'idle' && now - j.last < (still ? 100 : 33)) return;
+  if (still && state !== 'idle' && j.drawn) return;
+  j.last = now; j.drawn = true;
+  const tReal = now/1000 + j.phase;
+  const t = still ? 0 : tReal;
+  const breath = (state === 'idle' && !still) ? Math.sin(2*Math.PI*t/4.6) : 0;
   let target = level(state, t);
   if (still) target = 0.25;
   j.smooth += (target - j.smooth) * (target > j.smooth ? 0.55 : 0.12); // fast attack, slow release
   const L = still ? 0 : j.smooth;
   const scale = still && (state==='listening'||state==='speaking') ? 1.02 : 1;
   const water = state === 'speaking' && !c.hasAttribute('data-nowater');
-  const cx = w/2, cy = water ? h*0.44 : h/2, R = Math.min(w, h) * (water ? 0.27 : 0.32) * scale;
+  const cx = w/2, cy = water ? h*0.44 : h/2, R = Math.min(w, h) * (water ? 0.27 : 0.32) * scale * (1 + 0.025*breath);
   const cel = css('--glazeCel'), ind = css('--glazeInd'), por = css('--porcelain'), amb = css('--glazeAmb'), t3 = css('--text3');
   const look = {
-    idle:      { glow:cel, a:por, b:cel, glowA:0.35 + (still?0:0.1*Math.sin(t*1.05)) },
+    idle:      { glow:cel, a:por, b:cel, glowA: still ? 0.40 + 0.05*Math.sin(2*Math.PI*tReal/8) : 0.35 + 0.12*breath },
     listening: { glow:cel, a:por, b:cel, glowA:0.4 + 0.4*L },
     thinking:  { glow:ind, a:por, b:ind, glowA:0.45 + (still?0:0.2*Math.sin(t*4.5)) },
     speaking:  { glow:amb, a:por, b:por, glowA:0.45 + 0.45*L },
     offline:   { glow:t3, a:t3, b:t3, glowA:0 },
   }[state] || {};
   ctx.clearRect(0, 0, w, h);
+  ctx.save();
+  if (c.hasAttribute('data-sway') && !still) { // Mac popover only: extra-slow sway
+    ctx.translate(cx + 1.5*Math.sin(2*Math.PI*t/11), cy);
+    ctx.rotate(1.5*Math.PI/180*Math.sin(2*Math.PI*t/9 + 0.8));
+    ctx.translate(-cx, -cy);
+  }
   // glow
   ctx.save(); ctx.filter = `blur(${Math.round(R*0.35)}px)`; ctx.globalAlpha = look.glowA;
-  path(ctx, cx, cy, R*(1.05 + (state==='speaking' ? 0.25*L : 0.08*L)), state, t, L); ctx.fillStyle = look.glow; ctx.fill(); ctx.restore();
+  path(ctx, cx, cy, R*(1.05 + (state==='speaking' ? 0.25*L : 0.08*L) + 0.04*breath), state, t, L); ctx.fillStyle = look.glow; ctx.fill(); ctx.restore();
   // listening ring
   if (state === 'listening') {
     ctx.save(); ctx.globalAlpha = 0.25 + 0.5*L; ctx.strokeStyle = cel; ctx.lineWidth = 1.2;
@@ -678,6 +690,19 @@ function draw(j, now) {
   const g = ctx.createRadialGradient(cx - R*0.2, cy - R*0.35, 0, cx, cy, R*1.25);
   g.addColorStop(0, look.a); g.addColorStop(0.55, look.b); g.addColorStop(1, look.glow);
   path(ctx, cx, cy, R, state, t, L); ctx.fillStyle = g; ctx.globalAlpha = state==='offline' ? 0.4 : 1; ctx.fill(); ctx.globalAlpha = 1;
+  // idle shimmer: every 8–12 s a soft highlight drifts across the porcelain in 1.6 s
+  if (state === 'idle' && !still) {
+    const p = (now - j.shimAt) / 1600;
+    if (p >= 1) j.shimAt = now + (8 + Math.random()*4)*1000;
+    else if (p >= 0) {
+      const e = p < 0.5 ? 2*p*p : 1 - Math.pow(-2*p + 2, 2)/2; // easeInOut
+      const sx = cx - 0.7*R + 1.4*R*e, sy = cy - 0.45*R + 0.3*R*e;
+      ctx.save(); path(ctx, cx, cy, R, state, t, L); ctx.clip();
+      const sg = ctx.createRadialGradient(sx, sy, 0, sx, sy, 0.45*R);
+      sg.addColorStop(0, `rgba(255,255,255,${0.18*Math.sin(Math.PI*p)})`); sg.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = sg; ctx.fillRect(0, 0, w, h); ctx.restore();
+    }
+  }
   // thinking swirl
   if (state === 'thinking' && ctx.createConicGradient) {
     ctx.save(); path(ctx, cx, cy, R, state, t, L); ctx.clip();
@@ -690,11 +715,13 @@ function draw(j, now) {
     ctx.save(); ctx.filter = 'blur(8px)'; ctx.globalAlpha = 0.3;
     path(ctx, cx, cy + R*1.6, R*(0.8 + 0.4*L), state, t, L, -0.25); ctx.fillStyle = amb; ctx.fill(); ctx.restore();
   }
+  ctx.restore();
 }
-function frame(now) { jars.forEach(j => draw(j, now)); if (!reduce.matches) requestAnimationFrame(frame); }
+function frame(now) { jars.forEach(j => draw(j, now)); requestAnimationFrame(frame); }
 requestAnimationFrame(frame);
-reduce.addEventListener('change', () => requestAnimationFrame(frame));
-btn.addEventListener('click', () => requestAnimationFrame(frame)); // redraw static jars with new theme colors
+const redrawAll = () => jars.forEach(j => { j.drawn = false; j.last = -1e9; });
+reduce.addEventListener('change', redrawAll);
+btn.addEventListener('click', redrawAll); // redraw static jars with new theme colors
 
 // Earcons: mirrors DESIGN.md §14.1 (peak dBFS, notes, envelopes).
 const CUES = {
