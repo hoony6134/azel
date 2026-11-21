@@ -47,7 +47,9 @@ final class CallManager: NSObject, ObservableObject {
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
-    private var incoming: [UUID: (callID: String?, reason: String?, caller: String, persona: String?)] = [:]
+    private var incoming: [UUID: (callID: String?, reason: String?, caller: String, persona: String?, context: CallContext?)] = [:]
+    /// The task or reminder this call is about (from the push's `context`).
+    @Published private(set) var callContext: CallContext?
     private var activeSession: String?
     /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
     @Published private(set) var activePersona: Persona?
@@ -260,6 +262,7 @@ extension CallManager: CXProviderDelegate {
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         let persona = activePersona, caller = callerName
         begin(action.callUUID, callID: nil)
+        callContext = nil
         activePersona = persona
         callerName = caller
         let named = CXCallUpdate()
@@ -274,6 +277,7 @@ extension CallManager: CXProviderDelegate {
         let info = incoming.removeValue(forKey: action.callUUID)
         begin(action.callUUID, callID: info?.callID)
         callerName = info?.caller
+        callContext = info?.context
         // The push names the persona that is calling; its glaze tints the call screen.
         let personaID = info?.persona
         activePersona = MainActor.assumeIsolated { PersonaModel.shared.persona(id: personaID) }
@@ -329,7 +333,7 @@ extension CallManager: PKPushRegistryDelegate {
         let caller = p["caller"] as? String ?? AssistantName.current
         let uuid = UUID()
         incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller,
-                          (p["persona"] as? String) ?? (p["persona"] as? NSNumber).map(\.stringValue))
+                          (p["persona"] as? String) ?? (p["persona"] as? NSNumber).map(\.stringValue), CallContext.from(p["context"]))
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: caller)
         update.localizedCallerName = caller

@@ -9,8 +9,10 @@ struct BiseoMacApp: App {
     @StateObject private var schedule = ScheduleModel()
     @ObservedObject private var call = MacCall.shared
     @ObservedObject private var approvals = ApprovalCenter.shared
+    @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
 
     init() {
+        InCallMarker.remove()   // left over from a crash or a force quit
         Recordings.cleanup()
         Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
@@ -31,11 +33,13 @@ struct BiseoMacApp: App {
             MainWindow(model: model, wake: wake, history: history, schedule: schedule)
         }
         .defaultSize(width: 760, height: 720)
+        .handlesExternalEvents(matching: [])   // azel:// URLs go to the app delegate, never open this window
 
         Window("기록", id: "history") {
             HistorySplit(history: history).frame(minWidth: 640, minHeight: 420)
         }
         .defaultSize(width: 820, height: 560)
+        .handlesExternalEvents(matching: [])
         .keyboardShortcut("y")
         .commands {
             CommandGroup(after: .newItem) {
@@ -539,4 +543,15 @@ struct MacSettingsCard: View {
             if let e = wake.error { Text(e).font(.footnote).foregroundStyle(Theme.danger).textSelection(.enabled) }
         }
     }
+}
+
+/// URLs from `open -g` (the wake listener): handled without activating the app.
+final class MacAppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            if let persona = WakeURL.persona(url) { MainActor.assumeIsolated { MacCall.shared.wake(persona: persona) } }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) { InCallMarker.remove() }
 }

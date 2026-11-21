@@ -8,7 +8,7 @@ import SwiftUI
 final class MacCall: ObservableObject {
     static let shared = MacCall()
 
-    @Published private(set) var inCall = false
+    @Published private(set) var inCall = false { didSet { if inCall != oldValue { inCall ? InCallMarker.create() : InCallMarker.remove() } } }
     @Published private(set) var state = ""          // listening | thinking | speaking
     /// Reply audio still playing (the server can move on before the last of it is heard).
     @Published private(set) var playing = false
@@ -68,6 +68,8 @@ final class MacCall: ObservableObject {
     /// True while the hold-to-talk key is down (panel border goes celadon).
     @Published private(set) var talking = false
     private var pttCall = false
+    /// Started by the wake word: the mic is live from the start and the call ends after 30 s of quiet.
+    private var wakeCall = false
     private var fadeTask: Task<Void, Never>?
     private var idleTask: Task<Void, Never>?
 
@@ -109,7 +111,7 @@ final class MacCall: ObservableObject {
 
     /// Hold-to-talk calls end ~30 s after the last activity.
     private func scheduleIdle() {
-        guard pttCall else { return }
+        guard pttCall || wakeCall else { return }
         idleTask?.cancel()
         idleTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 30_000_000_000)
@@ -139,6 +141,16 @@ final class MacCall: ObservableObject {
             if NSPointInRect(NSEvent.mouseLocation, p.frame) { drainedAt = nil; return self.scheduleFade() }
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 }) { p.orderOut(nil) }
         }
+    }
+
+    /// `azel://wake?persona=…` from the wake listener: it already said "네?", so no earcon; the panel
+    /// shows without taking focus and the mic is live at once for the sentence after the name.
+    func wake(persona key: String?) {
+        if inCall { showPanel(); return }
+        let p = key.flatMap { k in PersonaModel.shared.personas.first { $0.id == k || $0.name == k } } ?? PersonaModel.shared.primary
+        wakeCall = true
+        start(panel: true, persona: p)
+        scheduleIdle()
     }
 
     func start(panel usePanel: Bool, session: String? = nil, intent: String? = nil, persona: Persona? = nil) {
@@ -258,6 +270,7 @@ final class MacCall: ObservableObject {
         state = ""
         talking = false
         pttCall = false
+        wakeCall = false
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
     }
@@ -442,5 +455,32 @@ struct PanelReply: View {
         .onDisappear { if let monitor { NSEvent.removeMonitor(monitor) } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(reply.text)
+    }
+}
+
+/// `~/Library/Application Support/Azel/in-call`: present while any call runs, so the wake listener
+/// keeps the mic free. The real home, not the sandbox container (an entitlement allows this folder).
+enum InCallMarker {
+    static var url: URL = {
+        let home = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_dir) } ?? NSHomeDirectory()
+        return URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/Azel/in-call")
+    }()
+
+    static func create() {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.createFile(atPath: url.path, contents: Data("\(getpid())\n".utf8)) {
+            Log.call.error("in-call marker not written: \(url.path, privacy: .public)")
+        }
+    }
+
+    static func remove() { try? FileManager.default.removeItem(at: url) }
+}
+
+/// `azel://wake?persona=<id or name>` → the persona key; nil for any other URL.
+enum WakeURL {
+    static func persona(_ url: URL) -> String?? {
+        guard url.scheme == "azel", url.host == "wake" else { return nil }
+        let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "persona" }?.value
+        return .some(p.flatMap { $0.isEmpty ? nil : $0 })
     }
 }

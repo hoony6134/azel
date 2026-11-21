@@ -85,3 +85,32 @@ final class TaskBackendTests: XCTestCase {
         XCTAssertEqual(TaskBackend.label("mystery"), "mystery")
     }
 }
+
+final class Batch5AppTests: XCTestCase {
+    func testTaskViewFieldsFromTheGateway() throws {
+        let t = try JSONDecoder().decode(AgentTask.self, from: Data(#"{"id":"abc123def456","goal":"메일 정리","status":"queued","notify":"push","created":1795300000,"cost_usd":0.12,"note":"다른 작업 2개가 끝나길 기다리는 중","error":"","steps":[{"label":"메일 확인"}]}"#.utf8))
+        XCTAssertEqual(t.note, "다른 작업 2개가 끝나길 기다리는 중")
+        XCTAssertEqual(t.notify, "push")
+        XCTAssertNil(t.error, "empty error hidden")
+        XCTAssertEqual(t.cost, 0.12)
+        XCTAssertEqual(t.created_at, Date(timeIntervalSince1970: 1_795_300_000))
+        XCTAssertEqual(t.steps.map(\.label), ["메일 확인"])
+    }
+
+    @MainActor func testMemoryItems() {
+        let m = MemoryItem(["id": 4, "text": "커피는 디카페인", "source": "call", "persona_id": NSNull(), "created_at": "2026-11-22T10:00:00Z"])
+        XCTAssertEqual(m.id, "4")
+        XCTAssertEqual(m.sourceLabel, "통화에서")
+        XCTAssertEqual(m.scopeLabel, "모든 비서")
+        XCTAssertEqual(MemoryItem(["id": "1", "content": "x", "source": "cygnus"]).sourceLabel, "Cygnus")
+        XCTAssertEqual(MemoryItem(["id": "2", "fact": "y", "source": "direct"]).sourceLabel, "직접 기억")
+    }
+
+    func testCallContextChip() {
+        XCTAssertEqual(CallContext.from(["kind": "task", "label": "메일 정리", "id": "t1"])?.chip, "맡긴 작업: 메일 정리")
+        XCTAssertEqual(CallContext.from(["kind": "schedule", "label": "약 먹기"])?.chip, "예약: 약 먹기")
+        XCTAssertEqual(CallContext.from("과제 마감")?.chip, "과제 마감")
+        XCTAssertNil(CallContext.from(["kind": "task"]))
+        XCTAssertNil(CallContext.from(nil))
+    }
+}

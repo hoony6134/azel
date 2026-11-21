@@ -28,6 +28,9 @@ struct WakeEnrollStatus: Decodable, Equatable {
         return "인식률 \(Self.percent(b)) → \(Self.percent(a))"
     }
 
+    /// "24/60, 20개부터 학습"
+    static func countLine(clips: Int, minClips: Int) -> String { "\(clips)/\(WakeEnrollAPI.maxTotal), \(minClips)개부터 학습" }
+
     /// 0.82 → "82%" (a value over 1 is taken as already in percent).
     static func percent(_ v: Double) -> String { "\(Int((v <= 1 ? v * 100 : v).rounded()))%" }
 
@@ -161,12 +164,15 @@ final class WakeEnrollModel: ObservableObject {
         redo = []
         // The server keeps at most 20 clips: a re-enrollment starts from a clean slate.
         await refreshStatus()
-        if let s = status, s.status == "training" { step = .failed(Self.busyMessage); return }
         if let s = status, let minClips = s.min_clips {
+            // Retraining server: recording never waits for training; clips sent during a run are
+            // stored and trigger another run when it ends (wake_enroll.py train_loop).
             // Retraining server: keep what's stored and add to it.
             let n = Self.sessionLength(stored: s.clips, minClips: minClips)
             guard n > 0 else { step = .failed("녹음은 \(WakeEnrollAPI.maxTotal)개까지예요. 기본 모델로 되돌리면 처음부터 다시 할 수 있어요."); return }
             prompts = Self.retrainPrompts(name, count: n)
+        } else if let s = status, s.status == "training" {
+            step = .failed(Self.busyMessage); return
         } else if let s = status, s.clips + prompts.count > WakeEnrollAPI.maxStored {
             if s.status == "training" { step = .failed(Self.busyMessage); return }
             _ = await attempt { try await WakeEnrollAPI.delete() }
@@ -300,7 +306,7 @@ struct WakeEnrollView: View {
         if let s = model.status, let minClips = s.min_clips {
             let first = s.clips < minClips
             return "‘\(n)’\(p) 보통 목소리, 작게, 멀리서, 빠르게, 피곤한 톤으로 번갈아 말해 주세요. "
-                + (first ? "\(minClips)번 녹음하면 학습을 시작해요." : "지금까지 \(s.clips)개를 녹음했어요. 10개를 더하면 다시 학습해요.")
+                + (first ? "\(minClips)번 녹음하면 학습을 시작해요." : "지금까지 \(s.clips)개를 녹음했어요. 더 녹음하면 그 목소리까지 넣어 다시 학습해요.")
         }
         return "‘\(n)’\(p) \(model.prompts.count)번, 조금씩 다르게 말해 주세요. 한 번 말할 때마다 자동으로 넘어가요."
     }
@@ -375,15 +381,15 @@ struct WakeEnrollRow: View {
             if let s = model.status, s.retrains {
                 if let r = s.resultText { Text(r).font(.subheadline).foregroundStyle(s.error == nil ? Theme.text2 : Theme.danger) }
                 if s.status == "training" { Text("학습 중이에요. 보통 1–4분 걸려요.").font(.footnote).foregroundStyle(Theme.text3) }
-                if let minClips = s.min_clips, s.clips > 0 {
-                    Text("녹음 \(s.clips)개" + (s.clips < minClips ? " · \(minClips)개부터 학습해요" : "")).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
+                if let minClips = s.min_clips {
+                    Text(WakeEnrollStatus.countLine(clips: s.clips, minClips: minClips)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
                 }
             }
             if let m = model.removeMessage { Text(m).font(.footnote).foregroundStyle(Theme.amber) }
             HStack {
                 Button(enrollTitle) { enrolling = true }
                     .tint(Theme.celadon)
-                    .disabled(model.status?.status == "training")
+                    .disabled(model.status.map { $0.retrains ? $0.clips >= WakeEnrollAPI.maxTotal : $0.status == "training" } ?? false)
                 Spacer()
                 if let s = model.status, s.status != "none" || s.clips > 0 {
                     Button(s.retrains ? "기본 모델로 되돌리기" : "삭제", role: .destructive) { confirmDelete = true }

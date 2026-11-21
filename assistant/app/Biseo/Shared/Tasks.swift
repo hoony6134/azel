@@ -33,10 +33,14 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
     /// The engine that actually ran it, and why it fell back if it did. Absent on older gateways.
     var backend: String?
     var fallback_reason: String?
+    /// Why it's waiting ("다른 작업 2개가 끝나길 기다리는 중"), and the finish notification.
+    var note: String?
+    var notify: String?             // call | push | none
+    var error: String?
 
     var isActive: Bool { ["queued", "running", "waiting_approval"].contains(status) }
 
-    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, device, persona, persona_id, created_at, backend, fallback_reason }
+    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, cost_usd, device, persona, persona_id, created_at, created, backend, fallback_reason, note, notify, error }
 
     init(id: String, goal: String, status: String, steps: [Step] = [], result: String? = nil, cost: Double? = nil, device: String? = nil) {
         self.id = id; self.goal = goal; self.status = status; self.steps = steps; self.result = result; self.cost = cost; self.device = device
@@ -52,11 +56,15 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
         // cost: a USD number, or an object with cost_usd
         if let n = try? c.decodeIfPresent(Double.self, forKey: .cost) { cost = n }
         else if let o = try? c.decodeIfPresent([String: Double].self, forKey: .cost) { cost = o["cost_usd"] ?? o["usd"] }
+        else if let n = try? c.decodeIfPresent(Double.self, forKey: .cost_usd) { cost = n }   // the gateway's task_view
         device = try c.decodeIfPresent(String.self, forKey: .device)
         persona = (try? c.decodeIfPresent(String.self, forKey: .persona)) ?? (try? c.decodeIfPresent(String.self, forKey: .persona_id))
-        created_at = TaskTime.decode(c, .created_at)
+        created_at = TaskTime.decode(c, .created_at) ?? TaskTime.decode(c, .created)
         backend = try? c.decodeIfPresent(String.self, forKey: .backend)
         fallback_reason = try? c.decodeIfPresent(String.self, forKey: .fallback_reason)
+        note = (try? c.decodeIfPresent(String.self, forKey: .note)).flatMap { $0.isEmpty ? nil : $0 }
+        notify = try? c.decodeIfPresent(String.self, forKey: .notify)
+        error = (try? c.decodeIfPresent(String.self, forKey: .error)).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     static func == (a: AgentTask, b: AgentTask) -> Bool { a.id == b.id && a.status == b.status && a.steps == b.steps && a.result == b.result }
@@ -163,6 +171,11 @@ enum TaskAPI {
         return try? JSONDecoder().decode(AgentTask.self, from: data)
     }
 
+    /// "끝나면 전화": change how a running task reports back.
+    static func setNotify(_ id: String, _ notify: String) async throws {
+        _ = try await Gateway.send("PATCH", "/v1/tasks/" + escape(id), json: ["notify": notify])
+    }
+
     static func cancel(_ id: String) async throws { _ = try await Gateway.send("POST", "/v1/tasks/\(escape(id))/cancel") }
 
     /// Device names for the picker (`GET /v1/devices`): a list of objects with `name`, or plain names.
@@ -211,6 +224,11 @@ final class TaskModel: ObservableObject {
         await refresh()
     }
 
+    func setNotify(_ t: AgentTask, call: Bool) async throws {
+        try await TaskAPI.setNotify(t.id, call ? "call" : "push")
+        await refresh()
+    }
+
     func cancel(_ t: AgentTask) async throws {
         try await TaskAPI.cancel(t.id)
         await refresh()
@@ -229,5 +247,28 @@ final class TaskModel: ObservableObject {
         guard url.scheme == "azel", url.host == "task" else { return nil }
         let id = url.pathComponents.dropFirst().first
         return id?.isEmpty == false ? id : nil
+    }
+}
+
+/// What a call opened from a task or a reminder is about (the call's `context`):
+/// `{kind: "task" | "schedule", label, id}`, or plain text.
+struct CallContext: Equatable {
+    var kind: String?
+    var label: String
+    var id: String?
+
+    static func from(_ v: Any?) -> CallContext? {
+        if let s = v as? String { return s.isEmpty ? nil : CallContext(kind: nil, label: s, id: nil) }
+        guard let d = v as? [String: Any], let label = (d["label"] ?? d["text"] ?? d["goal"] ?? d["purpose"]) as? String, !label.isEmpty else { return nil }
+        return CallContext(kind: d["kind"] as? String, label: label, id: d["id"].map(describe))
+    }
+
+    /// "맡긴 작업: …" / "예약: …".
+    var chip: String {
+        switch kind {
+        case "task": return "맡긴 작업: " + label
+        case "schedule", "reminder", "wake": return "예약: " + label
+        default: return label
+        }
     }
 }
