@@ -55,8 +55,8 @@ LENGTH_STYLE = {
 LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해(예: '오늘 일정은 두 개예요,'). "
-    "'네'나 '알겠습니다'만 하고 끝내지 마. "
+    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해. "
+    "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
     f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
@@ -134,12 +134,16 @@ NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세
                           r"|spark|ruchba|albireo|gienah|deneb|macbook"
                           r"|스파크|루크바|알비레오|기에나|데네브", re.I)  # Korean: how Whisper spells the spoken names
 # Personal data only full-mode gateways may touch (same list as the gateway's PERSONAL).
+# "내일 내가 해야 될 일", "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘": the user's own plans, said without 일정/할 일
+PLANS_ASK = (r"해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게) ?(뭐|있|정리|알려)"
+             r"|(오늘|내일|모레|글피|이번 ?주|다음 ?주|주말|월요일|화요일|수요일|목요일|금요일|토요일|일요일)"
+             r".{0,10}(뭐 ?(해|하|있)|정리|계획|바빠|바쁘|일과|해야)")
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
-                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
+                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)|" + PLANS_ASK, re.I)
 NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
 NO_GATEWAY = "지금 Claude 게이트웨이에 연결이 안 돼요."
 TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트 ?돌|에러|함수 ?짜|스크립트", "mac": r"macbook|맥북|파일|폴더|터미널|바탕화면|다운로드",
-              "schedule": r"일정(?!한)|할 ?일|과제|캘린더|회의|수업|마감|알람|브리핑|플래닛|planit"}
+              "schedule": r"일정(?!한)|할 ?일|과제|캘린더|회의|수업|마감|알람|브리핑|플래닛|planit|" + PLANS_ASK}
 
 def load_hashes(text: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {k: [] for k in LABELS}
@@ -383,6 +387,7 @@ GatewayLinks.brain_request, GatewayLinks.brain_event = _brain_request, _brain_ev
 BRAIN_BODY = (
     "아래 '참고할 상황'은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
     "여기에 답이 있으면 Claude 없이 네가 바로 답해. 없는 내용은 절대 지어내지 마. "
+    "상황의 일정은 줄마다 붙은 확인 시각 기준이야. 여섯 시간보다 오래된 일정은 '몇 시 기준으로는'이라고 밝히고 말해. "
     f"더 찾아봐야 하면 다른 말 없이 한 줄로 {TOOL_TAG} {{\"name\": 도구, \"args\": {{…}}}} 만 출력해. 도구: "
     "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
     "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
@@ -597,6 +602,31 @@ TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|�
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
 NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
          f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
+
+
+# A sentence about the user's own plans ("내일 일정은 두 건이에요", "오전 열 시에 팀 회의") is spoken only when its source is
+# in front of Qwen: the brain's context, a tool result or the user's own words in this call. Its hours must appear
+# there, and a plan with no hour at all needs some timed source. Otherwise Claude answers (it checks the real data).
+SCHED_NOUN = re.compile(r"일정|할 ?일|마감|회의|약속|미팅|수업|과제|시험|스케줄|제출|데드라인")
+KO_HOURS = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10,
+            "열한": 11, "열두": 12}
+_HOUR_RE = re.compile(r"(\d{1,2})\s*(?:시(?!간)|:\d{2})|(열한|열두|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*시(?!간)")
+
+
+class Ungrounded(Exception):
+    """Qwen stated the user's plans without a source: the turn goes to Claude instead."""
+
+
+def hours_in(text):
+    return {(int(n) if n else KO_HOURS[w]) % 12 for n, w in _HOUR_RE.findall(text)}
+
+
+def grounded(sentence, sources):
+    """False for a claim about the user's plans that no source backs (see SCHED_NOUN above)."""
+    if not SCHED_NOUN.search(sentence):
+        return True
+    said, known = hours_in(sentence), hours_in(sources)
+    return said <= known if said else bool(known)
 
 
 def content_free(reply):
@@ -1107,6 +1137,10 @@ async def respond(text, session, t0, timings, on_event=None):
 
             async def say(s):
                 nonlocal flushed
+                sources = ctx + "\n".join(m["content"] for m in messages if m["role"] == "user")
+                if not grounded(s, sources):
+                    timings["ungrounded"] = s[:80]
+                    raise Ungrounded
                 if guard and not flushed and content_free(" ".join(ack_held + [s])):
                     ack_held.append(s)  # "네," alone: keep it back until real content follows
                     return
@@ -1115,52 +1149,55 @@ async def respond(text, session, t0, timings, on_event=None):
                 ack_held.clear()
                 flushed = True
 
-            for rounds in range(4):  # at most two tool calls and one nudge, then an answer
-                buf, state, said_round = "", "maybe", []
-                async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
-                    timings.setdefault("llm_first_token_ms", ms(t0))
-                    buf += delta
-                    if state not in ("tool", "no"):
-                        state = tag_state(buf.lstrip())
-                    if state in ("maybe", "tool"):
-                        continue  # might be a tag; a tool call is collected whole
-                    if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
-                        return await via_claude()
-                    if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
-                        before, _, after = buf.partition(TOOL_TAG)
-                        for s in split_ready(before, final=True)[0]:
+            try:
+                for rounds in range(4):  # at most two tool calls and one nudge, then an answer
+                    buf, state, said_round = "", "maybe", []
+                    async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
+                        timings.setdefault("llm_first_token_ms", ms(t0))
+                        buf += delta
+                        if state not in ("tool", "no"):
+                            state = tag_state(buf.lstrip())
+                        if state in ("maybe", "tool"):
+                            continue  # might be a tag; a tool call is collected whole
+                        if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
+                            return await via_claude()
+                        if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
+                            before, _, after = buf.partition(TOOL_TAG)
+                            for s in split_ready(before, final=True)[0]:
+                                said_round.append(s)
+                                await say(s)
+                            buf, state = TOOL_TAG + after, "tool"
+                            continue
+                        speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
+                        done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
+                        buf = rest + held
+                        for s in done:
+                            timings.setdefault("first_sentence_ms", ms(t0))
                             said_round.append(s)
                             await say(s)
-                        buf, state = TOOL_TAG + after, "tool"
+                    if state == "tool" and ctx and rounds < 2:
+                        t_tool = time.perf_counter()
+                        result = await run_tool(buf.strip().split("\n")[0], session)
+                        timings.setdefault("tools", []).append(ms(t_tool))
+                        messages += [{"role": "assistant", "content": buf.strip()},
+                                     {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
                         continue
-                    speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
-                    done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
-                    buf = rest + held
-                    for s in done:
-                        timings.setdefault("first_sentence_ms", ms(t0))
+                    if state == "tool" or ROUTE_TAG in buf:
+                        return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
+                    for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
                         said_round.append(s)
                         await say(s)
-                if state == "tool" and ctx and rounds < 2:
-                    t_tool = time.perf_counter()
-                    result = await run_tool(buf.strip().split("\n")[0], session)
-                    timings.setdefault("tools", []).append(ms(t_tool))
-                    messages += [{"role": "assistant", "content": buf.strip()},
-                                 {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
-                    continue
-                if state == "tool" or ROUTE_TAG in buf:
-                    return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
-                for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
-                    said_round.append(s)
-                    await say(s)
-                if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
-                    ack_held.clear()
-                    if nudged:
-                        return await via_claude()
-                    nudged = True
-                    messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
-                                 {"role": "user", "content": NUDGE}]
-                    continue
-                break
+                    if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
+                        ack_held.clear()
+                        if nudged:
+                            return await via_claude()
+                        nudged = True
+                        messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
+                                     {"role": "user", "content": NUDGE}]
+                        continue
+                    break
+            except Ungrounded:
+                return await via_claude()  # never speak made-up plans
         finally:
             await sentences.put(None)
 
@@ -1954,6 +1991,21 @@ if __name__ == "__main__":
         assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        # 2026-11-21 23:35 call: "내일 내가 해야 될 일도 정리해줘" reached Qwen, which made up two plans
+        for ask in ("내일 내가 해야 될 일도 정리해줘", "알았어 고마워. 그리고 내일 내가 해야 될 일들도 좀 정리해줘.",
+                    "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘", "토요일에 뭐 있어?"):
+            assert pre_route(ask, {})[0] and PERSONAL.search(ask) and pick(TASK_WORDS, ask) == "schedule", ask
+        for chat in ("오늘 날씨 좋다", "뭐 해?", "해야 될 말이 있어"):
+            assert not PERSONAL.search(chat), chat
+        said, _ = asyncio.run(ack_check(["내일 일정은 두 건이에요. 오전 열 시에 팀 회의, 오후 세 시에 프로젝트 마감이에요."],
+                                        user="그냥 정리해 줘"))
+        assert said == ["클로드가 답해요."], said  # unbacked plans are never spoken, not even the first sentence
+        said, _ = asyncio.run(ack_check(["치과 약속은 오후 세 시예요."], user="아까 내가 오후 세 시에 치과 간다고 했지? 맞지?"))
+        assert said == ["치과 약속은 오후 세 시예요."], said  # the user's own words back it
+        assert grounded("마감은 밤 열한 시예요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
+        assert not grounded("오전 열 시에 팀 회의가 있어요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
+        assert not grounded("내일 일정은 두 건이에요.", "") and grounded("물은 백 도에서 끓어요.", "")
+        assert grounded("지금은 오후 열한 시예요.", "")  # the clock is not a plan
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
 
         async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
