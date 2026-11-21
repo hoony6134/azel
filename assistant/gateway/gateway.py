@@ -182,7 +182,8 @@ class Outbox:
                 try:
                     await state.call("POST", self.route(self.items[0]), self.items[0])
                 except HTTPException as e:  # refused, not unreachable: retrying would block the queue forever
-                    with self.rejected.open("a") as f:
+                    fd = os.open(self.rejected, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    with os.fdopen(fd, "a") as f:
                         f.write(json.dumps({"status": e.status_code, "row": self.items[0]}, ensure_ascii=False) + "\n")
                 self.items.pop(0)
         except StateDown:

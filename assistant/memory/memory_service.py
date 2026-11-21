@@ -87,6 +87,9 @@ create table if not exists {STATE}.sessions(
     voice_session text primary key, claude_session text not null, device text not null,
     updated timestamptz not null default now());
 create table if not exists {STATE}.leases(name text primary key, holder text not null, expires timestamptz not null);
+-- columns added after the first state schema (93aacc6): upgrade tables created by that version
+alter table {STATE}.usage add column if not exists import_key text unique;
+alter table {STATE}.devices add column if not exists writer text not null default 'limited';
 create table if not exists {STATE}.call_history(
     id text primary key, session text, call_id text, direction text, reason text, client text, opening text,
     started_at timestamptz not null default now(), ended_at timestamptz, duration_s double precision);

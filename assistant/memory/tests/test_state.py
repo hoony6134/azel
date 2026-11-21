@@ -199,6 +199,16 @@ def test_call_history_delete_and_prune(client):
     assert client.delete("/v1/state/history?older_than_days=0").status_code == 422
 
 
+def test_state_schema_upgrades_an_older_table(client):
+    m = sys.modules["memory_service"]
+    m.db(f"alter table {m.STATE}.devices drop column writer; alter table {m.STATE}.usage drop column import_key")
+    m.db(m.STATE_SCHEMA)  # what the service runs on start
+    cols = {r["column_name"] for r in m.db("select column_name from information_schema.columns where table_schema=%s",
+                                           (m.STATE,))}
+    assert {"writer", "import_key"} <= cols
+    m.db(m.STATE_SCHEMA)  # and again: idempotent
+
+
 def test_bad_tokens(client):
     for token in ["nope", "", "l1m-", "t0k-"]:
         assert limited_client("100.64.0.8", token).get("/v1/state/settings").status_code == 401

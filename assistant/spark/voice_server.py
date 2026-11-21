@@ -175,6 +175,9 @@ class GatewayLinks:
         raise RuntimeError(NO_GATEWAY)
 
     def receive(self, lk, msg):
+        """One frame from a gateway. Malformed frames are ignored, never allowed to drop the link."""
+        if not isinstance(msg, dict):
+            return
         t = msg.get("type")
         if t == "hello":
             device = str(msg.get("device", "?"))
@@ -194,14 +197,15 @@ class GatewayLinks:
         elif t == "settings":
             self.settings = msg.get("value") if isinstance(msg.get("value"), dict) else {}
         elif t == "call":
-            if not isinstance(msg.get("call_id"), str) or not msg["call_id"]:
+            if not isinstance(msg.get("call_id"), str) or not msg["call_id"] \
+                    or not isinstance(msg.get("opening", ""), str):
                 return  # malformed: ignore it rather than drop the link
             if len(self.openings) > 100:
                 old = self.openings.pop(next(iter(self.openings)))
                 if old["audio"]:
                     old["audio"].cancel()
             self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")))
-        elif msg.get("id") in self.queues:
+        elif isinstance(msg.get("id"), str) and isinstance(t, str) and msg["id"] in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
 
@@ -435,7 +439,7 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
                 if on_event:
                     await on_event(client_activity(ev))
             elif ev["type"] == "text":
-                yield ev["delta"]
+                yield str(ev.get("delta", ""))
             elif ev["type"] == "error":
                 finished = True
                 if not ev.get("code"):  # budget/personal refusals are answers, not a sick gateway
@@ -918,6 +922,10 @@ if __name__ == "__main__":
         gl.receive(intruder, {"type": "call", "call_id": "evil", "opening": "가짜 전화예요."})
         assert gl.settings.get("assistant_name") != "해커" and "evil" not in gl.openings
         gl.receive(full_mac, {"type": "call", "opening": "call_id 없음"})  # ignored, no KeyError
+        for junk in [[1, 2], "text", 7, None, {"type": "call", "call_id": "j1", "opening": ["x"]},
+                     {"id": ["r"], "type": "text"}, {"id": {"a": 1}}, {"id": "r9", "type": 5}]:
+            gl.receive(full_mac, junk)  # authenticated but malformed: ignored, the link stays
+        assert "j1" not in gl.openings and full_mac in gl.links
         gl.receive(full_mac, {"type": "call", "call_id": 7})
         gl.receive(full_mac, {"type": "hello", "device": "macbook", "mode": "full", "priority": "x"})
         assert full_mac.priority == 50 and full_mac in gl.links

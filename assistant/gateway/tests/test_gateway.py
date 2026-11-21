@@ -333,6 +333,7 @@ def test_rejected_usage_row_does_not_block_the_queue(gw):
     asyncio.run(g.record_usage({"model": "bad", "path": "api", "cost_usd": 1}))
     asyncio.run(g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.1}))
     assert [u["model"] for u in g.fake.db["usage"]] == ["haiku"] and g.pending_usage == []
+    assert os.stat(tmp / "usage_rejected.jsonl").st_mode & 0o077 == 0  # holds usage rows: owner only
     dead = [json.loads(line) for line in (tmp / "usage_rejected.jsonl").read_text().splitlines()]
     assert dead[0]["status"] == 422 and dead[0]["row"]["model"] == "bad"
 
