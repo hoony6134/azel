@@ -648,7 +648,7 @@ async def ask_claude_code(text, model, session):
     devices = await fresh_devices()
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
-    servers, allowed, run_settings, run_env = run_args(settings, devices)
+    servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
     resume = await resume_id(session)
     cfg, proc = None, None
     if WARM and not session.startswith(COLD_SESSIONS):
@@ -714,10 +714,11 @@ async def ask_claude_code(text, model, session):
 discovery = connectors.Discovery(CLAUDE)
 
 
-def run_args(settings, devices):
+def run_args(settings, devices, requester=""):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
-    custom servers the user switched on, plus the device daemons."""
-    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME, device_tokens)
+    custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
+    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME, device_tokens,
+                               {"X-Azel-Requester": requester} if requester else None)
 
 
 async def resume_id(session):
@@ -740,7 +741,7 @@ async def prewarm(session, persona_id=None):
         if path != "claude_code":
             return
         style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
-        servers, allowed, run_settings, run_env = run_args(settings, devices)
+        servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
         await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session),
                             run_settings, run_env)
     except Exception as e:
@@ -752,7 +753,8 @@ async def mcp(url, method, params):
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                          headers={"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}",
-                                  "Accept": "application/json, text/event-stream"})
+                                  "Accept": "application/json, text/event-stream",
+                                  **({"X-Azel-Requester": requester_ctx.get()} if requester_ctx.get() else {})})
     r.raise_for_status()
     if r.headers.get("content-type", "").startswith("text/event-stream"):
         msgs = [json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")]
@@ -922,7 +924,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if path in settings["budget_paths"] and await month_cost(settings) >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}
         return
-    note_requester(session=session, persona=current_persona.get() or primary_persona(settings)["id"])
+    requester_ctx.set(requester_id("ask", session))  # approvals from this ask's daemon calls come back with it
     gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
     said = False
     async for item in gen(text, model, session):
@@ -2241,26 +2243,49 @@ async def alerts_to_ring(names, now):
 APPROVAL_TTL_S = 300
 APPROVED_RUN_S = 600  # an approved command must run within this long of the tap, once (state's atomic "use")
 DECISIONS = ("once", "always", "deny")
-# Never made into an "always" rule (forced to once): commands that run other code (wrappers, interpreters).
-RULE_UNSAFE = {"env", "xargs", "find", "nice", "nohup", "time", "command", "caffeinate", "timeout", "sh", "bash",
-               "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node", "php", "lua", "osascript",
-               "open", "make", "npm", "npx", "yarn", "pnpm", "uv", "pip", "pip3", "brew", "launchctl", "defaults",
-               "crontab", "ssh", "scp", "rsync", "git"}
+# "Always" rules only for read-only programs; anything else is approved once (and the app says why).
+ALWAYS_OK = {"open", "ls", "cat", "head", "tail", "wc", "du", "df", "pwd", "rg", "grep", "find", "sw_vers", "uptime",
+             "pmset", "system_profiler", "git"}
+GIT_ALWAYS = {"status", "log", "diff", "show", "branch"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+OPEN_EXEC_EXT = (".command", ".tool", ".sh", ".scpt", ".scptd", ".applescript", ".workflow", ".terminal", ".py",
+                 ".pkg", ".mpkg", ".dmg", ".jar")
+ALWAYS_NO = "항상 허용은 조회용 명령(ls, cat, git status, 앱이나 웹 주소 열기 같은 것)에만 쓸 수 있어서 이번 한 번만 허용했어요."
 task_approvals: dict[str, set] = {}  # task id -> approval ids created while it ran (only those resume it)
+REQUESTER_RE = re.compile(r"(ask|task):[A-Za-z0-9_:.-]{1,100}")
+requester_ctx: contextvars.ContextVar = contextvars.ContextVar("requester", default="")  # API/NIM paths' daemon calls
 
 
-def rule_unsafe(command):
+def requester_id(kind, key):
+    """`ask:<persona:session>` or `task:<id>`: sent to daemons per run, back with the approvals they create."""
+    return f"{kind}:" + re.sub(r"[^A-Za-z0-9_:.-]", "_", str(key))[:100]
+
+
+def parse_requester(v):
+    if not isinstance(v, str) or not REQUESTER_RE.fullmatch(v):
+        return None
+    kind, key = v.split(":", 1)
+    return {"task_id": key} if kind == "task" else {"session": key, "persona": key.split(":", 1)[0] if ":" in key else None}
+
+
+def always_ok(command):
+    """True when an approval of `command` may become an "always" rule."""
     try:
-        names = [os.path.basename(t).lower() for t in shlex.split(command)]
+        t = shlex.split(command)
     except ValueError:
-        return True
-    return any(n in RULE_UNSAFE or re.fullmatch(r"python\d[\d.]*", n) for n in names)
-last_ask: dict = {}  # the most recent ask or task on this gateway: who an approval created meanwhile belongs to
-
-
-def note_requester(**who):
-    last_ask.clear()
-    last_ask.update(who, at=time.time())
+        return False
+    if not t or os.path.basename(t[0]).lower() not in ALWAYS_OK:
+        return False
+    n, rest = os.path.basename(t[0]).lower(), t[1:]
+    if n == "git":
+        return bool(rest) and rest[0] in GIT_ALWAYS
+    if n == "find":
+        return not FIND_ACTIONS & {r.lower() for r in rest}
+    if n == "pmset":
+        return rest[:1] == ["-g"]
+    if n == "open":  # apps (-a/-b) and URLs, never a file that runs something
+        return not any(r.lower().endswith(OPEN_EXEC_EXT) for r in rest)
+    return True
 
 
 async def approval_meta(aid):
@@ -2291,7 +2316,7 @@ async def create_approval(body: dict):
     aid = created["approval_id"]
     if MODE == "limited":  # no kv, rules or pushes with the limited token: the row alone, as before
         return {"approval_id": aid, "status": "pending"}
-    requester = {k: v for k, v in last_ask.items() if k != "at"} if now - last_ask.get("at", 0) < 600 else None
+    requester = parse_requester(body.get("requester"))  # the ask or task whose run asked (daemon header)
     if requester and requester.get("task_id"):
         task_approvals.setdefault(requester["task_id"], set()).add(aid)
     rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
@@ -2364,9 +2389,9 @@ async def decide(aid: str, body: dict):
     view = approval_view(row, meta)
     if view["status"] != "pending":
         raise HTTPException(409, f"approval is {view['status']}")
-    forced = decision == "always" and rule_unsafe(row["command"])
+    forced = decision == "always" and not always_ok(row["command"])
     if forced:
-        decision = "once"  # a command that runs other code never becomes a standing rule
+        decision = "once"  # only read-only commands become standing rules
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
     if decision == "always":
         rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
@@ -2377,7 +2402,7 @@ async def decide(aid: str, body: dict):
     meta["decision"] = decision
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
-            **({"forced_once": True} if forced else {})}
+            **({"forced_once": True, "forced_reason": ALWAYS_NO} if forced else {})}
 
 
 @app.post("/v1/approvals/{aid}/use")
@@ -2498,7 +2523,7 @@ async def task_round(t, prompt, resume, deadline):
     model = settings["task_defaults"].get("task", {}).get("model")
     model = t["model"] = model if model in MODELS else "sonnet"
     style = name_prompt(settings) + TASK_STYLE + device_prompt(settings, devices)
-    servers, allowed, run_settings, run_env = run_args(settings, devices)
+    servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("task", t["id"]))
     cfg = None
     if servers:
         fd, cfg = tempfile.mkstemp(suffix=".json")  # holds tokens: 0600, deleted after the run
@@ -2598,7 +2623,6 @@ async def run_task(t):
             if t["cancel_requested"]:
                 raise asyncio.CancelledError
             t.update(status="running", started=time.time())
-            note_requester(task_id=t["id"], persona=t["persona"])
             await task_save(t)
             deadline = time.monotonic() + t["max_minutes"] * 60
             session, prompt = None, None

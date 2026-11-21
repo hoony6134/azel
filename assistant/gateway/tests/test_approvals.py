@@ -1,6 +1,9 @@
 """Approvals: 5-minute expiry, once / always / deny, rules the app can revoke, audit, push, requester."""
+import asyncio
 import json
 import time
+
+import httpx
 
 import pytest
 
@@ -24,8 +27,7 @@ def agw(tmp_path, monkeypatch):
 
 def test_pending_push_and_requester(agw):
     g, c, pushes = agw
-    events(c.post("/v1/ask", json={"text": "맥북에서 크롬 열어", "session": "azel:call-1"}))
-    r = c.post("/v1/approvals", json=CMD).json()
+    r = c.post("/v1/approvals", json={**CMD, "requester": "ask:azel:call-1"}).json()  # the daemon passes it on
     assert r["status"] == "pending" and r["expires_at"] - time.time() == pytest.approx(300, abs=5)
     assert pushes == [("승인 요청", "macbook에서 명령 실행 승인이 필요해요", {"type": "approval", "approval_id": r["approval_id"]})]
     a = c.get(f"/v1/approvals/{r['approval_id']}").json()
@@ -56,7 +58,7 @@ def test_expiry(agw):
     assert c.post(f"/v1/approvals/{aid}", json={"decision": "once"}).status_code == 409
 
 
-SAFE = {**CMD, "command": "mkdir -p reports/2026"}
+SAFE = {**CMD, "command": "ls -la reports/2026"}
 
 
 def test_always_rule_auto_approves_and_can_be_revoked(agw):
@@ -71,7 +73,7 @@ def test_always_rule_auto_approves_and_can_be_revoked(agw):
     again = c.post("/v1/approvals", json=CMD).json()
     assert again["status"] == "approved" and again["rule_id"] == rules[0]["id"] and len(pushes) == n  # no tap needed
     assert c.get(f"/v1/approvals/{again['approval_id']}").json()["decision"] == "rule"
-    assert c.post("/v1/approvals", json={**CMD, "command": "mkdir -p reports"}).json()["status"] == "pending"  # exact only
+    assert c.post("/v1/approvals", json={**CMD, "command": "ls -la reports"}).json()["status"] == "pending"  # exact only
     assert c.post("/v1/approvals", json={**CMD, "device": "albireo"}).json()["status"] == "pending"  # per device
     assert c.delete(f"/v1/approvals/rules/{rules[0]['id']}").json() == {"deleted": rules[0]["id"]}
     assert c.delete(f"/v1/approvals/rules/{rules[0]['id']}").status_code == 404
@@ -106,14 +108,28 @@ def test_task_resumes_when_its_approval_expires(tmp_path, monkeypatch):
         assert t["result"] == "거절돼서 나머지만 했어요." and [s["kind"] for s in t["steps"]][-1] == "approval_expired"
 
 
-@pytest.mark.parametrize("cmd", ['open -a "Google Chrome"', "python3 tool.py", "env FOO=1 make", "find . -name x",
-                                 "bash run.sh", "/usr/bin/python3.12 x.py"])
-def test_always_forced_to_once_for_code_runners(agw, cmd):
+@pytest.mark.parametrize("cmd", ["python3 tool.py", "env FOO=1 ls", "bash run.sh", "/usr/bin/python3.12 x.py",
+                                 "mkdir -p reports", "cp a b", "rm x", "git push", "git -C x status", "git commit -m x",
+                                 "find . -delete", "find . -exec ls ;", "pmset -a sleep 0", "open run.command",
+                                 "open ./x.sh", "open ~/Downloads/a.pkg", "xargs ls", "'unbalanced"])
+def test_always_forced_to_once_unless_read_only(agw, cmd):
     g, c, _ = agw
     aid = c.post("/v1/approvals", json={**CMD, "command": cmd}).json()["approval_id"]
     r = c.post(f"/v1/approvals/{aid}", json={"decision": "always"}).json()
-    assert r["status"] == "approved" and r["decision"] == "once" and r["forced_once"] is True
+    assert r["status"] == "approved" and r["decision"] == "once" and r["forced_once"] is True, (cmd, r)
+    assert "한 번만" in r["forced_reason"]
     assert c.get("/v1/approvals/rules").json() == []
+
+
+@pytest.mark.parametrize("cmd", ['open -a "Google Chrome"', "open https://example.com", "ls -la", "cat a.txt", "head -n5 x",
+                                 "tail x", "wc -l x", "du -sh .", "df -h", "pwd", "git status", "git log -5", "git diff",
+                                 "git show HEAD", "git branch", "rg foo .", "grep -r x .", "find . -name x", "sw_vers",
+                                 "uptime", "pmset -g batt", "system_profiler SPHardwareDataType"])
+def test_always_allowed_for_read_only(agw, cmd):
+    g, c, _ = agw
+    aid = c.post("/v1/approvals", json={**CMD, "command": cmd}).json()["approval_id"]
+    r = c.post(f"/v1/approvals/{aid}", json={"decision": "always"}).json()
+    assert r["decision"] == "always" and "forced_once" not in r, (cmd, r)
 
 
 def test_use_is_central_once_and_bound(agw):
@@ -139,8 +155,7 @@ def test_task_commands_never_auto_approved(agw):
     g, c, pushes = agw
     aid = c.post("/v1/approvals", json=SAFE).json()["approval_id"]
     c.post(f"/v1/approvals/{aid}", json={"decision": "always"})
-    g.note_requester(task_id="abcdefabcdef", persona="azel")
-    r = c.post("/v1/approvals", json=SAFE).json()
+    r = c.post("/v1/approvals", json={**SAFE, "requester": "task:abcdefabcdef"}).json()
     assert r["status"] == "pending" and r["approval_id"] in g.task_approvals["abcdefabcdef"]
 
 
@@ -171,3 +186,35 @@ def test_limited_gateway_approvals_without_kv(tmp_path, monkeypatch):
         assert r["status"] == "pending"
         assert c.get(f"/v1/approvals/{r['approval_id']}").json()["status"] == "pending"
         assert c.post(f"/v1/approvals/{r['approval_id']}", json={"decision": "once"}).status_code == 403  # can't approve
+
+
+def test_requester_per_ask_and_task(agw):
+    """Two tasks and a chat at once: each approval belongs to the run that asked, never to whoever ran last."""
+    g, c, _ = agw
+    a = c.post("/v1/approvals", json={**SAFE, "requester": "task:aaaaaaaaaaaa"}).json()["approval_id"]
+    b = c.post("/v1/approvals", json={**SAFE, "requester": "task:bbbbbbbbbbbb"}).json()["approval_id"]
+    chat = c.post("/v1/approvals", json={**SAFE, "requester": "ask:luna:call-9"}).json()["approval_id"]
+    none = c.post("/v1/approvals", json={**SAFE, "requester": "evil; rm"}).json()["approval_id"]  # malformed: dropped
+    assert g.task_approvals["aaaaaaaaaaaa"] == {a} and g.task_approvals["bbbbbbbbbbbb"] == {b}
+    assert c.get(f"/v1/approvals/{chat}").json()["requester"] == {"session": "luna:call-9", "persona": "luna"}
+    assert c.get(f"/v1/approvals/{none}").json()["requester"] is None
+
+
+def test_runs_tell_daemons_who_they_are(agw, monkeypatch):
+    g, c, _ = agw
+    devs = [{"id": "macbook", "name": "macbook", "url": "http://d/mcp"}]
+    servers, *_ = g.run_args(asyncio.run(g.load_settings()), devs, g.requester_id("task", "abcabcabcabc"))
+    assert servers["macbook"]["headers"]["X-Azel-Requester"] == "task:abcabcabcabc"
+    assert g.requester_id("ask", "azel:call 1/x") == "ask:azel:call_1_x"  # only the daemon's allowed characters
+    seen, orig = [], httpx.AsyncClient
+
+    def handler(req):
+        seen.append(req.headers.get("x-azel-requester"))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
+    monkeypatch.setattr(g.httpx, "AsyncClient", lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+
+    async def api_path():  # what ask_stream sets for the API/NIM paths
+        g.requester_ctx.set(g.requester_id("ask", "azel:call-2"))
+        await g.mcp("http://d/mcp", "tools/list", {})
+    asyncio.run(api_path())
+    assert seen == ["ask:azel:call-2"]

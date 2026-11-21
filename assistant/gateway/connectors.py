@@ -156,13 +156,14 @@ def _headers(home, ref):
     return {"Authorization": f"Bearer {raw}"}
 
 
-def run_args(conn, disc, devices, token, home, tokens=None):
+def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
     """(mcp_servers for --mcp-config, allowed tool prefixes, run-scoped --settings JSON, extra env) for one run.
     `tokens`: daemon url -> its own bearer (team devices); others get `token`. A limited device's `delegate` is
     denied in the run's settings."""
     tokens = tokens or {}
     servers = {d["id"]: {"type": "http", "url": d["url"],
-                         "headers": {"Authorization": f"Bearer {tokens.get(d['url'], token)}"}} for d in devices}
+                         "headers": {"Authorization": f"Bearer {tokens.get(d['url'], token)}", **(extra or {})}}
+               for d in devices}
     for c in conn.get("custom", []):
         h = _headers(home, c.get("auth_ref"))
         if c.get("enabled", True) and h is not None and c["name"] not in servers:
