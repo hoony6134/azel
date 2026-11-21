@@ -63,7 +63,7 @@ How each surface renders it:
 | `internal` | `claude -p` via the gateway, API/NIM task loops | master `~/.config/biseo/token` |
 | `qwen` | the voice server's Qwen over the gateway link | link token |
 | `app` | the app's REST calls, push actions | master token (through the public proxy only for the routes on its allowlist) |
-| `external` | the user's own Claude Code (later claude.ai) via `/v1/mcp` | `~/.config/biseo/mcp_external_token` (0600, re-read on every request; delete or rotate the file to revoke) |
+| `external` | the user's own Claude Code (later claude.ai) via `/v1/mcp`: call_user and schedule_* only (no tasks: a task runs with the whole bridge, and task results hold personal data) | `~/.config/biseo/mcp_external_token` (0600, re-read on every request; delete or rotate the file to revoke) |
 
 One input rule depends on the caller, and it is part of the contract: **only `app` may send an exact `when`** (a time a
 person picked in the UI). Every model scope sends the user's own words in `when_text`, and the gateway resolves them
@@ -115,9 +115,9 @@ the tool name only.
 | `schedule_list` | scheduled calls with rule text and next fire | `GET /v1/schedule` | ✓ | ✓ | "예약 뭐 있어?" | — |
 | `schedule_update` | change time, purpose, notify, rule, dates; one fire or the rule | `PUT /v1/schedule/{id}[?occurrence=ISO]` | ✓ | ✓ | "10시 알림 6시로 바꿔줘" | `SNOOZE_10` → occurrence, `when_text: "10분 뒤"` |
 | `schedule_cancel` | cancel an item, a rule, or skip one fire | `DELETE /v1/schedule/{id}[?occurrence=ISO]` | ✓ | ✓ | "취소해줘", "내일 거만 빼줘" | `SKIP` → occurrence |
-| `create_task` | background work, notifying by call/push/none | `POST /v1/tasks` | ✓ | ✓ | (models) | — |
-| `task_status` | one task or the recent ones | `GET /v1/tasks`, `GET /v1/tasks/{id}` | ✓ | ✓ | "맡긴 거 어떻게 됐어?" | — |
-| `task_cancel` | stop a running task | `POST /v1/tasks/{id}/cancel` | ✓ (new tool) | ✓ | "그 작업 그만해" | `STOP` on a running-task push |
+| `create_task` | background work, notifying by call/push/none | `POST /v1/tasks` | ✓ | — | (models) | — |
+| `task_status` | one task or the recent ones | `GET /v1/tasks`, `GET /v1/tasks/{id}` | ✓ | — | "맡긴 거 어떻게 됐어?" | — |
+| `task_cancel` | stop a running task | `POST /v1/tasks/{id}/cancel` | ✓ (new tool) | — | "그 작업 그만해" | `STOP` on a running-task push |
 | `approval_status` | pending approvals and their state (read only) | `GET /v1/approvals`, `GET /v1/approvals/{id}` | ✓ | — (personal device commands) | "승인 기다리는 거 있어?" | — |
 | `<device>__<tool>` | daemon tools (list_dir, read_file, run_command, …) | not on REST: the app hands device work to `create_task`; tailnet `POST /v1/tools/call` | internal ✓; qwen read tools, run_command only after an approval, no delegate | — | — | — |
 | Cygnus reads (`gistra_*`, `infra_*`, `planit_*`) | read-only school, infra, planner data | not on REST: the app has no view for them yet; tailnet `POST /v1/tools/call` | ✓ | — (personal; opt-in later) | (models) | — |

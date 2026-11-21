@@ -156,6 +156,11 @@ def test_external_token_sees_only_its_scope_on_mcp(tgw):  # noqa: F811
         return [t["name"] for t in r.json()["result"]["tools"]]
     assert "approval_status" in names(full) and "approval_status" not in names(outside)
     assert set(names(outside)) == g.tools_bridge.SCOPES["external"]
+    assert not {"create_task", "task_status", "task_cancel"} & set(names(outside))  # a task runs with the whole bridge
+    for tool in ("task_status", "create_task"):
+        r = outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                          "params": {"name": tool, "arguments": {"limit": 100, "goal": "x"}}})
+        assert r.json()["error"]["message"] == "unknown tool", tool
     r = outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                       "params": {"name": "approval_status", "arguments": {}}})
     assert r.json()["error"] == {"code": -32602, "message": "unknown tool"}  # same as a tool that doesn't exist
@@ -163,7 +168,7 @@ def test_external_token_sees_only_its_scope_on_mcp(tgw):  # noqa: F811
                           ("POST", "/v1/tools/call"), ("POST", "/v1/ask"), ("GET", "/v1/mcp")):
         assert outside.request(method, route, json={}).status_code in (401, 405), route  # only POST /v1/mcp
     ok = outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                                       "params": {"name": "create_task", "arguments": {"goal": "x", "notify": "none"}}})
+                                       "params": {"name": "schedule_list", "arguments": {}}})
     assert ok.json()["result"]["isError"] is False
     path.chmod(0o644)  # readable by others: not a token any more
     assert outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "ping"}).status_code == 401

@@ -801,8 +801,8 @@ OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
 MCP_TOOLS = ALL_OWN  # claude -p already has the daemons, Cygnus and the claude.ai connectors as its own MCP servers
 # The external token (the user's own Claude Code, later claude.ai): ring, schedule and hand off work, nothing personal.
 SCOPES = {"full": {t["name"] for t in MCP_TOOLS},
-          "external": {"call_user", "schedule_create", "schedule_list", "schedule_cancel", "schedule_update",
-                       "create_task", "task_status", "task_cancel"}}  # no personal reads or memory by default
+          # no personal reads, memory or tasks: a task runs with the whole bridge and its results hold personal data
+          "external": {"call_user", "schedule_create", "schedule_list", "schedule_cancel", "schedule_update"}}
 APP_ACTIONS = None  # set below from ACTIONS: the app's actions; device tools and the web stay with models
 # ACTIONS.md §1 metadata. rest: the dedicated route (method, path, how the action's args map), or the reason there
 # is none. examples: (valid, invalid) inputs for the conformance test.
@@ -819,11 +819,11 @@ ACTIONS = {
                         "examples": ({"id": "{id}", "purpose": "물 마시기"}, {"id": "{id}"})},
     "schedule_cancel": {"read_only": False, "scopes": ("internal", "qwen", "app", "external"),
                         "rest": ("DELETE", "/v1/schedule/{id}"), "examples": ({"id": "{id}"}, {"id": "nope"})},
-    "create_task": {"read_only": False, "scopes": ("internal", "qwen", "app", "external"),
+    "create_task": {"read_only": False, "scopes": ("internal", "qwen", "app"),
                     "rest": ("POST", "/v1/tasks"), "examples": ({"goal": "정리", "notify": "none"}, {"goal": ""})},
-    "task_status": {"read_only": True, "scopes": ("internal", "qwen", "app", "external"),
+    "task_status": {"read_only": True, "scopes": ("internal", "qwen", "app"),
                     "rest": ("GET", "/v1/tasks/{id}"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
-    "task_cancel": {"read_only": False, "scopes": ("internal", "qwen", "app", "external"),
+    "task_cancel": {"read_only": False, "scopes": ("internal", "qwen", "app"),
                     "rest": ("POST", "/v1/tasks/{id}/cancel"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
     "approval_status": {"read_only": True, "scopes": ("internal", "qwen", "app"),
                         "rest": ("GET", "/v1/approvals/{id}"), "examples": ({}, {"id": "zz"})},

@@ -376,6 +376,8 @@ device that created them.
     "steps":[{"at","kind":"tool","tool","label"} | {"kind":"approval"|"approval_approved"|"approval_rejected",
     "approval_id"} | {"kind":"killed","reason":"time"|"budget"|"error"}]}`. Steps never carry tool arguments or results.
     `status`: `queued|running|waiting_approval|done|failed|cancelled`.
+  - The external MCP token (`~/.config/biseo/mcp_external_token`, ACTIONS.md) cannot create, read or cancel tasks:
+    a task runs with the whole bridge and its results hold personal data. That scope is call_user and schedule_*.
   - `PATCH /v1/tasks/{id}` `{"notify":"call"|"push"|"none"}` → the task without steps; only `notify` may change, only
     while `queued|running|waiting_approval` (409 once finished, 400 for anything else). Takes effect for the finish of
     a task already running on this gateway.

@@ -407,17 +407,16 @@ def test_mcp_scopes():
         r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, scope=scope))
         return [t["name"] for t in r["result"]["tools"]]
     assert names("full") == [t["name"] for t in TB.ALL_OWN]
-    assert names("external") == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task",
-                                 "task_status", "task_cancel", "schedule_create"]
-    for tool in ("approval_status", "macbook__list_dir", "infra_health", "nope"):
+    assert names("external") == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "schedule_create"]
+    for tool in ("approval_status", "macbook__list_dir", "infra_health", "nope", "create_task", "task_status", "task_cancel"):
         r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                   "params": {"name": tool, "arguments": {}}}, scope="external"))
         assert r["error"] == {"code": -32602, "message": "unknown tool"}, tool  # out of scope = nonexistent
     assert "result" in run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                              "params": {"name": "approval_status", "arguments": {}}}, scope="full"))
-    run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                          "params": {"name": "create_task", "arguments": {"goal": "정리"}}}, scope="external"))
-    assert w.tasks[-1]["notify"] == "push"  # the user is at a terminal, not in a call
+    r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                              "params": {"name": "create_task", "arguments": {"goal": "정리"}}}, scope="external"))
+    assert r["error"]["message"] == "unknown tool" and not w.tasks  # the external token cannot start tasks
 
 
 def test_when_text_is_resolved_by_the_gateway_not_the_model():
