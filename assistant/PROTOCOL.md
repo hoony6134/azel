@@ -508,6 +508,13 @@ asks, call_logs or schedule requests.
   Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
   `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
   schedule list). Timeout 3 s.
+  Cygnus tools (when the brain has a Cygnus PAT, `~/.config/biseo/cygnus_pat`, 0600, read-only): the brain's hello adds
+  `"tools": [names]` (the voice server then forwards exactly those names, else the five above), and each persona's
+  block lists them. Curated read-only set, arguments validated by the brain: `gistra_today{date?}`,
+  `gistra_schedule{from,to,kinds?}` (≤ 31 days), `gistra_assignments{course?}`, `planit_get_day{date?}`,
+  `planit_search_tasks{query}`, `memory_recall{query}` (personas with share_memory only), `infra_health{}`,
+  `infra_status{}` (problems only), `infra_alerts{}`. Results are trimmed to 1500 chars and cached for 60 s. With
+  `infra_health` listed, a server *status* question is no longer pre-routed to Claude (an action on a server still is).
 - voice → brain `{"type":"recall","id","text"}` → `{"id","type":"recall_result","hits":["…"]}` (≤ 2 memory hits);
   the voice server waits at most 400 ms, then answers without them.
 

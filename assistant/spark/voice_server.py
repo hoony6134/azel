@@ -193,6 +193,7 @@ class Link:
         self.fails = 0  # consecutive failed asks; 3 or more = unhealthy, tried last
         self.claude = True  # False: a gateway without Claude (scheduled calls, history, settings only)
         self.brain = False  # the resident brain: sends contexts, serves Qwen's tools, never takes asks or logs
+        self.tools: tuple = ()  # the tools a brain link serves (its hello), e.g. read-only Cygnus tools
 
     async def send(self, obj):
         async with self.lock:
@@ -274,6 +275,8 @@ class GatewayLinks:
             lk.device, lk.mode = device, mode
             lk.claude = msg.get("claude") is not False
             lk.brain = msg.get("role") == "brain" and mode == "full"
+            tools = msg.get("tools") if lk.brain and isinstance(msg.get("tools"), list) else []
+            lk.tools = tuple(t for t in tools[:40] if isinstance(t, str) and TOOL_NAME.fullmatch(t))
             try:
                 lk.priority = int(msg.get("priority", 50))
             except (TypeError, ValueError):
@@ -310,7 +313,12 @@ RECALL_WAIT_S = 0.4  # per-turn memory retrieval may delay the answer this much 
 TOOL_WAIT_S = 3.0  # a slow brain never stalls a turn
 TOOL_TAG = "[TOOL]"
 MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|우리|네가)|했었|했던|라고 했|물어봤")
-BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")
+BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")  # a brain without a tool list
+TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
+# With the brain's read-only server tools, a status question stays local; doing something on a server does not.
+WEB_LIVE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|검색|찾아(서|줘|봐)|맛집")
+STATUS_Q = re.compile(r"괜찮|상태|살아 ?있|켜져|꺼졌|다운|죽었|문제|경보|알림|이상|느려|디스크|용량|온도|메모리")
+SERVER_ACTION = re.compile(r"재시작|재부팅|리부트|고쳐|켜 ?줘|꺼 ?줘|지워|삭제|정리해|로그|배포|실행|돌려|설치")
 
 
 def _take_context(self, session, value, persona=None):
@@ -332,6 +340,12 @@ def _context_for(self, session, persona=None):
                                            else None)
     got = [c for c in (self.session_ctx.get(session), shared) if c and time.time() - c[0] < BRAIN_FRESH_S]
     return max(got)[1] if got else ""
+
+
+def _brain_tools(self):
+    """What Qwen may call through the brain: the tools its hello listed (the brain re-checks each call)."""
+    lk = self.brain_link()
+    return set(lk.tools or BRAIN_TOOLS) if lk else set()
 
 
 def _brain_link(self):
@@ -361,6 +375,7 @@ async def _brain_event(self, msg):
 
 
 GatewayLinks.take_context, GatewayLinks.context_for, GatewayLinks.brain_link = _take_context, _context_for, _brain_link
+GatewayLinks.brain_tools = _brain_tools
 GatewayLinks.brain_request, GatewayLinks.brain_event = _brain_request, _brain_event
 
 BRAIN_BODY = (
@@ -369,8 +384,9 @@ BRAIN_BODY = (
     f"더 찾아봐야 하면 다른 말 없이 한 줄로 {TOOL_TAG} {{\"name\": 도구, \"args\": {{…}}}} 만 출력해. 도구: "
     "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
     "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
-    "참고할 상황과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
-    f"최신 정보, 서버 진단, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
+    "참고할 상황에 'Cygnus 도구' 목록이 있으면 일정, 과제, 할 일, 서버 상태는 그 도구로 확인해서 답해. "
+    "참고할 상황과 도구로 안 되는 일(일정 정보도 일정 도구도 없을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
+    f"최신 정보, 서버 재시작 같은 작업, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해."
 )
 
@@ -389,8 +405,8 @@ async def run_tool(raw, session):
         return "도구 호출 형식이 틀렸어요."
     if name == "scheduled_calls":
         return await schedule_reply("", "list", session)
-    if name not in BRAIN_TOOLS:
-        return f"없는 도구예요: {name}"
+    if name not in links.brain_tools():
+        return f"없는 도구예요: {name[:40]}"
     try:
         reply = await links.brain_request({"type": "tool", "name": name, "args": args,
                                            "persona": (CALL_PERSONA.get() or {}).get("id")}, TOOL_WAIT_S)
@@ -549,7 +565,7 @@ def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
 
 
-def pre_route(text, settings, local=False):
+def pre_route(text, settings, local=False, tools=()):
     """(straight to Claude?, model) decided by keywords and settings, before any LLM call.
 
     local=True (the brain's context is in Qwen's prompt): personal questions go to Qwen first, which answers from
@@ -558,7 +574,9 @@ def pre_route(text, settings, local=False):
     default = settings.get("default_model", "auto")
     model = forced_model or (default if default in MODEL_WORDS else None)
     if local:  # "아까 날씨 물어봤을 때 뭐라 했지?" is memory, not live data: Qwen decides
-        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text)
+        server_status = "infra_health" in tools and STATUS_Q.search(text) and not SERVER_ACTION.search(text) \
+            and not WEB_LIVE.search(text)  # "서버 괜찮아?" with Cygnus tools: Qwen answers with infra_health
+        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status
         keywords = USE_CLAUDE.search(text) or live or \
             pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
     else:
@@ -997,7 +1015,7 @@ async def respond(text, session, t0, timings, on_event=None):
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
-    to_claude, model = (False, None) if sched else pre_route(bare, settings, local=bool(ctx))
+    to_claude, model = (False, None) if sched else pre_route(bare, settings, local=bool(ctx), tools=links.brain_tools() if ctx else ())
     sentences: asyncio.Queue = asyncio.Queue()
     route = {"value": "schedule" if sched else "claude" if to_claude else "qwen"}
 
@@ -2451,6 +2469,11 @@ if __name__ == "__main__":
             assert not lim.brain  # a link_limited token cannot pose as the brain
             links.remove(lim)
             assert pre_route("오늘 일정 뭐야?", {})[0] and not pre_route("오늘 일정 뭐야?", {}, local=True)[0]
+            infra = {"infra_health", "gistra_today"}
+            assert not pre_route("서버 괜찮아?", {}, local=True, tools=infra)[0] and pre_route("서버 괜찮아?", {}, local=True)[0]
+            assert not pre_route("스파크 디스크 용량 어때?", {}, local=True, tools=infra)[0]
+            assert pre_route("스파크 재시작해 줘", {}, local=True, tools=infra)[0]  # an action: still Claude
+            assert pre_route("서버 상태 검색해 줘", {}, local=True, tools=infra)[0]
             assert pre_route("날씨 어때?", {}, local=True)[0] and not pre_route("아까 날씨 물어봤을 때 뭐라 했어?", {}, local=True)[0] and pre_route("레포 빌드 에러 고쳐 줘", {}, local=True)[0]
             assert [tag_state(h) for h in ("[TO", "[TOOL] {", "[C")] == ["maybe", "tool", "maybe"]
             prompts = []
@@ -2492,6 +2515,14 @@ if __name__ == "__main__":
             t = time.perf_counter()
             asyncio.run(run("느린 기억 찾기", "s"))  # the brain never answers recall: give up after RECALL_WAIT_S
             assert RECALL_WAIT_S <= time.perf_counter() - t < RECALL_WAIT_S + 0.5 and "관련된 기록" not in prompts[0][0]["content"]
+            assert links.brain_tools() == set(BRAIN_TOOLS)  # a brain that lists no tools: the old set
+            links.receive(br, {"type": "hello", "device": "brain-deneb", "mode": "full", "priority": 1, "claude": False,
+                               "role": "brain", "tools": ["search_memory", "gistra_today", "infra_health", "Bad Name!", 7]})
+            assert links.brain_tools() == {"search_memory", "gistra_today", "infra_health"}
+            got = asyncio.run(run_tool('[TOOL] {"name": "gistra_today", "args": {}}', "s"))
+            assert got == "- 11/19 랩미팅 발표는 다음 주로 미룸" and bws.sent[-1]["name"] == "gistra_today"
+            assert asyncio.run(run_tool('[TOOL] {"name": "planit_create_task", "args": {}}', "s")).startswith("없는 도구")
+            assert asyncio.run(run_tool('[TOOL] {"name": "add_todo", "args": {}}', "s")).startswith("없는 도구")  # not listed
             links.remove(br)
             assert links.context_for("s") == ""  # brain gone: old prompt and routing
             links.remove(gw)
