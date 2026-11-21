@@ -152,8 +152,8 @@ The jar is a closed path of 120 points around a center. Base radius `R` (iPhone:
 screen width; Mac panel: 34 pt). For angle θ (0 = right, measured clockwise, y down):
 
 ```
-jar(θ)   = 1 + 0.06·sin(θ)                   // wider at the bottom half → "foot" heavier…
-         − 0.035·cos(2θ)                      // …and a soft shoulder
+jar(θ)   = 1 − 0.06·sin(θ)                   // y down: fuller upper half (shoulder), narrower foot…
+         − 0.035·cos(2θ)                      // …slightly taller than wide
          + 0.015·sin(3θ + 0.6)                // the hand-thrown asymmetry
 r(θ, t)  = R · jar(θ) · (1 + wobble(θ, t))
 ```
@@ -380,7 +380,8 @@ bottom-center of the active screen, 80 pt above the Dock.
 
 Layout: jar (68 pt, full state behaviour) left · captions middle (latest reply in title3
 medium, user transcript above in footnote text2, both 2 lines, newest wins) · right column:
-route chip and a small hang-up button (`xmark`, 28 pt). While an activity is running the
+route chip and a small hang-up button (`xmark`, 28 pt) with a `…` menu button beside it
+(28 pt) holding 음소거 (Space), 대기, 녹음 — there is no room for the iPhone dock. While an activity is running the
 user-transcript line is replaced by the one-line activity (§13.4).
 - Appears on hotkey down with `enter` motion (scale 0.96 → 1, opacity), listens while the
   key is held, shows thinking/speaking after release, fades out 4 s after `turn_done`
@@ -406,9 +407,9 @@ Three pages in a `TabView(.page)` on iOS / a stepped sheet on Mac, progress dots
    ("키체인에만 저장돼요" footnote). Button "연결 확인" calls `/v1/status`; results appear as
    three check rows (스파크, 게이트웨이, 토큰) with spinner → `checkmark.circle.fill` celadon /
    `xmark.circle.fill` danger + one-line reason. "다음" enabled only when all pass.
-3. **권한**: microphone (required, "말을 들으려면 필요해요"), notifications/VoIP calls ("아젤이
-   먼저 전화하려면 필요해요"); on Mac also Accessibility/Input Monitoring for the global hotkey.
-   Each is a row with a "허용" button that turns into a checkmark. "완료" → home.
+3. **권한**: microphone only (required, "말을 들으려면 필요해요"). VoIP push needs no
+   prompt and the Mac's Carbon hotkey needs no Accessibility permission, so neither gets a
+   row. Its "허용" button turns into a checkmark; "완료" → home.
 
 ## 10. Empty and error states
 

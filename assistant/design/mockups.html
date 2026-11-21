@@ -612,7 +612,7 @@ btn.addEventListener('click', () => {
 // Moon jar: same formula as DESIGN.md §6.2
 const reduce = matchMedia('(prefers-reduced-motion: reduce)');
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-function jarR(th) { return 1 + 0.06*Math.sin(th) - 0.035*Math.cos(2*th) + 0.015*Math.sin(3*th + 0.6); }
+function jarR(th) { return 1 - 0.06*Math.sin(th) - 0.035*Math.cos(2*th) + 0.015*Math.sin(3*th + 0.6); }
 function wobble(state, th, t, L) {
   switch (state) {
     case 'listening': return L*(0.05*Math.sin(3*th + 2.1*t) + 0.03*Math.sin(5*th - 3.3*t));
