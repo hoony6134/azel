@@ -1279,6 +1279,10 @@ def recent_context(hist, n=6):
 
 
 TITLE_EVERY = 3  # replies without the title before it comes back
+HONORIFICS = ("아저씨", "아줌마", "오빠", "오라버니", "형님", "형", "언니", "누나", "자기야", "자기", "사장님", "선생님", "이모",
+              "삼촌", "주인님", "고객님")
+_VOCATIVE = "|".join(sorted(map(re.escape, HONORIFICS), key=len, reverse=True))
+INVENTED = re.compile(rf"^\s*(?:{_VOCATIVE})\s*[,!~]\s*|\s*,\s*(?:{_VOCATIVE})(?=\s*[.!?~]*\s*$)")
 title_gap: dict[str, int] = {}  # history key -> replies since the user's title was last said
 
 
@@ -1292,6 +1296,8 @@ class Address:
         self.due = bool(title) and (first_reply or gap >= TITLE_EVERY)
 
     def __call__(self, s):
+        # a form of address the user never set ("아저씨", "오빠"): dropped as a vocative, the sentence kept
+        s = re.sub(INVENTED, lambda m: m.group(0) if self.title and self.title in m.group(0) else "", s).strip() or s
         if not self.title:
             return s
         t = re.escape(self.title)
@@ -2295,6 +2301,11 @@ if __name__ == "__main__":
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
+        assert Address("대표님", "h1", False)("아저씨, 오늘은 쉬세요.") == "오늘은 쉬세요."
+        assert Address("", "h2", True)("네, 오빠!") == "네!"  # no title set: an invented one goes
+        assert Address("", "h3", True)("좋아요, 누나.") == "좋아요."
+        assert Address("오빠", "h4", False)("오빠, 밥 먹었어?") == "오빠, 밥 먹었어?"  # the title the user chose
+        assert Address("대표님", "h5", False)("형 회사 이야기 해 볼까요?") == "형 회사 이야기 해 볼까요?"  # not a vocative
         title_gap.clear()
         replies = []
         for i, said in enumerate([["네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["대표님, 좋아요."],
