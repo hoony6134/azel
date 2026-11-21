@@ -208,7 +208,9 @@ device that created them.
   "last_reply" (last assistant reply, first 120 chars),"started_at","duration_s","direction","reason",
   "client","turns","routes":{"qwen":n,"claude":m},"kinds":["calendar",…]}]`, newest first. With `q`:
   full transcripts are searched with the memory records' hybrid vector + text ranking (calls still in
-  progress by substring), best first, each item adding `"match"`: a short snippet of the matching line;
+  progress by substring). Calls whose words match come first; meaning-only matches (vector, no word match)
+  are listed only when no call matches the words, and need cosine ≥ 0.9. Each item adds `"match"`: a short
+  snippet of the matching line;
   `GET /v1/history/{id}` → the call with `"turns":[{"at","user","assistant","route",
   "activity":[{"label","kind","at"}],"timings","interrupted"}]`, every `at` in seconds from the call's
   start, computed by the memory service; `DELETE /v1/history/{id}`; `DELETE /v1/history?older_than_days=N`. Setting

@@ -644,9 +644,9 @@ LIST_COLS = f"""h.id, h.session, h.direction, h.reason, h.client,
         where t.call = h.id group by route) r) as routes,
     (select coalesce(jsonb_agg(distinct a->>'kind'), '[]') from {TURNS} t, jsonb_array_elements(t.activity) a
         where t.call = h.id and jsonb_typeof(a) = 'object' and a->>'kind' is not null) as kinds"""
-# shortcut: e5 cosine for unrelated Korean text sits around 0.75-0.8, so a vector-only hit needs more than that;
-# tune on real calls if q misses paraphrases or returns noise.
-HISTORY_VEC_MIN, HISTORY_LEX_MIN = 0.86, 0.1
+# A vector-only hit (no word match) counts only when no call matches the words at all, and then needs a high
+# cosine: on ruchba's e5, an unrelated call scored above 0.86 for "주차". shortcut: tune 0.9 on real calls.
+HISTORY_VEC_MIN, HISTORY_LEX_MIN = 0.9, 0.1
 
 
 def snippet(text, q, width=80):
@@ -668,21 +668,23 @@ def history_list(limit: int = 20, before: float | None = None, q: str | None = N
                   {"before": before, "limit": limit})
     # Full transcripts, ranked like memory search: ended calls have a transcript record (hybrid vector + text);
     # calls still running do not yet, so their turns are matched by substring.
-    best: dict[str, tuple[float, str]] = {}
+    best: dict[str, tuple[bool, float, str]] = {}  # call -> (word match, score, snippet)
     for h in search(Search(query=q, kinds=["transcript"], limit=100)):
         cid = (h["meta"] or {}).get("call")
         if cid and cid not in best and (h["lex"] >= HISTORY_LEX_MIN or h["vec"] >= HISTORY_VEC_MIN):
-            best[cid] = (h["score"], snippet(h["text"], q))
+            best[cid] = (h["lex"] >= HISTORY_LEX_MIN, h["score"], snippet(h["text"], q))
     for r in db(f"select t.call, t.user_text, t.assistant from {TURNS} t join {HIST} h on h.id = t.call"
                 " where h.ended_at is null and (t.user_text ilike %(like)s or t.assistant::text ilike %(like)s)",
                 {"like": f"%{q}%"}):
-        best.setdefault(r["call"], (0.0, snippet(r["user_text"] + "\n" + " ".join(r["assistant"]), q)))
+        best.setdefault(r["call"], (True, 0.0, snippet(r["user_text"] + "\n" + " ".join(r["assistant"]), q)))
+    if any(word for word, _, _ in best.values()):  # words matched somewhere: meaning-only neighbours are noise
+        best = {k: v for k, v in best.items() if v[0]}
     if not best:
         return []
     rows = db(f"select {LIST_COLS} from {HIST} h where {where} and h.id = any(%(ids)s)",
               {"before": before, "ids": list(best)})
-    rows.sort(key=lambda r: -best[r["id"]][0])
-    return [{**r, "match": best[r["id"]][1]} for r in rows[:limit]]
+    rows.sort(key=lambda r: (not best[r["id"]][0], -best[r["id"]][1]))
+    return [{**r, "match": best[r["id"]][2]} for r in rows[:limit]]
 
 
 def offsets(steps, started):
