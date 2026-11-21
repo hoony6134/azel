@@ -69,8 +69,8 @@ enum JarState: Equatable {
 enum JarPath {
     static let points = 120
 
-    /// The lopsided moon-jar silhouette: heavier foot, soft shoulder, hand-thrown asymmetry.
-    static func jar(_ θ: Double) -> Double { 1 + 0.06 * sin(θ) - 0.035 * cos(2 * θ) + 0.015 * sin(3 * θ + 0.6) }
+    /// The lopsided moon-jar silhouette (y down): fuller shoulder, narrower foot, hand-thrown asymmetry.
+    static func jar(_ θ: Double) -> Double { 1 - 0.06 * sin(θ) - 0.035 * cos(2 * θ) + 0.015 * sin(3 * θ + 0.6) }
 
     static func wobble(_ state: JarState, θ: Double, t: Double, level: Double) -> Double {
         switch state {
@@ -115,6 +115,9 @@ struct MoonJar: View {
     var state: JarState
     let levels: Levels
     var paused = false
+    /// Set on `interrupt`: one quick ring ripple (DESIGN §5).
+    var ripple: Date? = nil
+    @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var phase
     @State private var previous: JarState = .idle
@@ -133,11 +136,17 @@ struct MoonJar: View {
                                         from: previous, to: state, mix: mix, reduceMotion: reduceMotion)
                 draw(state, path: path, opacity: mix, ctx: ctx, center: center, R: R, t: t, level: level)
                 if mix < 1 { draw(previous, path: path, opacity: 1 - mix, ctx: ctx, center: center, R: R, t: t, level: level) }
+                if let ripple, case let e = now.timeIntervalSince(ripple), e >= 0, e < 0.4 {
+                    let k = 1.05 + e * (reduceMotion ? 0 : 0.8)
+                    let ring = path.applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: k, y: k)
+                        .translatedBy(x: -center.x, y: -center.y))
+                    ctx.stroke(ring, with: .color(Theme.celadon.opacity(1 - e / 0.4)), lineWidth: 2)
+                }
             }
         }
         .onChange(of: state) { old, _ in previous = old; changedAt = Date() }
         .accessibilityElement()
-        .accessibilityLabel("박비서")
+        .accessibilityLabel(name)
         .accessibilityValue(state.spokenLabel)
         .accessibilityAddTraits(.updatesFrequently)
     }

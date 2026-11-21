@@ -46,8 +46,8 @@ struct SetupFlow: View {
         VStack(spacing: Theme.xl) {
             Spacer()
             MoonJar(state: .idle, levels: .silent).frame(width: 220, height: 220)
-            Text("박비서").font(.largeTitle.weight(.semibold)).foregroundStyle(Theme.text)
-            Text("전화하듯 말을 걸면 돼요.").font(.title3).foregroundStyle(Theme.text2)
+            Text("Azel").font(.largeTitle.weight(.semibold)).foregroundStyle(Theme.text)
+            Text("\(AssistantName.current)에게 전화하듯 말을 걸면 돼요.").font(.title3).foregroundStyle(Theme.text2)
             Spacer()
             primary("시작하기") { step = 1 }
         }
@@ -116,7 +116,7 @@ struct SetupFlow: View {
                     else { Button("허용") { Task { micGranted = await SetupFlow.requestMic() } }.buttonStyle(.bordered).tint(Theme.celadon) }
                 }
                 #if os(iOS)
-                Text("박비서가 먼저 거는 전화는 VoIP 푸시로 와서 따로 허용할 필요가 없어요.").font(.footnote).foregroundStyle(Theme.text3)
+                Text("\(AssistantName.josa(AssistantName.current, "이", "가")) 먼저 거는 전화는 VoIP 푸시로 와서 따로 허용할 필요가 없어요.").font(.footnote).foregroundStyle(Theme.text3)
                 #else
                 Text("전역 단축키(⌥Space)는 손쉬운 사용 권한 없이 동작해요.").font(.footnote).foregroundStyle(Theme.text3)
                 #endif
@@ -200,6 +200,9 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showSetup = false
     @State private var showRecordings = false
     @State private var showPaths = false
+    @State private var nameDraft = AssistantName.current
+    @State private var nameError: String?
+    @AppStorage("workSounds") private var workSounds = true
 
     enum SaveState: Equatable { case idle, saving, saved, failed(String) }
 
@@ -210,6 +213,7 @@ struct SettingsScreen<Extra: View>: View {
                     let f = FriendlyError.describe(loadError)
                     EmptyState(title: f.title, message: f.message, detail: loadError.localizedDescription, action: ("다시 시도", { Task { await load() } }))
                 }
+                if let s = Binding($settings) { assistantCard(s) }
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
@@ -249,14 +253,46 @@ struct SettingsScreen<Extra: View>: View {
         }
     }
 
+    // 비서 (DESIGN §7.5 card 1)
+    private func assistantCard(_ s: Binding<AppSettings>) -> some View {
+        Card("비서") {
+            HStack {
+                Text("이름").foregroundStyle(Theme.text)
+                Spacer()
+                TextField(AssistantName.fallback, text: $nameDraft)
+                    .multilineTextAlignment(.trailing).frame(maxWidth: 160)
+                    .onSubmit { commitName(s) }
+                    .onChange(of: nameDraft) { commitName(s) }
+                    .accessibilityLabel("비서 이름")
+                    .accessibilityHint("호출어는 바뀌지 않습니다")
+            }
+            if let nameError { Text(nameError).font(.footnote).foregroundStyle(Theme.danger) }
+            Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
+            Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
+                .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
+        }
+    }
+
+    /// Empty → the default name; anything else must pass validation before it is saved.
+    private func commitName(_ s: Binding<AppSettings>) {
+        let trimmed = nameDraft.trimmingCharacters(in: .whitespaces)
+        guard let name = trimmed.isEmpty ? AssistantName.fallback : AssistantName.validated(trimmed) else {
+            nameError = "한글, 영문, 공백으로 12자까지 쓸 수 있어요"
+            return
+        }
+        nameError = nil
+        if s.wrappedValue.assistant_name != name { s.wrappedValue.assistant_name = name }
+    }
+
     // Usage
     private var usageCard: some View {
         let cost = (usage["cost_usd"] as? NSNumber)?.doubleValue ?? 0
-        let budget = settings?.monthly_budget_usd ?? 0
+        let budget = (usage["budget_usd"] as? NSNumber)?.doubleValue ?? settings?.monthly_budget_usd ?? 0
         let warn = Double(settings?.budget_warn_pct ?? 80) / 100
         let frac = budget > 0 ? cost / budget : 0
         let barColor = frac >= 1 ? Theme.danger : frac >= warn ? Theme.amber : Theme.celadon
-        return Card("사용량", trailing: AnyView(Text(monthLabel).font(.subheadline).foregroundStyle(Theme.text2))) {
+        let calls = (usage["calls"] as? NSNumber).map { " · 통화 \($0.intValue)회" } ?? ""
+        return Card("사용량", trailing: AnyView(Text(monthLabel + calls).font(.subheadline.monospacedDigit()).foregroundStyle(Theme.text2))) {
             HStack(alignment: .firstTextBaseline, spacing: Theme.xs) {
                 Text(cost, format: .currency(code: "USD")).font(.title.monospacedDigit()).foregroundStyle(Theme.text)
                 if budget > 0 { Text("/ \(budget, format: .currency(code: "USD").precision(.fractionLength(0)))").foregroundStyle(Theme.text2) }
@@ -480,6 +516,7 @@ struct SettingsScreen<Extra: View>: View {
             let s: AppSettings = try await Gateway.get("/v1/settings")
             loaded = s
             settings = s
+            if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
             loadError = nil
         } catch { loadError = error }
         usage = (try? await Gateway.getJSON("/v1/usage") as? [String: Any]) ?? usage
@@ -497,6 +534,7 @@ struct SettingsScreen<Extra: View>: View {
             do {
                 try await Gateway.saveSettings(new)
                 loaded = new
+                if let n = new.assistant_name { AssistantName.current = n }
                 saveState = .saved
             } catch { saveState = .failed(FriendlyError.describe(error).title) }
         }
@@ -658,7 +696,7 @@ struct TranscriptView: View {
                         if !line.mine { Spacer(minLength: 40) }
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel((line.mine ? "나: " : "박비서: ") + line.text)
+                    .accessibilityLabel((line.mine ? "나: " : "\(AssistantName.current): ") + line.text)
                 }
             }
             .padding(20)
@@ -685,7 +723,7 @@ struct RecentCard: View {
             if let last { Text(last.text).lineLimit(compact ? 1 : 2).foregroundStyle(Theme.text) }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(record.start.formatted(date: .omitted, time: .shortened)), 나: \(first ?? ""), 박비서: \(last?.text ?? "")")
+        .accessibilityLabel("\(record.start.formatted(date: .omitted, time: .shortened)), 나: \(first ?? ""), \(AssistantName.current): \(last?.text ?? "")")
         .accessibilityHint("전체 대화 보기")
     }
 }

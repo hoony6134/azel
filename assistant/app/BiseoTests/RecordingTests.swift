@@ -70,7 +70,7 @@ final class RecordingFileTests: XCTestCase {
         XCTAssertEqual(Double(file.length) / file.fileFormat.sampleRate, 2, accuracy: 0.1)
         let text = try String(contentsOf: Recordings.transcriptURL(for: url), encoding: .utf8)
         XCTAssertTrue(text.contains("나: 안녕"))
-        XCTAssertTrue(text.contains("박비서 (qwen): 네"))
+        XCTAssertTrue(text.contains("\(AssistantName.current) (qwen): 네"))
         XCTAssertEqual(Recordings.list(in: dir), [url])
 
         Recordings.delete(url)

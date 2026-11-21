@@ -34,10 +34,11 @@ targets:
     info:
       path: Biseo/Info.plist
       properties:
-        CFBundleDisplayName: 박비서
+        CFBundleDisplayName: Azel
+        CFBundleName: Azel # macOS menu/app name; PRODUCT_NAME stays Biseo (module name, test host)
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
-        NSMicrophoneUsageDescription: 박비서와 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.
+        NSMicrophoneUsageDescription: Azel로 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.
         # iOS (ignored on macOS)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

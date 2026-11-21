@@ -31,6 +31,7 @@ final class AppModel: ObservableObject {
         session = Session.current(sessionPrefix)
         guard configured else { return }
         do { status = try await Gateway.get("/v1/status"); statusError = nil } catch { status = nil; statusError = error }
+        if let s: AppSettings = try? await Gateway.get("/v1/settings"), let name = s.assistant_name { AssistantName.current = name }
         if let items = try? await Gateway.approvals() { approvals = items }
     }
 

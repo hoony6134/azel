@@ -9,7 +9,7 @@ struct BiseoMacApp: App {
 
     init() {
         Recordings.cleanup()
-        HotKey.action = { MacCall.shared.toggle() }
+        HotKey.action = { MacCall.shared.hotkey(down: $0) }
         HotKey.register()
     }
 
@@ -18,11 +18,11 @@ struct BiseoMacApp: App {
             Popover(model: model, wake: wake)
         } label: {
             Image(nsImage: JarIcon.make(filled: call.inCall, dot: !model.approvals.isEmpty))
-                .accessibilityLabel("박비서")
+                .accessibilityLabel("Azel")
         }
         .menuBarExtraStyle(.window)
 
-        Window("박비서", id: "main") {
+        Window("Azel", id: "main") {
             MainWindow(model: model, wake: wake)
         }
         .defaultSize(width: 760, height: 720)
@@ -98,7 +98,7 @@ struct Popover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.l) {
             HStack {
-                Text("박비서").font(.headline).foregroundStyle(Theme.text)
+                Text("Azel").font(.headline).foregroundStyle(Theme.text)
                 Spacer()
                 StatusDot(ok: model.online)
                 Text(model.configured ? (model.online ? "연결됨" : model.statusError.map { FriendlyError.describe($0).title } ?? "확인 중") : "설정 필요")
@@ -112,7 +112,7 @@ struct Popover: View {
                     MoonJar(state: call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
                             levels: call.levels).frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: Theme.s) {
-                        Text("\(HotKey.label)를 눌러 말하세요").font(.subheadline).foregroundStyle(Theme.text2)
+                        Text(MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요").font(.subheadline).foregroundStyle(Theme.text2)
                         Button { call.inCall ? call.hangUp() : call.start(panel: true) } label: {
                             Label(call.inCall ? "끊기" : "전화", systemImage: call.inCall ? "phone.down.fill" : "phone.fill")
                         }
@@ -251,7 +251,11 @@ struct MacHome: View {
                     } else {
                         Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }
-                    MoonJar(state: jarState, levels: call.levels)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt)
+                        .contentShape(Rectangle())
+                        .onTapGesture { call.interrupt() }
+                        .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
+                        .accessibilityAction(named: "말 끊기") { call.interrupt() }
                         .frame(width: call.inCall ? 320 : 200, height: call.inCall ? 320 : 200)
                         .animation(Theme.enter, value: call.inCall)
                     if call.inCall { captions; dock } else { idle }
@@ -271,7 +275,7 @@ struct MacHome: View {
     private var idle: some View {
         VStack(spacing: Theme.l) {
             Button { call.start(panel: false) } label: {
-                Label("박비서에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
+                Label("\(AssistantName.current)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
                     .frame(maxWidth: .infinity).frame(height: 52)
                     .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
             }
@@ -342,6 +346,7 @@ struct MacHome: View {
 struct MacSettingsCard: View {
     @ObservedObject var wake: WakeModel
     @State private var hotkey = HotKey.index
+    @State private var mode = MacCall.pttMode
 
     var body: some View {
         Card("맥") {
@@ -354,6 +359,12 @@ struct MacSettingsCard: View {
                 .labelsHidden().fixedSize()
                 .onChange(of: hotkey) { HotKey.index = hotkey }
             }
+            Picker("단축키 동작", selection: $mode) {
+                Text("누르고 말하기").tag(MacCall.PTTMode.hold)
+                Text("눌러서 켜고 끄기").tag(MacCall.PTTMode.toggle)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: mode) { MacCall.pttMode = mode }
             Text("다른 앱이 같은 단축키를 쓰고 있으면 등록되지 않아요.").font(.footnote).foregroundStyle(Theme.text3)
             HStack {
                 Text("호출어 리스너: \(wake.label)").foregroundStyle(Theme.text)

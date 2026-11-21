@@ -138,6 +138,6 @@ enum FriendlyError {
         if case GatewayError.http(let code) = error, code == 401 || code == 403 {
             return ("토큰이 맞지 않아요", "설정의 토큰을 다시 입력해 주세요.")
         }
-        return ("박비서에게 닿지 않아요", "서버에 연결할 수 없어요. 네트워크와 서버 주소를 확인해 주세요.")
+        return ("\(AssistantName.current)에게 닿지 않아요", "서버에 연결할 수 없어요. 네트워크와 서버 주소를 확인해 주세요.")
     }
 }

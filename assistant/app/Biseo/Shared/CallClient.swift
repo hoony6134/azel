@@ -25,6 +25,8 @@ final class CallClient {
         didSet { if held != oldValue { held ? audio.pause() : audio.resume() } }
     }
     var isConnected: Bool { socket != nil }
+    /// Mac push-to-talk: false between key presses, so nothing goes up (the socket stays open).
+    var sending = true
     var isRecording: Bool { recorder != nil }
 
     let audio = AudioIO()
@@ -63,7 +65,7 @@ final class CallClient {
         task.resume()
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
-            let action = Self.micAction(muted: muted, held: held)
+            let action = sending ? Self.micAction(muted: muted, held: held) : .drop
             if action == .send { task?.send(.data(data)) { _ in } }
             if action != .drop { recorder?.mic(data, silent: action == .silence) }
         }
@@ -98,6 +100,23 @@ final class CallClient {
         }
     }
 
+    /// Push-to-talk key-up: ~700 ms of zero PCM so the server VAD closes the turn (DESIGN §12.5).
+    func sendSilence(milliseconds: Int = 700) {
+        socket?.send(.data(Self.silence(milliseconds: milliseconds))) { _ in }
+    }
+
+    /// Zero PCM16 at 16 kHz mono.
+    static func silence(milliseconds: Int) -> Data { Data(count: 16 * milliseconds * 2) }
+
+    /// Tap-to-interrupt (DESIGN §12.3): tell the server and drop local playback at once, without
+    /// waiting for its `interrupt` echo.
+    func interrupt() {
+        socket?.send(.string(#"{"type":"interrupt"}"#)) { _ in }
+        audio.flush()
+        if held { audio.pause() }
+        recorder?.interrupt()
+    }
+
     /// Starts writing both sides to Documents/Recordings. Only on the user's tap.
     func startRecording(session: String) throws {
         guard recorder == nil else { return }
@@ -128,6 +147,7 @@ final class CallClient {
         audio.stop()
         muted = false
         held = false
+        sending = true
     }
 
     /// iOS `didDeactivate`: the system took the audio session away.

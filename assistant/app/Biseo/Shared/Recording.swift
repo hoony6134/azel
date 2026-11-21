@@ -86,7 +86,7 @@ final class CallRecorder {
     func note(_ event: CallEvent) {
         guard let text = event.text, event.type == "transcript" || event.type == "reply" else { return }
         let t = Int(Date().timeIntervalSince(started))
-        let who = event.type == "transcript" ? "나" : "박비서" + (event.route.map { " (\($0))" } ?? "")
+        let who = event.type == "transcript" ? "나" : AssistantName.current + (event.route.map { " (\($0))" } ?? "")
         locked { transcript.append(String(format: "[%02d:%02d] ", t / 60, t % 60) + "\(who): \(text)") }
     }
 

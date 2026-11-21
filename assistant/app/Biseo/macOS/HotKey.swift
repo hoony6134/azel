@@ -19,17 +19,20 @@ enum HotKey {
     }
     static var label: String { presets[index].label }
 
-    static var action: () -> Void = {}
+    /// true on key down, false on key up.
+    static var action: (Bool) -> Void = { _ in }
     private static var ref: EventHotKeyRef?
     private static var handler: EventHandlerRef?
 
     static func register() {
         if handler == nil {
-            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-            InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-                DispatchQueue.main.async { HotKey.action() }
+            var specs = [EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
+                         EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased))]
+            InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+                let down = GetEventKind(event) == UInt32(kEventHotKeyPressed)
+                DispatchQueue.main.async { HotKey.action(down) }
                 return noErr
-            }, 1, &spec, nil, &handler)
+            }, 2, &specs, nil, &handler)
         }
         if let ref { UnregisterEventHotKey(ref) }
         ref = nil

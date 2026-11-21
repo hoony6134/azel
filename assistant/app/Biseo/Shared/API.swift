@@ -26,6 +26,8 @@ struct AppSettings: Codable, Equatable {
     var proactive: Proactive
     var default_device: String
     var device_fallback: [String]
+    /// DESIGN §0: what the assistant is called (default 아젤). Optional so older gateways still decode.
+    var assistant_name: String?
 }
 
 struct ServerStatus: Decodable {

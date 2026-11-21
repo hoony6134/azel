@@ -7,6 +7,7 @@ struct HomeView: View {
     @ObservedObject private var call = CallManager.shared
     @State private var toast: String?
     @State private var openRecord: CallRecord?
+    @AppStorage(AssistantName.key) private var name = AssistantName.fallback
 
     var body: some View {
         ScrollView {
@@ -82,7 +83,7 @@ struct HomeView: View {
 
     private var callButton: some View {
         Button { call.startCall() } label: {
-            Label("박비서에게 전화", systemImage: "phone.fill")
+            Label("\(name)에게 전화", systemImage: "phone.fill")
                 .font(.headline).foregroundStyle(Theme.onAccent)
                 .frame(maxWidth: .infinity).frame(height: 64)
                 .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))

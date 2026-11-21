@@ -3,8 +3,8 @@ import XCTest
 
 final class JarPathTests: XCTestCase {
     func testSilhouetteIsLopsidedAndStatesWobbleAsSpecified() {
-        // θ = π/2 is the foot (y down): heavier than the shoulder at 3π/2.
-        XCTAssertGreaterThan(JarPath.jar(.pi / 2), JarPath.jar(3 * .pi / 2))
+        // y down: θ = 3π/2 is the shoulder, fuller than the foot at π/2.
+        XCTAssertGreaterThan(JarPath.jar(3 * .pi / 2), JarPath.jar(.pi / 2))
         let R = 100.0
         // Silent listening/speaking and held/offline don't move.
         for s in [JarState.listening, .speaking, .held, .offline] {

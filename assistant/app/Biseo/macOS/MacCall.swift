@@ -18,6 +18,8 @@ final class MacCall: ObservableObject {
     @Published private(set) var recording = false
     @Published private(set) var connectedAt: Date?
     @Published var error: String?
+    /// Last interrupt (server or tap), drives the jar's ripple.
+    @Published private(set) var interruptedAt: Date?
     /// Device UIDs for the call engine; nil = system default. Saved across launches.
     @Published var inputUID = UserDefaults.standard.string(forKey: "inputDevice") { didSet { deviceChanged() } }
     @Published var outputUID = UserDefaults.standard.string(forKey: "outputDevice") { didSet { deviceChanged() } }
@@ -31,8 +33,74 @@ final class MacCall: ObservableObject {
         client.onClose = { [weak self] in self?.end(error: nil, keepPanel: true) }
     }
 
+    /// "누르고 말하기" (default) or "눌러서 켜고 끄기".
+    enum PTTMode: String, CaseIterable { case hold, toggle }
+    static var pttMode: PTTMode {
+        get { PTTMode(rawValue: UserDefaults.standard.string(forKey: "pttMode") ?? "") ?? .hold }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "pttMode") }
+    }
+
+    /// True while the hold-to-talk key is down (panel border goes celadon).
+    @Published private(set) var talking = false
+    private var pttCall = false
+    private var fadeTask: Task<Void, Never>?
+    private var idleTask: Task<Void, Never>?
+
     /// Hotkey: floating panel. The main window's home runs the call in place (DESIGN §8.3).
     func toggle() { inCall ? hangUp() : start(panel: true) }
+
+    func hotkey(down: Bool) {
+        switch Self.pttMode {
+        case .toggle: if down { toggle() }
+        case .hold: down ? pressBegan() : pressEnded()
+        }
+    }
+
+    /// Key down: open the call if needed and stream the mic while the key is held.
+    private func pressBegan() {
+        fadeTask?.cancel(); idleTask?.cancel()
+        talking = true
+        if inCall {
+            client.sending = true
+            showPanel()
+        } else {
+            start(panel: true)
+            pttCall = true
+        }
+    }
+
+    /// Key up: close the turn with silence, stop sending, keep the socket for the reply.
+    private func pressEnded() {
+        guard talking else { return }
+        talking = false
+        guard inCall, pttCall else { return }
+        client.sending = false
+        client.sendSilence()
+        scheduleIdle()
+    }
+
+    /// Hold-to-talk calls end ~30 s after the last activity.
+    private func scheduleIdle() {
+        guard pttCall else { return }
+        idleTask?.cancel()
+        idleTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let self, !Task.isCancelled, !self.talking else { return }
+            self.end(error: nil, keepPanel: false)
+        }
+    }
+
+    /// The panel fades 4 s after `turn_done` unless the pointer is over it.
+    private func scheduleFade() {
+        guard pttCall else { return }
+        fadeTask?.cancel()
+        fadeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard let self, !Task.isCancelled, !self.talking, let p = self.panel else { return }
+            if NSPointInRect(NSEvent.mouseLocation, p.frame) { return self.scheduleFade() }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 }) { p.orderOut(nil) }
+        }
+    }
 
     func start(panel usePanel: Bool, session: String? = nil) {
         guard !inCall else { return }
@@ -56,6 +124,15 @@ final class MacCall: ObservableObject {
     func toggleMute() {
         muted.toggle()
         client.muted = muted
+    }
+
+    /// Tap on the jar while it speaks.
+    func interrupt() {
+        guard inCall, state == "speaking" else { return }
+        client.interrupt()
+        log.apply(CallEvent(type: "interrupt"))
+        state = "listening"
+        interruptedAt = Date()
     }
 
     func toggleHold() {
@@ -86,7 +163,7 @@ final class MacCall: ObservableObject {
         do { try client.restartAudio() } catch { end(error: error.localizedDescription, keepPanel: true) }
     }
 
-    private static let micDenied = "마이크 권한이 없습니다. 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 박비서를 켜 주세요."
+    private static var micDenied: String { "\(AssistantName.josa(AssistantName.current, "이", "가")) 말을 들으려면 마이크를 허용해 주세요. 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 Azel을 켜 주세요." }
 
     private func connect() {
         inCall = true
@@ -97,9 +174,12 @@ final class MacCall: ObservableObject {
     }
 
     private func handle(_ event: CallEvent) {
+        scheduleIdle()
+        if event.type == "turn_done" { scheduleFade() }
         switch event.type {
         case "state": state = event.value ?? ""
         case "error": error = event.message
+        case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
         }
     }
@@ -115,6 +195,9 @@ final class MacCall: ObservableObject {
         recording = false
         connectedAt = nil
         state = ""
+        talking = false
+        pttCall = false
+        fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
     }
 
@@ -134,7 +217,7 @@ final class MacCall: ObservableObject {
             p.isReleasedWhenClosed = false
             p.isMovableByWindowBackground = true
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            p.setAccessibilityLabel("박비서 말하기 패널")
+            p.setAccessibilityLabel("\(AssistantName.current) 말하기 패널")
             p.contentView = NSHostingView(rootView: CallPanelView(call: self))
             panel = p
         }
@@ -165,7 +248,9 @@ struct CallPanelView: View {
 
     var body: some View {
         HStack(spacing: Theme.m) {
-            MoonJar(state: jarState, levels: call.levels).frame(width: 68, height: 68)
+            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt).frame(width: 68, height: 68)
+                .onTapGesture { call.interrupt() }
+                .accessibilityAction(named: "말 끊기") { call.interrupt() }
             VStack(alignment: .leading, spacing: 2) {
                 let user = call.lines.last { $0.mine }?.text
                 let reply = call.lines.last { !$0.mine }
@@ -207,7 +292,7 @@ struct CallPanelView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous)
-            .strokeBorder(jarState == .listening ? Theme.celadon : Theme.stroke, lineWidth: 1))
+            .strokeBorder(call.talking ? Theme.celadon : Theme.stroke, lineWidth: call.talking ? 1.5 : 1))
         .environment(\.colorScheme, .dark)
     }
 }

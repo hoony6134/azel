@@ -17,6 +17,10 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var recording = false
     @Published private(set) var connectedAt: Date?
     @Published var error: String?
+    /// Last interrupt (server or tap), drives the jar's ripple.
+    @Published private(set) var interruptedAt: Date?
+    /// Incoming calls show the push's `caller`; outgoing ones the cached assistant name.
+    @Published private(set) var callerName: String?
 
     private let provider: CXProvider
     private let controller = CXCallController()
@@ -26,7 +30,7 @@ final class CallManager: NSObject, ObservableObject {
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
-    private var incoming: [UUID: (callID: String?, reason: String?)] = [:]
+    private var incoming: [UUID: (callID: String?, reason: String?, caller: String)] = [:]
     private var activeSession: String?
 
     private override init() {
@@ -52,7 +56,8 @@ final class CallManager: NSObject, ObservableObject {
     func startCall(prefix: String = "iphone") {
         guard !inCall else { return }
         sessionPrefix = prefix
-        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: "박비서"))
+        callerName = nil
+        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: AssistantName.current))
         controller.request(CXTransaction(action: action)) { [weak self] err in
             if let err { DispatchQueue.main.async { self?.error = err.localizedDescription } }
         }
@@ -70,6 +75,15 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// Goes through CallKit so the system call UI shows the hold state too.
+    /// Tap on the jar while it speaks.
+    func interrupt() {
+        guard inCall, state == "speaking" else { return }
+        client.interrupt()
+        log.apply(CallEvent(type: "interrupt"))
+        state = "listening"
+        interruptedAt = Date()
+    }
+
     func toggleHold() {
         guard let uuid = callUUID else { return }
         controller.request(CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: !held))) { _ in }
@@ -141,6 +155,7 @@ final class CallManager: NSObject, ObservableObject {
         switch event.type {
         case "state": state = event.value ?? ""
         case "error": error = event.message
+        case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
         }
     }
@@ -180,6 +195,7 @@ extension CallManager: CXProviderDelegate {
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         let info = incoming.removeValue(forKey: action.callUUID)
         begin(action.callUUID, callID: info?.callID)
+        callerName = info?.caller
         if let reason = info?.reason { log.lines.append(CallLine(mine: false, text: "용건: \(reason)")) }
         action.fulfill()
     }
@@ -217,9 +233,9 @@ extension CallManager: PKPushRegistryDelegate {
     func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload,
                       for type: PKPushType, completion: @escaping () -> Void) {
         let p = payload.dictionaryPayload
-        let caller = p["caller"] as? String ?? "박비서"
+        let caller = p["caller"] as? String ?? AssistantName.current
         let uuid = UUID()
-        incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String)
+        incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller)
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: caller)
         update.localizedCallerName = caller
