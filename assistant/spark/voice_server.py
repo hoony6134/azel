@@ -481,8 +481,7 @@ DAYS = "월화수목금토일"
 REL_RE = re.compile(_N + r"\s*(분|시간)\s*(뒤|후|있다가|지나서)")
 CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _N + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
 WEEKDAY_RE = re.compile(r"(다음\s*주|담주|이번\s*주)?\s*([월화수목금토일])요일")
-REPEATS = {"daily", "weekdays"} | {f"weekly:{d}" for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")}
-DOW_EN = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+REPEATS = {"daily", "weekdays"} | {f"weekly:{d}" for d in range(7)}  # weekly:<dow>, 0 = Monday
 SCHED_LIST = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거).{0,8}(목록|뭐|있|확인|알려|된 거|돼 있)")
 SCHED_CANCEL = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거|전화).{0,8}취소|취소.{0,6}(예약|알람)|^\s*취소(해\s*줘|해요|요)?[.!]?\s*$")
 SCHED_WAKE = re.compile(r"깨워|모닝 ?콜|알람.{0,10}(맞춰|설정|해\s*줘|부탁)")
@@ -521,7 +520,7 @@ def parse_when(text, now=None):
             second=0, microsecond=0), None
     repeat = "daily" if "매일" in text else "weekdays" if re.search(r"평일|주중", text) else None
     if m := re.search(r"매주\s*([월화수목금토일])요일", text):
-        repeat = f"weekly:{DOW_EN[DAYS.index(m.group(1))]}"
+        repeat = f"weekly:{DAYS.index(m.group(1))}"
     clock = CLOCK_RE.search(text)
     if not clock:
         return None, repeat
@@ -548,7 +547,7 @@ def parse_when(text, now=None):
     at = datetime.combine(day or now.date(), datetime.min.time(), KST).replace(hour=hour, minute=minute)
     if day is None or repeat:  # "10시": today if still ahead, else tomorrow; repeats start at the next match
         while at <= now or (repeat == "weekdays" and at.weekday() >= 5) or \
-                (repeat and repeat.startswith("weekly") and DOW_EN[at.weekday()] != repeat.split(":")[1]):
+                (repeat and repeat.startswith("weekly") and at.weekday() != int(repeat.split(":")[1])):
             at += timedelta(days=1)
     return at, repeat
 
@@ -563,7 +562,7 @@ async def qwen_schedule(text, now):
     """Fallback for phrasings the rules miss: ask the local Qwen for strict JSON, then validate it."""
     prompt = ("사용자의 말에서 예약 전화를 뽑아 JSON 하나만 출력해. 다른 말은 쓰지 마. 형식: "
               '{"action":"create|list|cancel","at":"YYYY-MM-DDTHH:MM:00+09:00","repeat":null|"daily"|"weekdays"|'
-              '"weekly:mon".."weekly:sun","kind":"wake|reminder","note":"…"}. 시간을 모르면 "at":null. '
+              '"weekly:0".."weekly:6" (0=월요일),"kind":"wake|reminder","note":"…"}. 시간을 모르면 "at":null. '
               f"지금은 {now.isoformat(timespec='minutes')} (KST)야.")
     out = ""
     try:
@@ -1356,7 +1355,7 @@ if __name__ == "__main__":
             ("모레 오후 3시에 전화해 줘", sat8, (11, 23, 15, 0), None),
             ("매일 7시에 깨워 줘", sat8, (11, 22, 7, 0), "daily"),
             ("평일 6시 40분에 깨워 줘", sat8, (11, 23, 6, 40), "weekdays"),  # Saturday: next is Monday
-            ("매주 수요일 9시에 깨워 줘", sat8, (11, 25, 9, 0), "weekly:wed"),
+            ("매주 수요일 9시에 깨워 줘", sat8, (11, 25, 9, 0), "weekly:2"),
             ("다음 주 월요일 9시에 전화해 줘", sat8, (11, 23, 9, 0), None),
             ("10시에 깨워 줘", sat8, (11, 21, 10, 0), None),  # still ahead today
             ("10시에 깨워 줘", sat8.replace(hour=11), (11, 22, 10, 0), None),  # passed: tomorrow

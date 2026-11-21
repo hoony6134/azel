@@ -220,12 +220,13 @@ def test_state_schema_upgrades_an_older_table(client):
 
 def test_scheduled_calls(client):
     at = time.time() + 3600
-    a = client.post("/v1/state/schedule", json={"at": at, "repeat": "weekly:mon", "kind": "wake",
+    a = client.post("/v1/state/schedule", json={"at": at, "repeat": "weekly:0", "kind": "wake",
                                                 "created_by": "voice"}).json()
     b = client.post("/v1/state/schedule", json={"at": at - 600, "kind": "reminder", "note": "약 먹기"}).json()
     assert a["status"] == "pending" and a["attempts"] == 0 and abs(a["at"] - at) < 1
     assert [r["id"] for r in client.get("/v1/state/schedule").json()] == [b["id"], a["id"]]  # soonest first
-    for bad in [{"at": at, "repeat": "hourly"}, {"at": at, "kind": "nap"}, {"at": at, "note": "x" * 201}]:
+    for bad in [{"at": at, "repeat": "hourly"}, {"at": at, "repeat": "weekly:mon"}, {"at": at, "repeat": "weekly:7"},
+                {"at": at, "kind": "nap"}, {"at": at, "note": "x" * 201}, {"at": at, "created_by": "evil"}]:
         assert client.post("/v1/state/schedule", json=bad).status_code == 422
     f = client.post(f"/v1/state/schedule/{a['id']}", json={"status": "fired", "attempts": 1, "call_id": "c9",
                                                            "last_attempt": time.time(), "expect_status": "pending"})

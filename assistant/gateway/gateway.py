@@ -656,34 +656,37 @@ RETENTION_AT = "04:00"  # call history older than history_days is deleted daily 
 
 
 # ---------- scheduled calls ("내일 10시에 깨워 줘"); no Claude involved ----------
-REPEAT_RE = re.compile(r"daily|weekdays|weekly:(mon|tue|wed|thu|fri|sat|sun)")
-DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+REPEAT_RE = re.compile(r"daily|weekdays|weekly:[0-6]")  # weekly:<dow>, 0 = Monday
 MAX_DAYS, MAX_ATTEMPTS, RETRY_EVERY_S, ANSWER_WAIT_S = 30, 3, 120, 60
 
 
-def check_schedule(body, now=None):
+def check_schedule(body, created_by, now=None):
     """Validate a new scheduled call from the app or the voice server (a trust boundary)."""
     now = now or time.time()
-    at = body.get("at")
     try:
-        if isinstance(at, str):
-            dt = datetime.fromisoformat(at)
-            if dt.tzinfo is None:
-                raise ValueError("no time zone")
-            at = dt.timestamp()
-        at = float(at)
+        dt = datetime.fromisoformat(body.get("at"))
+        if dt.tzinfo is None:
+            raise ValueError("no offset")
+        at = dt.timestamp()
     except (TypeError, ValueError):
-        raise HTTPException(400, "at: ISO 8601 with a time zone (or epoch seconds)")
+        raise HTTPException(400, "at: an ISO 8601 string with an offset, e.g. 2026-11-22T10:00:00+09:00")
     if not now + 30 <= at <= now + MAX_DAYS * 86400 + 60:
         raise HTTPException(400, f"at must be ahead and within {MAX_DAYS} days")
     repeat = body.get("repeat") or None
     if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
-        raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<mon..sun>")
+        raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<0-6> (0 = Monday)")
     kind = body.get("kind") or "wake"
     note = body.get("note") or ""
     if kind not in ("wake", "reminder") or not isinstance(note, str) or len(note) > 200:
         raise HTTPException(400, "kind: wake|reminder; note: up to 200 characters")
-    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": DEVICE}
+    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": created_by}
+
+
+def public_item(row):
+    """The /v1/schedule item shape (app and voice alike): `at` as ISO 8601 in KST, no internal fields."""
+    return {"id": row["id"], "at": datetime.fromtimestamp(row["at"], KST).isoformat(), "repeat": row["repeat"],
+            "kind": row["kind"], "note": row["note"], "status": row["status"], "attempts": row["attempts"],
+            "created_by": row["created_by"]}
 
 
 def next_at(at, repeat, now=None):
@@ -705,7 +708,7 @@ def spoken_when(at, repeat=None, now=None):
     elif repeat == "weekdays":
         day = "평일"
     elif repeat:
-        day = f"매주 {'월화수목금토일'[DOW.index(repeat.split(':')[1])]}요일"
+        day = f"매주 {'월화수목금토일'[int(repeat.split(':')[1])]}요일"
     else:
         diff = (dt.date() - today).days
         day = {0: "오늘", 1: "내일", 2: "모레"}.get(diff, f"{dt.month}월 {dt.day}일")
@@ -717,9 +720,10 @@ def confirm_text(item, now=None):
     return f"{spoken_when(item['at'], item['repeat'], now)}에 {verb}."
 
 
-async def schedule_create(body, now=None):
-    item = await state.call("POST", "/v1/state/schedule", check_schedule(body, now))
-    return {**item, "say": confirm_text(item, now)}
+async def schedule_create(body, created_by, now=None):
+    """(public item, sentence to speak)."""
+    row = await state.call("POST", "/v1/state/schedule", check_schedule(body, created_by, now))
+    return public_item(row), confirm_text(row, now)
 
 
 async def schedule_list():
@@ -741,8 +745,8 @@ async def schedule_cancel(sid=None, at=None, now=None):
         next((i for i in items if abs(i["at"] - float(at)) < 60), None) if at else (items[0] if items else None)
     if not pick:
         return None
-    item = await state.call("DELETE", f"/v1/state/schedule/{quote(pick['id'], safe='')}")
-    return {**item, "say": f"{spoken_when(item['at'], item['repeat'], now)} 예약을 취소했어요."} if item else None
+    row = await state.call("DELETE", f"/v1/state/schedule/{quote(pick['id'], safe='')}")
+    return (public_item(row), f"{spoken_when(row['at'], row['repeat'], now)} 예약을 취소했어요.") if row else None
 
 
 async def serve_schedule(m):
@@ -753,14 +757,14 @@ async def serve_schedule(m):
         if MODE != "full":
             raise HTTPException(403, "limited")
         if action == "create":
-            item = await schedule_create(m)
-            reply.update(item=item, say=item["say"])
+            item, say = await schedule_create(m, "voice")
+            reply.update(item=item, say=say)
         elif action == "list":
             items = await schedule_list()
-            reply.update(items=items, say=list_text(items))
+            reply.update(items=[public_item(i) for i in items], say=list_text(items))
         elif action == "cancel":
-            item = await schedule_cancel(at=m.get("at"))
-            reply.update(item=item, say=item["say"] if item else "취소할 예약이 없어요.")
+            done = await schedule_cancel(at=m.get("at"))
+            reply.update(item=done[0] if done else None, say=done[1] if done else "취소할 예약이 없어요.")
         else:
             raise HTTPException(400, "action")
     except HTTPException as e:
@@ -1031,28 +1035,26 @@ def full_only():
 
 
 @app.get("/v1/schedule")
-async def schedule_get(status: str = "pending,fired"):
+async def schedule_get(include: str = ""):
+    """Pending and fired items, soonest first; `include=all` adds answered, missed and cancelled ones."""
     full_only()
-    allowed = {"pending", "fired", "answered", "missed", "cancelled"}
-    if not set(status.split(",")) <= allowed:
-        raise HTTPException(400, f"status: comma list of {sorted(allowed)}")
-    items = await state.call("GET", "/v1/state/schedule", status=status) or []
-    return [{**i, "at_iso": datetime.fromtimestamp(i["at"], KST).isoformat()} for i in items]
+    status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
+    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", status=status) or []]
 
 
-@app.post("/v1/schedule")
+@app.post("/v1/schedule", status_code=201)
 async def schedule_post(body: dict):
     full_only()
-    return await schedule_create(body)
+    return (await schedule_create(body, "app"))[0]
 
 
 @app.delete("/v1/schedule/{sid}")
 async def schedule_delete(sid: str):
     full_only()
-    item = await schedule_cancel(sid=sid)
-    if item is None:
+    done = await schedule_cancel(sid=sid)
+    if done is None:
         raise HTTPException(404, "no such scheduled call")
-    return item
+    return done[0]
 
 
 @app.get("/v1/history")

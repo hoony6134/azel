@@ -86,8 +86,9 @@ JSON text frames:
   (never for an empty transcript; fillers left out), end `{"ended_at","duration_s"}`. One `log_id` per
   `/v1/call` connection; a turn cut short by hang-up is sent before the end.
 - voice → gateway: `{"type":"schedule","id","action":"create"|"list"|"cancel","at"?,"repeat"?,"kind"?,"note"?}`
-  (to a full-mode link, Claude or not) → gateway → voice `{"id","type":"schedule_result","ok","say",
-  "item"?|"items"?}`; the voice server speaks `say` (e.g. "내일 오전 10시에 깨워 드릴게요.").
+  (to a full-mode link, Claude or not; `at` ISO 8601 with offset for create, epoch for cancel) → gateway →
+  voice `{"id","type":"schedule_result","ok","say","item"?|"items"?}` (items in the `/v1/schedule` shape,
+  `created_by: "voice"`); the voice server speaks `say` (e.g. "내일 오전 10시에 깨워 드릴게요.").
   `{"type":"call_answered","call_id"}` when `/v1/call` connects with a `call_id` (stops a scheduled call's
   retries).
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
@@ -187,12 +188,15 @@ device that created them.
   the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
-- Scheduled calls (full gateways only; limited → 403): `GET /v1/schedule?status=pending,fired` (comma list
-  of pending|fired|answered|missed|cancelled) → items `{"id","at","at_iso","repeat","kind","note","status",
-  "attempts","call_id","last_attempt","created_by"}`, soonest first; `POST /v1/schedule`
-  `{"at": ISO 8601 with offset | epoch,"repeat": null|"daily"|"weekdays"|"weekly:mon".."weekly:sun",
-  "kind":"wake"|"reminder","note"?}` → the item plus `"say"` (400 unless ahead and within 30 days);
-  `DELETE /v1/schedule/{id}` → the cancelled item plus `"say"`. Firing: the full gateway holding lease
+- Scheduled calls (full gateways only; limited → 403). Item (the same shape on the voice path):
+  `{"id","at","repeat","kind","note","status","attempts","created_by"}` with `at` an ISO 8601 string with
+  offset in KST (e.g. `"2026-11-22T10:00:00+09:00"`, accepted and returned), `repeat` null | `"daily"` |
+  `"weekdays"` | `"weekly:<dow>"` (0 = Monday … 6 = Sunday), `kind` `wake`|`reminder`, `status`
+  `pending`|`fired`|`answered`|`missed`|`cancelled`, `created_by` `voice`|`app`.
+  `GET /v1/schedule` → pending and fired items, soonest first; `?include=all` adds past ones (answered,
+  missed, cancelled). `POST /v1/schedule` `{"at","repeat"?,"kind"?,"note"?}` → **201** with the created item;
+  400 if `at` is not an ISO string with offset, is past, or is more than 30 days out (or repeat/kind/note
+  invalid). `DELETE /v1/schedule/{id}` → cancels and returns the item (404 unless pending or fired). Firing: the full gateway holding lease
   `scheduler` (TTL 150 s, renewed every minute, priority = `BISEO_SCHEDULER_PRIORITY`, a lower value takes
   it over) places the call at `at` (quiet hours ignored: the user asked for that time; opening "일어나실
   시간이에요." or the reminder note), retries every 2 min while unanswered up to 3 attempts, then marks it
@@ -284,8 +288,8 @@ records, search, contacts and context, answers 403) when either:
   `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
   token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
 - `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`.
-- Scheduled calls (full callers only): `POST /v1/state/schedule` `{"at": epoch,"repeat","kind","note",
-  "created_by"}` → the row; `GET /v1/state/schedule?status=pending,fired`; `POST /v1/state/schedule/{id}`
+- Scheduled calls (full callers only; internal, epoch seconds; gateways convert to the `/v1/schedule`
+  shape): `POST /v1/state/schedule` `{"at": epoch,"repeat","kind","note","created_by":"voice"|"app"}` → the row; `GET /v1/state/schedule?status=pending,fired`; `POST /v1/state/schedule/{id}`
   `{"status"?,"attempts"?,"call_id"?,"at"?,"last_attempt"?,"expect_status"?}` (compare-and-set on
   `expect_status`: 409 if the row moved on); `DELETE /v1/state/schedule/{id}` → cancelled (404 unless
   pending or fired). Table `scheduled_calls` in the state schema.

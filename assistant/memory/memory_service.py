@@ -506,7 +506,7 @@ def release_lease(name: str, holder: str):
 SCHED = f"{STATE}.scheduled_calls"
 SCHED_COLS = (f"id, {EPOCH.format('at')}, repeat, kind, note, created_by, status, attempts, call_id,"
               f" {EPOCH.format('last_attempt')}, {EPOCH.format('created')}")
-REPEAT_RE = r"^(daily|weekdays|weekly:(mon|tue|wed|thu|fri|sat|sun))$"
+REPEAT_RE = r"^(daily|weekdays|weekly:[0-6])$"  # weekly:<dow>, 0 = Monday
 
 
 class Scheduled(BaseModel):
@@ -514,7 +514,7 @@ class Scheduled(BaseModel):
     repeat: str | None = Field(None, pattern=REPEAT_RE)
     kind: str = Field("wake", pattern="^(wake|reminder)$")
     note: str = Field("", max_length=200)
-    created_by: str = Field("", max_length=40)
+    created_by: str = Field("app", pattern="^(voice|app)$")
 
 
 @app.post("/v1/state/schedule", dependencies=[v1])

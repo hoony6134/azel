@@ -461,17 +461,26 @@ def test_schedule_api_validates_and_confirms(gw):
     g, c, _ = gw
     now = time.time()
     tomorrow10 = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-    r = c.post("/v1/schedule", json={"at": tomorrow10.isoformat(), "kind": "wake"}).json()
-    assert r["say"] == "내일 오전 10시에 깨워 드릴게요." and r["status"] == "pending"
-    for bad in [{"at": now - 60}, {"at": now + 31 * 86400}, {"at": "2026-12-01T10:00:00"},  # no time zone
-                {"at": now + 3600, "repeat": "hourly"}, {"at": now + 3600, "kind": "nap"},
-                {"at": now + 3600, "note": "x" * 201}, {"at": "내일"}]:
+    r = c.post("/v1/schedule", json={"at": tomorrow10.isoformat(), "kind": "wake"})
+    assert r.status_code == 201
+    item = r.json()
+    assert item == {"id": item["id"], "at": tomorrow10.isoformat(), "repeat": None, "kind": "wake", "note": "",
+                    "status": "pending", "attempts": 0, "created_by": "app"}
+    iso = lambda t: datetime.fromtimestamp(t, g.KST).isoformat()  # noqa: E731
+    for bad in [{"at": iso(now - 60)}, {"at": iso(now + 31 * 86400)}, {"at": "2026-12-01T10:00:00"},  # no offset
+                {"at": now + 3600}, {"at": iso(now + 3600), "repeat": "hourly"},
+                {"at": iso(now + 3600), "repeat": "weekly:mon"}, {"at": iso(now + 3600), "repeat": "weekly:7"},
+                {"at": iso(now + 3600), "kind": "nap"}, {"at": iso(now + 3600), "note": "x" * 201}, {"at": "내일"}]:
         assert c.post("/v1/schedule", json=bad).status_code == 400, bad
-    [item] = c.get("/v1/schedule").json()
-    assert item["at_iso"] == tomorrow10.isoformat()
-    assert c.get("/v1/schedule?status=bogus").status_code == 400
-    assert c.delete(f"/v1/schedule/{item['id']}").json()["say"] == "내일 오전 10시 예약을 취소했어요."
-    assert c.delete(f"/v1/schedule/{item['id']}").status_code == 404 and c.get("/v1/schedule").json() == []
+    weekly = c.post("/v1/schedule", json={"at": iso(now + 7200), "repeat": "weekly:0", "kind": "reminder",
+                                          "note": "회의"}).json()
+    assert weekly["repeat"] == "weekly:0" and weekly["created_by"] == "app"
+    assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"], item["id"]]  # soonest first
+    gone = c.delete(f"/v1/schedule/{item['id']}").json()
+    assert gone == {**item, "status": "cancelled"}
+    assert c.delete(f"/v1/schedule/{item['id']}").status_code == 404
+    assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"]]  # default: pending and fired
+    assert {i["id"] for i in c.get("/v1/schedule?include=all").json()} == {weekly["id"], item["id"]}
 
 
 def test_spoken_times(gw):
@@ -481,13 +490,14 @@ def test_spoken_times(gw):
         (kst(2026, 11, 22, 10, 0), None, "내일 오전 10시"), (kst(2026, 11, 22, 7, 30), None, "내일 오전 7시 30분"),
         (kst(2026, 11, 21, 22, 30), None, "오늘 오후 10시 30분"), (kst(2026, 11, 23, 15, 0), None, "모레 오후 3시"),
         (kst(2026, 11, 30, 9, 0), None, "11월 30일 오전 9시"), (kst(2026, 11, 22, 7, 0), "daily", "매일 오전 7시"),
-        (kst(2026, 11, 23, 6, 40), "weekdays", "평일 오전 6시 40분"), (kst(2026, 11, 23, 9, 0), "weekly:mon", "매주 월요일 오전 9시"),
+        (kst(2026, 11, 23, 6, 40), "weekdays", "평일 오전 6시 40분"), (kst(2026, 11, 23, 9, 0), "weekly:0", "매주 월요일 오전 9시"),
+        (kst(2026, 11, 29, 9, 0), "weekly:6", "매주 일요일 오전 9시"),
         (kst(2026, 11, 22, 0, 5), None, "내일 오전 12시 5분")]:
         assert g.spoken_when(at.timestamp(), repeat, now) == want, want
     fri7 = kst(2026, 11, 27, 7, 0).timestamp()  # a Friday
     assert g.next_at(fri7, "weekdays", fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
     assert g.next_at(fri7, "daily", fri7) == kst(2026, 11, 28, 7, 0).timestamp()
-    assert g.next_at(fri7, "weekly:fri", fri7) == kst(2026, 12, 4, 7, 0).timestamp()
+    assert g.next_at(fri7, "weekly:4", fri7) == kst(2026, 12, 4, 7, 0).timestamp()
     assert g.next_at(fri7, "daily", fri7 + 3 * 86400) == kst(2026, 12, 1, 7, 0).timestamp()  # skips missed days
 
 
@@ -505,10 +515,13 @@ def test_schedule_over_the_link(gw):
               {"type": "schedule", "id": "r2", "action": "list"},
               {"type": "schedule", "id": "r3", "action": "cancel"},
               {"type": "schedule", "id": "r4", "action": "cancel"},
-              {"type": "schedule", "id": "r5", "action": "create", "at": time.time() - 10}]:
+              {"type": "schedule", "id": "r5", "action": "create",
+               "at": datetime.fromtimestamp(time.time() - 10, g.KST).isoformat()}]:
         asyncio.run(g.serve_schedule(m))
     by = {m["id"]: m for m in sent}
     assert by["r1"]["say"] == "내일 오전 7시 30분에 깨워 드릴게요." and by["r1"]["ok"]
+    assert by["r1"]["item"]["at"] == at.isoformat() and by["r1"]["item"]["created_by"] == "voice"
+    assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by"}
     assert by["r2"]["say"] == "예약된 전화는 내일 오전 7시 30분 기상이에요."
     assert by["r3"]["say"] == "내일 오전 7시 30분 예약을 취소했어요."
     assert by["r4"]["say"] == "취소할 예약이 없어요."
