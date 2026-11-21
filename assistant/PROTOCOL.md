@@ -290,7 +290,8 @@ device that created them.
   `prices` `{model: [usd_in, usd_out] per MTok}` (absent → cost 0). `default_model`, `task_defaults.*.model`, a
   persona's `default_model` and `/v1/ask`'s `model` accept `"nim"`; the voice server sends `model:"nim"` for
   "엔비디아로 …". The NIM path streams like Claude (text deltas, `activity` thinking/tool_start/tool_end, `done`) with
-  the devices' MCP tools as function tools; a model that answers 400 to a request with tools is asked again without
+  the brain's read-only Cygnus tools (when the host has `brain/cygnus.py` and a PAT) and the devices' MCP tools as function
+  tools; a model that answers 400 to a request with tools is asked again without
   them (remembered per model). Speakable errors: `nim_key` (no key, or the key refused), `nim_off`, `nim_error`.
   Usage rows: `path:"nim"`, `model` = the NIM model id. A limited gateway treats `nim` as its usual Claude path.
   - `GET /v1/providers/nim/models` → `{"models":[ids]}` from NIM's `/models` (cached 10 min; 409 without a key,
