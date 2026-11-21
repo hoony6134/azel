@@ -181,8 +181,13 @@ device that created them.
                 "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
-   "history_days":365}
+   "history_days":365,"reply_length":"normal"}
   ```
+  `reply_length` `brief`|`normal`|`detailed` (else 400) sets how long answers run, with the same wording for
+  Qwen's system prompt and Claude's voice style: brief = one or two sentences; normal = brief for chit-chat,
+  about four or five sentences for explanations, summaries, schedules and status reports; detailed = up to
+  six to eight. The first clause stays short either way (latency). Qwen's `max_tokens` follows it (250 /
+  600 / 1000).
   `proactive.enabled` is the master switch ("먼저 전화하기"): off, no proactive call fires (briefing,
   deadline check, server alerts, autonomous calls). User-created scheduled calls always fire. There are no
   quiet hours any more (scheduled calls replace them). A stored settings document in the old shape
@@ -224,8 +229,10 @@ device that created them.
   the latter off by default):
   - Checkpoints: at each `autonomous.checkpoints` time (default 08:30, 13:00, 18:00) one full gateway
     with Claude (lease `job:checkpoint:<date>:<HH:MM>`) runs one `claude -p` that reads GISTRA, Planit,
-    Calendar and Gmail and writes a compact situation note (what is due within 48 h, what needs the user,
-    urgency 1–5 per line) to the memory service's task context `azel-situation`. About 3 runs a day.
+    Calendar and Gmail and writes a compact note (what is due within 48 h, what needs the user, urgency 1–5
+    per line) to the memory service's task context `azel-checkpoint`. About 3 runs a day. The brain
+    (`assistant/brain`) merges it with other state into `azel-situation`; the decision reads
+    `azel-situation`, or `azel-checkpoint` when that is missing or older than 6 h.
   - Decision: at :00 and :30 the scheduler lease holder gathers signals without Claude (critical alerts
     of the last 24 h, delegated device jobs finished or failed in the last 2 h via each trusted daemon's
     `list_jobs`, approvals pending > 30 min, scheduled calls missed in the last 24 h, task contexts with

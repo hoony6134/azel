@@ -45,11 +45,17 @@ KST = timezone(timedelta(hours=9))
 MAX_UPLOAD = 16000 * 2 * 60  # one minute of 16 kHz PCM16
 ROUTE_TAG = "[CLAUDE]"
 
+# reply_length (shared setting, the app exposes it): how long answers run. The short first clause stays for latency.
+LENGTH_STYLE = {
+    "brief": "짧게 한두 문장으로 요점만 말해.",
+    "normal": "질문에 맞는 길이로 말해. 잡담과 간단한 답은 한두 문장, 설명·요약·일정·상태 보고는 네다섯 문장 정도로 자연스럽게.",
+    "detailed": "질문에 맞는 길이로 말해. 잡담은 짧게, 설명·요약·일정·상태 보고는 여섯에서 여덟 문장까지 자세히, 말하듯 자연스럽게.",
+}
+LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어 존댓말로, 짧고 자연스럽게 말해. 첫 문장은 열 글자 안팎으로 짧게 시작해. "
+    "한국어 존댓말로 자연스럽게 말해. 첫 문장은 열 글자 안팎으로 짧게 시작해. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
-    "길게 설명할 일은 요점만 두세 문장으로 줄여. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
     f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 간단한 상식, 계산, 방금 대화 내용 정리는 네가 바로 답해."
@@ -60,9 +66,15 @@ def assistant_name(settings):
     return settings.get("assistant_name") or DEFAULT_NAME
 
 
-def system_prompt(name):
-    """Qwen's system prompt for this turn: the name comes from the shared settings, so a rename applies at once."""
-    return f"너는 사용자의 개인 비서 '{name}'야. " + SYSTEM_BODY
+def reply_length(settings):
+    return settings.get("reply_length") if settings.get("reply_length") in LENGTH_STYLE else "normal"
+
+
+def system_prompt(name, length="normal", context=""):
+    """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
+    at once. `context`: extra situation text from the brain, appended last."""
+    return f"너는 사용자의 개인 비서 '{name}'야. " + SYSTEM_BODY + " " + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
+        + (f"\n\n참고할 상황:\n{context}" if context else "")
 
 
 def strip_vocative(text, name):
@@ -425,8 +437,8 @@ async def transcribe(wav: np.ndarray) -> str:
     return "" if text.rstrip(".!") in HALLUCINATIONS else text
 
 
-async def llm_stream(messages):
-    body = {"model": LLM_MODEL, "messages": messages, "stream": True, "max_tokens": 400, "temperature": 0.7}
+async def llm_stream(messages, max_tokens=600):
+    body = {"model": LLM_MODEL, "messages": messages, "stream": True, "max_tokens": max_tokens, "temperature": 0.7}
     async with client.stream("POST", LLM_URL, json=body) as r:
         r.raise_for_status()
         async for line in r.aiter_lines():
@@ -709,10 +721,10 @@ async def respond(text, session, t0, timings, on_event=None):
                 return
             if to_claude:
                 return await via_claude()
-            messages = [{"role": "system", "content": system_prompt(name) + now_kst()}, *hist,
+            messages = [{"role": "system", "content": system_prompt(name, reply_length(settings)) + now_kst()}, *hist,
                         {"role": "user", "content": text}]
             buf = ""
-            async for delta in llm_stream(messages):
+            async for delta in llm_stream(messages, LENGTH_TOKENS[reply_length(settings)]):
                 timings.setdefault("llm_first_token_ms", ms(t0))
                 buf += delta
                 state = tag_state(buf.lstrip())
@@ -742,8 +754,10 @@ async def respond(text, session, t0, timings, on_event=None):
         await producer  # surfaces LLM errors
     finally:
         producer.cancel()
-        # Only what was actually produced goes into history (a barge-in cuts it short).
-        hist.append({"role": "assistant", "content": " ".join(spoken) or "(말이 끊김)"})
+        # Only what was actually spoken goes into history (a barge-in cuts it short). Nothing spoken: no assistant
+        # turn at all; a placeholder text would leak into captions and Qwen would parrot it.
+        if spoken:
+            hist.append({"role": "assistant", "content": " ".join(spoken)})
 
 
 app = FastAPI(title="assistant-voice")
@@ -1168,6 +1182,21 @@ if __name__ == "__main__":
         assert asyncio.run(filler_check(0.1)) == [FILLER, *said]  # slow: one filler
         assert asyncio.run(filler_check(0.35)) == [FILLER, FILLER_LONG, *said]  # very slow: nudge once
         assert asyncio.run(filler_check(0.0, gap=0.4)) == [*said]  # pauses after the first text: no filler
+
+        async def cut_before_speaking():  # barge-in before any sentence was spoken
+            async def slow_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                await asyncio.sleep(5)
+                yield "늦은 답"
+            globals()["claude_stream"] = slow_claude
+            gen = respond("내일 일정 알려줘", "cut", time.perf_counter(), {})
+            first = asyncio.ensure_future(gen.__anext__())
+            await asyncio.sleep(0.02)
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            await gen.aclose()
+        asyncio.run(cut_before_speaking())
+        assert list(history["cut"]) == [{"role": "user", "content": "내일 일정 알려줘"}]  # no placeholder turn
+        assert not any("끊김" in m["content"] for h in history.values() for m in h)
         claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S = real
 
         async def activity_check():  # gateway activity -> app frames, routing first, nothing but phase/label/tool
@@ -1205,6 +1234,11 @@ if __name__ == "__main__":
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
         assert assistant_name({}) == "아젤" and "'아젤'" in system_prompt(assistant_name({}))
+        assert "두세 문장으로 줄여" not in system_prompt("아젤")  # no longer forced short
+        for length in ("brief", "normal", "detailed"):
+            assert LENGTH_STYLE[length] in system_prompt("아젤", reply_length({"reply_length": length}))
+        assert reply_length({"reply_length": "huge"}) == "normal" and reply_length({}) == "normal"
+        assert system_prompt("아젤", "normal", "내일 9시 회의").endswith("참고할 상황:\n내일 9시 회의")
         gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
         assert "'루나'" in system_prompt(assistant_name(gl.settings)) and "아젤" not in system_prompt("루나")
         for said, name, want in [("아젤아, 서버 괜찮아?", "아젤", "서버 괜찮아?"), ("아젤 지금 몇 시야", "아젤", "지금 몇 시야"),
@@ -1328,7 +1362,7 @@ if __name__ == "__main__":
             async def fake_transcribe(audio):
                 return "안녕"
 
-            async def fake_llm(messages):
+            async def fake_llm(messages, max_tokens=600):
                 yield "네, 안녕하세요."
 
             async def fake_tts(sentence):
@@ -1349,7 +1383,7 @@ if __name__ == "__main__":
                     m = w.receive()
                     if m.get("text"):
                         kinds_seen.append(json.loads(m["text"])["type"])
-                        if kinds_seen[-1] == "turn_done":
+                        if kinds_seen[-1] in ("turn_done", "error"):  # never wait forever on a failed turn
                             break
                 w.send_text(json.dumps({"type": "hangup"}))
             assert "activity" not in kinds_seen, kinds_seen  # a Qwen turn sends no activity events

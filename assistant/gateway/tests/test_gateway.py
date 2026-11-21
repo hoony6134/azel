@@ -182,6 +182,18 @@ def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypa
     assert placed == ["wake"]  # the user asked for this one
 
 
+def test_reply_length_setting(gw):
+    g, c, tmp = gw
+    assert c.get("/v1/settings").json()["reply_length"] == "normal"
+    c.post("/v1/ask", json={"text": "a"})
+    prompt = lambda: (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]  # noqa: E731
+    assert g.LENGTH_STYLE["normal"] in prompt() and "두세 문장 안에" not in prompt()
+    assert c.put("/v1/settings", json={"reply_length": "detailed"}).status_code == 200
+    c.post("/v1/ask", json={"text": "b"})
+    assert g.LENGTH_STYLE["detailed"] in prompt()
+    assert c.put("/v1/settings", json={"reply_length": "long"}).status_code == 400
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400
@@ -766,7 +778,13 @@ def test_signals_and_checkpoint(gw, monkeypatch):
     assert len(sig["missed_calls"]) == 1 and sig["missed_calls"][0].endswith("기상 전화 못 받음")
     assert sig["tasks"] == ["t1: 치과 예약 / 열린 질문: 몇 시?"]
     assert sig["device_jobs"] == ["macbook: 빌드 → failed"]
-    assert sig["situation"] == ["[5] 토론지 — 내일 23시 — 아직 안 냄"]
+    assert sig["situation"] == ["[5] 토론지 — 내일 23시 — 아직 안 냄"]  # from azel-checkpoint (no brain note)
+    assert "azel-situation" not in g.fake.db["context"] and "azel-checkpoint" in g.fake.db["context"]
+    g.fake.db["context"]["azel-situation"] = {"task_id": "azel-situation", "summary": "브레인 메모",
+                                              "open_questions": [], "updated": datetime.now(g.KST).isoformat()}
+    assert asyncio.run(g.gather_signals(now))["situation"] == ["브레인 메모"]  # the brain's note wins when fresh
+    g.fake.db["context"]["azel-situation"]["updated"] = (datetime.now(g.KST) - timedelta(hours=7)).isoformat()
+    assert asyncio.run(g.gather_signals(now))["situation"] == ["[5] 토론지 — 내일 23시 — 아직 안 냄"]  # stale
     alert = {"alerts": [{"status": "firing", "labels": {"severity": "critical", "alertname": "DiskFull"}}]}
     c.put("/v1/settings", json={"proactive": {"server_alerts": False}})
     c.post("/v1/alerts", json=alert)  # no call, but remembered as a signal

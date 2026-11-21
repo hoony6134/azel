@@ -72,18 +72,29 @@ DEFAULTS = {
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
+    "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
 }
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
 
 
+# reply_length: the same wording the voice server gives Qwen, so both routes answer at the same length.
+LENGTH_STYLE = {
+    "brief": "짧게 한두 문장으로 요점만 말해. ",
+    "normal": "질문에 맞는 길이로 말해. 잡담과 간단한 답은 한두 문장, 설명·요약·일정·상태 보고는 네다섯 문장 정도로 자연스럽게. ",
+    "detailed": "질문에 맞는 길이로 말해. 잡담은 짧게, 설명·요약·일정·상태 보고는 여섯에서 여덟 문장까지 자세히, 말하듯 자연스럽게. ",
+}
+
+
 def name_prompt(settings):
-    return f"너의 이름은 '{settings['assistant_name']}'이야. "
+    """Name and reply length, from the shared settings."""
+    return f"너의 이름은 '{settings['assistant_name']}'이야. " + LENGTH_STYLE.get(settings.get("reply_length"),
+                                                                           LENGTH_STYLE["normal"])
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
-    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 두세 문장 안에 요점만 말해. "
+    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 시작해. "
     "마크다운, 목록, 표, 이모지, URL, 코드 블록을 쓰지 마. '확인하지 않은 것' 같은 꼬리말도 붙이지 마. "
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
 )
@@ -707,7 +718,8 @@ RETENTION_AT = "04:00"  # call history older than history_days is deleted daily
 
 
 # ---------- autonomous calls: the server decides when to call, with guardrails ----------
-SITUATION = "azel-situation"  # memory-service task context the Claude checkpoint writes
+SITUATION = "azel-situation"  # merged situation note, written by the brain (assistant/brain)
+CHECKPOINT = "azel-checkpoint"  # the Claude checkpoint's raw note; fallback when the situation note is stale
 CHECKPOINT_PROMPT = (
     "자율 전화 판단용 상황 메모를 써. GISTRA(과제·시험·수업), Planit(할 일), 캘린더, 메일을 확인해서 "
     "앞으로 48시간 안에 마감이거나 사용자의 결정·답장이 필요한 것만, 한 줄에 하나씩 '[긴급도 1-5] 무엇 — 언제까지 — "
@@ -726,7 +738,7 @@ async def run_checkpoint():
     text = await ask_text(CHECKPOINT_PROMPT, session=f"checkpoint-{uuid.uuid4().hex[:8]}", model="sonnet",
                           task="schedule")
     if text:
-        await state.call("PUT", f"/v1/context/{SITUATION}", {"summary": text[:4000], "open_questions": []})
+        await state.call("PUT", f"/v1/context/{CHECKPOINT}", {"summary": text[:4000], "open_questions": []})
 
 
 async def device_jobs(now):
@@ -774,18 +786,29 @@ async def gather_signals(now):
     async def contexts():
         rows = await state.call("GET", "/v1/context", recent=20) or []
         return [f"{r['task_id']}: {r['summary'][:80]} / 열린 질문: {'; '.join(r['open_questions'])[:120]}"
-                for r in rows if r["open_questions"] and r["task_id"] != SITUATION]
+                for r in rows if r["open_questions"] and r["task_id"] not in (SITUATION, CHECKPOINT)]
 
     for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
                      ("tasks", contexts), ("device_jobs", lambda: device_jobs(now))):
         await source(name, fn)
-    note = None
-    try:
-        note = await state.call("GET", f"/v1/context/{SITUATION}")
-    except Exception:
-        pass
-    sig["situation"] = [note["summary"][:1500]] if note and note.get("summary") else []
+    sig["situation"] = []
+    for key in (SITUATION, CHECKPOINT):  # the brain's merged note; the raw checkpoint if that is missing or stale
+        try:
+            note = await state.call("GET", f"/v1/context/{key}")
+        except Exception:
+            note = None
+        if note and note.get("summary") and fresh_note(note, now):
+            sig["situation"] = [note["summary"][:1500]]
+            break
     return sig
+
+
+def fresh_note(note, now, max_age_s=6 * 3600):
+    """True if the context row was updated within max_age_s (rows without a parseable time count as fresh)."""
+    try:
+        return now - datetime.fromisoformat(str(note["updated"])).timestamp() < max_age_s
+    except (KeyError, ValueError):
+        return True
 
 
 async def llm_json(system, user):
@@ -1190,6 +1213,8 @@ async def put_settings(body: dict):
                                     for k, v in both.items()})
         check_proactive(merged)
         body["proactive"] = merged
+    if "reply_length" in body and body["reply_length"] not in LENGTH_STYLE:
+        raise HTTPException(400, f"reply_length: one of {sorted(LENGTH_STYLE)}")
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
