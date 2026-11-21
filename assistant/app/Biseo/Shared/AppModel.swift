@@ -49,7 +49,7 @@ final class AppModel: ObservableObject {
     func decide(_ item: [String: Any], _ approve: Bool) async throws {
         let id = describe(item["id"] ?? "")
         let path = "/v1/approvals/" + (id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id)
-        _ = try await Gateway.send("POST", path, json: ["approve": approve])
+        _ = try await Gateway.send("POST", path, json: ApprovalAPI.body(approve ? .once : .deny))
         await refresh()
     }
 }

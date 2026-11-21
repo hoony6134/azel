@@ -268,6 +268,7 @@ struct SettingsScreen<Extra: View>: View {
                             #endif
                     }
                 }
+                ApprovalRulesCard()
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
@@ -802,101 +803,73 @@ private struct FlowChips: View {
 
 struct ApprovalsScreen: View {
     @ObservedObject var model: AppModel
-    @State private var confirm: [String: Any]?
-    @State private var done: Set<String> = []
-    @State private var error: String?
-    @State private var succeeded = 0
-
-    private static let risky = ["rm ", "rm\t", "git push", "sudo", ">"]
+    @ObservedObject private var center = ApprovalCenter.shared
 
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: Theme.l) {
-                if let error { Text(error).font(.footnote).foregroundStyle(Theme.danger) }
-                SectionNote(status: model.approvalsStatus) { Task { await model.refresh() } }
-                if model.approvals.isEmpty && model.approvalsStatus == .ok {
+            LazyVStack(alignment: .leading, spacing: Theme.l) {
+                SectionNote(status: center.status) { Task { await center.refresh() } }
+                if center.pending.isEmpty && center.status == .ok {
                     EmptyState(title: "모두 처리했어요", message: "승인이 필요하면 알려 드릴게요.")
                 }
-                ForEach(model.approvals.indices, id: \.self) { i in card(model.approvals[i]) }
+                ForEach(center.pending) { a in
+                    Button { center.show(a) } label: { PendingApprovalRow(request: a) }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("열어서 허용하거나 거부해요")
+                }
+                if !center.history.isEmpty {
+                    Text("지난 요청").font(.headline).foregroundStyle(Theme.text2).padding(.top, Theme.s)
+                    ForEach(center.history) { ApprovalHistoryRow(request: $0) }
+                }
             }
             .padding(.horizontal, 20).padding(.vertical, Theme.l)
             .frame(maxWidth: 640).frame(maxWidth: .infinity)
         }
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("승인")
-        .refreshable { await model.refresh() }
-        .task { await model.refresh() }
-        #if os(iOS)
-        .sensoryFeedback(.success, trigger: succeeded)
-        #endif
-        .confirmationDialog("이 명령을 승인할까요?", isPresented: Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } }),
-                            titleVisibility: .visible, presenting: confirm) { item in
-            Button("승인") { decide(item, true) }
-            Button("취소", role: .cancel) {}
-        } message: { item in Text(describe(item["command"] ?? "")) }
+        .refreshable { await center.refresh(); await model.refresh() }
+        .task { await center.refresh() }
     }
+}
 
-    private func card(_ item: [String: Any]) -> some View {
-        let id = describe(item["id"] ?? "")
-        let command = item["command"].map(describe) ?? ""
-        let known: Set = ["id", "device", "tool", "command", "cwd", "created", "status", "decided"]
-        return Card {
-            if done.contains(id) {
-                Label("처리했어요", systemImage: "checkmark").foregroundStyle(Theme.celadon)
-            } else {
-                HStack(spacing: Theme.s) {
-                    Text(item["device"].map(describe) ?? "기기").font(.headline).foregroundStyle(Theme.text)
-                    if let tool = item["tool"] {
-                        Text(describe(tool)).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2)
-                            .padding(.horizontal, Theme.s).padding(.vertical, 2).overlay(Capsule().strokeBorder(Theme.stroke))
-                    }
-                    Spacer()
-                    if let created = (item["created"] as? NSNumber)?.doubleValue {
-                        Text(Date(timeIntervalSince1970: created), style: .relative).font(.footnote).foregroundStyle(Theme.text3)
+private struct PendingApprovalRow: View {
+    let request: ApprovalRequest
+
+    var body: some View {
+        Card {
+            HStack {
+                Text(request.device.isEmpty ? "기기" : request.device).font(.headline).foregroundStyle(Theme.text)
+                Spacer()
+                if request.expires != nil {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(ApprovalRequest.countdown(request.secondsLeft(now: ctx.date) ?? 0)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
                     }
                 }
-                if !command.isEmpty {
-                    ScrollView(.horizontal) {
-                        Text(command).font(.callout.monospaced()).foregroundStyle(Theme.text).textSelection(.enabled).padding(Theme.m)
-                    }
-                    .background(Theme.bg, in: RoundedRectangle(cornerRadius: Theme.rowRadius, style: .continuous))
-                }
-                if let cwd = item["cwd"] {
-                    Label(describe(cwd), systemImage: "folder").font(.footnote).foregroundStyle(Theme.text2)
-                }
-                ForEach(item.keys.filter { !known.contains($0) }.sorted(), id: \.self) { key in
-                    Text("\(key): \(describe(item[key]!))").font(.footnote).foregroundStyle(Theme.text2)
-                }
-                HStack(spacing: Theme.m) {
-                    Button { decide(item, false) } label: { Text("거절").frame(maxWidth: .infinity).frame(height: 44) }
-                        .buttonStyle(.bordered).foregroundStyle(Theme.danger)
-                    Button { Self.risky.contains { command.contains($0) } ? (confirm = item) : decide(item, true) } label: {
-                        Text("승인").frame(maxWidth: .infinity).frame(height: 44)
-                    }
-                    .buttonStyle(.borderedProminent).tint(Theme.celadon).foregroundStyle(Theme.onAccent)
-                }
+                Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
             }
+            Text(request.command).font(.callout.monospaced()).foregroundStyle(Theme.text).lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let cwd = request.cwd { Label(cwd, systemImage: "folder").font(.footnote).foregroundStyle(Theme.text2).lineLimit(1) }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel([item["device"], item["tool"], item["command"].map { "명령: \(describe($0))" }, item["cwd"].map { "위치: \(describe($0))" }]
-            .compactMap { $0.map(describe) }.joined(separator: ", "))
-        .accessibilityAction(named: "승인") { decide(item, true) }
-        .accessibilityAction(named: "거절") { decide(item, false) }
+        .contentShape(Rectangle())
     }
+}
 
-    private func decide(_ item: [String: Any], _ approve: Bool) {
-        let id = describe(item["id"] ?? "")
-        Task {
-            do {
-                withAnimation(Theme.enter) { _ = done.insert(id) }
-                try await model.decide(item, approve)
-                succeeded += 1
-                error = nil
-            } catch {
-                done.remove(id)
-                self.error = FriendlyError.describe(error).title
+private struct ApprovalHistoryRow: View {
+    let request: ApprovalRequest
+
+    var body: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(request.command).font(.footnote.monospaced()).foregroundStyle(Theme.text).lineLimit(2)
+                Text([request.device, request.created.map { $0.formatted(date: .abbreviated, time: .shortened) }].compactMap { $0 }.joined(separator: " · "))
+                    .font(.footnote).foregroundStyle(Theme.text3)
             }
+            Spacer()
+            Text(ApprovalRequest.outcome(request)).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2)
         }
+        .padding(.vertical, Theme.xs)
+        .accessibilityElement(children: .combine)
     }
 }
 
