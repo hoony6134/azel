@@ -376,6 +376,9 @@ device that created them.
     "steps":[{"at","kind":"tool","tool","label"} | {"kind":"approval"|"approval_approved"|"approval_rejected",
     "approval_id"} | {"kind":"killed","reason":"time"|"budget"|"error"}]}`. Steps never carry tool arguments or results.
     `status`: `queued|running|waiting_approval|done|failed|cancelled`.
+  - Deploy order: the memory service before the gateways (an older memory service drops a schedule item's `cron`).
+  - Tasks started by claude -p (`mcp__azel__create_task`) get the call's `origin_session` too: an ask's run sends
+    `X-Azel-Origin` and `X-Azel-Requester` on the azel MCP server entry (accepted on the full scope only).
   - The external MCP token (`~/.config/biseo/mcp_external_token`, ACTIONS.md) cannot create, read or cancel tasks:
     a task runs with the whole bridge and its results hold personal data. That scope is call_user and schedule_*.
   - `PATCH /v1/tasks/{id}` `{"notify":"call"|"push"|"none"}` → the task without steps; only `notify` may change, only

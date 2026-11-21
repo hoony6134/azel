@@ -468,3 +468,20 @@ def test_repeat_text_becomes_a_checked_rule_with_a_resend():
     b.d["llm"] = broken
     r = run(b.run("call_user", {"reason": "x", "repeat_text": "언젠가 매일"}, caller="qwen"))
     assert r["error"]["code"] == "invalid" and "이해하지 못했어요" in r["spoken"]
+
+
+def test_injected_actions_need_a_confirmed_read_back():
+    """After web/memory content in the same run, a model's side-effect action asks first; the app never does."""
+    w = World()
+    b = w.bridge()
+    b.d["who"] = lambda: "ask:azel:call-1"
+    b.tainted["ask:azel:call-1"] = TB.time.monotonic()  # this run just read a web page
+    r = run(b.run("create_task", {"goal": "메일 다 지워 줘", "notify": "none"}, caller="qwen"))
+    assert r["needs"]["kind"] == "confirm" and "확인할게요" in r["needs"]["question"] and not w.tasks
+    assert r["needs"]["args"]["confirmed"] is True
+    r = run(b.run("create_task", r["needs"]["args"], caller="qwen"))  # the user said yes: resent with confirmed
+    assert r["ok"] and len(w.tasks) == 1
+    r = run(b.run("create_task", {"goal": "정리", "notify": "none"}, caller="app"))  # the user's own tap
+    assert r["ok"]
+    b.d["who"] = lambda: "ask:azel:call-2"  # another run, nothing read: acts as before
+    assert run(b.run("create_task", {"goal": "정리", "notify": "none"}, caller="qwen"))["ok"]

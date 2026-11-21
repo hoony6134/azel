@@ -811,7 +811,8 @@ def run_args(settings, devices, requester=""):
         origin = requester[4:] if requester.startswith("ask:") and ORIGIN_RE.fullmatch(requester[4:]) else ""
         servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {
             "Authorization": f"Bearer {TOKEN}",
-            **({"X-Azel-Origin": origin} if origin else {})}}}  # its create_task / call_user continue this call
+            **({"X-Azel-Origin": origin} if origin else {}),  # its create_task / call_user continue this call
+            **({"X-Azel-Requester": requester} if requester else {})}}}
         allowed = [*allowed, "mcp__azel"]
         rs = json.loads(run_settings)
         if "allowedMcpServers" in rs:
@@ -1134,6 +1135,8 @@ def served(coro, m):
     """A link request served in its own context carrying the conversation it came from."""
     ctx = contextvars.copy_context()
     ctx.run(origin_ctx.set, origin_of(m))
+    if origin_of(m):
+        ctx.run(requester_ctx.set, requester_id("ask", origin_of(m)))  # Qwen's tool calls belong to that ask
     return asyncio.create_task(coro, context=ctx)
 
 
@@ -3333,6 +3336,7 @@ TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 
                   "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
                   "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기에는 읽기와 진단만 해.")
 bridge = tools_bridge.Bridge(
+    who=lambda: requester_ctx.get(),  # the run (ask:<session> | task:<id>): the prompt-injection guard's key
     fresh_devices=lambda: fresh_devices(), device_tools=lambda d: device_tools(d), run_tool=lambda b, w: run_tool(b, w),
     place_call=lambda reason, opening, pid: place_call(reason, opening=opening, persona_id=pid),
     schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
@@ -3492,6 +3496,8 @@ async def mcp_server(request: Request):
         print("external mcp:", str((msg.get("params") or {}).get("name"))[:40], flush=True)  # the name only
     if scope == "full" and ORIGIN_RE.fullmatch(origin := request.headers.get("x-azel-origin", "")):
         origin_ctx.set(origin)  # claude -p's create_task/call_user: the call it runs in (never from the external token)
+    if scope == "full" and REQUESTER_RE.fullmatch(req := request.headers.get("x-azel-requester", "")):
+        requester_ctx.set(req)
     out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope)
     return Response(status_code=202) if out is None else JSONResponse(out)
 
@@ -3541,6 +3547,7 @@ def task_backend_cfg(backend, settings):
 
 async def run_task_api(t):
     """One task on an API backend (agent_loop): same caps, steps, approvals and notification as claude_code."""
+    requester_ctx.set(requester_id("task", t["id"]))  # its tool calls are this task's (approvals, injection guard)
     settings = await load_settings()
     devices = await fresh_devices()
     system = task_api_system(settings, devices)

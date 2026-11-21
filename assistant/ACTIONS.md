@@ -85,7 +85,17 @@ The conformance test asserts this asymmetry explicitly.
   start or end date → `needs.confirm` with the read-back, until `confirmed: true`.
 - **Ambiguous matches** (cancel, update): several items match → `needs.choose`. Nothing changes.
 - **Recurring item without `scope`** (update) → `needs.clarify`. The model is told: a named day means `occurrence`,
-  otherwise `rule`.
+  otherwise `rule`. Cancel the same: a rule with no scope → `needs.clarify` "이번 한 번만 취소할까요, 매번 취소할까요?";
+  the app's `DELETE /v1/schedule/{id}` sends `scope: rule` (or `occurrence` with `?occurrence=`). Cancel with nothing
+  named → the only item, else `needs.choose` (never "the soonest").
+- **Identical rule** (create): the same cron, kind, purpose and persona as an active item → 409. The daily cap (20)
+  counts over the rule's own first 14 days (from `start_date`, never before now), the other items' fires included.
+- **Prompt-injection guard:** after a `web_search`, `web_fetch`, `memory_recall`, `people_lookup`, Cygnus or Google read
+  in the same run (`ask:<persona:session>` or `task:<id>`, from the gateway's requester; within 10 minutes), a model's
+  side-effect action (call_user, schedule_create/update/cancel, create_task, remember) → `needs.confirm` with a read-back,
+  until it is resent with `confirmed: true`. The app (`caller: app`) is the user's own tap and never asks.
+- **No task chains:** a task cannot start a task (`create_task` is not in agent_loop's tools; claude -p task runs deny
+  `mcp__azel__create_task`).
 - **Purpose and opening:** the raw request is stored but never spoken; `purpose` is normalized (`openings.py`).
 
 ## 5. Limits (in the handler)

@@ -55,6 +55,7 @@ CALL_USER = {
         "confirmed": {"type": "boolean", "description": "단순한 매일·매주 규칙이 아니면, 사용자에게 읽어 주고 확인받은 뒤 true"},
         "persona_id": {"type": "string", "maxLength": 32}}},
 }
+CONFIRMED = {"type": "boolean", "description": "확인 질문(needs: confirm)에 사용자가 맞다고 한 뒤 true로 다시 보낼 때만"}
 PICK = {  # how schedule_cancel and schedule_update choose their item
     "id": {"type": "string", "maxLength": 40}, "at": {"type": "string", "description": "ISO 8601 KST (반복이면 그 회차의 시각)"},
     "description": {"type": "string", "maxLength": 100, "description": "메모나 '내일 7시' 같은 말"}}
@@ -69,7 +70,7 @@ SCHEDULE_CANCEL = {
                    "반복 예약은 scope가 필요하다: occurrence(at의 그 회차, 없으면 다음 회차 하나만) 또는 rule(반복 전체). "
                    "없으면 사용자에게 물어본다.",
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
-        **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]}}}}
+        **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]}, "confirmed": CONFIRMED}}}
 SCHEDULE_UPDATE = {
     "name": "schedule_update",
     "description": ("예약된 전화 하나를 바꾼다(시각, 목적, 알림 방식, 반복 규칙, 기간). 고르는 법은 schedule_cancel과 같고, 여러 개가 "
@@ -107,7 +108,7 @@ CREATE_TASK = {
     "name": "create_task",
     "description": ("여러 단계가 필요한 일을 백그라운드 작업으로 맡긴다(정리, 조사, 기기에서 하는 작업). 끝나거나 실패하거나 승인이 "
                     "필요하면 notify대로 알린다: call(전화), push(알림), none."),
-    "input_schema": {"type": "object", "additionalProperties": False, "required": ["goal"], "properties": {
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["goal"], "properties": { "confirmed": CONFIRMED,
         "goal": {"type": "string", "maxLength": 2000}, "device": {"type": "string", "maxLength": 32},
         "notify": {"type": "string", "enum": ["call", "push", "none"]},
         "backend": {"type": "string", "enum": ["claude_api", "claude_code", "nim", "qwen"],
@@ -116,6 +117,14 @@ CREATE_TASK = {
         "budget_usd": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"},
         "max_minutes": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"}}},
 }
+
+
+# Prompt injection: text read from the web, mail/calendar, Cygnus or memory may carry instructions. After such a read
+# in the same run (ask or task), a side-effect action from a model needs a read-back the user confirmed.
+TAINT_TOOLS = {"web_search", "web_fetch", "memory_recall", "people_lookup"}
+SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "schedule_update": "예약 변경",
+                "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기"}
+TAINT_S = 600
 
 
 class Bridge:
@@ -127,6 +136,7 @@ class Bridge:
     def __init__(self, **deps):
         self.d = deps
         self.recent = {}  # (at, cron) -> (monotonic, say): a model repeating the same call_user creates nothing
+        self.tainted = {}  # run id (ask:<session> | task:<id>) -> monotonic of its last web/mail/Cygnus/memory read
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -154,7 +164,18 @@ class Bridge:
                 raise Fail("not_found", f"없는 기능이에요: {str(name)[:40]}")
             if name in OWN_SCHEMAS:
                 check_args(OWN_SCHEMAS[name], args)
+            who = self.d.get("who", lambda: "")()
+            if name in SIDE_EFFECTS and caller != "app" and who and args.get("confirmed") is not True \
+                    and time.monotonic() - self.tainted.get(who, -1e9) < TAINT_S:
+                what = str(args.get("when_text") or args.get("goal") or args.get("text") or args.get("description")
+                           or args.get("reason") or "")[:40]
+                q = f"방금 찾아본 내용을 보고 하려는 거라 확인할게요. {what + ' ' if what else ''}{SIDE_EFFECTS[name]}, 할까요?"
+                raise Need("confirm", q, f"아직 아무것도 하지 않았어요. 사용자에게 '{q}'라고 묻고, 사용자가 맞다고 하면 "
+                           "같은 내용에 confirmed=true를 더해 다시 불러.", resend={**args, "confirmed": True})
             out = await self.dispatch(name, args, persona_id, caller, on_progress, where)
+            if who and (name in TAINT_TOOLS or any(name in {t["name"] for t in self.d.get(src, lambda: ([], None))()[0]}
+                                                   for src in ("cygnus", "google"))):
+                self.tainted[who] = time.monotonic()
             if isinstance(out, dict):  # a device tool's own result
                 r = result(not out["is_error"], out["content"],
                            error={"code": "failed", "message": out["content"][:300]} if out["is_error"] else None)
@@ -768,7 +789,7 @@ REMEMBER = {
     "name": "remember",
     "description": ("사용자가 '기억해', '잊지 마'라고 하거나 오래 갈 취향·사실·계획을 말하면 저장한다. 한 문장의 사실로. "
                     "비밀번호, 카드번호, 계좌, 토큰 같은 비밀은 저장하지 않는다. 결과의 문장을 그대로 읽어 줘."),
-    "input_schema": {"type": "object", "additionalProperties": False, "required": ["fact"], "properties": {
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["fact"], "properties": { "confirmed": CONFIRMED,
         "fact": {"type": "string", "maxLength": 300, "description": "예: '좋아하는 커피는 아이스 바닐라 라떼'"},
         "about": {"type": "string", "maxLength": 40, "description": "사람에 관한 거면 그 사람"},
         "persona_scope": {"type": "string", "enum": ["shared", "persona"],
