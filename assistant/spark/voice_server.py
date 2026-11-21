@@ -154,6 +154,7 @@ class Link:
         self.mode = "limited" if limited else "full"
         self.fails = 0  # consecutive failed asks; 3 or more = unhealthy, tried last
         self.claude = True  # False: a gateway without Claude (scheduled calls, history, settings only)
+        self.brain = False  # the resident brain: sends contexts, serves Qwen's tools, never takes asks or logs
 
     async def send(self, obj):
         async with self.lock:
@@ -170,6 +171,8 @@ class GatewayLinks:
         self.queues: dict[str, tuple[asyncio.Queue, Link]] = {}
         self.settings: dict = {}
         self.openings: dict[str, str] = {}
+        self.brain_ctx: tuple[float, str] | None = None  # (received at, block) from the brain, for every call
+        self.session_ctx: dict[str, tuple[float, str]] = {}  # per call session (e.g. why the assistant called)
 
     def add(self, ws, limited=False):
         lk = Link(ws, limited)
@@ -207,7 +210,7 @@ class GatewayLinks:
 
     def pick(self, personal: bool, need_claude: bool = True) -> Link:
         """The link for one ask; RuntimeError carries a speakable reason when none may take it."""
-        ranked = sorted((lk for lk in self.links if lk.claude or not need_claude),
+        ranked = sorted((lk for lk in self.links if (lk.claude or not need_claude) and not lk.brain),
                         key=lambda lk: (lk.fails >= 3, lk.priority))
         full = [lk for lk in ranked if lk.mode == "full"]
         if full:
@@ -232,12 +235,16 @@ class GatewayLinks:
                 return  # never let a link of the other mode evict (or pose as) that device's link
             lk.device, lk.mode = device, mode
             lk.claude = msg.get("claude") is not False
+            lk.brain = msg.get("role") == "brain" and mode == "full"
             try:
                 lk.priority = int(msg.get("priority", 50))
             except (TypeError, ValueError):
                 lk.priority = 50
             for old in same:
                 self.remove(old)  # that gateway reconnected; its old socket is dead
+        elif t == "context":
+            if lk.brain and isinstance(msg.get("value"), str):
+                self.take_context(msg.get("session"), msg["value"])
         elif t in ("settings", "call") and lk.mode != "full":
             return  # shared settings and call openings come from full gateways only
         elif t == "settings":
@@ -256,6 +263,113 @@ class GatewayLinks:
 
 
 links = GatewayLinks()
+
+
+# ---------- brain: context and local tools for Qwen (PROTOCOL.md section 6) ----------
+BRAIN_FRESH_S = 900  # an older context block is ignored (the brain pushes one at least every 5 min while it changes)
+RECALL_WAIT_S = 0.4  # per-turn memory retrieval may delay the answer this much at most
+TOOL_WAIT_S = 4.0
+TOOL_TAG = "[TOOL]"
+MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|우리|네가)|했었|했던|라고 했|물어봤")
+BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")
+
+
+def _take_context(self, session, value):
+    value = value[:6000]
+    if isinstance(session, str) and session:
+        if len(self.session_ctx) > 200:
+            self.session_ctx.pop(next(iter(self.session_ctx)))
+        self.session_ctx[session] = (time.time(), value)
+    else:
+        self.brain_ctx = (time.time(), value)
+
+
+def _context_for(self, session):
+    """The freshest block for this call ('' when no brain is up): the session's own, else the shared one."""
+    if not self.brain_link():
+        return ""
+    got = [c for c in (self.session_ctx.get(session), self.brain_ctx) if c and time.time() - c[0] < BRAIN_FRESH_S]
+    return max(got)[1] if got else ""
+
+
+def _brain_link(self):
+    return next((lk for lk in reversed(self.links) if lk.brain), None)
+
+
+async def _brain_request(self, msg, timeout):
+    """One request to the brain and its one reply; RuntimeError when no brain is up."""
+    lk = self.brain_link()
+    if lk is None:
+        raise RuntimeError("no brain")
+    rid, q = uuid.uuid4().hex, asyncio.Queue()
+    self.queues[rid] = (q, lk)
+    try:
+        await lk.send({**msg, "id": rid})
+        return await asyncio.wait_for(q.get(), timeout)
+    finally:
+        self.queues.pop(rid, None)
+
+
+async def _brain_event(self, msg):
+    if lk := self.brain_link():
+        try:
+            await lk.send(msg)
+        except Exception:
+            pass
+
+
+GatewayLinks.take_context, GatewayLinks.context_for, GatewayLinks.brain_link = _take_context, _context_for, _brain_link
+GatewayLinks.brain_request, GatewayLinks.brain_event = _brain_request, _brain_event
+
+BRAIN_BODY = (
+    "아래 [아는 것]은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
+    "여기에 답이 있으면 Claude 없이 네가 바로 답해. 없는 내용은 절대 지어내지 마. "
+    f"더 찾아봐야 하면 다른 말 없이 한 줄로 {TOOL_TAG} {{\"name\": 도구, \"args\": {{…}}}} 만 출력해. 도구: "
+    "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
+    "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
+    "[아는 것]과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
+    f"최신 정보, 서버 진단, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
+    "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해."
+)
+
+
+def brain_system(name, ctx, hits=(), length="normal"):
+    """Qwen's SYSTEM when the brain is up: voice style, the routing and tool rules, then what the brain knows."""
+    body = SYSTEM_BODY.split("중요:")[0] + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) + " "  # voice style + length
+    mem = ("\n[이번 말과 관련된 기록]\n" + "\n".join(f"- {h}" for h in hits)) if hits else ""
+    # Stable parts first, the clock and this turn's hits last, so the endpoint's prefix cache covers the context.
+    return f"너는 사용자의 개인 비서 '{name}'야. " + body + BRAIN_BODY + f"\n\n[아는 것]\n{ctx}\n" + now_kst().strip() + mem
+
+
+async def run_tool(raw, session):
+    """Run one '[TOOL] {...}' line from Qwen: brain tools over the link, scheduled calls via a gateway."""
+    call = raw.strip().removeprefix(TOOL_TAG).strip()
+    try:
+        data = json.loads(call[call.index("{"):call.rindex("}") + 1])
+        name, args = str(data.get("name", "")), data.get("args") if isinstance(data.get("args"), dict) else {}
+    except ValueError:
+        return "도구 호출 형식이 틀렸어요."
+    if name == "scheduled_calls":
+        return await schedule_reply("", "list", session)
+    if name not in BRAIN_TOOLS:
+        return f"없는 도구예요: {name}"
+    try:
+        reply = await links.brain_request({"type": "tool", "name": name, "args": args}, TOOL_WAIT_S)
+        return str(reply.get("result", ""))[:2000]
+    except (RuntimeError, asyncio.TimeoutError):
+        return "지금은 그 도구를 쓸 수 없어요."
+
+
+async def recall(text, timings):
+    """Up to two memory hits for this utterance, or none if the brain cannot answer within RECALL_WAIT_S."""
+    t = time.perf_counter()
+    try:
+        reply = await links.brain_request({"type": "recall", "text": text[:300]}, RECALL_WAIT_S)
+        hits = [str(h)[:300] for h in reply.get("hits", [])][:2] if isinstance(reply.get("hits"), list) else []
+    except (RuntimeError, asyncio.TimeoutError):
+        hits = []
+    timings["recall_ms"] = ms(t)
+    return hits
 
 
 def prepare_opening(text, reason=""):
@@ -354,20 +468,31 @@ def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
 
 
-def pre_route(text, settings):
-    """(straight to Claude?, model) decided by keywords and settings, before any LLM call."""
+def pre_route(text, settings, local=False):
+    """(straight to Claude?, model) decided by keywords and settings, before any LLM call.
+
+    local=True (the brain's context is in Qwen's prompt): personal questions go to Qwen first, which answers from
+    the context or its tools, or hands over with the routing tag."""
     forced_model = pick(MODEL_WORDS, text)
     default = settings.get("default_model", "auto")
     model = forced_model or (default if default in MODEL_WORDS else None)
-    keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
+    if local:  # "아까 날씨 물어봤을 때 뭐라 했지?" is memory, not live data: Qwen decides
+        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text)
+        keywords = USE_CLAUDE.search(text) or live or \
+            pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
+    else:
+        keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
 
 
 def tag_state(head):
-    """Qwen's reply so far (left-stripped): 'tag' = route to Claude, 'maybe' = too short to tell, 'no' = speak it."""
+    """Qwen's reply so far (left-stripped): 'tag' = route to Claude, 'tool' = a tool call (collect it whole),
+    'maybe' = too short to tell, 'no' = speak it."""
     if head.startswith(ROUTE_TAG):
         return "tag"
-    return "maybe" if ROUTE_TAG.startswith(head) else "no"
+    if head.startswith(TOOL_TAG):
+        return "tool"
+    return "maybe" if ROUTE_TAG.startswith(head) or TOOL_TAG.startswith(head) else "no"
 
 
 def token_label(got: str, labels=("client",)):
@@ -719,7 +844,8 @@ async def respond(text, session, t0, timings, on_event=None):
     name = assistant_name(settings)
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
-    to_claude, model = (False, None) if sched else pre_route(bare, settings)
+    ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
+    to_claude, model = (False, None) if sched else pre_route(bare, settings, local=bool(ctx))
     sentences: asyncio.Queue = asyncio.Queue()
     route = {"value": "schedule" if sched else "claude" if to_claude else "qwen"}
 
@@ -740,7 +866,8 @@ async def respond(text, session, t0, timings, on_event=None):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            async for delta in claude_stream(text, session, model, task, personal, recent_context(hist),
+            known = f"비서가 알고 있는 것(참고만):\n{ctx}\n\n" if ctx else ""  # full links only, like the turns
+            async for delta in claude_stream(text, session, model, task, personal, known + recent_context(hist),
                                              on_event=on_event):
                 got_text.set()
                 buf += delta
@@ -764,23 +891,37 @@ async def respond(text, session, t0, timings, on_event=None):
                 return
             if to_claude:
                 return await via_claude()
-            messages = [{"role": "system", "content": system_prompt(name, reply_length(settings)) + now_kst()}, *hist,
-                        {"role": "user", "content": text}]
-            buf = ""
-            async for delta in llm_stream(messages, LENGTH_TOKENS[reply_length(settings)]):
-                timings.setdefault("llm_first_token_ms", ms(t0))
-                buf += delta
-                state = tag_state(buf.lstrip())
-                if state == "maybe":
-                    continue  # might be the routing tag; wait for more
-                if state == "tag":
-                    return await via_claude()
-                done, buf = split_ready(buf, final=False, first="first_sentence_ms" not in timings)
-                for s in done:
-                    timings.setdefault("first_sentence_ms", ms(t0))
+            length = reply_length(settings)
+            system = brain_system(name, ctx, await recall(bare, timings), length) if ctx \
+                else system_prompt(name, length) + now_kst()
+            messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
+            for rounds in range(3):  # at most two tool calls, then an answer
+                buf, state = "", "maybe"
+                async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
+                    timings.setdefault("llm_first_token_ms", ms(t0))
+                    buf += delta
+                    if state not in ("tool", "no"):
+                        state = tag_state(buf.lstrip())
+                    if state in ("maybe", "tool"):
+                        continue  # might be a tag; a tool call is collected whole
+                    if state == "tag":
+                        return await via_claude()
+                    done, buf = split_ready(buf, final=False, first="first_sentence_ms" not in timings)
+                    for s in done:
+                        timings.setdefault("first_sentence_ms", ms(t0))
+                        await sentences.put(s)
+                if state == "tool" and ctx and rounds < 2:
+                    t_tool = time.perf_counter()
+                    result = await run_tool(buf.strip().split("\n")[0], session)
+                    timings.setdefault("tools", []).append(ms(t_tool))
+                    messages += [{"role": "assistant", "content": buf.strip()},
+                                 {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
+                    continue
+                if state == "tool":
+                    return await via_claude()  # tools looping, or no brain: let Claude take it
+                for s in split_ready(buf, final=True)[0]:
                     await sentences.put(s)
-            for s in split_ready(buf, final=True)[0]:
-                await sentences.put(s)
+                break
         finally:
             await sentences.put(None)
 
@@ -1041,6 +1182,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         briefing = intent == "briefing" and not call_id
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
+        await links.brain_event({"type": "call_event", "event": "start", "session": session,
+                                 "reason": (op or {}).get("reason", "") and (op or {}).get("text", "")})
         start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started,
                          # the user's point of view, like a phone's call log: the assistant calling = incoming
                          direction="incoming" if call_id else "outgoing",
@@ -1090,6 +1233,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await asyncio.gather(current["task"], return_exceptions=True)  # its turn is logged before the end
         ended = time.time()
         await links.log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
+        await links.brain_event({"type": "call_event", "event": "end", "session": session})
+        links.session_ctx.pop(session, None)
 
 
 if __name__ == "__main__":
@@ -1620,4 +1765,64 @@ if __name__ == "__main__":
         RedactQuery().filter(rec)
         assert "s3cret" not in rec.getMessage() and "/v1/call?<redacted>" in rec.getMessage()
         assert any(isinstance(f, RedactQuery) for f in logging.getLogger("uvicorn.error").filters)
+        def brain_check():
+            """The brain link: never picked for asks or logs; its context reaches Qwen; Qwen's tool call runs on it."""
+            class BrainWS(FakeWS):  # answers tool and recall requests like brain.py
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "tool":
+                        links.receive(self.lk, {"id": m["id"], "type": "tool_result", "result": "- 11/19 랩미팅 발표는 다음 주로 미룸"})
+                    elif m.get("type") == "recall" and "느린" not in m["text"]:
+                        links.receive(self.lk, {"id": m["id"], "type": "recall_result", "hits": ["(어제) 서버 이전 끝남"]})
+            gw, bws = links.add(FakeWS()), BrainWS()
+            br = bws.lk = links.add(bws)
+            links.receive(gw, {"type": "hello", "device": "macbook", "mode": "full", "priority": 10})
+            links.receive(br, {"type": "hello", "device": "brain-deneb", "mode": "full", "priority": 1, "claude": False,
+                               "role": "brain"})
+            assert links.pick(True) is gw and links.pick(True, need_claude=False) is gw  # never the brain
+            assert links.context_for("s") == ""
+            links.receive(gw, {"type": "context", "value": "가짜"})  # only the brain may set context
+            links.receive(br, {"type": "context", "value": "[사용자 프로필]\n- 광주에 삶"})
+            links.receive(br, {"type": "context", "session": "s1", "value": "이번 전화: 마감 알림"})
+            assert links.context_for("s") == "[사용자 프로필]\n- 광주에 삶" and links.context_for("s1") == "이번 전화: 마감 알림"
+            lim = links.add(FakeWS(), limited=True)
+            links.receive(lim, {"type": "hello", "device": "x", "mode": "full", "role": "brain"})
+            assert not lim.brain  # a link_limited token cannot pose as the brain
+            links.remove(lim)
+            assert pre_route("오늘 일정 뭐야?", {})[0] and not pre_route("오늘 일정 뭐야?", {}, local=True)[0]
+            assert pre_route("날씨 어때?", {}, local=True)[0] and not pre_route("아까 날씨 물어봤을 때 뭐라 했어?", {}, local=True)[0] and pre_route("레포 빌드 에러 고쳐 줘", {}, local=True)[0]
+            assert [tag_state(h) for h in ("[TO", "[TOOL] {", "[C")] == ["maybe", "tool", "maybe"]
+            prompts = []
+
+            async def fake_llm(messages, max_tokens=600):
+                prompts.append(messages)
+                if len(prompts) == 1:
+                    yield '[TOOL] {"name": "search_memory", '
+                    yield '"args": {"query": "랩미팅"}}'
+                else:
+                    yield "다음 주로 미루셨어요."
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            globals().update(llm_stream=fake_llm, tts=fake_tts)
+            timings = {}
+
+            async def run(text, session):
+                return [(x, r) async for x, r, *_ in respond(text, session, time.perf_counter(), timings)]
+            said = asyncio.run(run("아까 말한 랩미팅 그거 어떻게 됐지?", "s"))
+            assert said == [("다음 주로 미루셨어요.", "qwen")], said
+            sysmsg = prompts[0][0]["content"]
+            assert "광주에 삶" in sysmsg and "서버 이전 끝남" in sysmsg and TOOL_TAG in sysmsg
+            assert "랩미팅 발표는 다음 주로" in prompts[1][-1]["content"] and timings["recall_ms"] < 400
+            assert not [m for m in gw.ws.sent if m.get("type") == "ask"]  # answered locally, no Claude
+            prompts.clear()
+            t = time.perf_counter()
+            asyncio.run(run("느린 기억 찾기", "s"))  # the brain never answers recall: give up after RECALL_WAIT_S
+            assert RECALL_WAIT_S <= time.perf_counter() - t < RECALL_WAIT_S + 0.5 and "관련된 기록" not in prompts[0][0]["content"]
+            links.remove(br)
+            assert links.context_for("s") == ""  # brain gone: old prompt and routing
+            links.remove(gw)
+            globals().update(llm_stream=real_llm, tts=real[1])
+        brain_check()
         print("voice_server checks ok")

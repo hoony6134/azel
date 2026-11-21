@@ -80,8 +80,9 @@ peer is not in 100.64.0.0/10 or the request carries `X-Forwarded-For`, `Forwarde
 (the public proxy is itself a tailnet peer, so the header check is what stops it). **Every gateway keeps its own link**; the voice server holds all of them at once.
 JSON text frames:
 
-- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority","claude"?}` first on every
-  connect (`claude: false` = a gateway without Claude, e.g. an always-on deneb: it never gets asks but
+- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority","claude"?,"role"?}` first on every
+  connect (`role: "brain"`: the resident brain's link, section 6; never picked for asks, logs or schedules;
+  `claude: false` = a gateway without Claude, e.g. an always-on deneb: it never gets asks but
   takes schedule requests, call logs and answered reports; `priority`: lower is preferred; a link that never says hello counts as full, priority 50;
   a new hello from the same `device` replaces that device's older link of the same mode; a hello that
   would replace a link of the other mode is ignored),
@@ -376,3 +377,47 @@ records, search, contacts and context, answers 403) when either:
   `DELETE /v1/state/history?older_than_days=N` (also delete those calls' transcript records). Tables
   `call_history` and `call_turns` (on delete cascade) in the state schema; the existing `calls` table
   stays the placed-call openings.
+
+## 6. Brain — the resident assistant (`brain/`, deneb; the Mac for development)
+
+One process on an always-on full (jh-only) host. It listens on nothing: it dials the voice server's gateway
+link and talks to the memory service and the local Qwen (`http://100.64.0.11:8888/v1/chat/completions`). Tokens:
+`token` (memory service, gateways' `/v1/ask`) and `link_token`, both 0600. One brain writes at a time (lease
+`brain`, 120 s); a second brain only serves its link. Background Qwen requests are paced to one per
+`BRAIN_BG_GAP_S` (default 4) seconds.
+
+Link (section 1b), its own connection: hello `{"type":"hello","device":"brain-<host>","mode":"full","claude":false,
+"role":"brain","priority":99}`. `role:"brain"` counts only on a full (`link`-token) link. A brain link never gets
+asks, call_logs or schedule requests.
+- brain → voice `{"type":"context","session"?,"value"}`: the Korean context block (≤ 2400 chars: profile,
+  situation, recent calls), pushed on connect and whenever it changes (situation refresh every 5 min). With
+  `session`: that call only (a placed call adds its reason). The voice server uses a block younger than 15 min, only
+  in Qwen's SYSTEM, and as "알고 있는 것" ahead of a Claude ask on a full link. Never to a limited link.
+- voice → brain `{"type":"call_event","event":"start"|"end","session","reason"?}`; the brain answers a start with
+  that session's context.
+- voice → brain `{"type":"tool","id","name","args"}` → `{"id","type":"tool_result","result":"…"}` (Korean, for Qwen).
+  Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
+  `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
+  schedule list). Timeout 4 s.
+- voice → brain `{"type":"recall","id","text"}` → `{"id","type":"recall_result","hits":["…"]}` (≤ 2 memory hits);
+  the voice server waits at most 400 ms, then answers without them.
+
+Qwen with a brain context: personal questions are no longer pre-routed to Claude (live data, devices by name,
+code and file work, and named models still are). Qwen answers from the context, or prints one line
+`[TOOL] {"name":…,"args":{…}}` (the voice server runs it and asks Qwen again; at most two tools per turn), or
+`[CLAUDE]` as before. Without a brain (no link, or no context younger than 15 min) routing and the prompt are as
+before.
+
+Memory written by the brain (no schema change; record kind `note`, contexts):
+- after every ended call with ≥ 12 characters of user speech: a `note` record `"[통화 요약 <when>] <summary> 결정: …
+  후속: …"` with `meta {"type":"call_summary","call","title","at","decisions","facts","followups"}`; follow-ups as
+  context `call-<first 12 of the history id>` (`open_questions` = follow-ups, which the gateways' autonomous
+  signals read); facts merged into `azel-profile` by Qwen.
+- `azel-profile`: stable facts and preferences, seeded once from Cygnus memory through a full gateway's
+  `/v1/ask` (Claude), then refined from calls.
+- `azel-day`: Claude's day digest (today and tomorrow, deadlines within 7 days, today's todos, mail needing a
+  reply) through `/v1/ask` at `BRAIN_DIGEST_AT` (default 07:30, 12:30, 17:30) unless one is younger than 2.5 h.
+- `azel-situation`: composed without a model from `azel-day`, `azel-checkpoint` (the gateways' autonomous-call
+  checkpoint note), scheduled calls, pending approvals, full-writer devices, open call follow-ups (3 days),
+  `azel-todos`, and recent call summaries (3 days). First line `## 상황 (…)`; a note there without it is a gateway's
+  checkpoint and is moved to `azel-checkpoint`.
