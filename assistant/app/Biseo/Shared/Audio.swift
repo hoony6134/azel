@@ -48,10 +48,47 @@ extension PCM {
     }
 }
 
+/// Mic and output loudness in 0…1 for the visualizer (DESIGN §6.1). Written on audio threads, read
+/// every frame by the jar's Canvas; deliberately not @Published.
+final class Levels: @unchecked Sendable {
+    static let silent = Levels()
+    private let lock = NSLock()
+    private var _mic: Float = 0, _out: Float = 0
+    var mic: Float { lock.lock(); defer { lock.unlock() }; return _mic }
+    var out: Float { lock.lock(); defer { lock.unlock() }; return _out }
+
+    /// RMS → 0…1: −50 dBFS → 0, −6 dBFS → 1.
+    static func level(rms: Float) -> Float { max(0, min(1, (20 * log10(max(rms, 1e-5)) + 50) / 44)) }
+
+    /// One-pole smoothing: attack 40 ms, release 180 ms.
+    static func smooth(_ previous: Float, _ target: Float, dt: Float) -> Float {
+        let tau: Float = target > previous ? 0.04 : 0.18
+        return previous + (target - previous) * (1 - exp(-dt / tau))
+    }
+
+    static func rms(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return 0 }
+        var sum: Float = 0
+        for i in 0..<Int(buffer.frameLength) { sum += data[0][i] * data[0][i] }
+        return (sum / Float(buffer.frameLength)).squareRoot()
+    }
+
+    func update(mic buffer: AVAudioPCMBuffer) { update(\._mic, buffer) }
+    func update(out buffer: AVAudioPCMBuffer) { update(\._out, buffer) }
+    func reset() { lock.lock(); _mic = 0; _out = 0; lock.unlock() }
+
+    private func update(_ key: ReferenceWritableKeyPath<Levels, Float>, _ buffer: AVAudioPCMBuffer) {
+        let target = Self.level(rms: Self.rms(buffer))
+        let dt = Float(buffer.frameLength) / Float(buffer.format.sampleRate)
+        lock.lock(); self[keyPath: key] = Self.smooth(self[keyPath: key], target, dt: dt); lock.unlock()
+    }
+}
+
 /// Mic tap → PCM16 16 kHz chunks, and an ordered PCM16 24 kHz player.
 final class AudioIO {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    let levels = Levels()
     var onMic: ((Data) -> Void)?
     #if os(macOS)
     /// Core Audio device ids for the next start(); nil = system default.
@@ -76,7 +113,12 @@ final class AudioIO {
         guard let converter = AVAudioConverter(from: format, to: PCM.micFormat) else { throw AVError(.unknown) }
         converter.downmix = true
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.levels.update(mic: buffer)
             if let data = PCM.pcm16Data(from: buffer, converter: converter) { self?.onMic?(data) }
+        }
+        let mixer = engine.mainMixerNode
+        mixer.installTap(onBus: 0, bufferSize: 1024, format: mixer.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+            self?.levels.update(out: buffer)
         }
         try engine.start()
         player.play()
@@ -100,6 +142,8 @@ final class AudioIO {
     func stop() {
         player.stop()
         engine.inputNode.removeTap(onBus: 0)
+        engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()
+        levels.reset()
     }
 }

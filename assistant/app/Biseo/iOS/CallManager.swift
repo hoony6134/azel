@@ -6,11 +6,11 @@ import PushKit
 final class CallManager: NSObject, ObservableObject {
     static let shared = CallManager()
 
-    struct Line: Identifiable { let id = UUID(); let mine: Bool; let text: String; var route: String? = nil }
-
     @Published private(set) var inCall = false
     @Published private(set) var state = ""          // listening | thinking | speaking
-    @Published private(set) var lines: [Line] = []
+    @Published private(set) var log = CallLog()
+    var lines: [CallLine] { log.lines }
+    var levels: Levels { client.audio.levels }
     @Published private(set) var muted = false
     @Published private(set) var held = false
     @Published private(set) var speaker = false
@@ -27,6 +27,7 @@ final class CallManager: NSObject, ObservableObject {
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
     private var incoming: [UUID: (callID: String?, reason: String?)] = [:]
+    private var activeSession: String?
 
     private override init() {
         let config = CXProviderConfiguration()
@@ -104,7 +105,7 @@ final class CallManager: NSObject, ObservableObject {
         self.callID = callID
         inCall = true
         state = ""
-        lines = []
+        log = CallLog()
         muted = false
         held = false
         recording = false
@@ -122,7 +123,8 @@ final class CallManager: NSObject, ObservableObject {
             do { try client.restartAudio() } catch { fail(error.localizedDescription) }
             return
         }
-        do { try client.start(session: callID ?? Session.current(sessionPrefix), callID: callID) } catch {
+        activeSession = callID ?? Session.current(sessionPrefix)
+        do { try client.start(session: activeSession!, callID: callID) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
@@ -138,10 +140,8 @@ final class CallManager: NSObject, ObservableObject {
     private func handle(_ event: CallEvent) {
         switch event.type {
         case "state": state = event.value ?? ""
-        case "transcript": if let t = event.text { lines.append(Line(mine: true, text: t)) }
-        case "reply": if let t = event.text { lines.append(Line(mine: false, text: t, route: event.route)) }
         case "error": error = event.message
-        default: break
+        default: log.apply(event)
         }
     }
 
@@ -154,6 +154,8 @@ final class CallManager: NSObject, ObservableObject {
 
     private func teardown() {
         client.stop()
+        if let activeSession { Recents.add(CallRecord(session: activeSession, start: connectedAt ?? Date(), lines: log.lines)) }
+        activeSession = nil
         callUUID = nil
         callID = nil
         sessionPrefix = "iphone"
@@ -178,7 +180,7 @@ extension CallManager: CXProviderDelegate {
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         let info = incoming.removeValue(forKey: action.callUUID)
         begin(action.callUUID, callID: info?.callID)
-        if let reason = info?.reason { lines.append(Line(mine: false, text: "용건: \(reason)")) }
+        if let reason = info?.reason { log.lines.append(CallLine(mine: false, text: "용건: \(reason)")) }
         action.fulfill()
     }
 

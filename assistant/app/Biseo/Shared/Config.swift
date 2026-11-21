@@ -8,10 +8,10 @@ enum Config {
     /// "Advanced": straight to the services over Tailscale (plain HTTP/WS, see Info.plist ATS note).
     static let tailnetVoiceURL = "ws://100.64.0.11:8891", tailnetGatewayURL = "http://100.64.0.8:8892"
     #if os(macOS)
-    static let addressNote = "기본은 공개 주소(TLS)입니다. Tailnet 주소는 Tailscale에 연결돼 있을 때만 됩니다."
+    static let addressNote = "기본은 공개 주소(TLS)예요. Tailnet 주소는 Tailscale에 연결돼 있을 때만 돼요."
     #else
     // iOS ATS blocks plain http/ws to 100.64.x.x even with NSAllowsLocalNetworking (macOS allows it).
-    static let addressNote = "공개 주소(TLS)만 쓸 수 있습니다. iOS는 암호화되지 않은 Tailnet 주소(http/ws)를 막습니다."
+    static let addressNote = "공개 주소(TLS)만 쓸 수 있어요. iOS는 암호화되지 않은 Tailnet 주소(http/ws)를 막아요."
     #endif
 
     static var voiceURL: String {

@@ -2,8 +2,7 @@ import SwiftUI
 
 @main
 struct BiseoApp: App {
-    @State private var configured = Config.token != nil
-    @State private var pendingApprovals = 0
+    @StateObject private var model = AppModel(sessionPrefix: "iphone")
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -13,22 +12,41 @@ struct BiseoApp: App {
 
     var body: some Scene {
         WindowGroup {
-            if configured {
-                TabView {
-                    CallView().tabItem { Label("전화", systemImage: "phone.fill") }
-                    SettingsView().tabItem { Label("설정", systemImage: "gearshape") }
-                    UsageView().tabItem { Label("사용량", systemImage: "chart.bar") }
-                    StatusView().tabItem { Label("상태", systemImage: "server.rack") }
-                    ApprovalsView(pending: $pendingApprovals).tabItem { Label("승인", systemImage: "checkmark.shield") }
-                        .badge(pendingApprovals)
+            Group {
+                if model.configured {
+                    RootView(model: model)
+                } else {
+                    SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
-                .onChange(of: scenePhase, initial: true) {
-                    guard scenePhase == .active else { return }
-                    Task { if let items = try? await Gateway.approvals() { pendingApprovals = items.count } }
-                }
-            } else {
-                NavigationStack { SetupView { configured = true } }
             }
+            .preferredColorScheme(nil)
+            .tint(Theme.celadon)
+            .onChange(of: scenePhase, initial: true) {
+                if scenePhase == .active { Task { await model.refresh() } }
+            }
+        }
+    }
+}
+
+/// Three tabs (DESIGN §7.1); the call screen covers them whenever a call is up, including one
+/// CallKit answered from the lock screen.
+struct RootView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject private var call = CallManager.shared
+    @State private var tab = 0
+
+    var body: some View {
+        TabView(selection: $tab) {
+            NavigationStack { HomeView(model: model, tab: $tab) }
+                .tabItem { Label("홈", systemImage: "circle.circle") }.tag(0)
+            NavigationStack { ApprovalsScreen(model: model) }
+                .tabItem { Label("승인", systemImage: "checkmark.shield") }.tag(1)
+                .badge(model.approvals.count)
+            NavigationStack { SettingsScreen(model: model) }
+                .tabItem { Label("설정", systemImage: "gearshape") }.tag(2)
+        }
+        .fullScreenCover(isPresented: Binding(get: { call.inCall }, set: { if !$0 { call.hangUp() } })) {
+            CallScreen()
         }
     }
 }

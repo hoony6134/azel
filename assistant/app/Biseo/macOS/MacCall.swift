@@ -8,11 +8,11 @@ import SwiftUI
 final class MacCall: ObservableObject {
     static let shared = MacCall()
 
-    struct Line: Identifiable { let id = UUID(); let mine: Bool; let text: String; var route: String? = nil }
-
     @Published private(set) var inCall = false
     @Published private(set) var state = ""          // listening | thinking | speaking
-    @Published private(set) var lines: [Line] = []
+    @Published private(set) var log = CallLog()
+    var lines: [CallLine] { log.lines }
+    var levels: Levels { client.audio.levels }
     @Published private(set) var muted = false
     @Published private(set) var held = false
     @Published private(set) var recording = false
@@ -23,6 +23,7 @@ final class MacCall: ObservableObject {
     @Published var outputUID = UserDefaults.standard.string(forKey: "outputDevice") { didSet { deviceChanged() } }
 
     private let client = CallClient()
+    private var activeSession = Session.current("mac")
     private var panel: NSPanel?
 
     private init() {
@@ -30,14 +31,16 @@ final class MacCall: ObservableObject {
         client.onClose = { [weak self] in self?.end(error: nil, keepPanel: true) }
     }
 
-    func toggle() { inCall ? hangUp() : start() }
+    /// Hotkey: floating panel. The main window's home runs the call in place (DESIGN §8.3).
+    func toggle() { inCall ? hangUp() : start(panel: true) }
 
-    func start() {
+    func start(panel usePanel: Bool, session: String? = nil) {
         guard !inCall else { return }
-        lines = []
+        activeSession = session ?? Session.current("mac")
+        log = CallLog()
         state = ""
         error = nil
-        showPanel()
+        if usePanel { showPanel() }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: connect()
         case .notDetermined:
@@ -65,7 +68,7 @@ final class MacCall: ObservableObject {
     func toggleRecording() {
         guard inCall else { return }
         if client.isRecording { client.stopRecording() } else {
-            do { try client.startRecording(session: Session.current("mac")) } catch { self.error = "녹음 시작 실패" }
+            do { try client.startRecording(session: activeSession) } catch { self.error = "녹음 시작 실패" }
         }
         recording = client.isRecording
     }
@@ -88,7 +91,7 @@ final class MacCall: ObservableObject {
     private func connect() {
         inCall = true
         applyDevices()
-        do { try client.start(session: Session.current("mac")); connectedAt = Date() } catch {
+        do { try client.start(session: activeSession); connectedAt = Date() } catch {
             end(error: error.localizedDescription, keepPanel: true)
         }
     }
@@ -96,15 +99,14 @@ final class MacCall: ObservableObject {
     private func handle(_ event: CallEvent) {
         switch event.type {
         case "state": state = event.value ?? ""
-        case "transcript": if let t = event.text { lines.append(Line(mine: true, text: t)) }
-        case "reply": if let t = event.text { lines.append(Line(mine: false, text: t, route: event.route)) }
         case "error": error = event.message
-        default: break
+        default: log.apply(event)
         }
     }
 
     /// keepPanel: leave the transcript / error on screen after the server hung up or something failed.
     private func end(error message: String?, keepPanel: Bool) {
+        if inCall { Recents.add(CallRecord(session: activeSession, start: connectedAt ?? Date(), lines: log.lines)) }
         client.stop()
         if let message { error = message }
         inCall = false
@@ -120,93 +122,97 @@ final class MacCall: ObservableObject {
 
     private func showPanel() {
         if panel == nil {
-            let p = CallPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 300),
-                              styleMask: [.titled, .closable, .nonactivatingPanel, .fullSizeContentView, .utilityWindow],
+            let p = CallPanel(contentRect: NSRect(x: 0, y: 0, width: 460, height: 112),
+                              styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
-            p.title = "박비서"
-            p.titlebarAppearsTransparent = true
             p.isFloatingPanel = true
             p.level = .floating
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = true
             p.hidesOnDeactivate = false
             p.isReleasedWhenClosed = false
+            p.isMovableByWindowBackground = true
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.setAccessibilityLabel("박비서 말하기 패널")
             p.contentView = NSHostingView(rootView: CallPanelView(call: self))
             panel = p
         }
         if let p = panel, let screen = NSScreen.main {
+            // Bottom-centre, 80 pt above the Dock (visibleFrame already excludes it).
             let f = screen.visibleFrame
-            p.setFrameTopLeftPoint(NSPoint(x: f.midX - p.frame.width / 2, y: f.maxY - 40))
+            p.setFrameOrigin(NSPoint(x: f.midX - p.frame.width / 2, y: f.minY + 80))
         }
+        panel?.alphaValue = 0
         panel?.makeKeyAndOrderFront(nil) // non-activating: takes Esc without pulling focus from the current app
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.25; panel?.animator().alphaValue = 1 }
     }
 }
 
-/// Esc (cancelOperation) and the close button hang up.
+/// Esc (cancelOperation) hangs up; Space toggles mute.
 private final class CallPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override func cancelOperation(_ sender: Any?) { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
-    override func performClose(_ sender: Any?) { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
     override func close() { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
 }
 
+/// DESIGN §8.2: jar · captions · route chip and close, on material, radius 30.
 struct CallPanelView: View {
     @ObservedObject var call: MacCall
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    private var stateText: String {
-        if !call.inCall { return "통화 종료" }
-        return ["listening": "듣는 중", "thinking": "생각 중", "speaking": "말하는 중"][call.state] ?? "연결 중"
-    }
-
-    private func icon(_ title: String, _ name: String, on: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: name).foregroundStyle(on ? Color.red : Color.primary) }
-            .buttonStyle(.borderless).help(title).accessibilityLabel(title)
-    }
+    private var jarState: JarState { call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : .offline }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: call.inCall ? "waveform" : "phone.down").symbolEffect(.variableColor, isActive: call.state == "speaking")
-                Text(call.held ? "대기 중" : stateText).font(.headline)
-                if call.recording { RecordingBadge(since: call.connectedAt) }
-                Spacer()
-                if call.inCall {
-                    icon(call.muted ? "음소거 해제" : "음소거", call.muted ? "mic.slash.fill" : "mic.fill", on: call.muted) { call.toggleMute() }
-                    icon(call.held ? "대기 해제" : "대기", "pause.fill", on: call.held) { call.toggleHold() }
-                    icon(call.recording ? "녹음 중지" : "녹음", "record.circle", on: call.recording) { call.toggleRecording() }
-                    DeviceMenu(call: call)
+        HStack(spacing: Theme.m) {
+            MoonJar(state: jarState, levels: call.levels).frame(width: 68, height: 68)
+            VStack(alignment: .leading, spacing: 2) {
+                let user = call.lines.last { $0.mine }?.text
+                let reply = call.lines.last { !$0.mine }
+                if let error = call.error {
+                    Text(error).font(.footnote).foregroundStyle(Theme.danger).lineLimit(2)
+                } else if reply == nil && user == nil {
+                    Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                 }
-                Button(call.inCall ? "끊기" : "닫기") { call.hangUp() }.keyboardShortcut(.cancelAction)
+                if let user { Text(user).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
+                if let reply {
+                    Text(reply.text + (reply.interrupted ? " …" : "")).font(.title3.weight(.medium))
+                        .foregroundStyle(reply.interrupted ? Theme.text3 : Theme.text).lineLimit(2)
+                }
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(call.lines) { line in
-                            HStack(alignment: .firstTextBaseline) {
-                                if line.mine { Spacer(minLength: 24) }
-                                Text(line.text).textSelection(.enabled)
-                                    .foregroundStyle(line.mine ? Color.primary : Color.accentColor)
-                                if let route = line.route {
-                                    Text(route).font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background(route == "claude" ? Color.orange.opacity(0.2) : Color.blue.opacity(0.2), in: Capsule())
-                                        .accessibilityLabel("\(route) 응답")
-                                }
-                                if !line.mine { Spacer(minLength: 24) }
-                            }
-                            .id(line.id)
-                        }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(Theme.caption, value: call.lines)
+            VStack(alignment: .trailing, spacing: Theme.s) {
+                HStack(spacing: Theme.xs) {
+                    if call.recording { Circle().fill(Theme.danger).frame(width: 8, height: 8).accessibilityLabel("녹음 중") }
+                    Menu {
+                        Button(call.muted ? "음소거 해제" : "음소거") { call.toggleMute() }.keyboardShortcut(.space, modifiers: [])
+                        Button(call.held ? "대기 해제" : "대기") { call.toggleHold() }
+                        Button(call.recording ? "녹음 중지" : "녹음") { call.toggleRecording() }
+                    } label: { Image(systemName: "ellipsis.circle") }
+                    .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("통화 제어")
+                    Button { call.hangUp() } label: {
+                        Image(systemName: "xmark").font(.caption.bold()).frame(width: 28, height: 28)
+                            .background(Circle().fill(Theme.hangup)).foregroundStyle(.white)
                     }
+                    .buttonStyle(.plain).keyboardShortcut(.cancelAction).accessibilityLabel(call.inCall ? "통화 끊기" : "닫기")
                 }
-                .onChange(of: call.lines.count) { if let last = call.lines.last { proxy.scrollTo(last.id) } }
+                if let r = call.log.lastRoute { RouteChip(route: r) }
             }
-            if let error = call.error { Text(error).font(.footnote).foregroundStyle(.red) }
-            Text("Esc 또는 \(HotKey.label)로 끊기").font(.caption).foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 14).padding(.bottom, 12).padding(.top, 28)
-        .frame(width: 380, height: 300)
+        .padding(.horizontal, Theme.l)
+        .frame(width: 460, height: 112)
+        .background {
+            if reduceTransparency { Theme.bgRaised } else { Rectangle().fill(.ultraThinMaterial) }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous)
+            .strokeBorder(jarState == .listening ? Theme.celadon : Theme.stroke, lineWidth: 1))
+        .environment(\.colorScheme, .dark)
     }
 }
 
-/// Input / output device for this call (macOS has no AVRoutePickerView for voice calls).
+/// Input / output device for calls (macOS has no AVRoutePickerView for voice calls).
 struct DeviceMenu: View {
     @ObservedObject var call: MacCall
 
