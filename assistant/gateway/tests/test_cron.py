@@ -19,11 +19,11 @@ def at(month, day, h, m=0):
 @pytest.mark.parametrize("expr,text", [
     ("0 7 * * *", "매일 오전 7시"),
     ("0 21 * * *", "매일 오후 9시"),
-    ("0 14 * * 2,4", "화요일·목요일 오후 2시"),
+    ("0 14 * * 2,4", "매주 화요일·목요일 오후 2시"),
     ("0 10-18/2 * * 1-5", "평일 오전 10시부터 오후 6시까지 2시간마다"),
     ("0 9 1 * *", "매월 1일 오전 9시"),
     ("30 8 * * 0,6", "주말 오전 8시 30분"),
-    ("0 9,13 * * 0", "일요일 오전 9시·오후 1시"),
+    ("0 9,13 * * 0", "매주 일요일 오전 9시·오후 1시"),
     ("*/30 * * * *", "30분마다"),
     ("0 * * * 1-5", "평일 매시간"),
     ("0 12 25 12 *", "12월 25일 오후 12시"),
@@ -34,7 +34,7 @@ def test_rule_text(expr, text):
 
 def test_rule_text_dates():
     assert C.rule_text("0 7 * * *", date(2026, 12, 1), date(2026, 12, 31)) == \
-        "12월 1일부터 매일 오전 7시 (12월 31일까지)"
+        "12월 1일부터 12월 31일까지 매일 오전 7시"
 
 
 @pytest.mark.parametrize("expr,want", [
@@ -101,3 +101,28 @@ def test_as_date():
     assert C.as_date("2026-11-30") == date(2026, 11, 30) and C.as_date(None) is None
     with pytest.raises(C.CronError):
         C.as_date("다음 주")
+
+
+def test_from_words_validates_qwen():
+    import asyncio
+
+    def llm_says(d):
+        async def llm(system, user):
+            return d
+        return llm
+    r = asyncio.run(C.from_words("평일 10시부터 6시까지 2시간마다 스트레칭하라고 알림으로", llm_says(
+        {"cron": "0  10-18/2 * * 1-5", "kind": "reminder", "purpose": "스트레칭"}), NOW))
+    assert r["cron"] == "0 10-18/2 * * 1-5" and r["notify"] == "push" and r["confirm"]
+    assert r["say"] == "평일 오전 10시부터 오후 6시까지 2시간마다 알림 드릴게요. 맞죠?"
+    r = asyncio.run(C.from_words("매일 아침 7시에 깨워줘", llm_says({"cron": "0 7 * * *", "kind": "wake"}), NOW))
+    assert r["say"] == "매일 오전 7시에 깨워 드릴게요." and not r["confirm"]
+    calls = []
+
+    async def fixes_on_retry(system, user):
+        calls.append(user)
+        return {"cron": "0 10-18/2 1-5"} if len(calls) == 1 else {"cron": "0 10-18/2 * * 1-5"}
+    assert asyncio.run(C.from_words("평일 10시부터 6시까지 2시간마다", fixes_on_retry, NOW))["cron"] == "0 10-18/2 * * 1-5"
+    assert "5칸" in calls[1]
+    for bad in ({"cron": "every day"}, {"cron": "*/5 * * * *"}, None, {"cron": "0 7 * * *", "start_date": "곧"}):
+        with pytest.raises(C.CronError):
+            asyncio.run(C.from_words("x", llm_says(bad), NOW))

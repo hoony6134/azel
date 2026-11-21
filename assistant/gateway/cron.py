@@ -108,7 +108,7 @@ def _days(c, parts):
     if not c["dow_any"]:
         dow = c["dow"]
         names = "평일" if dow == {1, 2, 3, 4, 5} else "주말" if dow == {0, 6} else \
-            "·".join(f"{DOW[x]}요일" for x in sorted(dow, key=lambda x: (x + 6) % 7))
+            "매주 " + "·".join(f"{DOW[x]}요일" for x in sorted(dow, key=lambda x: (x + 6) % 7))
         out.append(names if c["dom_any"] else f"또는 {names}")
     return " ".join(out) or "매일"
 
@@ -130,11 +130,8 @@ def rule_text(expr, start=None, end=None):
     c, parts = parse(expr), expr.split()
     days, times = _days(c, parts), _times(c)
     text = times if days == "매일" and (times.endswith("분마다") or times == "매시간") else f"{days} {times}"
-    if start:
-        text = f"{start.month}월 {start.day}일부터 " + text
-    if end:
-        text += f" ({end.month}월 {end.day}일까지)"
-    return text
+    span = (f"{start.month}월 {start.day}일부터 " if start else "") + (f"{end.month}월 {end.day}일까지 " if end else "")
+    return span + text
 
 
 def check(expr, now, start=None, end=None, others=()):
@@ -163,3 +160,46 @@ def as_date(value):
         return date.fromisoformat(str(value))
     except ValueError:
         raise CronError("날짜는 2026-11-30처럼 써 주세요.")
+
+
+WORDS_PROMPT = (
+    "사용자가 반복 예약을 부탁했어. 5칸 cron(KST, 분 시 일 월 요일; 요일 0=일요일 1=월요일 … 6=토요일)으로 바꿔 JSON 하나만 출력해. "
+    '형식: {"cron": "0 7 * * *", "start_date": null|"YYYY-MM-DD", "end_date": null|"YYYY-MM-DD", '
+    '"kind": "wake"|"reminder", "purpose": "짧은 명사구 또는 빈 문자열"}. '
+    "규칙: cron은 언제나 공백으로 나뉜 정확히 5칸. 쓸 수 있는 것은 숫자, *, 쉼표 목록, a-b 범위, */n, a-b/n뿐. "
+    "예: '매일 아침 7시' = \"0 7 * * *\", '화목 2시' = \"0 14 * * 2,4\", '매월 1일' = \"0 9 1 * *\", "
+    "'평일 10시부터 6시까지 2시간마다' = \"0 10-18/2 * * 1-5\", '주말 8시 반' = \"30 8 * * 0,6\". 오전·새벽 없이 1~6시라고만 하면 오후(13~18시). 시각이 없으면 오전 9시. "
+    "'깨워'는 wake, 나머지는 reminder. purpose에는 '-하라고', '전화해줘', '알려줘' 같은 어미를 빼고 목적만. 다른 말은 쓰지 마.")
+
+
+async def from_words(text, llm, now, others=()):
+    """A spoken recurring request as a checked rule: {cron, start_date, end_date, notify, kind, purpose, rule_text,
+    confirm, say}. Qwen proposes; parse() and check() decide. CronError carries the reason to say."""
+    from late_night import prompt_rule  # the same night rule as one-off calls ("내일부터" at 01:00)
+    system = WORDS_PROMPT + f"\n지금: {now:%Y-%m-%d %H:%M} ({DOW[(now.weekday() + 1) % 7]}요일)" + prompt_rule(now)
+    d, expr, user = None, "", str(text)[:300]
+    for _ in range(2):  # one retry, told what was wrong ("0 10-18/2 1-5": three fields)
+        try:
+            d = await llm(system, user)
+        except Exception:  # noqa: BLE001
+            d = None
+        expr = " ".join(str((d or {}).get("cron") or "").split()) if isinstance(d, dict) else ""
+        try:
+            parse(expr)
+            break
+        except CronError:
+            user = f"{text}\n(앞의 답 {expr!r}은 5칸 cron이 아니었어. 정확히 5칸으로 다시.)"[:400]
+    else:
+        raise CronError("반복 규칙을 이해하지 못했어요. 다시 말씀해 주세요.")
+    start, end = as_date(d.get("start_date")), as_date(d.get("end_date"))
+    check(expr, now, start, end, others)
+    notify = "push" if any(w in str(text) for w in ("알림으로", "푸시", "알림만")) else "call"
+    kind = "wake" if d.get("kind") == "wake" and notify == "call" else "reminder"
+    purpose = str(d.get("purpose") or "").strip()[:60]
+    purpose = "" if purpose in ("알림", "전화", "연락", "기상", "알람") else purpose  # the call itself, not a purpose
+    rule = rule_text(expr, start, end)
+    verb = "알림 드릴게요" if notify == "push" else "깨워 드릴게요" if kind == "wake" else "전화드릴게요"
+    confirm = not trivial(expr) or bool(start or end)
+    say = f"{rule}에 {verb}." if not confirm else f"{rule}{'' if rule.endswith('마다') else '에'} {verb}. 맞죠?"
+    return {"cron": expr, "start_date": start, "end_date": end, "notify": notify, "kind": kind, "purpose": purpose,
+            "rule_text": rule, "confirm": confirm, "say": say}
