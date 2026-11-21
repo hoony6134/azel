@@ -34,7 +34,7 @@ final class CallManager: NSObject, ObservableObject {
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
-    private var incoming: [UUID: (callID: String?, reason: String?, caller: String)] = [:]
+    private var incoming: [UUID: (callID: String?, reason: String?, caller: String, persona: String?)] = [:]
     private var activeSession: String?
     /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
     @Published private(set) var activePersona: Persona?
@@ -235,6 +235,9 @@ extension CallManager: CXProviderDelegate {
         let info = incoming.removeValue(forKey: action.callUUID)
         begin(action.callUUID, callID: info?.callID)
         callerName = info?.caller
+        // The push names the persona that is calling; its glaze tints the call screen.
+        let personaID = info?.persona
+        activePersona = MainActor.assumeIsolated { PersonaModel.shared.persona(id: personaID) }
         if let reason = info?.reason { log.lines.append(CallLine(mine: false, text: "용건: \(reason)")) }
         action.fulfill()
     }
@@ -274,7 +277,8 @@ extension CallManager: PKPushRegistryDelegate {
         let p = payload.dictionaryPayload
         let caller = p["caller"] as? String ?? AssistantName.current
         let uuid = UUID()
-        incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller)
+        incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller,
+                          (p["persona"] as? String) ?? (p["persona"] as? NSNumber).map(\.stringValue))
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: caller)
         update.localizedCallerName = caller
