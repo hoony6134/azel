@@ -93,6 +93,39 @@ struct AppSettings: Codable, Equatable {
     var reply_length: String?
     /// Days the server keeps call history (0 = forever). Optional for older gateways.
     var history_days: Int?
+    /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
+    var providers: Providers?
+
+    struct Providers: Codable, Equatable {
+        var nim: NIM?
+
+        struct NIM: Codable, Equatable {
+            var enabled: Bool
+            var base_url: String?
+            var model: String?
+            /// Read-only: the key itself is write-only (`PUT /v1/providers/nim/key`).
+            var has_key: Bool?
+
+            private enum Keys: String, CodingKey { case enabled, base_url, model, has_key }
+            init(enabled: Bool = false, base_url: String? = nil, model: String? = nil, has_key: Bool? = nil) {
+                self.enabled = enabled; self.base_url = base_url; self.model = model; self.has_key = has_key
+            }
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: Keys.self)
+                enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+                base_url = try c.decodeIfPresent(String.self, forKey: .base_url)
+                model = try c.decodeIfPresent(String.self, forKey: .model)
+                has_key = try c.decodeIfPresent(Bool.self, forKey: .has_key)
+            }
+            /// PUT leaves out has_key.
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: Keys.self)
+                try c.encode(enabled, forKey: .enabled)
+                try c.encodeIfPresent(base_url, forKey: .base_url)
+                try c.encodeIfPresent(model, forKey: .model)
+            }
+        }
+    }
 }
 
 struct ServerStatus: Decodable {
@@ -174,5 +207,19 @@ enum Gateway {
             "bundle_id": Bundle.main.bundleIdentifier ?? "xyz.scian.biseo",
             "env": env,
         ])
+    }
+}
+
+enum NIMAPI {
+    /// Model ids: a list of strings or of objects with `id`/`name`.
+    static func models() async throws -> [String] {
+        let json = try JSONSerialization.jsonObject(with: try await Gateway.send("GET", "/v1/providers/nim/models"))
+        let list = (json as? [Any]) ?? ((json as? [String: Any])?["models"] as? [Any]) ?? ((json as? [String: Any])?["data"] as? [Any]) ?? []
+        return list.compactMap { ($0 as? String) ?? ($0 as? [String: Any]).flatMap { ($0["id"] ?? $0["name"]) as? String } }
+    }
+
+    /// Write-only: the key goes to the gateway once and is never kept on this device.
+    static func putKey(_ value: String) async throws {
+        _ = try await Gateway.send("PUT", "/v1/providers/nim/key", json: ["value": value])
     }
 }
