@@ -79,6 +79,7 @@ DEFAULTS = {
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
+    "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
     "noise_mode": "normal",  # normal | noisy: the voice server's voice-activity thresholds and barge-in
     "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
@@ -94,10 +95,28 @@ LENGTH_STYLE = {
 }
 
 
+# Azel's character (shared setting `personality`; "" / missing = this default). The single source: the gateway
+# sends the default to the voice server in the settings (`personality_default`), so Qwen and Claude get the same text.
+PERSONALITY_DEFAULT = (
+    "유능하고 믿음직한 개인 비서. 핵심부터 정확하게 말하고, 일정·마감·장애·돈·건강처럼 중요한 일은 진지하게 "
+    "다룬다. 분위기가 편할 때만 짧고 재치 있는 한마디를 덧붙이되 답 하나에 한 번을 넘기지 않는다. 급하거나 나쁜 소식, 사용자가 지쳐 보일 때,"
+    " 위험한 작업이나 승인이 필요한 일에는 장난을 치지 않는다. 존댓말을 쓰되 딱딱하지 않게, 친한 동료처럼 말한다. 과장된 칭찬이나 이모티콘 같은 말투는 쓰지 않는다."
+)
+
+
+def personality(settings):
+    p = settings.get("personality")
+    return p.strip() if isinstance(p, str) and p.strip() else PERSONALITY_DEFAULT
+
+
+def persona_block(settings):
+    """Who is talking: name and character. Used for Claude's voice style and every prompt that speaks to the user."""
+    return f"너의 이름은 '{settings['assistant_name']}'이야. 성격: {personality(settings)} "
+
+
 def name_prompt(settings):
-    """Name and reply length, from the shared settings."""
-    return f"너의 이름은 '{settings['assistant_name']}'이야. " + LENGTH_STYLE.get(settings.get("reply_length"),
-                                                                           LENGTH_STYLE["normal"])
+    """Persona and reply length, from the shared settings."""
+    return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"])
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
@@ -297,6 +316,7 @@ async def load_settings():
         doc = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
     s.update(doc)
     s["proactive"] = migrate_proactive(s.get("proactive"))
+    s["personality_default"] = PERSONALITY_DEFAULT  # shown, never stored (the app's placeholder, the voice server's text)
     s["default_device"] = OLD_DEVICE_NAMES.get(s["default_device"], s["default_device"])
     s["device_fallback"] = [OLD_DEVICE_NAMES.get(d, d) for d in s["device_fallback"]]
     return s
@@ -925,7 +945,9 @@ async def qwen_decide(signals, now):
         return {"call": False, "urgency": 0, "reason": "신호 없음", "opening": ""}
     when = datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d %H:%M (%a)")
     try:
-        d = await llm_json(DECIDE_PROMPT, f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
+        persona = persona_block(await load_settings())  # the opening is said in Azel's voice
+        d = await llm_json(DECIDE_PROMPT + f" opening은 이 비서의 말투로 써: {persona}",
+                           f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
     except Exception as e:
         print("autonomous decision failed:", type(e).__name__, flush=True)
         d = None
@@ -1316,6 +1338,7 @@ async def get_settings():
 
 @app.put("/v1/settings")
 async def put_settings(body: dict):
+    body.pop("personality_default", None)  # read-only: an app may send the whole document back
     unknown = set(body) - set(DEFAULTS)
     if unknown:
         raise HTTPException(400, f"unknown keys: {sorted(unknown)}")
@@ -1333,6 +1356,11 @@ async def put_settings(body: dict):
                                     for k, v in both.items()})
         check_proactive(merged)
         body["proactive"] = merged
+    if "personality" in body:
+        if body["personality"] is None:
+            body["personality"] = ""
+        if not isinstance(body["personality"], str) or len(body["personality"]) > 600:
+            raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
     if "noise_mode" in body and body["noise_mode"] not in ("normal", "noisy"):
         raise HTTPException(400, "noise_mode: normal or noisy")
     if "reply_length" in body and body["reply_length"] not in LENGTH_STYLE:
@@ -1347,7 +1375,7 @@ async def put_settings(body: dict):
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
     s = await load_settings() | body
-    await save_settings(s)
+    await save_settings({k: v for k, v in s.items() if k != "personality_default"})
     await link_send({"type": "settings", "value": s})
     return s
 

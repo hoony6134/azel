@@ -207,6 +207,24 @@ def test_reply_length_setting(gw):
     assert c.put("/v1/settings", json={"noise_mode": "loud"}).status_code == 400
 
 
+def test_personality(gw):
+    g, c, tmp = gw
+    s = c.get("/v1/settings").json()
+    assert s["personality"] == "" and s["personality_default"] == g.PERSONALITY_DEFAULT
+    c.post("/v1/ask", json={"text": "a"})
+    prompt = lambda: (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]  # noqa: E731
+    assert f"성격: {g.PERSONALITY_DEFAULT}" in prompt()  # empty = the default, for Claude too
+    s = c.put("/v1/settings", json={**s, "personality": "느긋하고 다정함"}).json()  # whole document back: fine
+    assert s["personality"] == "느긋하고 다정함" and "personality_default" not in g.fake.db["settings"]
+    c.post("/v1/ask", json={"text": "b"})
+    assert "성격: 느긋하고 다정함" in prompt() and g.PERSONALITY_DEFAULT not in prompt()
+    for reset in ["", "   ", None]:  # "기본값으로 되돌리기"
+        s = c.put("/v1/settings", json={"personality": reset}).json()
+        assert s["personality"] == ("" if reset is None else reset) and g.personality(s) == g.PERSONALITY_DEFAULT
+    assert c.put("/v1/settings", json={"personality": "가" * 601}).status_code == 400
+    assert c.put("/v1/settings", json={"personality": 3}).status_code == 400
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400

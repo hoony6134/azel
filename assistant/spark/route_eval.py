@@ -130,6 +130,57 @@ async def ack_eval():
     return len(bad)
 
 
+# Personality: replies with Azel's character must keep humour to one sentence at most, none in serious cases, and
+# stay within reply_length (normal: at most 6 sentences). Qwen judges the humour (a second, cheap local call).
+def _gateway_personality():
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../gateway/gateway.py")).read()
+    block = re.search(r"PERSONALITY_DEFAULT = \((.*?)\n\)", src, re.S).group(1)
+    return "".join(re.findall(r'"(.*?)"', block))
+
+
+PERSONA_CASES = [  # (what the user says or the situation to announce, playful | light | serious)
+    ("오늘 좀 심심하다", "playful"), ("주말에 뭐 하면 좋을까?", "playful"), ("너는 커피 좋아해?", "playful"),
+    ("상황: 내일 오전 9시까지 과제 마감이 있어. 이걸 나한테 알려 줘.", "light"),
+    ("상황: 서버 ruchba가 다운됐다는 경보가 왔어. 이걸 나한테 알려 줘.", "serious"),
+    ("하아, 피곤하다", "serious"), ("요즘 너무 지쳐", "serious"),
+    ("상황: macbook에서 git push 실행에 승인이 필요해. 이걸 나한테 알려 줘.", "serious"),
+    ("상황: 카드 결제가 실패했어. 이걸 나한테 알려 줘.", "serious"),
+    ("상황: 내일 아침 8시에 병원 예약이 있어. 이걸 나한테 알려 줘.", "serious"),
+]
+JUDGE = ("다음은 음성 비서의 답이야. 농담, 재치 있는 말, 장난스러운 표현이 들어간 문장이 몇 개인지 숫자 하나만 답해. "
+         "없으면 0.\n\n답: ")
+
+
+async def _collect(messages, max_tokens=600):
+    out = ""
+    async for d in vs.llm_stream(messages, max_tokens):
+        out += d
+    return out.strip()
+
+
+async def persona_eval(persona):
+    rows = []
+    for text, kind in PERSONA_CASES:
+        sysmsg = vs.system_prompt(vs.DEFAULT_NAME, "normal", "", persona) + vs.now_kst()
+        reply = await _collect([{"role": "system", "content": sysmsg}, {"role": "user", "content": text}])
+        if vs.ROUTE_TAG in reply:
+            rows.append((text, kind, None, None, reply[:40]))
+            continue
+        verdict = await _collect([{"role": "user", "content": JUDGE + reply}], 10)
+        jokes = int(m.group()) if (m := re.search(r"\d+", verdict)) else 0
+        rows.append((text, kind, jokes, len(vs.split_ready(reply, final=True)[0]), reply))
+    judged = [r for r in rows if r[2] is not None]
+    bad_humor = [r for r in judged if (r[1] == "serious" and r[2] > 0) or r[2] > 1]
+    too_long = [r for r in judged if r[3] > 6]
+    label = "with persona" if persona else "no persona"
+    print(f"[persona: {label}] humour violations {len(bad_humor)}/{len(judged)}, over length {len(too_long)}/"
+          f"{len(judged)}, routed to Claude {len(rows) - len(judged)}, avg sentences "
+          f"{sum(r[3] for r in judged) / max(1, len(judged)):.1f}")
+    for r in bad_humor + too_long:
+        print(f"  {r[1]:8} jokes={r[2]} sentences={r[3]} | {r[0]}  -> {r[4][:80]!r}")
+    return len(bad_humor) + len(too_long)
+
+
 async def qwen_route(text):
     """'claude' if Qwen emits the routing tag first, else 'qwen' (stream closed as soon as it is decided)."""
     messages = [{"role": "system", "content": vs.system_prompt(vs.DEFAULT_NAME) + vs.now_kst()},
@@ -173,11 +224,16 @@ async def run(name, cases, personal_cases):
 async def main():
     acc, leaked = await run("main", CASES, PERSONAL_CASES)
     acc2, leaked2 = await run("held-out", HELDOUT, HELDOUT_PERSONAL)
+    persona_bad = 0
+    if os.environ.get("PERSONA_EVAL", "1") != "0":
+        await persona_eval("")  # before: no character (reported only)
+        for _ in range(int(os.environ.get("PERSONA_ROUNDS", "2"))):
+            persona_bad += await persona_eval(_gateway_personality())
     acks = 0
     for _ in range(ACK_ROUNDS):  # Qwen samples at temperature 0.7: several rounds show how often it happens
         acks += await ack_eval()
     await vs.client.aclose()
-    return min(acc, acc2), leaked + leaked2 + acks
+    return min(acc, acc2), leaked + leaked2 + acks + persona_bad
 
 
 if __name__ == "__main__":

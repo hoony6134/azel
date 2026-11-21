@@ -222,8 +222,15 @@ device that created them.
                 "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
-   "history_days":365,"reply_length":"normal","noise_mode":"normal"}
+   "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":""}
   ```
+  `personality` (text up to 600 chars, else 400) is Azel's character: one persona block (`assistant_name` +
+  personality) goes into Qwen's system prompt, Claude's voice style, briefings and autonomous-call openings,
+  so both models sound like the same person. `""`, whitespace, `null` or a missing key mean the built-in
+  default; the stored value is returned as is (`""` after "기본값으로 되돌리기"), and `GET /v1/settings`
+  adds the read-only `personality_default` (the default text, for the app's placeholder; a `PUT` that sends
+  it back is fine, it is never stored). The gateway also pushes it to the voice server, so the default text
+  has one source.
   `reply_length` `brief`|`normal`|`detailed` (else 400) sets how long answers run, with the same wording for
   Qwen's system prompt and Claude's voice style: brief = one or two sentences; normal = brief for chit-chat,
   about four or five sentences for explanations, summaries, schedules and status reports; detailed = up to
