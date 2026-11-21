@@ -131,7 +131,7 @@ class Bridge:
     async def tools(self, caller="api"):
         """Messages-API definitions of everything this caller may use, and where device tools run."""
         dev_defs, where = await self.d["device_tools"](await self.d["fresh_devices"]())
-        if caller == "qwen":
+        if caller in ("qwen", "voice"):  # a voice turn of any model never delegates; tasks do
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
         cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
@@ -254,7 +254,7 @@ class Bridge:
 
     async def device(self, name, args, where, caller, on_progress):
         url, tool = where[name]
-        if caller == "qwen" and tool == "delegate":
+        if caller in ("qwen", "voice") and tool == "delegate":
             raise Fail("invalid", "여러 단계 작업은 create_task로 맡겨 주세요.")
         if caller == "qwen" and tool not in READ_TOOLS and not args.get("approval_id"):
             # the local model never executes on its own: ask the user first, every time

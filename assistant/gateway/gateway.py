@@ -787,6 +787,11 @@ def run_args(settings, devices, requester=""):
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
                                                               {"X-Azel-Requester": requester} if requester else None)
+    if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
+        rs = json.loads(run_settings)
+        rs.setdefault("permissions", {}).setdefault("deny", [])
+        rs["permissions"]["deny"] = sorted({*rs["permissions"]["deny"], *(f"mcp__{d['id']}__delegate" for d in devices)})
+        run_settings = json.dumps(rs, sort_keys=True)
     if MODE == "full":  # live web lookups: never on limited gateways (Bash, Edit and Write stay disallowed)
         allowed = [*allowed, "WebSearch", "WebFetch"]
     if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
@@ -925,10 +930,10 @@ async def ask_api(text, model, session):
 
 async def ask_api_full(text, model, settings, devices, dev_tools, where):
     """A full gateway's Messages API turn: Cygnus bridge tools plus the devices' tools, stable cached prefix."""
-    defs, where = await bridge.tools("api")  # devices, call_user, create_task, Cygnus: the same for every path
+    defs, where = await bridge.tools("voice")  # devices (no delegate), call_user, create_task, Cygnus
 
     async def run(name, args):
-        return (await bridge.call(name, args, current_persona.get(), caller="api", where=where))["content"]
+        return (await bridge.call(name, args, current_persona.get(), caller="voice", where=where))["content"]
     system = name_prompt(settings) + (FULL_API_STYLE if google_status() != "connected" else FULL_API_STYLE.replace(
         "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해.", GOOGLE_STYLE)) + device_prompt(settings, devices)
     yield activity("thinking")
@@ -957,13 +962,13 @@ async def ask_nim(text, model, session):
         yield {"type": "error", "code": "nim_off", "message": "엔비디아 모델이 꺼져 있어요. 앱의 설정에서 켜 주세요."}
         return
     devices = await fresh_devices()
-    tools, where = await bridge.tools("api")  # devices, call_user, create_task, Cygnus: the same for every path
+    tools, where = await bridge.tools("voice")  # devices (no delegate), call_user, create_task, Cygnus
     now = datetime.now(KST)
     system = (name_prompt(settings) + API_STYLE + device_prompt(settings, devices) + NIM_STYLE
               + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}(한국 시간)이야.")
 
     async def run(b):
-        r = await bridge.call(b["name"], b["input"], current_persona.get(), caller="api", where=where)
+        r = await bridge.call(b["name"], b["input"], current_persona.get(), caller="voice", where=where)
         return {"content": r["content"], "is_error": r["is_error"]}
 
     def act(phase, tool=""):
