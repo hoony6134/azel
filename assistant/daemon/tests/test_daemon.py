@@ -535,3 +535,77 @@ def test_dash_c_moves_the_base(cfg, gw, cmd):
     finally:
         d.CFG["approve_unlisted"] = False
     assert res["status"] == "refused", (cmd, res)
+
+
+def test_rg_hostname_bin_never_runs_without_a_tap(cfg, gw, tmp_path):
+    """The exact review case: rg is allowlisted, so this ran ./x with no approval at all."""
+    proj = cfg["roots"][0] / "proj"
+    (proj / "x").write_text("#!/bin/sh\ntouch PWNED\n")
+    (proj / "x").chmod(0o755)
+    (proj / "f.txt").write_text("foo\n")
+    for cmd in ["rg --hostname-bin=./x --hyperlink-format='file://{host}{path}' --color=always foo f.txt",
+                "rg --hostname-bin ./x foo f.txt", "rg --pre=./x foo f.txt", "rg --pre-glob=* --pre ./x foo ."]:
+        res = d.run_command(command=cmd, cwd="proj")
+        assert res["status"] == "refused", (cmd, res)
+    assert not (proj / "PWNED").exists() and not [c for c in gw[0] if c[1] == "/v1/approvals"]
+
+
+ROUND4 = [
+    "git config --global core.fsmonitor ./x", "git config core.pager ./x", "git config diff.external ./x",
+    "git config --add alias.st !sh", "git config --unset user.name", "git config -e",
+    "tar -xPf evil.tar", "tar -x -P -f evil.tar", "tar --absolute-paths -xf evil.tar", "tar xPf evil.tar",
+    "bsdtar -xPf evil.tar", "pax -r -f evil.pax", "pax -rw src dst",
+    "open ./run", "open x.terminal", "open x.fileloc", "open /Applications/Calculator.app", "open a.workflow",
+    "open a.action", "open a.inetloc",
+    "defaults -currentHost write com.apple.x k v", "defaults -currentHost import com.x f.plist",
+    "plutil -replace k -string v x.plist", "plutil -insert k -string v x.plist", "plutil -remove k x.plist",
+    "cat ~/.zlogout", "ls ~/.config/fish", "cp x ~/.local/bin/ls", "cat ~/.aws/credentials", "cat ~/.netrc",
+    "ls ~/.config/gh", "cat ~/.zsh_history", "ls ~/.local",
+    "cp evil .git/hooks/pre-commit", "cp evil repo/.git/config", "tee .git/config", "cp -r hooks .git",
+    "ls -C.git/hooks", "tar -xf a.tar -C .git",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND4)
+def test_hard_deny_round4(cfg, gw, cmd):
+    proj = cfg["roots"][0] / "proj"
+    (proj / "run").write_text("#!/bin/sh\n")
+    (proj / "run").chmod(0o755)
+    (proj / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+    d.CFG["approve_unlisted"] = True
+    cfg["roots"].append(d.Path.home().resolve())
+    try:
+        res = d.run_command(command=cmd, cwd=str(proj))
+    finally:
+        cfg["roots"].pop()
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", (cmd, res)
+    assert not [c for c in gw[0] if c[1] == "/v1/approvals"], cmd
+
+
+def test_cwd_inside_dot_git_refused(cfg, gw):
+    hooks = cfg["roots"][0] / "proj" / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    d.CFG["approve_unlisted"] = True
+    try:
+        assert d.run_command(command="cp ../../x pre-commit", cwd=str(hooks))["status"] == "refused"
+        assert d.run_command(command="ls", cwd=str(hooks.parent))["status"] == "refused"
+    finally:
+        d.CFG["approve_unlisted"] = False
+
+
+@pytest.mark.parametrize("cmd", ["git -C . status", "git -C proj log -1", "git config --get user.name",
+                                 "git config --list", "git config -l --show-origin", "git config --get-regexp alias"])
+def test_git_reads_and_dash_capital_c_still_allowed(cfg, gw, cmd):
+    res = d.run_command(command=cmd, cwd="proj" if "proj log" not in cmd else ".")
+    assert res["status"] != "refused", (cmd, res)  # git is allowlisted here; it runs (exit code aside)
+
+
+def test_open_apps_and_urls_still_reach_approval(cfg, gw):
+    d.CFG["approve_unlisted"] = True
+    try:
+        for cmd in ['open -a "Google Chrome"', "open https://example.com", "open -a Safari https://example.com",
+                    "open notes.txt"]:
+            assert d.run_command(command=cmd, cwd="proj")["status"] == "pending_approval", cmd
+    finally:
+        d.CFG["approve_unlisted"] = False

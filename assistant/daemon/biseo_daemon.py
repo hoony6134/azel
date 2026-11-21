@@ -105,7 +105,7 @@ GIT_CODE_FLAGS = ("--config", "--exec-path", "--upload-pack", "--receive-pack")
 
 def check_args(tokens: list[str], wd: Path) -> None:
     """Refuse flags that run arbitrary code and path-like arguments that leave allowed_roots."""
-    if tokens[0] == "rg" and any(t.startswith("--pre") for t in tokens):
+    if tokens[0] == "rg" and any(t.startswith(("--pre", "--hostname-bin")) for t in tokens):
         raise Refused("rg --pre runs arbitrary programs")
     if tokens[0] == "git" and any(t in ("-c", "-u") or t.startswith(GIT_CODE_FLAGS) for t in tokens):
         raise Refused("git flag can run arbitrary code")
@@ -128,13 +128,18 @@ INLINE = {"perl": "eE", "ruby": "e", "node": "ep", "nodejs": "ep", "php": "r", "
 INLINE_LONG = {"--eval", "--print", "--command"}
 TERMINALS = {"terminal", "terminal.app", "iterm", "iterm.app", "iterm2", "iterm2.app", "com.apple.terminal",
              "com.googlecode.iterm2"}
-SCRIPT_EXT = (".command", ".tool", ".sh", ".scpt", ".scptd", ".applescript", ".workflow")
+SCRIPT_EXT = (".command", ".tool", ".sh", ".scpt", ".scptd", ".applescript", ".workflow", ".terminal", ".fileloc",
+              ".app", ".action", ".inetloc")
 SECRET_DIRS = ("~/.config/biseo", "~/.ssh", "~/.claude", "~/Library/Keychains",
                # persistence: shell start-up files, login items, git hooks and config
                "~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.zlogin", "~/.bashrc", "~/.bash_profile", "~/.profile",
-               "~/Library/LaunchAgents", "~/.gitconfig", "~/.config/git")
+               "~/Library/LaunchAgents", "~/.gitconfig", "~/.config/git", "~/.zlogout", "~/.config/fish",
+               "~/.local/bin", "~/.aws", "~/.netrc", "~/.config/gh", "~/.zsh_history")
 SECRET_WORDS = (".config/biseo", ".ssh/", "/.ssh", ".claude", "Keychains", ".keychain", ".zshrc", ".zprofile",
-                ".zshenv", ".bashrc", ".bash_profile", "LaunchAgents", ".gitconfig", ".config/git")  # also in flag values
+                ".zshenv", ".bashrc", ".bash_profile", "LaunchAgents", ".gitconfig", ".config/git", ".zlogout",
+                ".config/fish", ".local/bin", ".aws", ".netrc", ".config/gh", ".zsh_history")  # also in flag values
+GIT_CONFIG_READ = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list",
+                   "-l"}
 # Programs that run code from their arguments or start sessions, never allowed (macOS ships most of them).
 DENY_PROGRAMS = {"awk", "gawk", "nawk", "mawk", "expect", "sqlite3", "vim", "vi", "nvim", "view", "emacs", "tmux",
                  "screen", "bun", "deno", "php", "make", "gmake", "xcrun", "launchctl", "crontab", "at", "batch",
@@ -202,10 +207,14 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
             raise Refused(f"{n} is never allowed")
         if "=" in tokens[i] and not tokens[i].startswith("-") and tokens[i].split("=", 1)[0].lower() in DENY_VARS:
             raise Refused(f"{tokens[i].split('=', 1)[0]} is never allowed")
-        if n == "git" and any(r in ("-c", "--exec-path") or r.startswith(("-c", "--config", "--exec-path", "--upload-pack",
-                                                                           "--receive-pack")) or "sshcommand" in r
-                              for r in low):
+        if n == "git" and any(r == "-c" or (r.startswith("-c") and len(r) > 2)  # case matters: -C <dir> is fine
+                              or r.lower().startswith(("--config", "--exec-path", "--upload-pack", "--receive-pack"))
+                              or "sshcommand" in r.lower() for r in rest):
             raise Refused("git options that run commands are never allowed")
+        if n == "git" and "config" in low and not GIT_CONFIG_READ & set(low):
+            raise Refused("git config may only be read (core.fsmonitor, diff.external… turn git status into code)")
+        if n == "rg" and any(r.startswith(("--pre", "--hostname-bin")) for r in low):
+            raise Refused("rg --pre / --hostname-bin run programs")
         bad = ("-e", "--rsh") if n == "rsync" else ("-o", "-f", "-s", "-e") if n in ("ssh", "scp", "sftp") else None
         if bad and any(r.startswith(bad) or "proxycommand" in r or "localcommand" in r or "proxyjump" in r for r in low):
             raise Refused(f"{n} options that run commands are never allowed")  # -o/-F/-S/-e/--rsh/ProxyCommand
@@ -216,17 +225,29 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
                 or r.startswith(("--use-compress-program", "--to-command", "--checkpoint-action", "--info-script",
                                  "--new-volume-script")) for k, r in enumerate(low)):
             raise Refused("tar options that run commands are never allowed")
+        if n in ("tar", "gtar", "bsdtar") and any(
+                r in ("-P", "--absolute-paths") or (r.startswith("-") and not r.startswith("--") and "P" in r[1:])
+                or (k == 0 and not r.startswith("-") and r.isalpha() and "P" in r) for k, r in enumerate(rest)):
+            raise Refused("tar -P writes absolute paths (start-up files, login items)")
+        if n == "pax" and any(r.startswith("-") and not r.startswith("--") and "r" in r[1:] for r in rest):
+            raise Refused("pax -r is never allowed")
         if n in ("less", "more") and any("!" in r for r in rest):
             raise Refused("less ! is never allowed")
-        if n == "defaults" and low[:1] and low[0] in ("write", "import", "delete", "rename"):
+        if n == "defaults" and {"write", "import", "delete", "rename"} & set(low):
             raise Refused("defaults write is never allowed")
+        if n == "plutil" and any(r in ("-replace", "-insert", "-remove") for r in low):
+            raise Refused("plutil edits are never allowed")
         letters = "c" if re.fullmatch(r"python[\d.]*", n) else INLINE.get(n)
         if letters and any(set(_short_flags(r)) & set(letters) or r.split("=")[0] in INLINE_LONG for r in rest):
             raise Refused(f"inline code ({n} {'/'.join('-' + c for c in letters)}) is never allowed")
         if n == "open":
             app = [low[k + 1] for k, r in enumerate(low[:-1]) if r in ("-a", "-b")]
-            if any(os.path.basename(a.rstrip("/")) in TERMINALS for a in app) or any(r.endswith(SCRIPT_EXT) for r in low):
-                raise Refused("opening a terminal or a script is never allowed")
+            files = [r for k, r in enumerate(rest) if not r.startswith("-") and (k == 0 or rest[k - 1] not in ("-a", "-b"))]
+            runnable = [f for f in files if "://" not in f and ((wd / Path(f).expanduser()).is_file()
+                                                                and os.access(wd / Path(f).expanduser(), os.X_OK))]
+            if any(os.path.basename(a.rstrip("/")) in TERMINALS for a in app) or runnable \
+                    or any(f.lower().rstrip("/").endswith(SCRIPT_EXT) for f in files):
+                raise Refused("opening a terminal, an app bundle by path, a script or an executable is never allowed")
         if n == "rm" and any(r == "--recursive" or set(_short_flags(r)) & {"r", "R"} for r in rest):
             for r in rest:
                 if not r.startswith("-"):
@@ -260,6 +281,8 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
     # cwd: never a secret dir, inside one, or above one (~ would let `rg -uuu` read ~/.ssh)
     if any(wd == s or wd.is_relative_to(s) or s.is_relative_to(wd) for s in secrets):
         raise Refused("cwd covers the assistant's, SSH, Claude, keychain or start-up files")
+    if ".git" in wd.parts:  # inside a repo's .git: hooks and config are a write away
+        raise Refused("cwd inside a .git directory is never allowed")
     bases = [wd]  # -C / --directory change where later relative paths land (tar, git, make…)
     for k, t in enumerate(tokens):
         if t in ("-C", "--directory") and k + 1 < len(tokens):
@@ -276,6 +299,8 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
                 continue
             for base in bases:
                 p = (base / Path(v.replace("$HOME", "~")).expanduser()).resolve()
+                if p.name == ".git" or (".git" in p.parts and (p.name == "config" or "hooks" in p.parts)):
+                    raise Refused(f"a repo's .git, hooks or config is never touched: {v}")
                 # the secret paths themselves, anything inside them, and their ancestors (~, ~/.config, /Users, /)
                 if any(p == s or p.is_relative_to(s) or s.is_relative_to(p) for s in secrets):
                     raise Refused(f"path covers the assistant's, SSH, Claude, keychain or start-up files: {v}")
