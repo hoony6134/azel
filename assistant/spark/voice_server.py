@@ -1836,6 +1836,7 @@ def real_content(text):
 
 
 TAIL_GUARD_S = 1.0  # the phone may still be playing this long after the server's estimate (network, buffering)
+PLAYED_WAIT_S = 2.0  # an app that reports "played": wait this long past the estimate for it, then go on anyway
 
 
 def _bigrams(s):
@@ -1915,7 +1916,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     # gen: the reply generation. Every reply claims a new one and an interrupt bumps it, so audio (and captions) a
     # superseded reply produces afterwards is dropped here: binary frames carry no id the app could check.
     current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set(), "side": set(),
-                     "said": deque(maxlen=8)}  # (sent at, text) of recent reply sentences, for the echo check
+                     "said": deque(maxlen=8),  # (sent at, text) of recent reply sentences, for the echo check
+                     # the reply whose audio went out last, and the last one the app reported fully played (an app
+                     # that sends {"type":"played"} at all: "reports")
+                     "audio_gen": 0, "played": None, "reports": False}
 
     def spawn(coro):
         """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
@@ -1947,6 +1951,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if audio is not None:
                 now = time.monotonic()
                 current["play_end"] = max(now, current["play_end"]) + len(audio) / 2 / 24000
+                current["audio_gen"] = gen or current["audio_gen"]
                 for i in range(0, len(audio), 9600):  # 200 ms chunks at 24 kHz
                     await ws.send_bytes(audio[i:i + 9600])
             else:
@@ -1990,8 +1995,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     async def until_played():
         """Stay 'speaking' until the phone has played everything sent, plus a short tail: only then is it the
         user's turn. Speech meanwhile is a barge-in (pause/check), never a new turn. A pause stretches the wait."""
-        while current["paused_at"] is not None or (left := current["play_end"] + PLAY_TAIL_S - time.monotonic()) > 0:
-            await asyncio.sleep(0.05 if current["paused_at"] is not None else min(left, 0.2))
+        while current["paused_at"] is not None or (left := current["play_end"] + PLAY_TAIL_S - time.monotonic()) > 0 \
+                or (current["reports"] and current["played"] != current["audio_gen"]
+                    and time.monotonic() < current["play_end"] + PLAYED_WAIT_S):  # the estimate ended before the phone
+            await asyncio.sleep(0.05 if current["paused_at"] is not None or left <= 0 else min(left, 0.2))
+
+    def played_out():
+        """The app said the last reply's audio has finished playing on the phone (no estimate involved)."""
+        return current["reports"] and current["played"] == current["audio_gen"]
 
     async def pause():
         """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
@@ -2201,6 +2212,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
                     side(tap_interrupt())
+                if kind == "played":  # the phone finished reply N: playback really ends now, not at the estimate
+                    current["reports"] = True
+                    if json.loads(msg["text"]).get("reply_id") == current["audio_gen"]:
+                        current["played"] = current["audio_gen"]
+                        if current["paused_at"] is None:
+                            current["play_end"] = time.monotonic()
                 continue
             vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -2209,7 +2226,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 busy = task and not task.done()
                 # The tail guard: speech then still gets the barge-in check (echo, noise), never a free new turn
                 # whose reply_start would make the app drop the rest of a reply it is still playing.
-                playing = now < current["play_end"] + TAIL_GUARD_S * (current["play_end"] > 0) \
+                playing = now < current["play_end"] + TAIL_GUARD_S * (current["play_end"] > 0 and not played_out()) \
                     or current["paused_at"] is not None
                 if kind == "start" and guard.active(now):
                     guard.start(now)  # a placed call's opening: its own rules (first sentence, greetings)
@@ -2914,6 +2931,44 @@ if __name__ == "__main__":
             logs = [m for m in full.ws.sent if m.get("type") == "call_log" and m.get("event") == "turn"]
             links.remove(full)
             return list(history["azel:leak"]), prompts, logs
+        def played_check():
+            """An app that reports {"type":"played"}: the turn ends when the phone says the reply finished (here before
+            the estimate), and once it reports, a missing report holds the turn up to PLAYED_WAIT_S past the estimate."""
+            from fastapi.testclient import TestClient
+
+            async def fake_transcribe(audio):
+                return "안녕"
+
+            async def fake_llm(messages, max_tokens=600):
+                yield "물은 백 도에서 끓어요."
+
+            async def fake_tts(sentence):
+                return b"\0" * 48000, 24000  # one second
+            globals().update(transcribe=fake_transcribe, llm_stream=fake_llm, tts=fake_tts,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            speech = (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+            waits = []
+            with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
+                    "/v1/call?client=iphone&session=played", headers={"Authorization": "Bearer app-tok"}) as w:
+                for report in (True, False):
+                    w.send_bytes(speech)
+                    rid, t0 = None, None
+                    while True:
+                        m = w.receive()
+                        f = json.loads(m["text"]) if m.get("text") else {}
+                        if f.get("type") == "reply_start":
+                            rid, t0 = f["reply_id"], time.monotonic()
+                        if m.get("bytes") and report and rid:
+                            w.send_text(json.dumps({"type": "played", "reply_id": rid}))
+                            report = False
+                        if f.get("type") in ("turn_done", "error"):
+                            waits.append((f["type"], time.monotonic() - t0))
+                            break
+                w.send_text(json.dumps({"type": "hangup"}))
+            links.remove(full)
+            return waits
         def briefing_check(situation):
             """/v1/call?intent=briefing against a fake full gateway; returns (reply texts, frame types, call logs)."""
             from fastapi.testclient import TestClient
@@ -3150,6 +3205,8 @@ if __name__ == "__main__":
             globals().update(tts=real[1], llm_stream=real_llm)
         persona_check()
         logs = history_check()
+        (k1, early), (k2, held) = played_check()
+        assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
         hist, prompts, turn_logs = hangup_leak_check()
         assert hist[:2] == [{"role": "user", "content": "안녕"},
                             {"role": "assistant", "content": "물은 백 도에서 끓어요." + CUT_MARK}], hist
