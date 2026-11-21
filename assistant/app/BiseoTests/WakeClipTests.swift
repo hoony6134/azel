@@ -26,6 +26,15 @@ final class WakeClipTests: XCTestCase {
     func testNoisy() { XCTAssertEqual(WakeClip.check(clip(amplitude: 0.35, background: 0.1)), .noisy) }
     func testSilence() { XCTAssertEqual(WakeClip.check(noise(1.5, amplitude: 0.0017)), .noSpeech) }
 
+    func testTrimmedClipsFitTheServersLimits() {
+        let t = WakeClip.trimmed(clip())!
+        XCTAssertTrue(WakeClip.uploadable(t))
+        XCTAssertEqual(Double(t.count) / 16_000, 0.8 + 0.4, accuracy: 0.05, "speech + 0.2 s each side")
+        let long = WakeClip.trimmed(noise(0.4, amplitude: 0.0017) + tone(3.0, amplitude: 0.35))!
+        XCTAssertLessThanOrEqual(long.count, 40_000, "capped at 2.5 s")
+        XCTAssertNil(WakeClip.trimmed(noise(1, amplitude: 0.0017)))
+    }
+
     func testEveryProblemHasAPrompt() {
         for p in [WakeClip.Problem.tooQuiet, .clipped, .tooShort, .tooLong, .noisy, .noSpeech] { XCTAssertFalse(p.message.isEmpty) }
     }

@@ -16,7 +16,8 @@ final class WakeEnrollTests: XCTestCase {
     func testMultipartCarriesEveryClipAsClipsArray() {
         let body = WakeEnrollAPI.multipart([WakeClip.wav([0, 0.1]), WakeClip.wav([0.2])], boundary: "B")
         let text = String(decoding: body, as: UTF8.self)
-        XCTAssertEqual(text.components(separatedBy: "name=\"clips[]\"").count - 1, 2)
+        XCTAssertEqual(text.components(separatedBy: "name=\"clips\";").count - 1, 2, "the field is `clips`, repeated")
+        XCTAssertFalse(text.contains("clips[]"))
         XCTAssertTrue(text.contains("Content-Type: audio/wav"))
         XCTAssertTrue(text.hasSuffix("--B--\r\n"))
     }

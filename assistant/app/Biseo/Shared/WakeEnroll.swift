@@ -59,6 +59,18 @@ enum WakeClip {
         return nil
     }
 
+    /// The server takes 0.4–2.5 s clips: the speech span with 0.2 s of padding on each side,
+    /// capped at 2.5 s. nil when there is no speech.
+    static func trimmed(_ s: [Float]) -> [Float]? {
+        guard let span = speechSpan(frameLevels(s)) else { return nil }
+        let pad = Int(0.2 * rate)
+        let start = max(0, span.lowerBound * frame - pad)
+        let end = min(s.count, min(span.upperBound * frame + pad, start + Int(2.5 * rate)))
+        return Array(s[start..<end])
+    }
+
+    static func uploadable(_ s: [Float]) -> Bool { (Int(0.4 * rate)...Int(2.5 * rate)).contains(s.count) }
+
     /// 16-bit PCM mono WAV at 16 kHz.
     static func wav(_ s: [Float]) -> Data {
         var d = Data()

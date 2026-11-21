@@ -45,14 +45,17 @@ enum WakeEnrollAPI {
         try JSONDecoder().decode(WakeEnrollStatus.self, from: try await Gateway.send("GET", "/v1/wake/enroll"))
     }
 
+    static let maxStored = 20
+
+    /// 409 while training.
     static func delete() async throws { _ = try await Gateway.send("DELETE", "/v1/wake/enroll") }
 
-    /// Multipart `clips[]` of WAV files.
+    /// Multipart: one `clips` part per WAV (the field repeats; it is not `clips[]`).
     static func multipart(_ clips: [Data], boundary: String) -> Data {
         var body = Data()
         for (i, wav) in clips.enumerated() {
             body.append(Data("--\(boundary)\r\n".utf8))
-            body.append(Data("Content-Disposition: form-data; name=\"clips[]\"; filename=\"clip\(i).wav\"\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"clips\"; filename=\"clip\(i).wav\"\r\n".utf8))
             body.append(Data("Content-Type: audio/wav\r\n\r\n".utf8))
             body.append(wav)
             body.append(Data("\r\n".utf8))
@@ -115,6 +118,12 @@ final class WakeEnrollModel: ObservableObject {
     func begin() async {
         clips = [:]
         redo = []
+        // The server keeps at most 20 clips: a re-enrollment starts from a clean slate.
+        await refreshStatus()
+        if let s = status, s.clips + prompts.count > WakeEnrollAPI.maxStored {
+            if s.status == "training" { step = .failed(Self.busyMessage); return }
+            _ = await attempt { try await WakeEnrollAPI.delete() }
+        }
         guard await SetupFlow.requestMic() else { step = .failed("마이크 권한이 필요해요"); return }
         step = .recording(0)
     }
@@ -132,7 +141,8 @@ final class WakeEnrollModel: ObservableObject {
                 guard let self else { return }
                 listening = false
                 if let p = WakeClip.check(clip) { problem = p; return }
-                clips[i] = clip
+                guard let trimmed = WakeClip.trimmed(clip), WakeClip.uploadable(trimmed) else { problem = .tooLong; return }
+                clips[i] = trimmed
                 advance(from: i)
             }
         } catch {
@@ -183,8 +193,13 @@ final class WakeEnrollModel: ObservableObject {
         step = .done // still training on the server; the settings row shows the status
     }
 
+    static let busyMessage = "학습 중이라 잠시 후 다시 시도해 주세요"
+    @Published var removeMessage: String?
+
     func remove() async {
-        _ = await attempt { try await WakeEnrollAPI.delete() }
+        if case .failure(let e) = await attempt({ try await WakeEnrollAPI.delete() }), case GatewayError.http(409) = e {
+            removeMessage = Self.busyMessage
+        } else { removeMessage = nil }
         await refreshStatus()
     }
 }
@@ -292,6 +307,7 @@ struct WakeEnrollRow: View {
                 Text(statusText).font(.subheadline).foregroundStyle(Theme.text2)
             }
             SectionNote(status: model.statusNote) { Task { await model.refreshStatus() } }
+            if let m = model.removeMessage { Text(m).font(.footnote).foregroundStyle(Theme.amber) }
             HStack {
                 Button(model.status?.status == "ready" || model.status?.status == "failed" ? "다시 등록" : "등록") { enrolling = true }
                     .tint(Theme.celadon)
