@@ -179,7 +179,7 @@ def test_mcp_server_lists_and_calls_assistant_tools():
     init = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
     assert init["result"]["capabilities"] == {"tools": {}}
     listed = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))["result"]["tools"]
-    assert [t["name"] for t in listed] == [t["name"] for t in TB.OWN_TOOLS] and "inputSchema" in listed[0]
+    assert [t["name"] for t in listed] == [t["name"] for t in TB.ALL_OWN] and "inputSchema" in listed[0]
     out = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                 "params": {"name": "create_task", "arguments": {"goal": "정리해서 전화해 줘"}}}))
     assert out["result"]["isError"] is False and w.tasks[0]["notify"] == "call"  # claude -p in a call: call back
@@ -271,9 +271,9 @@ def test_schedule_task_and_approval_tools():
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
         run(b.call("call_user", {"when": when, "reason": note}, caller="app"))
-    assert [t["name"] for t in run(b.tools("api"))[0]][3:10] == ["call_user", "schedule_list", "schedule_cancel",
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:11] == ["call_user", "schedule_list", "schedule_cancel",
                                                                   "schedule_update", "create_task", "task_status",
-                                                                  "approval_status"]
+                                                                  "task_cancel", "approval_status"]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
     assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"},
@@ -408,9 +408,9 @@ def test_mcp_scopes():
     def names(scope):
         r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, scope=scope))
         return [t["name"] for t in r["result"]["tools"]]
-    assert names("full") == [t["name"] for t in TB.OWN_TOOLS]
+    assert names("full") == [t["name"] for t in TB.ALL_OWN]
     assert names("external") == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task",
-                                 "task_status"]
+                                 "task_status", "task_cancel", "schedule_create"]
     for tool in ("approval_status", "macbook__list_dir", "infra_health", "nope"):
         r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                   "params": {"name": tool, "arguments": {}}}, scope="external"))
