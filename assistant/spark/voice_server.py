@@ -425,8 +425,63 @@ def memory_hits(hits):
     return ("\n[이번 말과 관련된 기록]\n" + "\n".join(f"- {h}" for h in hits)) if hits else ""
 
 
-async def run_tool(raw, session):
-    """Run one '[TOOL] {...}' line from Qwen: brain tools over the link, scheduled calls via a gateway."""
+# ---------- the gateway's tools (devices, call_user, create_task): gateway/tools_bridge.py over the link ----------
+GW_TOOLS_TTL_S = 300
+GW_TOOL_WAIT_S = 330  # an approval may take the user up to 5 minutes
+gw_tools: dict = {"at": 0.0, "defs": []}
+
+
+async def gateway_tools():
+    """The gateway's tool list from the cache, never waited for: a stale list is refreshed in the background (an
+    older gateway that does not know tools_list just leaves it empty)."""
+    if time.time() - gw_tools["at"] > GW_TOOLS_TTL_S and time.time() - gw_tools.get("refreshing", 0) > 10:
+        gw_tools["refreshing"] = time.time()  # a refresh that never finished (cancelled) blocks nothing past 10 s
+        asyncio.get_running_loop().create_task(_refresh_gateway_tools())
+    return gw_tools["defs"]
+
+
+async def _refresh_gateway_tools():
+    try:
+        reply = await links.request({"type": "tools_list"}, timeout=3)
+        defs = reply.get("tools") if isinstance(reply.get("tools"), list) else []
+        gw_tools.update(at=time.time(), defs=[t for t in defs if isinstance(t, dict) and isinstance(t.get("name"), str)])
+    except (RuntimeError, asyncio.TimeoutError):
+        gw_tools["at"] = time.time() - GW_TOOLS_TTL_S + 30  # try again in 30 s
+    finally:
+        gw_tools["refreshing"] = 0
+
+
+def gateway_tools_text(defs):
+    if not defs:
+        return ""
+    lines = "\n".join(f"- {t['name']}: {str(t.get('description', ''))[:120]}" for t in defs[:40])
+    return ("\n\n[기기·전화·작업 도구, 같은 형식으로 불러]\n" + lines + "\n사용자에게 전화를 걸거나 예약하려면 call_user, 여러 단계 "
+            "일은 create_task로 맡겨(끝나고 전화를 원하면 notify call). 기기에서 무언가 실행하는 도구는 사용자가 앱에서 "
+            "허용해야 실행돼. 전화를 걸 수 없다고 말하지 마.")
+
+
+async def gateway_tool(name, args, on_say=None):
+    """One gateway tool over the link; a tool_progress frame ("앱에서 허용해 주세요") is spoken as it arrives."""
+    lk = links.pick(personal=True, need_claude=False)
+    rid, q = uuid.uuid4().hex, asyncio.Queue()
+    links.queues[rid] = (q, lk)
+    try:
+        await lk.send({"type": "tool_call", "id": rid, "name": name, "args": args,
+                       "persona": (CALL_PERSONA.get() or {}).get("id")})
+        end = time.monotonic() + GW_TOOL_WAIT_S
+        while True:
+            msg = await asyncio.wait_for(q.get(), max(0.1, end - time.monotonic()))
+            if msg.get("type") == "tool_progress" and on_say and isinstance(msg.get("say"), str):
+                await on_say(msg["say"][:120])
+            elif msg.get("type") in ("tool_result", "error"):
+                return str(msg.get("result") or msg.get("message") or "")[:2000]
+    finally:
+        links.queues.pop(rid, None)
+
+
+async def run_tool(raw, session, on_say=None):
+    """Run one '[TOOL] {...}' line from Qwen: brain tools over the brain link, the gateway's tools (devices,
+    call_user, create_task) over a gateway link, scheduled calls via a gateway."""
     call = raw.strip().removeprefix(TOOL_TAG).strip()
     try:
         data = json.loads(call[call.index("{"):call.rindex("}") + 1])
@@ -435,6 +490,11 @@ async def run_tool(raw, session):
         return "도구 호출 형식이 틀렸어요."
     if name == "scheduled_calls":
         return await schedule_reply("", "list", session)
+    if name in {t["name"] for t in gw_tools["defs"]} and name not in links.brain_tools():
+        try:
+            return await gateway_tool(name, args, on_say)
+        except (RuntimeError, asyncio.TimeoutError):
+            return "지금은 그 도구를 쓸 수 없어요."
     if name not in links.brain_tools():
         return f"없는 도구예요: {name[:40]}"
     try:
@@ -1238,7 +1298,9 @@ async def respond(text, session, t0, timings, on_event=None):
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
+            gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
+            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) \
+                + gateway_tools_text(gw_defs) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
@@ -1284,9 +1346,13 @@ async def respond(text, session, t0, timings, on_event=None):
                             timings.setdefault("first_sentence_ms", ms(t0))
                             said_round.append(s)
                             await say(s)
-                    if state == "tool" and ctx and rounds < 2:
+                    if state == "tool" and (ctx or gw_defs) and rounds < 2:
                         t_tool = time.perf_counter()
-                        result = await run_tool(buf.strip().split("\n")[0], session)
+
+                        async def tool_say(text):  # "앱에서 허용해 주세요" while an approval is pending
+                            said_round.append(text)
+                            await sentences.put(text)
+                        result = await run_tool(buf.strip().split("\n")[0], session, tool_say)
                         timings.setdefault("tools", []).append(ms(t_tool))
                         messages += [{"role": "assistant", "content": buf.strip()},
                                      {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
@@ -2997,4 +3063,48 @@ if __name__ == "__main__":
             links.remove(gw)
             globals().update(llm_stream=real_llm, tts=real[1])
         brain_check()
+        def gateway_tools_check():
+            """Qwen runs a gateway tool over the link; an approval wait is spoken, then the result is answered."""
+            class GatewayToolsWS(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "tools_list":
+                        links.receive(self.lk, {"id": m["id"], "type": "tools", "tools": [
+                            {"name": "macbook__run_command", "description": "명령 실행"},
+                            {"name": "call_user", "description": "전화"}]})
+                    elif m.get("type") == "tool_call":
+                        links.receive(self.lk, {"id": m["id"], "type": "tool_progress", "say": "앱에서 허용해 주세요."})
+                        links.receive(self.lk, {"id": m["id"], "type": "tool_result", "result": "크롬을 열었어요.",
+                                                "is_error": False})
+            ws = GatewayToolsWS()
+            gw = ws.lk = links.add(ws)
+            links.receive(gw, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            prompts = []
+
+            async def tool_llm(messages, max_tokens=600):
+                prompts.append(messages)
+                yield ('[TOOL] {"name": "macbook__run_command", "args": {"command": "open -a Chrome"}}'
+                       if len(prompts) == 1 else "크롬을 열었어요.")
+
+            async def fake_tts(sentence, *a, **k):
+                return b"", 24000
+            globals().update(llm_stream=tool_llm, tts=fake_tts)
+
+            gw_tools.update(at=0.0, defs=[], refreshing=0)
+
+            async def go():
+                await gateway_tools()  # starts the background refresh
+                await asyncio.sleep(0.05)
+                return [x async for x, *_ in respond("크롬 좀 켜 줄래", "gwt", time.perf_counter(), {})]
+            said = asyncio.run(go())
+            sent = [m for m in ws.sent if m.get("type") == "tool_call"]
+            links.remove(gw)
+            gw_tools.update(at=0.0, defs=[])
+            globals().update(llm_stream=real_llm, tts=real[1])
+            return said, sent, prompts
+        said, sent, prompts = gateway_tools_check()
+        assert said == ["앱에서 허용해 주세요.", "크롬을 열었어요."], said
+        assert sent[0]["name"] == "macbook__run_command" and sent[0]["args"] == {"command": "open -a Chrome"}
+        assert "call_user" in prompts[0][0]["content"] and "전화를 걸 수 없다고 말하지 마" in prompts[0][0]["content"]
         print("voice_server checks ok")
