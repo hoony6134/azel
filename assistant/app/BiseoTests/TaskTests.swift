@@ -98,12 +98,32 @@ final class Batch5AppTests: XCTestCase {
     }
 
     @MainActor func testMemoryItems() {
-        let m = MemoryItem(["id": 4, "text": "커피는 디카페인", "source": "call", "persona_id": NSNull(), "created_at": "2026-11-22T10:00:00Z"])
-        XCTAssertEqual(m.id, "4")
+        let m = MemoryItem(["id": "123", "text": "커피는 디카페인", "source": "auto", "about": "취향", "persona": NSNull(), "in_cygnus": true, "created": "2026-11-22T10:00:00Z"])
+        XCTAssertEqual(m.id, "123")
         XCTAssertEqual(m.sourceLabel, "통화에서")
         XCTAssertEqual(m.scopeLabel, "모든 비서")
-        XCTAssertEqual(MemoryItem(["id": "1", "content": "x", "source": "cygnus"]).sourceLabel, "Cygnus")
-        XCTAssertEqual(MemoryItem(["id": "2", "fact": "y", "source": "direct"]).sourceLabel, "직접 기억")
+        XCTAssertTrue(m.inCygnus)
+        XCTAssertEqual(m.about, "취향")
+        XCTAssertNotNil(m.created)
+        XCTAssertEqual(MemoryItem(["id": "1", "text": "x", "source": "explicit"]).sourceLabel, "직접 기억")
+        XCTAssertFalse(MemoryItem(["id": "2", "text": "y"]).inCygnus)
+    }
+
+    @MainActor func testMemoryRoutesAndHiding() async throws {
+        URLProtocol.registerClass(FakeServer.self)
+        Config.testOverride = (gateway: "https://fake.test", token: "test-token")
+        defer { URLProtocol.unregisterClass(FakeServer.self); Config.testOverride = nil; FakeServer.routes = [:] }
+        let model = MemoryModel()
+        FakeServer.routes = ["GET /v1/memories": (502, "bad gateway")]
+        await model.refresh()
+        XCTAssertEqual(model.available, false, "memory service not redeployed yet: hidden")
+        FakeServer.routes = ["GET /v1/memories": (200, #"[{"id":"5","text":"a","source":"explicit","persona":null,"in_cygnus":false,"created":"2026-11-22T10:00:00Z"}]"#),
+                             "DELETE /v1/memories/5": (200, #"{"ok":true,"spoken":"지웠어요","data":{"id":"5"}}"#)]
+        await model.refresh()
+        XCTAssertEqual(model.available, true)
+        XCTAssertEqual(model.items.map(\.id), ["5"])
+        try await model.delete(model.items[0])
+        XCTAssertTrue(model.items.isEmpty)
     }
 
     func testCallContextChip() {
@@ -112,5 +132,24 @@ final class Batch5AppTests: XCTestCase {
         XCTAssertEqual(CallContext.from("과제 마감")?.chip, "과제 마감")
         XCTAssertNil(CallContext.from(["kind": "task"]))
         XCTAssertNil(CallContext.from(nil))
+    }
+}
+
+final class CallContextFrameTests: XCTestCase {
+    func testFirstFrameAndPatchBody() throws {
+        let e = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"context","context":{"kind":"task","label":"역사 특강 과제","id":"abc123def456"}}"#.utf8))
+        XCTAssertEqual(CallContext.from(event: e)?.chip, "맡긴 작업: 역사 특강 과제")
+        XCTAssertNil(CallContext.from(event: try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening"}"#.utf8))))
+    }
+
+    func testNotifyPatchHitsTheTaskRoute() async throws {
+        URLProtocol.registerClass(FakeServer.self)
+        Config.testOverride = (gateway: "https://fake.test", token: "test-token")
+        defer { URLProtocol.unregisterClass(FakeServer.self); Config.testOverride = nil; FakeServer.routes = [:] }
+        FakeServer.seen = []
+        FakeServer.routes = ["PATCH /v1/tasks/abc123def456": (200, #"{"id":"abc123def456","goal":"x","status":"running","notify":"call"}"#)]
+        try await TaskAPI.setNotify("abc123def456", "call")
+        let sent = try JSONSerialization.jsonObject(with: FakeServer.seen.last!.body) as! [String: String]
+        XCTAssertEqual(sent, ["notify": "call"])
     }
 }

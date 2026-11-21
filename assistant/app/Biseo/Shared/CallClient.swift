@@ -78,12 +78,13 @@ final class CallClient {
     /// The token goes in the Authorization header, never the query: query strings end up in proxy logs.
     /// `intent`: e.g. "briefing" for 오늘 브리핑 / the Siri briefing, so the server opens with it.
     static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil,
-                        persona: String? = nil) throws -> URLRequest {
+                        persona: String? = nil, mode: String? = nil) throws -> URLRequest {
         guard var url = URLComponents(string: voiceURL + "/v1/call") else { throw StartError.notConfigured }
         url.queryItems = [URLQueryItem(name: "session", value: session)]
         if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
         if let intent { url.queryItems?.append(URLQueryItem(name: "intent", value: intent)) }
         if let persona { url.queryItems?.append(URLQueryItem(name: "persona", value: persona)) }
+        if let mode { url.queryItems?.append(URLQueryItem(name: "mode", value: mode)) }
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -91,10 +92,10 @@ final class CallClient {
     }
 
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
-    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil) throws {
+    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
-                                                                         session: session, callID: callID, intent: intent, persona: persona))
+                                                                         session: session, callID: callID, intent: intent, persona: persona, mode: mode))
         socket = task
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
@@ -115,13 +116,14 @@ final class CallClient {
             Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
             throw StartError.audio
         }
-        receive(task)
+        receive(task, call: beginCall())
         pulseTimer?.invalidate()
         wasPlaying = false
         pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
             let playing = audio.speechPlaying
             if playing != wasPlaying { wasPlaying = playing; onPlayback?(playing) }
+            reportPlayed()
             if let cue = thinking.tick(now: ProcessInfo.processInfo.systemUptime) { self.cue(cue, listening: false) }
         }
         // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
@@ -135,13 +137,13 @@ final class CallClient {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: check)
     }
 
-    private func receive(_ task: URLSessionWebSocketTask) {
+    private func receive(_ task: URLSessionWebSocketTask, call: Int) {
         task.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let message):
                 if !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
-                process(message)
+                deliver(message, call: call)
             case .failure:
                 let status = (task.response as? HTTPURLResponse)?.statusCode
                 let message = Self.closeMessage(status: status, receivedAny: receivedAny)
@@ -149,9 +151,32 @@ final class CallClient {
                 DispatchQueue.main.async { if task === self.socket { self.onClose?(message) } }
                 return
             }
-            receive(task)
+            receive(task, call: call)
         }
     }
+
+    /// Which call the socket callbacks belong to: bumped at start and at stop, so a frame of the
+    /// call that just ended (still in flight after hangup) never plays, in this call or the next.
+    private var callNumber = 0
+
+    private func beginCall() -> Int {
+        admissionLock.lock(); defer { admissionLock.unlock() }
+        callNumber += 1
+        return callNumber
+    }
+
+    /// `process` for a message of call `call`; dropped (audio counted) when that call is over.
+    func deliver(_ message: URLSessionWebSocketTask.Message, call: Int) {
+        admissionLock.lock(); let current = callNumber == call; admissionLock.unlock()
+        guard current else {
+            if case .data(let pcm) = message { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock() }
+            return
+        }
+        process(message)
+    }
+
+    /// For tests: the number the next socket's callbacks would carry if a call were up.
+    var currentCall: Int { admissionLock.lock(); defer { admissionLock.unlock() }; return callNumber }
 
     /// One socket message, in arrival order. Audio and interrupts are handled right here; the UI
     /// hops to main. Internal (not private) so tests can feed a scripted server.
@@ -163,6 +188,7 @@ final class CallClient {
             guard admit else { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock(); return }
             audio.play(pcm)
             karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
+            playedLock.lock(); played.audio(samples: pcm.count / 2); playedLock.unlock()
             DispatchQueue.main.async { self.thinking.audioArrived() }
             statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
             recorder?.assistant(pcm)
@@ -175,13 +201,12 @@ final class CallClient {
             let newReply = event.type == "reply_start" && admission.replyStart(event.reply_id)
             admission.apply(type: event.type, value: event.value)
             admissionLock.unlock()
-            // A new reply while the previous one is still playing (the server's playback estimate
-            // ended early): drop the rest of the old one. Its text events already arrived, so the
-            // karaoke keeps them and only restarts its clock.
-            if newReply && audio.speechPlaying {
-                audio.flush()
-                karaokeLock.lock(); karaoke.restartClock(); karaokeLock.unlock()
-            }
+            // A new reply queues after the previous one's tail (PM, 2026-11-22: a reply_start alone
+            // never cuts audio; only `interrupt` does).
+            playedLock.lock()
+            if newReply, let id = event.reply_id { played.start(id) }
+            if event.type == "turn_done" { played.close() }
+            playedLock.unlock()
             switch event.type {
             case "interrupt":
                 cutPlayback()
@@ -210,9 +235,20 @@ final class CallClient {
     private func cutPlayback() {
         freezeKaraoke()
         audio.flush()
+        playedLock.lock(); played.flush(); playedLock.unlock()   // a cut reply is never reported as played
         playback.apply("interrupt")
         if !playback.playing { audio.pause() }
         admissionLock.lock(); admission.interrupt(); admissionLock.unlock()
+    }
+
+    /// `{"type":"played","reply_id":N}` once reply N's last buffer has actually played, so the server
+    /// stops guessing when playback ended (the cut-off investigation, 2026-11-22).
+    private var played = PlayedTracker()
+    private let playedLock = NSLock()
+
+    private func reportPlayed() {
+        playedLock.lock(); let due = played.due(played: audio.playedSamples); playedLock.unlock()
+        for id in due { socket?.send(.string(#"{"type":"played","reply_id":\#(id)}"#)) { _ in } }
     }
 
     /// Which incoming audio belongs to the reply being played (user bug, 2026-11-22: after an
@@ -321,12 +357,14 @@ final class CallClient {
 
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
+        _ = beginCall()            // the old socket's late frames are dropped from here on
         silenceCheck?.cancel()
         pulseTimer?.invalidate()
         pulseTimer = nil
         thinking = ThinkingCues()
         karaokeLock.lock(); karaoke = KaraokeTimeline(); karaokeLock.unlock()
         admissionLock.lock(); admission = AudioAdmission(); admissionLock.unlock()
+        playedLock.lock(); played = PlayedTracker(); playedLock.unlock()
         if wasPlaying { wasPlaying = false; onPlayback?(false) }
         if socket != nil {
             statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()
@@ -344,6 +382,28 @@ final class CallClient {
         playback = PlaybackGate()
         sending = true
     }
+
+    /// Audio the user already said (the wake listener's recording) sent as mic frames, 100 ms each,
+    /// ahead of the live mic. The caller keeps `sending` off until this returns.
+    func sendUserAudio(_ pcm16: Data) {
+        guard let task = socket else { return }
+        let chunk = 3_200
+        var i = pcm16.startIndex
+        while i < pcm16.endIndex {
+            let end = min(i + chunk, pcm16.endIndex)
+            task.send(.data(pcm16.subdata(in: i..<end))) { _ in }
+            i = end
+        }
+        statsLock.lock(); sentBytes += pcm16.count; sentPeak = max(sentPeak, Self.peak(pcm16)); statsLock.unlock()
+    }
+
+    /// Mid-call brain switch (`{"type":"mode","value":…}`); the server confirms with a mode event.
+    func switchMode(_ mode: String) {
+        socket?.send(.string(#"{"type":"mode","value":"\#(mode)"}"#)) { _ in }
+    }
+
+    /// The mode an event reports: a `mode` event's value, or a `mode` field on any event.
+    static func reportedMode(_ e: CallEvent) -> String? { e.type == "mode" ? (e.value ?? e.mode) : e.mode }
 
     /// iOS `didDeactivate`: the system took the audio session away.
     func stopAudio() { audio.stop() }
@@ -402,5 +462,55 @@ struct RouteRestartGate {
         if let last, now - last < Self.quiet { return false }
         last = now
         return true
+    }
+}
+
+/// Where each reply ends on the playback clock (samples scheduled since the last flush, the same
+/// clock as `AudioIO.playedSamples`), to tell the server when one has really finished playing.
+struct PlayedTracker: Equatable {
+    private struct Reply: Equatable { var id: Int; var begin: Int; var end: Int; var closed = false }
+    private var replies: [Reply] = []
+    private var scheduled = 0
+    private var lastAudio = 0.0
+    /// The server sends `turn_done` only after `played` (gateway 9e2ecc8), so the latest reply is
+    /// reported once everything queued has played and no audio came for this long (a short
+    /// streaming stall must not end the turn).
+    static let settle = 0.25
+
+    /// `reply_start`: closes the reply before it (no more audio comes for it).
+    mutating func start(_ id: Int) {
+        close()
+        replies.append(Reply(id: id, begin: scheduled, end: scheduled))
+    }
+
+    mutating func audio(samples: Int, now: Double = ProcessInfo.processInfo.systemUptime) {
+        scheduled += samples
+        lastAudio = now
+        if let i = replies.indices.last, !replies[i].closed { replies[i].end = scheduled }
+    }
+
+    /// `turn_done`: the open reply is complete.
+    mutating func close() { if let i = replies.indices.last { replies[i].closed = true } }
+
+    /// Interrupt or hangup: the clock restarts and nothing cut is reported.
+    mutating func flush() { replies = []; scheduled = 0 }
+
+    /// Replies whose last sample has played, oldest first: closed ones (a later reply started or
+    /// turn_done) as soon as they played; the open one once the queue ran dry and stayed dry
+    /// `settle` seconds.
+    mutating func due(played: Int, now: Double = ProcessInfo.processInfo.systemUptime) -> [Int] {
+        var out: [Int] = []
+        if let i = replies.indices.last, !replies[i].closed, replies[i].end > replies[i].begin,
+           played >= replies[i].end, played >= scheduled, now - lastAudio >= Self.settle {
+            replies[i].closed = true
+        }
+        while let r = replies.first, r.closed {
+            if r.end > r.begin {
+                guard played >= r.end else { break }
+                out.append(r.id)
+            }
+            replies.removeFirst()
+        }
+        return out
     }
 }

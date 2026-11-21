@@ -100,3 +100,71 @@ final class RouteChangeTests: XCTestCase {
     }
     #endif
 }
+
+final class HangupAudioTests: XCTestCase {
+    private func frame(_ n: Int) -> URLSessionWebSocketTask.Message { .data(Data(count: n)) }
+
+    func testLateFramesOfAHungUpCallNeverPlay() {
+        let client = CallClient()
+        let ended = client.currentCall
+        client.deliver(frame(1000), call: ended)                    // the call still up: plays
+        client.stop()                                               // hang up
+        client.deliver(frame(2000), call: ended)                    // still in flight from the old socket
+        client.deliver(.string(#"{"type":"reply_start","reply_id":9}"#), call: ended)
+        client.deliver(frame(3000), call: ended)
+        XCTAssertEqual(client.audioCounts.accepted, 1000)
+        XCTAssertEqual(client.audioCounts.dropped, 2000 + 3000)
+        client.stop()                                               // twice is fine
+    }
+
+    #if os(macOS)
+    func testHangupDropsEverythingScheduled() throws {
+        let audio = AudioIO()
+        try audio.start()
+        audio.play(Data(count: 24_000 * 2 * 3))                     // 3 s of a reply queued
+        XCTAssertTrue(audio.speechPlaying)
+        audio.stop()
+        XCTAssertFalse(audio.speechPlaying, "nothing left to play")
+        XCTAssertEqual(audio.playedSamples, 0)
+        try audio.start()                                           // the next call
+        XCTAssertFalse(audio.speechPlaying, "the old reply doesn't come back")
+        audio.stop()
+    }
+    #endif
+}
+
+final class PlayedReportTests: XCTestCase {
+    func testReportsEachReplyOnceItsLastSamplePlayed() {
+        var t = PlayedTracker()
+        t.start(1); t.audio(samples: 1000, now: 10); t.audio(samples: 500, now: 10.1)
+        XCTAssertEqual(t.due(played: 1500, now: 10.2), [], "dry for 0.1 s: maybe a streaming stall")
+        t.start(2)                                   // the next reply closes #1 and queues after it
+        t.audio(samples: 800, now: 10.3)
+        XCTAssertEqual(t.due(played: 1400, now: 10.4), [])
+        XCTAssertEqual(t.due(played: 1500, now: 10.4), [1], "a closed reply: as soon as it played")
+        XCTAssertEqual(t.due(played: 1600, now: 10.5), [], "once only")
+        XCTAssertEqual(t.due(played: 2300, now: 10.5), [], "the queue just ran dry")
+        XCTAssertEqual(t.due(played: 2300, now: 10.6), [2], "dry for 0.25 s: reported without waiting for turn_done")
+        XCTAssertEqual(t.due(played: 2300, now: 11), [])
+    }
+
+    func testInterruptedAndSilentRepliesAreNotReported() {
+        var t = PlayedTracker()
+        t.start(1); t.audio(samples: 1000, now: 0)
+        t.flush()                                    // interrupt
+        XCTAssertEqual(t.due(played: 5000, now: 9), [])
+        t.start(2); t.close()                        // text-only reply, no audio
+        t.start(3); t.audio(samples: 100, now: 1); t.close()
+        XCTAssertEqual(t.due(played: 100, now: 1), [3])
+    }
+
+    func testANewReplyStartQueuesAfterTheTail() {
+        let client = CallClient()
+        client.process(.string(#"{"type":"reply_start","reply_id":1}"#))
+        client.process(.data(Data(count: 2000)))
+        client.process(.string(#"{"type":"reply_start","reply_id":2}"#))  // no interrupt: nothing dropped
+        client.process(.data(Data(count: 2000)))
+        XCTAssertEqual(client.audioCounts.accepted, 4000)
+        XCTAssertEqual(client.audioCounts.dropped, 0)
+    }
+}

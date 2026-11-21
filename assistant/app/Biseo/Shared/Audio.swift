@@ -263,13 +263,17 @@ final class AudioIO {
     /// Idempotent. Taps and the ducking timer go first, then the players and the engine.
     func stop() {
         duckTimer?.cancel(); duckTimer = nil
+        // Always drop what is scheduled, even when the engine already stopped (iOS didDeactivate),
+        // so an old reply can't resume when the engine starts again.
+        defer {
+            player.stop()
+            cuePlayer.stop()
+            speechLock.lock(); speechEnd = 0; scheduledSamples = 0; pausedAt = nil; speechLock.unlock()
+        }
         guard started else { return }
         started = false
         engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
-        player.stop()
-        cuePlayer.stop()
-        speechLock.lock(); speechEnd = 0; scheduledSamples = 0; pausedAt = nil; speechLock.unlock()
         engine.stop()
         // Voice processing left on keeps ducking other audio after the call; it only runs in calls.
         if engine.inputNode.isVoiceProcessingEnabled { try? engine.inputNode.setVoiceProcessingEnabled(false) }

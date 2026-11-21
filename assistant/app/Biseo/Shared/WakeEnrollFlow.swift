@@ -284,7 +284,16 @@ struct WakeEnrollView: View {
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("내 목소리로 호출어 학습")
         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("닫기") { model.cancelRecording(); dismiss() } } }
-        .onDisappear { model.cancelRecording() }
+        .onDisappear {
+            model.cancelRecording()
+            #if os(macOS)
+            AzelFiles.enrolling.remove()
+            #endif
+        }
+        #if os(macOS)
+        // The wake listener ignores the mic while this exists, so recording "아젤" doesn't wake it.
+        .onAppear { AzelFiles.enrolling.create() }
+        #endif
     }
 
     private var intro: some View {

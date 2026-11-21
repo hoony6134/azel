@@ -257,6 +257,12 @@ struct CallContext: Equatable {
     var label: String
     var id: String?
 
+    /// From the call's first WS frame (`{"type":"context","context":{…}}`).
+    static func from(event e: CallEvent) -> CallContext? {
+        guard e.type == "context", let c = e.context, let label = c.label, !label.isEmpty else { return nil }
+        return CallContext(kind: c.kind, label: label, id: c.id)
+    }
+
     static func from(_ v: Any?) -> CallContext? {
         if let s = v as? String { return s.isEmpty ? nil : CallContext(kind: nil, label: s, id: nil) }
         guard let d = v as? [String: Any], let label = (d["label"] ?? d["text"] ?? d["goal"] ?? d["purpose"]) as? String, !label.isEmpty else { return nil }

@@ -14,6 +14,10 @@ struct CallEvent: Decodable, Equatable {
     var tool: String?         // activity
     var kind: String?         // activity: calendar | mail | memory | … (DESIGN §13.2)
     var reply_id: Int?        // reply_start
+    var mode: String?         // the active brain mode (state / mode events)
+    var context: Context?     // `context`: the first frame of a call placed for a task or a reminder
+
+    struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
 }
 
 struct AppSettings: Codable, Equatable {
@@ -107,6 +111,8 @@ struct AppSettings: Codable, Equatable {
     /// claude_api | claude_code | nim | qwen: the default engine for tasks. nil on older gateways,
     /// which then never get it back (synthesized encoding omits nil).
     var task_backend: String?
+    /// auto | local | claude_api | claude_code: the default brain for calls. nil on older gateways.
+    var brain_mode: String?
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 

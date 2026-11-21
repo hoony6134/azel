@@ -1,29 +1,32 @@
 import SwiftUI
 
-/// One remembered fact (`GET /v1/memory`). Decoded loosely until the brain's shape is final.
+/// One remembered fact (`GET /v1/memories`, brain batch 5):
+/// {id, text, source: explicit | auto, about, persona (nil = shared), in_cygnus, created}.
 struct MemoryItem: Identifiable, Equatable {
     var id: String
     var text: String
     var source: String?
+    var about: String?
     var personaID: String?
+    var inCygnus: Bool
     var created: Date?
 
     init(_ d: [String: Any]) {
         id = describe(d["id"] ?? "")
-        text = (d["text"] ?? d["content"] ?? d["fact"]).map(describe) ?? ""
+        text = (d["text"]).map(describe) ?? ""
         source = d["source"] as? String
-        personaID = (d["persona_id"] ?? d["persona"]) as? String
-        created = ApprovalRequest.time(d["created_at"] ?? d["created"])
+        about = (d["about"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        personaID = d["persona"] as? String
+        inCygnus = (d["in_cygnus"] as? Bool) ?? false
+        created = ApprovalRequest.time(d["created"])
     }
 
-    /// 직접 기억 / 통화에서 / Cygnus.
+    /// 직접 기억 ("기억해" from the user) / 통화에서 (picked up automatically).
     var sourceLabel: String? {
         switch source {
-        case nil: return nil
-        case "direct", "manual", "user", "explicit": return "직접 기억"
-        case "call", "voice", "conversation", "auto": return "통화에서"
-        case "cygnus": return "Cygnus"
-        case let s?: return s
+        case "explicit": return "직접 기억"
+        case "auto": return "통화에서"
+        default: return nil
         }
     }
 
@@ -35,15 +38,16 @@ struct MemoryItem: Identifiable, Equatable {
 }
 
 enum MemoryAPI {
+    /// Newest first, no paging (the server caps `limit` at 200). Without `X-Azel-Result: 2` the
+    /// answer is the bare list.
     static func list() async throws -> [MemoryItem] {
-        let json = try JSONSerialization.jsonObject(with: try await Gateway.send("GET", "/v1/memory"))
-        let o = json as? [String: Any]
-        let rows = (json as? [[String: Any]]) ?? (o?["items"] as? [[String: Any]]) ?? (o?["memories"] as? [[String: Any]]) ?? []
-        return rows.map(MemoryItem.init)
+        let json = try JSONSerialization.jsonObject(with: try await Gateway.send("GET", "/v1/memories?limit=200"))
+        return ((json as? [[String: Any]]) ?? ((json as? [String: Any])?["data"] as? [[String: Any]]) ?? []).map(MemoryItem.init)
     }
 
+    /// 200 with the action result; 404 for an unknown id. The app's confirm dialog is the confirmation.
     static func delete(_ id: String) async throws {
-        _ = try await Gateway.send("DELETE", "/v1/memory/" + (id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id))
+        _ = try await Gateway.send("DELETE", "/v1/memories/" + (id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id))
     }
 }
 
@@ -58,9 +62,11 @@ final class MemoryModel: ObservableObject {
         switch await attempt({ try await MemoryAPI.list() }) {
         case .success(let l): items = l.sorted { ($0.created ?? .distantPast) > ($1.created ?? .distantPast) }; status = .ok; available = true
         case .failure(let e):
-            let s = SectionStatus.from(e) ?? status
+            guard let s = SectionStatus.from(e) else { return }   // cancelled
             status = s
-            if s == .unavailable { available = false }
+            // Any failure before a first success hides the row (the memory service may not have
+            // the batch-5 routes yet); after one, the screen shows the error with 다시 시도.
+            if available != true { available = false }
         }
     }
 
@@ -89,7 +95,11 @@ struct MemoryScreen: View {
                             Text(s).font(.caption.weight(.semibold)).foregroundStyle(Theme.indigo)
                                 .padding(.horizontal, 6).padding(.vertical, 1).overlay(Capsule().strokeBorder(Theme.indigo.opacity(0.6)))
                         }
-                        Text([m.scopeLabel, m.created.map { $0.formatted(date: .abbreviated, time: .omitted) }].compactMap { $0 }.joined(separator: " · "))
+                        if m.inCygnus {
+                            Text("Cygnus").font(.caption.weight(.semibold)).foregroundStyle(Theme.text2)
+                                .padding(.horizontal, 6).padding(.vertical, 1).overlay(Capsule().strokeBorder(Theme.stroke))
+                        }
+                        Text([m.about, m.scopeLabel, m.created.map { $0.formatted(date: .abbreviated, time: .omitted) }].compactMap { $0 }.joined(separator: " · "))
                             .font(.footnote).foregroundStyle(Theme.text3)
                     }
                 }

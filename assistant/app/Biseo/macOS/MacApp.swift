@@ -12,7 +12,7 @@ struct BiseoMacApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
 
     init() {
-        InCallMarker.remove()   // left over from a crash or a force quit
+        AzelFiles.clearMarkers()   // left over from a crash or a force quit
         Recordings.cleanup()
         Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
@@ -549,9 +549,9 @@ struct MacSettingsCard: View {
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
-            if let persona = WakeURL.persona(url) { MainActor.assumeIsolated { MacCall.shared.wake(persona: persona) } }
+            if let w = WakeURL.parse(url) { MainActor.assumeIsolated { MacCall.shared.wake(persona: w.persona, utterance: w.utterance) } }
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) { InCallMarker.remove() }
+    func applicationWillTerminate(_ notification: Notification) { AzelFiles.clearMarkers() }
 }

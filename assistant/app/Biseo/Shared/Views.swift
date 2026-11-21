@@ -545,6 +545,15 @@ struct SettingsScreen<Extra: View>: View {
                     Button("다시 시도") { scheduleSave(settings, delay: 0) }.font(.footnote).tint(Theme.celadon)
                 }
             }
+            if s.wrappedValue.brain_mode != nil {
+                row("기본 두뇌") {
+                    picker(BrainMode.allCases.map { ($0.rawValue, $0.label) },
+                           Binding(get: { s.wrappedValue.brain_mode ?? "auto" }, set: { s.wrappedValue.brain_mode = $0 }))
+                }
+                if let h = BrainMode(rawValue: s.wrappedValue.brain_mode ?? "")?.hint {
+                    Text(h).font(.footnote).foregroundStyle(Theme.text3)
+                }
+            }
             row("기본 모델") { picker(models, s.default_model) }
             row("Claude 경로") { picker(paths, s.claude_path) }
             Divider()
@@ -784,6 +793,7 @@ struct SettingsScreen<Extra: View>: View {
             // Device names migrate to their ids for display; nothing is saved until the user edits.
             let s = DeviceID.normalize(raw)
             AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)   // before the 호칭 row renders
+            BrainModeChoice.shared.supported = BrainModeChoice.reports(data)
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
