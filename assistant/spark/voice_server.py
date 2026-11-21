@@ -742,13 +742,22 @@ _HOUR_RE = re.compile(r"(\d{1,2})\s*(?:시(?!간)|:\d{2})|(열한|열두|한|두
 # "오 분 뒤에 전화드릴게요" with nothing scheduled: a sentence saying the assistant did or will do an action is spoken only
 # when a tool in this turn confirmed one. Otherwise a scheduling request is asked back ("몇 분 뒤에…?"), anything else
 # goes to Claude.
-ACTION_CLAIM = re.compile(r"전화(를)? ?(드릴게요|드릴께요|드렸|걸게요|걸어 ?드릴게요|해 ?드릴게요)|예약(을)? ?(했|해 ?드렸|해 ?둘게요|"
+# A future promise only: "제가 전화드렸어요" on a placed call (the assistant DID call) is a fact, not a claim.
+ACTION_CLAIM = re.compile(r"전화(를)? ?(드릴게요|드릴께요|걸게요|걸어 ?드릴게요|해 ?드릴게요)|예약(을)? ?(했|해 ?드렸|해 ?둘게요|"
                           r"해 ?드릴게요|할게요|잡았|해 ?놨)|깨워 ?드릴게요|알람(을)? ?(맞췄|맞춰 ?(둘|드릴)게요)|맡겼|맡겨 ?(둘|드릴)게요|"
                           r"실행했|열었(어요|습니다)|보냈(어요|습니다)|취소했")
 TOOL_REFUSED = re.compile(r"이미 통화 중|다 걸었어요|없는 도구|쓸 수 없어요|틀렸어요|실패|거절|만료|허용되지 않아|할 수 없어요|없어요\.?$")
 ASK_WHEN = "몇 분 뒤에 걸어 드릴까요?"
 ACTION_TOOLS = {"call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo"}
 CLAIM_FALLBACK = "그건 제가 직접 처리하지 못했어요. 어떻게 할지 다시 말씀해 주시겠어요?"
+
+
+def asks_action(text):
+    """The user's own words ask for something done (a call, a wake-up, a task): only then is a claim checked."""
+    return bool(SCHED_CALL.search(text) or SCHED_WAKE.search(text) or ASK_CALL.search(text) or pick(TASK_WORDS, text))
+
+
+ASK_CALL = re.compile(r"(전화|연락|콜)\s*(좀|부탁|줘|주세요|줄래|줄 ?수)|(예약|알람|맡겨)\s*(좀|줘)")
 
 
 def action_tool(name):
@@ -1408,8 +1417,8 @@ async def respond(text, session, t0, timings, on_event=None):
             if on_event:
                 await on_event(ev)
 
-        async def speak(s):  # the action-claim gate, for every model's final text
-            if ACTION_CLAIM.search(s) and not acted["ok"]:
+        async def speak(s):  # the action-claim gate, for every model's final text (only when an action was asked)
+            if ACTION_CLAIM.search(s) and not acted["ok"] and asks_action(text):
                 timings["unconfirmed"] = s[:80]
                 claimed["n"] += 1
                 if claimed["n"] == 1:
@@ -1465,7 +1474,7 @@ async def respond(text, session, t0, timings, on_event=None):
                         dropped = True
                         return
                     raise Ungrounded
-                if ACTION_CLAIM.search(s) and not confirmed["ok"]:
+                if ACTION_CLAIM.search(s) and not confirmed["ok"] and asks_action(bare):
                     timings["unconfirmed"] = s[:80]
                     raise Unconfirmed
                 if guard and not flushed and content_free(" ".join(ack_held + [s])):
@@ -1522,8 +1531,7 @@ async def respond(text, session, t0, timings, on_event=None):
                         line = buf.strip().split("\n")[0]
                         result = await run_tool(line, session, tool_say)
                         tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
-                        if (tool_name in ("call_user", "create_task", "schedule_cancel", "add_todo", "done_todo")
-                                or "__" in tool_name) and not TOOL_REFUSED.search(result.strip()):
+                        if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
                             confirmed["ok"] = True
                         timings.setdefault("tools", []).append(ms(t_tool))
                         messages += [{"role": "assistant", "content": buf.strip()},
@@ -3443,6 +3451,11 @@ if __name__ == "__main__":
         assert unconfirmed_check("끝나면 전화해줄 수 있어", ["맥북 작업이 끝나면 바로 전화드릴게요."]) == ["클로드가 답해요."] \
             or task_intent("끝나면 전화해줄 수 있어")  # or the task route takes it
         assert unconfirmed_check("물은 몇 도에서 끓어?", ["물은 100도에서 끓어요."]) == ["물은 100도에서 끓어요."]
+        # A placed or reminder call: "여보세요" → "네, 제가 전화드렸어요." is the truth, never the claim fallback
+        assert unconfirmed_check("여보세요", ["네, 제가 전화드렸어요. 약 드실 시간이에요."]) == ["네, 제가 전화드렸어요.", "약 드실 시간이에요."] \
+            or unconfirmed_check("여보세요", ["네, 제가 전화드렸어요. 약 드실 시간이에요."]) == ["네, 제가 전화드렸어요. 약 드실 시간이에요."]
+        assert unconfirmed_check("고마워", ["다음에 또 전화드릴게요."]) == ["다음에 또 전화드릴게요."]  # no action asked
+        assert not action_tool("macbook__list_dir") and action_tool("mcp__macbook__run_command")  # reads never confirm
         def schedule_tool_check():
             class ToolGatewayWS(FakeWS):
                 async def send_text(self, raw):
