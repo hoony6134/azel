@@ -319,7 +319,7 @@ struct SettingsScreen<Extra: View>: View {
             PersonaListCard(model: personas)
         }
         Card("대화") {
-            if s.wrappedValue.user_title != nil { VStack(alignment: .leading, spacing: Theme.xs) {
+            if AppSettings.supportsUserTitle { VStack(alignment: .leading, spacing: Theme.xs) {
                 row("호칭") {
                     TextField("예: 정훈님, 오빠, 대표님", text: $titleDraft)
                         .multilineTextAlignment(.trailing).frame(maxWidth: 180)
@@ -755,11 +755,11 @@ struct SettingsScreen<Extra: View>: View {
             personalityDefault = PersonalityDefault.read(data) ?? personalityDefault
             // Device names migrate to their ids for display; nothing is saved until the user edits.
             let s = DeviceID.normalize(raw)
+            AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)   // before the 호칭 row renders
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
             titleDraft = s.user_title ?? ""
-            AppSettings.supportsUserTitle = s.user_title != nil
             noiseMode = s.noise_mode ?? "normal"
             loadError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }

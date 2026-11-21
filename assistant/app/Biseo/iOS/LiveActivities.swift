@@ -27,6 +27,21 @@ final class LiveActivities {
         // Activities left over from a previous run (the app was killed mid-call).
         for a in ActivityKit.Activity<CallActivityAttributes>.activities { Task { await a.end(nil, dismissalPolicy: .immediate) } }
         for a in ActivityKit.Activity<TaskActivityAttributes>.activities { tasks[a.attributes.taskID] = a }
+        // Tasks that finished (or vanished) while the app was closed: end their cards now.
+        Task { [weak self] in
+            guard let self, !tasks.isEmpty, case .success(let list) = await attempt({ try await TaskAPI.list() }) else { return }
+            for id in Self.stale(Array(tasks.keys), tasks: list) {
+                guard let a = tasks.removeValue(forKey: id) else { continue }
+                let t = list.first { $0.id == id }
+                let final = t.map { TaskActivityAttributes.ContentState(status: $0.status, step: $0.steps.last?.label, steps: $0.steps.count) }
+                await a.end(final.map { .init(state: $0, staleDate: nil) }, dismissalPolicy: .immediate)
+            }
+        }
+    }
+
+    /// Activity task ids whose task is no longer running (finished, cancelled, or gone).
+    nonisolated static func stale(_ ids: [String], tasks: [AgentTask]) -> [String] {
+        ids.filter { id in !(tasks.first { $0.id == id }?.isActive ?? false) }
     }
 
     private var enabled: Bool { ActivityAuthorizationInfo().areActivitiesEnabled }

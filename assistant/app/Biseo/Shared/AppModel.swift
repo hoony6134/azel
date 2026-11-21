@@ -29,15 +29,15 @@ final class AppModel: ObservableObject {
         guard configured else { return }
         // Independent and parallel; a cancelled refresh changes nothing, other failures keep the old data.
         async let statusResult = attempt { try await Gateway.get("/v1/status") as ServerStatus }
-        async let settingsResult = attempt { try await Gateway.get("/v1/settings") as AppSettings }
+        async let settingsResult = attempt { try await Gateway.send("GET", "/v1/settings") }
         async let approvalsResult = attempt { try await Gateway.send("GET", "/v1/approvals") }
         switch await statusResult {
         case .success(let s): status = s; statusError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { statusError = e }
         }
-        if case .success(let s) = await settingsResult {
+        if case .success(let data) = await settingsResult, let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
             if let name = s.assistant_name { AssistantName.current = name }
-            AppSettings.supportsUserTitle = s.user_title != nil
+            AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)
         }
         switch await approvalsResult {
         case .success(let data):

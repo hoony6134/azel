@@ -60,7 +60,7 @@ enum ApprovalWindow {
             let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 420), styleMask: [.titled, .closable, .fullSizeContentView],
                             backing: .buffered, defer: false)
             p.title = "승인 요청"
-            p.level = .floating
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)   // above the call panel
             p.isReleasedWhenClosed = false
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]

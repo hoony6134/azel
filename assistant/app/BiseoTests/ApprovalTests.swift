@@ -120,3 +120,22 @@ final class UserTitleGuardTests: XCTestCase {
         XCTAssertTrue(String(decoding: FakeServer.seen.last!.body, as: UTF8.self).contains("user_title"))
     }
 }
+
+@MainActor
+final class ReviewFixTests: XCTestCase {
+    func testAnApprovalCountsAsSeenOnlyOnceShown() throws {
+        let a = ApprovalRequest(["id": "ap9", "status": "pending", "command": "ls"])
+        let c = ApprovalCenter.shared
+        c.show(a)                                        // e.g. under the call cover: not on screen yet
+        XCTAssertEqual(ApprovalCenter.nextToShow([a], seen: [])?.id, "ap9")
+        c.markShown("ap9")
+        c.presented = nil
+    }
+
+    func testForcedOnceNoteAndParsing() {
+        let a = ApprovalRequest(["id": "1", "command": "rm -rf build", "forced_once": true, "forced_reason": "삭제 명령"])
+        XCTAssertTrue(a.forcedOnce)
+        XCTAssertEqual(a.forcedNote, "이 명령은 매번 확인이 필요해요: 삭제 명령")
+        XCTAssertNil(ApprovalRequest(["id": "2", "command": "ls"]).forcedNote)
+    }
+}

@@ -12,6 +12,9 @@ struct ApprovalRequest: Identifiable, Equatable {
     var expires: Date?
     var status: String              // pending | approved | denied | expired | …
     var decision: String?
+    /// The server allows only "once" for this command (it never becomes an always-allow rule).
+    var forcedOnce: Bool
+    var forcedReason: String?
 
     init(_ d: [String: Any]) {
         id = describe(d["id"] ?? "")
@@ -23,9 +26,16 @@ struct ApprovalRequest: Identifiable, Equatable {
         expires = Self.time(d["expires_at"])
         status = (d["status"] as? String) ?? "pending"
         decision = d["decision"] as? String
+        forcedOnce = (d["forced_once"] as? Bool) ?? false
+        forcedReason = (d["forced_reason"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     var isPending: Bool { status == "pending" }
+
+    var forcedNote: String? {
+        guard forcedOnce else { return nil }
+        return "이 명령은 매번 확인이 필요해요" + (forcedReason.map { ": " + $0 } ?? "")
+    }
 
     func secondsLeft(now: Date = Date()) -> Int? { expires.map { max(0, Int($0.timeIntervalSince(now).rounded(.up))) } }
     func isExpired(now: Date = Date()) -> Bool { secondsLeft(now: now) == 0 || status == "expired" }
@@ -149,10 +159,13 @@ final class ApprovalCenter: ObservableObject {
             .min { ($0.created ?? .distantPast) < ($1.created ?? .distantPast) }
     }
 
+    /// Asks for the sheet; it counts as seen only once it is on screen (`markShown`), so one that
+    /// couldn't present (e.g. under the call cover) comes back on the next poll.
     func show(_ a: ApprovalRequest) {
-        seen.insert(a.id)
         if let present { present(a) } else { presented = a }
     }
+
+    func markShown(_ id: String) { seen.insert(id) }
 
     /// Push tap (`type: "approval"`, `approval_id`).
     func open(id: String) async {
@@ -205,6 +218,10 @@ struct ApprovalSheet: View {
             if let cwd = request.cwd { Label(cwd, systemImage: "folder").font(.footnote).foregroundStyle(Theme.text2) }
             if let p = PersonaModel.shared.label(for: request.persona) { PersonaChip(name: p.name, tint: p.tint) }
             if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
+            if let note = request.forcedNote {
+                Label(note, systemImage: "exclamationmark.shield").font(.footnote).foregroundStyle(Theme.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
                 let expired = request.isExpired(now: ctx.date)
                 VStack(spacing: Theme.s) {
@@ -213,7 +230,10 @@ struct ApprovalSheet: View {
                             .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.rowRadius, style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    Button("이 기기에서 항상 허용") { decide(.always) }.frame(maxWidth: .infinity).frame(height: 40)
+                    // A forced command can't become a rule: the second button is gone, the note above says why.
+                    if !request.forcedOnce {
+                        Button("이 기기에서 항상 허용") { decide(.always) }.frame(maxWidth: .infinity).frame(height: 40)
+                    }
                     Button("거부", role: .destructive) { decide(.deny) }.frame(maxWidth: .infinity).frame(height: 40)
                 }
                 .disabled(expired || working)
@@ -223,6 +243,7 @@ struct ApprovalSheet: View {
         .padding(24)
         .background(Theme.bgRaised.ignoresSafeArea())
         .accessibilityElement(children: .contain)
+        .onAppear { ApprovalCenter.shared.markShown(request.id) }
     }
 
     private func decide(_ d: ApprovalDecision) {
@@ -272,5 +293,28 @@ struct ApprovalRulesCard: View {
     private func revoke(_ r: ApprovalRule) async {
         do { try await ApprovalAPI.revoke(r.id); message = nil; await load() }
         catch { message = "해제하지 못했어요: " + FriendlyError.describe(error).title }
+    }
+}
+
+extension View {
+    /// The approval sheet from this view, while `active`: the root when no call is up, the call
+    /// screen during a call (a sheet under a full-screen cover can't present).
+    func approvalSheet(active: Bool) -> some View {
+        modifier(ApprovalSheetHost(active: active))
+    }
+}
+
+private struct ApprovalSheetHost: ViewModifier {
+    let active: Bool
+    @ObservedObject private var center = ApprovalCenter.shared
+
+    func body(content: Content) -> some View {
+        content.sheet(item: Binding(get: { active ? center.presented : nil },
+                                    set: { if active && $0 == nil { center.presented = nil } })) { a in
+            ApprovalSheet(request: a) { center.presented = nil }
+                #if os(iOS)
+                .presentationDetents([.medium, .large])
+                #endif
+        }
     }
 }

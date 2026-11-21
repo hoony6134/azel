@@ -51,3 +51,20 @@ final class CustomTintTests: XCTestCase {
     }
     #endif
 }
+
+#if os(iOS)
+final class TiltGateTests: XCTestCase {
+    func testMotionRunsOnlyOnTheVisibleForegroundHome() {
+        XCTAssertTrue(TiltModel.shouldRun(active: true, inCall: false, reduceMotion: false, visible: true))
+        XCTAssertFalse(TiltModel.shouldRun(active: false, inCall: false, reduceMotion: false, visible: true), "background")
+        XCTAssertFalse(TiltModel.shouldRun(active: true, inCall: true, reduceMotion: false, visible: true), "under the call cover")
+        XCTAssertFalse(TiltModel.shouldRun(active: true, inCall: false, reduceMotion: true, visible: true))
+        XCTAssertFalse(TiltModel.shouldRun(active: true, inCall: false, reduceMotion: false, visible: false), "another tab")
+    }
+
+    func testFinishedTasksEndTheirActivities() throws {
+        let tasks = try JSONDecoder().decode([AgentTask].self, from: Data(#"[{"id":"a","goal":"x","status":"running"},{"id":"b","goal":"y","status":"done"}]"#.utf8))
+        XCTAssertEqual(Set(LiveActivities.stale(["a", "b", "gone"], tasks: tasks)), ["b", "gone"])
+    }
+}
+#endif

@@ -76,23 +76,25 @@ enum PersonaAPI {
     /// The fields the server takes (no id/primary).
     /// The fields the server takes (no id/primary); unset optionals are left out rather than sent
     /// as null, which the deployed gateway rejects.
-    static func body(_ p: Persona) -> [String: Any] {
+    /// `clearTitle`: the gateway knows `user_title`, so an empty one is sent as "" (follow the shared
+    /// setting) instead of being left out, which would keep the old 호칭.
+    static func body(_ p: Persona, clearTitle: Bool = false) -> [String: Any] {
         var b: [String: Any] = ["name": p.name, "share_memory": p.share_memory]
         if let v = p.voice { b["voice"] = v }
         if let v = p.voice_style { b["voice_style"] = v }
         if let v = p.personality { b["personality"] = v }
         if let v = p.color { b["color"] = v }
         if let v = p.default_model { b["default_model"] = v }
-        if let v = p.user_title, !v.isEmpty { b["user_title"] = v }   // "" = shared setting: left out
+        if let v = p.user_title, !v.isEmpty { b["user_title"] = v } else if clearTitle { b["user_title"] = "" }
         return b
     }
 
-    static func create(_ p: Persona) async throws -> Persona {
-        try JSONDecoder().decode(Persona.self, from: try await Gateway.send("POST", "/v1/personas", json: body(p)))
+    static func create(_ p: Persona, clearTitle: Bool = false) async throws -> Persona {
+        try JSONDecoder().decode(Persona.self, from: try await Gateway.send("POST", "/v1/personas", json: body(p, clearTitle: clearTitle)))
     }
 
-    static func update(_ p: Persona) async throws {
-        _ = try await Gateway.send("PUT", "/v1/personas/" + escape(p.id), json: body(p))
+    static func update(_ p: Persona, clearTitle: Bool = false) async throws {
+        _ = try await Gateway.send("PUT", "/v1/personas/" + escape(p.id), json: body(p, clearTitle: clearTitle))
     }
 
     static func deletePath(_ id: String, deleteHistory: Bool) -> String {
@@ -206,7 +208,7 @@ final class PersonaModel: ObservableObject {
         let custom = CustomTint.hex(p.color).flatMap { PersonaTint.nearest(hex: p.color) == nil ? $0 : nil }
         if let custom { p.color = CustomTint.nearestTint(custom).rawValue }
         do {
-            p = try await write(p)
+            p = try await write(p, clearTitle: AppSettings.supportsUserTitle)
         } catch GatewayError.rejected(let detail) where p.user_title?.isEmpty == false && Self.isUnknownField(detail) {
             var rest = p
             rest.user_title = nil
@@ -219,9 +221,9 @@ final class PersonaModel: ObservableObject {
     }
 
     /// Returns the saved persona (with its new id after a create).
-    private func write(_ p: Persona) async throws -> Persona {
-        if p.id.isEmpty { return try await PersonaAPI.create(p) }
-        try await PersonaAPI.update(p)
+    private func write(_ p: Persona, clearTitle: Bool = false) async throws -> Persona {
+        if p.id.isEmpty { return try await PersonaAPI.create(p, clearTitle: clearTitle) }
+        try await PersonaAPI.update(p, clearTitle: clearTitle)
         return p
     }
 

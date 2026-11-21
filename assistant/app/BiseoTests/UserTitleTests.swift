@@ -21,6 +21,11 @@ final class UserTitleTests: XCTestCase {
         XCTAssertNil(PersonaAPI.body(Persona(name: "미아", user_title: nil))["user_title"])
         XCTAssertNil(PersonaAPI.body(Persona(name: "미아", user_title: ""))["user_title"], "\"\" follows the shared setting: left out")
         XCTAssertEqual(PersonaAPI.body(Persona(name: "미아", user_title: "오빠"))["user_title"] as? String, "오빠")
+        XCTAssertEqual(PersonaAPI.body(Persona(name: "미아", user_title: nil), clearTitle: true)["user_title"] as? String, "",
+                       "cleared on a gateway that knows the field: sent as \"\"")
+        XCTAssertTrue(AppSettings.reportsUserTitle(Data(#"{"user_title":""}"#.utf8)), "the deployed gateway returns \"\"")
+        XCTAssertTrue(AppSettings.reportsUserTitle(Data(#"{"user_title":null}"#.utf8)))
+        XCTAssertFalse(AppSettings.reportsUserTitle(Data(#"{"default_model":"auto"}"#.utf8)))
     }
 
     func testOlderGatewayStillSavesTheOtherFields() async throws {

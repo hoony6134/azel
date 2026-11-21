@@ -79,9 +79,7 @@ struct RootView: View {
         .fullScreenCover(isPresented: Binding(get: { call.inCall }, set: { if !$0 { call.hangUp() } })) {
             CallScreen()
         }
-        .sheet(item: $approvals.presented) { a in
-            ApprovalSheet(request: a) { approvals.presented = nil }.presentationDetents([.medium, .large])
-        }
+        .approvalSheet(active: !call.inCall)
     }
 }
 

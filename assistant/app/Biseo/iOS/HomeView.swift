@@ -14,6 +14,10 @@ struct HomeView: View {
 
     @StateObject private var tilt = TiltModel()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    /// CoreMotion only while the home screen is really in view: foreground, no call cover, motion allowed.
+    private var tilting: Bool { TiltModel.shouldRun(active: scenePhase == .active, inCall: call.inCall, reduceMotion: reduceMotion, visible: homeVisible) }
+    @State private var homeVisible = false
 
     var body: some View {
         ScrollView {
@@ -60,9 +64,9 @@ struct HomeView: View {
             .ignoresSafeArea()
         }
         .toolbar(.hidden, for: .navigationBar)
-        .onAppear { if !reduceMotion { tilt.start() } }
-        .onDisappear { tilt.stop() }
-        .onChange(of: reduceMotion) { _, on in on ? tilt.stop() : tilt.start() }
+        .onAppear { homeVisible = true }
+        .onDisappear { homeVisible = false }
+        .onChange(of: tilting, initial: true) { _, on in on ? tilt.start() : tilt.stop() }
         .overlay(alignment: .bottom) {
             if let toast {
                 Text(toast).font(.subheadline).foregroundStyle(Theme.text)
@@ -168,6 +172,10 @@ final class TiltModel: ObservableObject {
     @Published private(set) var offset: CGSize = .zero
     private let motion = CMMotionManager()
     private var follow = TiltFollower()
+
+    nonisolated static func shouldRun(active: Bool, inCall: Bool, reduceMotion: Bool, visible: Bool) -> Bool {
+        active && !inCall && !reduceMotion && visible
+    }
 
     func start() {
         guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }

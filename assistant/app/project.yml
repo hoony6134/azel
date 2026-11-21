@@ -50,6 +50,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIBackgroundModes: [audio, voip]
         NSSupportsLiveActivities: true
+        NSSupportsLiveActivitiesFrequentUpdates: true
         # macOS (ignored on iOS): menu-bar only, no Dock icon
         LSUIElement: true
         # azel://task/<id> opens a task (finish notifications deep-link here)
