@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct BiseoApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "iphone")
+    @StateObject private var history = HistoryModel()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -14,7 +15,7 @@ struct BiseoApp: App {
         WindowGroup {
             Group {
                 if model.configured {
-                    RootView(model: model)
+                    RootView(model: model, history: history)
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
@@ -22,7 +23,7 @@ struct BiseoApp: App {
             .preferredColorScheme(nil)
             .tint(Theme.celadon)
             .onChange(of: scenePhase, initial: true) {
-                if scenePhase == .active { Task { await model.refresh() } }
+                if scenePhase == .active { Task { await model.refresh(); await history.refresh() } }
             }
         }
     }
@@ -32,18 +33,25 @@ struct BiseoApp: App {
 /// CallKit answered from the lock screen.
 struct RootView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var history: HistoryModel
     @ObservedObject private var call = CallManager.shared
     @State private var tab = 0
 
     var body: some View {
         TabView(selection: $tab) {
-            NavigationStack { HomeView(model: model, tab: $tab) }
+            NavigationStack { HomeView(model: model, history: history, tab: $tab) }
                 .tabItem { Label("홈", systemImage: "circle.circle") }.tag(0)
+            NavigationStack {
+                HistoryList(model: history, onCall: { CallManager.shared.startCall() })
+                    .navigationTitle("기록")
+                    .navigationDestination(for: HistoryItem.self) { HistoryDetailView(item: $0, history: history) }
+            }
+            .tabItem { Label("기록", systemImage: "clock") }.tag(1)
             NavigationStack { ApprovalsScreen(model: model) }
-                .tabItem { Label("승인", systemImage: "checkmark.shield") }.tag(1)
+                .tabItem { Label("승인", systemImage: "checkmark.shield") }.tag(2)
                 .badge(model.approvals.count)
-            NavigationStack { SettingsScreen(model: model) }
-                .tabItem { Label("설정", systemImage: "gearshape") }.tag(2)
+            NavigationStack { SettingsScreen(model: model, history: history) }
+                .tabItem { Label("설정", systemImage: "gearshape") }.tag(3)
         }
         .fullScreenCover(isPresented: Binding(get: { call.inCall }, set: { if !$0 { call.hangUp() } })) {
             CallScreen()

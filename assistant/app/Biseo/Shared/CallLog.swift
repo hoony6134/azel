@@ -42,35 +42,5 @@ struct CallLog: Equatable {
     var lastRoute: String? { lines.last { !$0.mine && $0.route != nil }?.route }
 }
 
-/// Past calls kept on this device only (DESIGN §12 Q1): the last 20, no server involved.
-struct CallRecord: Codable, Identifiable, Equatable {
-    var id: String { "\(session)@\(start.timeIntervalSince1970)" }
-    let session: String
-    let start: Date
-    var lines: [CallLine]
-}
-
-enum Recents {
-    static let limit = 20
-
-    static var file: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("recents.json")
-    }
-
-    static func load(from url: URL = file) -> [CallRecord] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        return (try? JSONDecoder().decode([CallRecord].self, from: data)) ?? []
-    }
-
-    /// Newest first; calls where nothing was said are not kept.
-    static func add(_ record: CallRecord, to url: URL = file) {
-        guard !record.lines.isEmpty else { return }
-        let all = Array(([record] + load(from: url)).prefix(limit))
-        try? JSONEncoder().encode(all).write(to: url, options: .atomic)
-        NotificationCenter.default.post(name: changed, object: nil)
-    }
-
-    static let changed = Notification.Name("biseo.recents.changed")
-}
+/// Posted when a call ends so the history list reloads (the server writes the record).
+let callEndedNotification = Notification.Name("biseo.call.ended")

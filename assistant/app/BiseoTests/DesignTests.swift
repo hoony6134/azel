@@ -80,21 +80,7 @@ final class CallLogTests: XCTestCase {
     }
 }
 
-final class RecentsTests: XCTestCase {
-    func testKeepsNewestTwentyAndSkipsSilentCalls() {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("recents-\(UUID().uuidString).json")
-        defer { try? FileManager.default.removeItem(at: url) }
-        Recents.add(CallRecord(session: "silent", start: Date(), lines: []), to: url)
-        XCTAssertTrue(Recents.load(from: url).isEmpty)
-        for i in 0..<25 {
-            Recents.add(CallRecord(session: "s\(i)", start: Date(timeIntervalSince1970: Double(i)), lines: [CallLine(mine: true, text: "\(i)")]), to: url)
-        }
-        let all = Recents.load(from: url)
-        XCTAssertEqual(all.count, Recents.limit)
-        XCTAssertEqual(all.first?.session, "s24")
-        XCTAssertEqual(all.last?.session, "s5")
-    }
-
+final class GreetingTests: XCTestCase {
     func testGreetingByHour() {
         let cal = Calendar.current
         let at = { (h: Int) in cal.date(bySettingHour: h, minute: 0, second: 0, of: Date())! }

@@ -190,6 +190,7 @@ private let triggerNames = ["deadline": "마감 임박", "server_down": "서버 
 
 struct SettingsScreen<Extra: View>: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var history: HistoryModel
     @ViewBuilder var extra: Extra
     @State private var settings: AppSettings?
     @State private var loaded: AppSettings?
@@ -200,6 +201,7 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showSetup = false
     @State private var showRecordings = false
     @State private var showPaths = false
+    @State private var pendingDays: Int?
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
@@ -224,6 +226,7 @@ struct SettingsScreen<Extra: View>: View {
                     deviceCard(s)
                 }
                 connectionCard
+                if let s = Binding($settings) { historyCard(s) }
                 if !Recordings.list().isEmpty { recordingsCard }
                 extra
             }
@@ -471,6 +474,37 @@ struct SettingsScreen<Extra: View>: View {
         }
     }
 
+    // 기록 보관 (§7.5 card 10)
+    private static var retention: [(Int, String)] { [(7, "7일"), (30, "30일"), (90, "90일"), (365, "1년"), (0, "계속")] }
+    private static func rank(_ d: Int) -> Int { d == 0 ? .max : d }
+
+    private func historyCard(_ s: Binding<AppSettings>) -> some View {
+        let current = s.wrappedValue.history_days ?? 365
+        return Card("기록") {
+            HStack {
+                Text("기록 보관").foregroundStyle(Theme.text)
+                Spacer()
+                Picker("", selection: Binding(get: { current }, set: { new in
+                    if Self.rank(new) < Self.rank(current) { pendingDays = new } else { s.wrappedValue.history_days = new }
+                })) { ForEach(Self.retention, id: \.0) { Text($0.1).tag($0.0) } }
+                    .pickerStyle(.menu).labelsHidden().tint(Theme.celadon).fixedSize()
+            }
+            Text("보관 기간이 지난 통화 기록은 서버에서 지워져요. 녹음은 이 기기에만 있어요.").font(.footnote).foregroundStyle(Theme.text3)
+        }
+        .confirmationDialog(pendingDays.map { d in
+            let n = history.count(olderThan: d)
+            return "\(Self.retention.first { $0.0 == d }?.1 ?? "\(d)일")보다 오래된 기록" + (n > 0 ? " \(n)개가" : "이") + " 지워져요"
+        } ?? "", isPresented: Binding(get: { pendingDays != nil }, set: { if !$0 { pendingDays = nil } }), titleVisibility: .visible) {
+            Button("지우기", role: .destructive) {
+                guard let d = pendingDays else { return }
+                s.wrappedValue.history_days = d
+                pendingDays = nil
+                Task { await history.deleteOlder(than: d) }
+            }
+            Button("취소", role: .cancel) { pendingDays = nil }
+        }
+    }
+
     private var recordingsCard: some View {
         Card("녹음") {
             Button { showRecordings = true } label: {
@@ -545,7 +579,7 @@ struct SettingsScreen<Extra: View>: View {
 }
 
 extension SettingsScreen where Extra == EmptyView {
-    init(model: AppModel) { self.init(model: model) { EmptyView() } }
+    init(model: AppModel, history: HistoryModel) { self.init(model: model, history: history) { EmptyView() } }
 }
 
 /// Fallback order as chips: tap a chip to move it earlier, × to remove, + to add (§7.5).
@@ -679,7 +713,7 @@ struct ApprovalsScreen: View {
     }
 }
 
-// MARK: - Transcript (call sheet, recents)
+// MARK: - Transcript (call sheet)
 
 struct TranscriptView: View {
     let lines: [CallLine]
@@ -705,29 +739,6 @@ struct TranscriptView: View {
             .padding(20)
         }
         .background(Theme.bg.ignoresSafeArea())
-    }
-}
-
-/// One recent call (§7.2): time, route chip, first user line, last reply.
-struct RecentCard: View {
-    let record: CallRecord
-    var compact = false
-
-    var body: some View {
-        let first = record.lines.first { $0.mine }?.text
-        let last = record.lines.last { !$0.mine }
-        Card {
-            HStack {
-                Text(record.start, format: .dateTime.hour().minute()).font(.footnote.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.text3)
-                Spacer()
-                if let r = last?.route { RouteChip(route: r) }
-            }
-            if !compact, let first { Text(first).lineLimit(1).foregroundStyle(Theme.text2) }
-            if let last { Text(last.text).lineLimit(compact ? 1 : 2).foregroundStyle(Theme.text) }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(record.start.formatted(date: .omitted, time: .shortened)), 나: \(first ?? ""), \(AssistantName.current): \(last?.text ?? "")")
-        .accessibilityHint("전체 대화 보기")
     }
 }
 

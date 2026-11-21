@@ -5,6 +5,7 @@ import SwiftUI
 struct BiseoMacApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "mac")
     @StateObject private var wake = WakeModel()
+    @StateObject private var history = HistoryModel()
     @ObservedObject private var call = MacCall.shared
 
     init() {
@@ -15,7 +16,7 @@ struct BiseoMacApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            Popover(model: model, wake: wake)
+            Popover(model: model, wake: wake, history: history)
         } label: {
             Image(nsImage: JarIcon.make(filled: call.inCall, dot: !model.approvals.isEmpty))
                 .accessibilityLabel("Azel")
@@ -23,9 +24,15 @@ struct BiseoMacApp: App {
         .menuBarExtraStyle(.window)
 
         Window("Azel", id: "main") {
-            MainWindow(model: model, wake: wake)
+            MainWindow(model: model, wake: wake, history: history)
         }
         .defaultSize(width: 760, height: 720)
+
+        Window("기록", id: "history") {
+            HistorySplit(history: history).frame(minWidth: 640, minHeight: 420)
+        }
+        .defaultSize(width: 820, height: 560)
+        .keyboardShortcut("y")
         .commands {
             CommandGroup(after: .newItem) {
                 Button("새 대화") { model.newConversation() }.keyboardShortcut("n")
@@ -92,6 +99,7 @@ final class WakeModel: ObservableObject {
 struct Popover: View {
     @ObservedObject var model: AppModel
     @ObservedObject var wake: WakeModel
+    @ObservedObject var history: HistoryModel
     @ObservedObject private var call = MacCall.shared
     @Environment(\.openWindow) private var openWindow
 
@@ -132,16 +140,17 @@ struct Popover: View {
                     }
                     .buttonStyle(.bordered).tint(Theme.amber)
                 }
-                if !model.recents.isEmpty {
-                    VStack(alignment: .leading, spacing: Theme.xs) {
-                        Text("최근 대화").font(.footnote.weight(.semibold)).foregroundStyle(Theme.text3)
-                        ForEach(model.recents.prefix(3)) { r in
-                            HStack(alignment: .firstTextBaseline) {
-                                Text(r.start, format: .dateTime.hour().minute()).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
-                                Text(r.lines.last { !$0.mine }?.text ?? "").font(.subheadline).foregroundStyle(Theme.text).lineLimit(1)
-                            }
+                VStack(alignment: .leading, spacing: Theme.xs) {
+                    if !history.recent.isEmpty { Text("최근 대화").font(.footnote.weight(.semibold)).foregroundStyle(Theme.text3) }
+                    ForEach(history.recent) { item in
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(item.start, format: .dateTime.hour().minute()).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
+                            Text(item.title ?? "제목 없음").font(.subheadline).foregroundStyle(Theme.text).lineLimit(1)
                         }
+                        .accessibilityElement(children: .combine)
                     }
+                    Button("기록 모두 보기…") { showHistory() }.buttonStyle(.borderless).font(.footnote).tint(Theme.celadon)
+                        .keyboardShortcut("y")
                 }
             }
             Divider()
@@ -160,7 +169,7 @@ struct Popover: View {
         .padding(Theme.l)
         .frame(width: 340)
         .background(Theme.bgRaised)
-        .task { await model.refresh(); await wake.refresh() }
+        .task { await model.refresh(); await wake.refresh(); await history.refresh() }
     }
 
     private func small(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -175,6 +184,33 @@ struct Popover: View {
     private func show() {
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func showHistory() {
+        openWindow(id: "history")
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+/// §15.5: history list as a sidebar, detail on the right.
+struct HistorySplit: View {
+    @ObservedObject var history: HistoryModel
+    @State private var selection: HistoryItem?
+
+    var body: some View {
+        NavigationSplitView {
+            HistoryList(model: history, selection: $selection, onCall: { MacCall.shared.start(panel: true) })
+                .navigationSplitViewColumnWidth(min: 260, ideal: 300)
+                .onDeleteCommand { if let s = selection { history.delete(s); selection = nil } }
+        } detail: {
+            if let selection {
+                HistoryDetailView(item: selection, history: history).id(selection.id)
+            } else {
+                Text("기록을 고르세요").foregroundStyle(Theme.text3).frame(maxWidth: .infinity, maxHeight: .infinity).background(Theme.bg)
+            }
+        }
+        .task { await history.refresh() }
+        .tint(Theme.celadon)
     }
 }
 
@@ -200,6 +236,7 @@ struct Popover: View {
 struct MainWindow: View {
     @ObservedObject var model: AppModel
     @ObservedObject var wake: WakeModel
+    @ObservedObject var history: HistoryModel
     @State private var section: String? = "home"
 
     var body: some View {
@@ -208,6 +245,7 @@ struct MainWindow: View {
                 NavigationSplitView {
                     List(selection: $section) {
                         Label("홈", systemImage: "circle.circle").tag("home")
+                        Label("기록", systemImage: "clock").tag("history")
                         Label("승인", systemImage: "checkmark.shield").tag("approvals").badge(model.approvals.count)
                         Label("설정", systemImage: "gearshape").tag("settings")
                     }
@@ -215,8 +253,9 @@ struct MainWindow: View {
                 } detail: {
                     switch section {
                     case "approvals": ApprovalsScreen(model: model)
-                    case "settings": SettingsScreen(model: model) { MacSettingsCard(wake: wake) }
-                    default: MacHome(model: model)
+                    case "history": HistorySplit(history: history)
+                    case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
+                    default: MacHome(model: model, history: history) { section = "history" }
                     }
                 }
             } else {
@@ -231,8 +270,10 @@ struct MainWindow: View {
 /// Home with the call in place: the jar grows and the dock appears when a call is up.
 struct MacHome: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var history: HistoryModel
+    var showAll: () -> Void
     @ObservedObject private var call = MacCall.shared
-    @State private var openRecord: CallRecord?
+    @State private var openItem: HistoryItem?
 
     private var jarState: JarState {
         call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline)
@@ -269,10 +310,11 @@ struct MacHome: View {
                 .frame(maxWidth: .infinity)
             }
         }
-        .sheet(item: $openRecord) { r in
-            TranscriptView(lines: r.lines).frame(width: 520, height: 560)
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("닫기") { openRecord = nil } } }
+        .sheet(item: $openItem) { item in
+            NavigationStack { HistoryDetailView(item: item, history: history) }.frame(width: 600, height: 600)
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("닫기") { openItem = nil } } }
         }
+        .task { await history.refresh() }
     }
 
     private var idle: some View {
@@ -285,13 +327,17 @@ struct MacHome: View {
             .buttonStyle(.plain).disabled(model.statusError != nil)
             Text("어디서든 \(HotKey.label)로 부를 수 있어요").font(.footnote).foregroundStyle(Theme.text3)
             VStack(alignment: .leading, spacing: Theme.m) {
-                Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
-                if model.recents.isEmpty {
+                HStack {
+                    Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
+                    Spacer()
+                    if !history.recent.isEmpty { Button("모두 보기", action: showAll).buttonStyle(.borderless).tint(Theme.celadon) }
+                }
+                if history.recent.isEmpty {
                     Text("아직 대화가 없어요 · 첫 전화를 걸어 보세요").foregroundStyle(Theme.text3)
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: Theme.l)], spacing: Theme.l) {
-                    ForEach(model.recents.prefix(6)) { r in
-                        Button { openRecord = r } label: { RecentCard(record: r) }.buttonStyle(.plain)
+                    ForEach(history.recent) { item in
+                        Button { openItem = item } label: { HistoryCard(item: item) }.buttonStyle(.plain)
                     }
                 }
             }

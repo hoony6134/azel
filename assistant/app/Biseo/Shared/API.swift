@@ -32,6 +32,8 @@ struct AppSettings: Codable, Equatable {
     var device_fallback: [String]
     /// DESIGN §0: what the assistant is called (default 아젤). Optional so older gateways still decode.
     var assistant_name: String?
+    /// Days the server keeps call history (0 = forever). Optional for older gateways.
+    var history_days: Int?
 }
 
 struct ServerStatus: Decodable {

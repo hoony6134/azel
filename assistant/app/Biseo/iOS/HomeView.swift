@@ -3,10 +3,10 @@ import SwiftUI
 /// DESIGN §7.2: status, greeting, idle jar, call capsule, quick actions, recent calls.
 struct HomeView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var history: HistoryModel
     @Binding var tab: Int
     @ObservedObject private var call = CallManager.shared
     @State private var toast: String?
-    @State private var openRecord: CallRecord?
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
 
     var body: some View {
@@ -51,14 +51,8 @@ struct HomeView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
-        .sheet(item: $openRecord) { r in
-            NavigationStack {
-                TranscriptView(lines: r.lines)
-                    .navigationTitle(r.start.formatted(date: .abbreviated, time: .shortened))
-                    .navigationBarTitleDisplayMode(.inline)
-            }
-        }
-        .refreshable { await model.refresh() }
+        .navigationDestination(for: HistoryItem.self) { HistoryDetailView(item: $0, history: history) }
+        .refreshable { await model.refresh(); await history.refresh() }
     }
 
     @ViewBuilder private var statusLine: some View {
@@ -104,7 +98,7 @@ struct HomeView: View {
             }
             .accessibilityHint("이전 대화 맥락을 비웁니다")
             if !model.approvals.isEmpty {
-                quick("승인 \(model.approvals.count)건", "checkmark.shield", label: "승인 \(model.approvals.count)건") { tab = 1 }
+                quick("승인 \(model.approvals.count)건", "checkmark.shield", label: "승인 \(model.approvals.count)건") { tab = 2 }
             }
         }
     }
@@ -120,18 +114,23 @@ struct HomeView: View {
         .accessibilityLabel(label)
     }
 
+    /// Top 3 of /v1/history (§7.2), the cached list when offline.
     @ViewBuilder private var recents: some View {
         VStack(alignment: .leading, spacing: Theme.m) {
-            Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
-            if model.recents.isEmpty {
+            HStack {
+                Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
+                Spacer()
+                if !history.recent.isEmpty { Button("모두 보기") { tab = 1 }.font(.subheadline).tint(Theme.celadon) }
+            }
+            if history.recent.isEmpty {
                 VStack(spacing: Theme.xs) {
                     Text("아직 대화가 없어요").foregroundStyle(Theme.text2)
                     Text("첫 전화를 걸어 보세요").font(.footnote).foregroundStyle(Theme.text3)
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, Theme.l)
             }
-            ForEach(model.recents.prefix(3)) { r in
-                Button { openRecord = r } label: { RecentCard(record: r) }.buttonStyle(.plain)
+            ForEach(history.recent) { item in
+                NavigationLink(value: item) { HistoryCard(item: item) }.buttonStyle(.plain)
             }
         }
     }
