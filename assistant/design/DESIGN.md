@@ -331,7 +331,7 @@ Full-bleed, no navigation bar, status bar light content.
 `ScrollView` of grouped cards on `bg` (not `Form`), 16 pt between cards, card padding 16.
 Card header: headline + optional trailing text button.
 
-1. **비서 card** (top): row "이름" with the current `assistant_name` ("아젤") as a trailing
+1. **비서 card** (top; superseded by the persona list, §17.4): row "이름" with the current `assistant_name` ("아젤") as a trailing
    text field (max 12 characters, trimmed, empty → back to "아젤"). Footer helper (footnote,
    text3): "호출어는 다시 학습하기 전까지 '아젤'로 유지돼요." Saved like the other settings; the
    new name shows on the call screen, CallKit and menus from the next call.
@@ -806,3 +806,148 @@ tools); `icon/icon-preview.html` shows them on home screens, in the Dock and the
   slots.
 - **Menu bar**: the same orb as 18 pt templates, outline while idle and filled during a call.
 - Checked for kinks at 1024 and legible at 29 pt and 20 pt (iOS) and 16 px (macOS).
+
+## 17. Personas (비서 여럿)
+
+Up to **8 assistants**, each with a name, a voice, a personality and an orb colour. One is
+**primary** (default 아젤): it places briefings and assistant-initiated calls and answers the
+wake word. `assistant_name` (§0) becomes "the primary persona's name"; every "아젤" in this
+spec means "the current persona's name" unless it says primary.
+
+### 17.1 Data (assumed; see §17.10)
+
+Persona: `id`, `name` (1–12 chars, unique), `voice` (one of the TTS server's speakers),
+`style` (optional TTS instruction, ≤ 80 chars), `personality` (≤ 500 chars), `color` (a key
+from §17.2), `share_memory` (bool), plus `primary_persona` (id). The app remembers the
+**selected** persona locally (per device); a call carries it (`persona=<id>` on `/v1/call`),
+and history items carry `persona`.
+
+### 17.2 Orb colours
+
+Eight curated tints, all from Korean ceramics and nature so they sit with the celadon
+palette. Each has a **glaze** (orb, mini orbs; decorative) and an **accent** (text, chips, the
+call button fill) per mode. Every accent is ≥ 4.5:1 on `bg` and `card`, and its button label
+(`onAccent`: `#0D1113` in dark, white in light) is ≥ 4.5:1 too (lowest: 4.88).
+
+| Key | Name | Glaze dark / light | Accent dark / light |
+|---|---|---|---|
+| `celadon` | 청자 (default 아젤) | `#82CBB4` / `#A8DCCB` | `#82CBB4` / `#2C7663` |
+| `indigo` | 쪽빛 | `#9AAAF0` / `#B4BFF3` | `#9AAAF0` / `#4656B8` |
+| `amber` | 호박 | `#E9BC6E` / `#F0CB86` | `#E9BC6E` / `#8F5E12` |
+| `azalea` | 진달래 | `#F2A7B8` / `#F6C1CD` | `#F2A7B8` / `#A63D5A` |
+| `sprout` | 연두 | `#B9D77A` / `#CDE39C` | `#B9D77A` / `#55721C` |
+| `sky` | 하늘 | `#8FCBEA` / `#B3DCF1` | `#8FCBEA` / `#28698C` |
+| `plum` | 자주 | `#C4A2E6` / `#D6BEEE` | `#C4A2E6` / `#6E4A9A` |
+| `ash` | 먹 | `#B8C0BD` / `#CDD3D1` | `#B8C0BD` / `#56605D` |
+
+No red: `danger` stays reserved for errors and hang-up. The colour is never the only way to
+tell personas apart (the name is always shown next to it).
+
+**What the tint changes**: the idle and listening glaze and ring (§6.2), the mini orbs, the
+persona chip, and the home call button fill. **What it doesn't**: thinking keeps the indigo
+swirl and speaking keeps the porcelain body with amber glow, so the call *state* always reads
+the same whoever is talking. The app icon stays celadon.
+
+### 17.3 iPhone home: switching
+
+- **Persona row** above the call button (only when there are ≥ 2 personas): a horizontal
+  `ScrollView` of mini orbs, 44 pt each (idle orb, §6.3 breathing at 0.5 amplitude, in the
+  persona's glaze) with the name under it (footnote, 1 line). Selected: a 2 pt ring in its
+  accent, name in `text` semibold; others name in `text2`. 12 pt gaps, centered when they
+  fit. A trailing "+" (dashed 44 pt circle, `text2`) opens the create sheet while there are
+  fewer than 8.
+- Tapping a mini orb selects it: the big orb crossfades to its glaze (`state` 0.45 s), the
+  call button becomes "{name}에게 전화" with the persona's accent fill, a `.selection` haptic.
+  Long-press opens its edit sheet (`contextMenu`: 편집, 기본 비서로 지정).
+- With one persona the row is hidden and nothing else changes.
+- Briefing quick action ("오늘 브리핑") always calls the **primary**; its label says so when
+  another persona is selected: "아젤의 오늘 브리핑".
+
+### 17.4 비서 list (설정 → 비서)
+
+The top card in 설정 becomes **비서**: one row per persona (24 pt orb dot, name, voice name in
+`text2`, a "기본" chip on the primary), then "비서 추가" (`plus`, accent). Tap a row → edit sheet.
+Drag to reorder (the order of the home row). The 작업 효과음 toggle moves to a **소리** card
+below.
+
+- **Only the primary exists** (fresh install): the card shows 아젤 plus a footnote "성격과
+  목소리가 다른 비서를 8명까지 만들 수 있어요." above "비서 추가".
+- **Limit reached (8)**: "비서 추가" is disabled (text3) with the footnote "비서는 8명까지예요.
+  하나를 지우면 새로 만들 수 있어요."; the home row's "+" is hidden.
+
+### 17.5 Create / edit sheet
+
+A `.sheet` with large detent, title "새 비서" / the persona's name, toolbar 취소 / 저장
+(저장 disabled until valid). Sections as cards:
+
+1. **Preview**: the persona's idle orb (96 pt) in the chosen glaze, name below, updating live.
+2. **이름**: text field, 1–12 chars, trimmed; inline danger footnote "이미 있는 이름이에요" /
+   "이름을 입력해 주세요".
+3. **색**: 8 swatches (44 pt circles in the glaze, 2 pt accent ring + `checkmark` when
+   selected), 4 per row; VoiceOver labels "청자", "쪽빛"…
+4. **목소리**: a list of the TTS speakers (radio rows, voice name + short descriptor if the
+   server gives one); each row has a trailing **들어보기** button (`play.circle`, 44 pt hit
+   area) that speaks "안녕하세요, {이름}이에요. 무엇을 도와드릴까요?" in that voice with the
+   current style. While playing it becomes `stop.circle` with a progress ring; only one sample
+   plays at a time; respects the silent switch (`.ambient` session, §14.2).
+5. **말투** (style): one-line field, placeholder "예: 차분하고 천천히, 밝고 빠르게"; footnote
+   "목소리에 주는 짧은 지시예요." Changing it re-enables 들어보기.
+6. **성격** (personality): `TextEditor`, 4–8 lines, placeholder "예: 꼼꼼하고 다정하게, 결론부터
+   말해 줘", counter "120/500" (text3; danger past 500).
+7. **기억 공유** toggle (default on); footnote: on — "다른 비서와 같은 기억을 써요."; off — "이
+   비서만의 기억을 따로 가져요."
+8. **기본 비서로 지정** (non-primary only): a row button; confirm "{이름}을(를) 기본 비서로
+   할까요? 아침 브리핑과 먼저 거는 전화를 {이름}이(가) 해요. 호출어는 ‘아젤’ 그대로예요."
+   On the primary this row is a static note "기본 비서예요".
+9. **비서 지우기** (non-primary only): destructive text button at the bottom → alert
+   "‘{이름}’을(를) 지울까요?", body "통화 기록은 남아요. 이 비서만의 기억은 지워져요." (the
+   second sentence only when `share_memory` is off), buttons 지우기 (destructive) / 취소. Deleting
+   the selected persona selects the primary.
+
+Unsaved changes + 취소 → "변경 사항을 버릴까요?" confirmation.
+
+### 17.6 Call screen and CallKit
+
+- Top bar title = persona name; idle/listening glaze and ring use its glaze (§17.2).
+- CallKit: `CXHandle(type: .generic, value: persona.id)`, `localizedCallerName =
+  persona.name`, so the system call UI and Recents show the name. Incoming calls placed by
+  the assistant come from the primary.
+- The persona can't be switched during a call.
+
+### 17.7 History
+
+- Each row gets the persona: an 8 pt dot in its accent before the meta line and the name as
+  its first item: "● 소담 · 오전 8:02 · 4분 · 6턴". The detail header shows a persona chip
+  (accent outline, like route chips). Calls from a deleted persona show "지운 비서" in `text3`
+  with an `ash` dot.
+- **Filter**: a horizontal chip row under the search field (only with ≥ 2 personas): "전체" +
+  one chip per persona (dot + name). Single select; filters the list (and the `?q=` search) by
+  `persona`. Selected chip: accent fill with `onAccent` text.
+
+### 17.8 Mac
+
+- Popover: the hero shows a row of mini orbs (28 pt, names in tooltips and VoiceOver), the
+  selected one ringed, then "{이름} · ⌥ Space를 누른 채 말하세요". ⌘1…⌘8 select personas while the
+  popover is open. The "전화" button and push-to-talk use the selected persona.
+- Push-to-talk panel: the orb uses the persona's glaze; the name appears before the route
+  chip; the hotkey always talks to the selected persona.
+- Main window: 설정 → 비서 uses the same list and edit sheet (as a sheet window).
+
+### 17.9 Accessibility
+
+- Mini orb: label "{이름}", value "선택됨" when selected, trait `.isButton`, hint "두 번 탭하면
+  이 비서로 바꿉니다", action "편집".
+- Swatch: label = colour name; value "선택됨". Voice row: label "{voice}", actions "들어보기".
+- Persona changes are announced: "{이름}(으)로 바꿨어요".
+- Reduce Motion: mini orbs are static; the big orb's tint crossfades without scaling.
+
+### 17.10 Open questions (for the PM)
+
+1. API: where do personas live (`/v1/settings` `personas` array, or `GET/PUT /v1/personas`)?
+   Does `/v1/call` take `persona=<id>`, and do history items carry `persona`?
+2. Voice list and samples: can the gateway expose the TTS speaker list (`GET /v1/voices`,
+   with optional Korean descriptors) and a sample endpoint (`POST /v1/voices/sample`
+   `{voice, style, text}` → audio)? The app can't reach the TTS server directly.
+3. With `share_memory` off, what happens to that persona's memory when it is deleted
+   (deleted with it, as the copy assumes)?
+4. `assistant_name` in settings: replaced by the primary persona's name, or kept as an alias?

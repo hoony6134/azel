@@ -192,6 +192,55 @@ canvas.jar { display:block; }
 .macwin section { padding:20px 28px; overflow:hidden; }
 .macwin .tx .a { font-size:16px; } .macwin .tx .u { font-size:14px; }
 
+/* Personas (DESIGN.md §17): --pg glaze, --pa accent */
+.t-celadon { --pg:#82CBB4; --pa:#82CBB4; } [data-theme="light"] .t-celadon { --pg:#A8DCCB; --pa:#2C7663; }
+.t-indigo { --pg:#9AAAF0; --pa:#9AAAF0; } [data-theme="light"] .t-indigo { --pg:#B4BFF3; --pa:#4656B8; }
+.t-amber { --pg:#E9BC6E; --pa:#E9BC6E; } [data-theme="light"] .t-amber { --pg:#F0CB86; --pa:#8F5E12; }
+.t-azalea { --pg:#F2A7B8; --pa:#F2A7B8; } [data-theme="light"] .t-azalea { --pg:#F6C1CD; --pa:#A63D5A; }
+.t-sprout { --pg:#B9D77A; --pa:#B9D77A; } [data-theme="light"] .t-sprout { --pg:#CDE39C; --pa:#55721C; }
+.t-sky { --pg:#8FCBEA; --pa:#8FCBEA; } [data-theme="light"] .t-sky { --pg:#B3DCF1; --pa:#28698C; }
+.t-plum { --pg:#C4A2E6; --pa:#C4A2E6; } [data-theme="light"] .t-plum { --pg:#D6BEEE; --pa:#6E4A9A; }
+.t-ash { --pg:#B8C0BD; --pa:#B8C0BD; } [data-theme="light"] .t-ash { --pg:#CDD3D1; --pa:#56605D; }
+.prow { display:flex; gap:12px; justify-content:center; margin:2px 0 12px; }
+.pm { display:flex; flex-direction:column; align-items:center; gap:4px; font-size:13px; color:var(--text2); width:52px; }
+.pm .po { width:48px; height:48px; border-radius:50%; border:2px solid transparent; display:grid; place-items:center; }
+.pm.sel { color:var(--text); font-weight:600; } .pm.sel .po { border-color:var(--pa); }
+.pm.add .po { border:1.5px dashed var(--text2); color:var(--text2); font-size:22px; width:44px; height:44px; margin:2px; }
+.callbtn.persona { background:var(--pa); }
+.chip.pchip { color:var(--pa); border-color:color-mix(in srgb, var(--pa) 60%, transparent); background:color-mix(in srgb, var(--pa) 12%, transparent); }
+.pdot { width:24px; height:24px; border-radius:50%; flex:none; background:radial-gradient(circle at 35% 30%, #fff, var(--pg) 75%); }
+.pd { width:8px; height:8px; border-radius:50%; background:var(--pa); display:inline-block; margin-right:5px; vertical-align:1px; }
+.prow2 { display:flex; align-items:center; gap:12px; padding:10px 0; border-top:1px solid var(--stroke); font-size:17px; }
+.prow2:first-of-type { border-top:none; }
+.prow2 .v { margin-left:auto; color:var(--text2); font-size:15px; }
+.basic { font-size:13px; font-weight:600; color:var(--celadon); border:1px solid var(--stroke); border-radius:999px; padding:3px 9px; }
+.fchips { display:flex; gap:8px; margin:0 0 4px; overflow:hidden; }
+.fchips > span { display:inline-flex; align-items:center; height:32px; padding:0 12px; border-radius:999px; border:1px solid var(--stroke); font-size:14px; white-space:nowrap; color:var(--text); }
+.fchips > span.on { background:var(--text); color:var(--bg); border-color:var(--text); }
+.sheetbg { position:absolute; inset:0; background:rgba(0,0,0,.45); }
+.sheet { position:absolute; left:0; right:0; top:54px; bottom:0; background:var(--bgRaised); border-radius:22px 22px 0 0; padding:8px 18px 20px; display:flex; flex-direction:column; gap:12px; overflow:hidden; }
+.grab { width:36px; height:5px; border-radius:3px; background:var(--stroke); margin:0 auto 2px; flex:none; }
+.stb { display:flex; justify-content:space-between; align-items:center; font-size:17px; flex:none; }
+.stb .c { color:var(--celadon); } .stb .s { color:var(--celadon); font-weight:600; } .stb b { font-weight:600; }
+.field { background:var(--card); border:1px solid var(--stroke); border-radius:14px; padding:12px 14px; font-size:17px; flex:none; }
+.flabel { font-size:13px; font-weight:600; color:var(--text2); margin:2px 4px -6px; flex:none; }
+.swatches { display:grid; grid-template-columns:repeat(8, 32px); justify-content:space-between; flex:none; }
+.sw { width:32px; height:32px; border-radius:50%; background:radial-gradient(circle at 35% 30%, #fff, var(--pg) 70%); border:2px solid transparent; position:relative; }
+.sw.on { border-color:var(--pa); box-shadow:0 0 0 2px var(--bgRaised) inset; }
+.vrow { display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid var(--stroke); font-size:16px; }
+.vrow:first-child { border-top:none; }
+.vrow .chk { width:20px; color:var(--celadon); font-weight:700; }
+.vrow .play { margin-left:auto; display:inline-flex; align-items:center; gap:4px; font-size:14px; font-weight:600; color:var(--celadon); border:1px solid var(--stroke); border-radius:999px; padding:5px 10px; }
+.alert { position:absolute; left:42px; right:42px; top:42%; background:var(--card); border:1px solid var(--stroke); border-radius:16px; text-align:center; overflow:hidden; z-index:3; }
+.alert h3 { font-size:17px; font-weight:600; padding:18px 16px 4px; }
+.alert p { font-size:14px; color:var(--text2); padding:0 16px 16px; line-height:1.45; }
+.alert .ab { display:grid; grid-template-columns:1fr 1fr; border-top:1px solid var(--stroke); }
+.alert .ab span { padding:12px; font-size:17px; color:var(--celadon); }
+.alert .ab span + span { border-left:1px solid var(--stroke); color:var(--danger); font-weight:600; }
+.mrow { display:flex; gap:8px; align-items:center; }
+.mrow .po { width:34px; height:34px; border-radius:50%; border:2px solid transparent; display:grid; place-items:center; }
+.mrow .sel .po { border-color:var(--pa); }
+
 /* Settings / approvals lists */
 .title { font-size:34px; font-weight:700; margin:10px 0 14px; }
 .stack { display:flex; flex-direction:column; gap:14px; overflow:hidden; }
@@ -284,8 +333,9 @@ canvas.jar { display:block; }
     <div class="foot" style="display:flex;align-items:center;gap:6px;margin-top:4px"><span class="dot"></span> 연결됨 · 스파크 <span class="num">42 ms</span></div>
     <div class="greet">좋은 아침이에요</div>
     <div class="sub">11월 21일 금요일</div>
-    <div class="jarwrap" style="margin:8px 0 6px"><canvas class="jar" data-state="idle" width="190" height="190" role="img" aria-label="아젤, 두 번 탭하면 전화를 겁니다"></canvas></div>
-    <button class="callbtn" aria-label="아젤에게 전화"><svg width="22" height="22"><use href="#i-phone"/></svg>아젤에게 전화</button>
+    <div class="jarwrap t-celadon" style="margin:4px 0 2px"><canvas class="jar" data-state="idle" data-tint width="150" height="150" role="img" aria-label="아젤, 두 번 탭하면 전화를 겁니다"></canvas></div>
+    <div class="prow" aria-label="비서 선택"><span class="pm t-celadon sel" role="button" aria-label="아젤" aria-pressed="true"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="44" height="44"></canvas></span>아젤</span><span class="pm t-azalea" role="button" aria-label="소담"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="44" height="44"></canvas></span>소담</span><span class="pm t-sky" role="button" aria-label="하람"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="44" height="44"></canvas></span>하람</span><span class="pm t-amber" role="button" aria-label="도윤"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="44" height="44"></canvas></span>도윤</span><span class="pm add" role="button" aria-label="비서 추가"><span class="po">+</span>추가</span></div>
+    <button class="callbtn persona t-celadon" aria-label="아젤에게 전화"><svg width="22" height="22"><use href="#i-phone"/></svg>아젤에게 전화</button>
     <div class="quick">
       <span><svg width="17" height="17"><use href="#i-sun"/></svg>오늘 브리핑</span>
       <span><svg width="17" height="17"><use href="#i-pen"/></svg>새 대화</span>
@@ -347,8 +397,7 @@ canvas.jar { display:block; }
     <div class="stack">
       <div class="card">
         <h2>비서</h2>
-        <div class="row"><span>이름</span><span class="v" style="color:var(--text)" aria-label="비서 이름, 아젤">아젤</span></div>
-        <div class="foot" style="margin:2px 0 6px;line-height:1.4">호출어는 다시 학습하기 전까지 ‘아젤’로 유지돼요.</div>
+        <div class="row" aria-label="비서 4명, 기본 비서 아젤"><span style="display:flex;align-items:center;gap:4px"><span class="pdot t-celadon" style="width:20px;height:20px"></span><span class="pdot t-azalea" style="width:20px;height:20px"></span><span class="pdot t-sky" style="width:20px;height:20px"></span><span class="pdot t-amber" style="width:20px;height:20px"></span>&nbsp; 아젤 외 3명</span><span class="menu">›</span></div>
         <div class="row"><span>작업 효과음 <span class="foot" style="color:var(--celadon);font-weight:600">&nbsp;들어 보기</span></span><span class="switch" role="switch" aria-checked="true" aria-label="작업 효과음"></span></div>
         <div class="row"><span>기록 보관</span><span class="menu">30일 ⌄</span></div>
       </div>
@@ -419,6 +468,91 @@ canvas.jar { display:block; }
 </figure>
 
 
+
+<!-- Personas: list -->
+<figure>
+<div class="phone"><div class="screen">
+  <div class="statusbar"><span>9:41</span><span class="island"></span><span>100%</span></div>
+  <div class="body">
+    <div class="nav"><span>‹ 설정</span><span></span></div>
+    <div class="title" style="margin-top:0">비서</div>
+    <div class="stack">
+      <div class="card">
+        <div class="prow2 t-celadon"><span class="pdot"></span>아젤 <span class="basic">기본</span><span class="v">Sohee</span></div>
+        <div class="prow2 t-azalea"><span class="pdot"></span>소담<span class="v">Serena</span></div>
+        <div class="prow2 t-sky"><span class="pdot"></span>하람<span class="v">Vivian</span></div>
+        <div class="prow2 t-amber"><span class="pdot"></span>도윤<span class="v">Ryan</span></div>
+        <div class="prow2" style="color:var(--celadon);font-weight:600"><span style="width:24px;text-align:center;font-size:22px">+</span>비서 추가</div>
+        <div class="foot" style="margin-top:6px;line-height:1.4">비서는 8명까지 만들 수 있어요 · 4/8. 순서를 바꾸면 홈의 순서도 바뀌어요.</div>
+      </div>
+      <div class="card">
+        <h2>소리</h2>
+        <div class="row"><span>작업 효과음</span><span class="switch" role="switch" aria-checked="true" aria-label="작업 효과음"></span></div>
+      </div>
+      <div class="card" style="opacity:1">
+        <h2>8명이 되면</h2>
+        <div class="prow2" style="color:var(--text3)"><span style="width:24px;text-align:center;font-size:22px">+</span>비서 추가</div>
+        <div class="foot" style="line-height:1.4">비서는 8명까지예요. 하나를 지우면 새로 만들 수 있어요.</div>
+      </div>
+    </div>
+  </div>
+  <nav class="tabbar">
+    <span class="tab"><svg><use href="#i-home"/></svg>홈</span>
+    <span class="tab"><svg><use href="#i-clock"/></svg>기록</span>
+    <span class="tab"><svg><use href="#i-shield"/></svg>승인<span class="badge">2</span></span>
+    <span class="tab on"><svg><use href="#i-gear"/></svg>설정</span>
+  </nav>
+</div></div>
+<figcaption>iPhone · 설정 → 비서 (목록 · 8명 제한 상태)</figcaption>
+</figure>
+
+<!-- Personas: edit sheet -->
+<figure>
+<div class="phone"><div class="screen">
+  <div class="statusbar" style="position:relative;z-index:2"><span>9:41</span><span class="island"></span><span>100%</span></div>
+  <div class="sheetbg"></div>
+  <div class="sheet t-azalea" role="dialog" aria-label="소담 편집">
+    <div class="grab"></div>
+    <div class="stb"><span class="c">취소</span><b>소담</b><span class="s">저장</span></div>
+    <div style="display:flex;flex-direction:column;align-items:center;flex:none"><canvas class="jar" data-state="idle" data-tint width="96" height="96" role="img" aria-label="소담 미리보기"></canvas><span style="font-size:15px;font-weight:600;color:var(--pa)">소담</span></div>
+    <div class="flabel">이름</div>
+    <div class="field">소담</div>
+    <div class="flabel">색</div>
+    <div class="swatches" role="radiogroup" aria-label="색"><span class="sw t-celadon" role="radio" aria-checked="false" aria-label="청자"></span><span class="sw t-indigo" role="radio" aria-checked="false" aria-label="쪽빛"></span><span class="sw t-amber" role="radio" aria-checked="false" aria-label="호박"></span><span class="sw t-azalea on" role="radio" aria-checked="true" aria-label="진달래"></span><span class="sw t-sprout" role="radio" aria-checked="false" aria-label="연두"></span><span class="sw t-sky" role="radio" aria-checked="false" aria-label="하늘"></span><span class="sw t-plum" role="radio" aria-checked="false" aria-label="자주"></span><span class="sw t-ash" role="radio" aria-checked="false" aria-label="먹"></span></div>
+    <div class="flabel">목소리</div>
+    <div class="field" style="padding:2px 14px"><div class="vrow"><span class="chk"></span>Sohee<span class="play" role="button" aria-label="Sohee 들어보기">▶ 들어보기</span></div><div class="vrow"><span class="chk">✓</span>Serena<span class="play" role="button" aria-label="Serena 들어보기">■ 재생 중</span></div><div class="vrow"><span class="chk"></span>Vivian<span class="play" role="button" aria-label="Vivian 들어보기">▶ 들어보기</span></div></div>
+    <div class="flabel">말투</div>
+    <div class="field" style="color:var(--text)">차분하고 천천히</div>
+  </div>
+</div></div>
+<figcaption>iPhone · 비서 편집 시트 (미리보기 · 색 · 목소리 들어보기)</figcaption>
+</figure>
+
+<!-- Personas: edit sheet bottom + delete confirm -->
+<figure>
+<div class="phone"><div class="screen">
+  <div class="statusbar" style="position:relative;z-index:2"><span>9:41</span><span class="island"></span><span>100%</span></div>
+  <div class="sheetbg"></div>
+  <div class="sheet t-azalea">
+    <div class="grab"></div>
+    <div class="stb"><span class="c">취소</span><b>소담</b><span class="s">저장</span></div>
+    <div class="flabel">성격</div>
+    <div class="field" style="min-height:110px;line-height:1.45">꼼꼼하고 다정하게. 결론부터 짧게 말하고, 필요하면 이유를 덧붙여 줘.<div class="foot" style="text-align:right;margin-top:8px">38/500</div></div>
+    <div class="field" style="display:flex;justify-content:space-between;align-items:center">기억 공유<span class="switch" role="switch" aria-checked="true" aria-label="기억 공유"></span></div>
+    <div class="foot" style="margin:-6px 4px 0;line-height:1.4;color:var(--text2)">다른 비서와 같은 기억을 써요.</div>
+    <div class="field" style="color:var(--celadon);font-weight:600">기본 비서로 지정</div>
+    <div class="field" style="color:var(--danger);font-weight:600;text-align:center">비서 지우기</div>
+  </div>
+  <div class="sheetbg" style="z-index:2;background:rgba(0,0,0,.35)"></div>
+  <div class="alert" role="alertdialog" aria-label="소담을 지울까요?">
+    <h3>‘소담’을 지울까요?</h3>
+    <p>통화 기록은 남아요.</p>
+    <div class="ab"><span>취소</span><span>지우기</span></div>
+  </div>
+</div></div>
+<figcaption>iPhone · 비서 편집 아래쪽 + 지우기 확인</figcaption>
+</figure>
+
 <!-- 7. History list -->
 <figure>
 <div class="phone"><div class="screen">
@@ -426,15 +560,16 @@ canvas.jar { display:block; }
   <div class="body">
     <div class="title" style="margin-bottom:10px">기록</div>
     <div class="search" role="search" aria-label="기록 검색"><svg aria-hidden="true"><use href="#i-search"/></svg>기록 검색</div>
+    <div class="fchips" role="radiogroup" aria-label="비서 필터"><span class="on" role="radio" aria-checked="true">전체</span><span class="t-celadon" role="radio" aria-checked="false"><span class="pd"></span>아젤</span><span class="t-azalea" role="radio" aria-checked="false"><span class="pd"></span>소담</span><span class="t-sky" role="radio" aria-checked="false"><span class="pd"></span>하람</span></div>
     <div class="hwrap" style="flex-shrink:1;min-height:0;overflow:hidden">
       <h2 class="day">오늘</h2>
       <div class="hlist">
-        <div class="hrow" aria-label="오전 8시 2분, 오늘 일정 뭐 있어?, 4분, 6턴, 내가 건 전화, Claude 사용"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">오늘 일정 뭐 있어?</span><span class="hc"><svg aria-hidden="true"><use href="#i-wave"/></svg><span class="chip claude">Claude</span></span><span class="hm">오전 8:02 · 4분 · 6턴</span></div>
-        <div class="hrow" aria-label="오전 7시, 아침 브리핑, 3분, 4턴, 아젤이 건 전화"><svg class="in" aria-hidden="true"><use href="#i-in"/></svg><span class="ht">아침 브리핑</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm">오전 7:00 · 3분 · 4턴</span></div>
+        <div class="hrow" aria-label="오전 8시 2분, 오늘 일정 뭐 있어?, 4분, 6턴, 내가 건 전화, Claude 사용"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">오늘 일정 뭐 있어?</span><span class="hc"><svg aria-hidden="true"><use href="#i-wave"/></svg><span class="chip claude">Claude</span></span><span class="hm t-celadon"><span class="pd"></span>아젤 · 오전 8:02 · 4분 · 6턴</span></div>
+        <div class="hrow" aria-label="오전 7시, 아침 브리핑, 3분, 4턴, 아젤이 건 전화"><svg class="in" aria-hidden="true"><use href="#i-in"/></svg><span class="ht">아침 브리핑</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm t-celadon"><span class="pd"></span>아젤 · 오전 7:00 · 3분 · 4턴</span></div>
       </div>
       <h2 class="day">어제</h2>
       <div class="hlist" style="position:relative">
-        <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">잘 자, 내일 7시에 깨워 줘</span><span class="hc"><span class="chip qwen">로컬</span></span><span class="hm">오후 11:40 · 1분 · 2턴</span></div>
+        <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">잘 자, 내일 7시에 깨워 줘</span><span class="hc"><span class="chip qwen">로컬</span></span><span class="hm t-azalea"><span class="pd"></span>소담 · 오후 11:40 · 1분 · 2턴</span></div>
         <div style="position:relative;overflow:hidden;border-top:1px solid var(--stroke)"><span class="swipe-del">삭제</span>
           <div class="hrow swiped"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">스파크 GPU 메모리 얼마나 써?</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm">오후 4:18 · 2분 · 3턴</span></div></div>
         <div class="hrow deleting" aria-label="지우는 중"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">이 PR 리뷰 코멘트 몇 개 남았어?</span><span class="hc foot">지우는 중…</span><span class="hm">오후 2:05 · 5분 · 7턴</span></div>
@@ -463,7 +598,7 @@ canvas.jar { display:block; }
   <div class="body">
     <div class="nav"><span>‹ 기록</span><span style="display:flex;gap:18px" aria-hidden="true">공유&nbsp; 삭제</span></div>
     <div class="dh">오늘 일정 뭐 있어?</div>
-    <div class="dm"><svg aria-hidden="true"><use href="#i-out"/></svg>오늘 오전 8:02 · 4분 · 6턴 <span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
+    <div class="dm"><span class="chip pchip t-celadon">아젤</span><svg aria-hidden="true"><use href="#i-out"/></svg>오늘 오전 8:02 · 4분 · 6턴 <span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
     <div class="player">
       <span class="pp" aria-label="일시정지"><svg><use href="#i-pause"/></svg></span>
       <span class="wavebar" role="slider" aria-label="재생 위치" aria-valuetext="1분 20초 / 4분 2초"></span>
@@ -492,8 +627,9 @@ canvas.jar { display:block; }
     <span>100%</span><span>금 9:41</span></div>
   <div class="popover">
     <div class="hd">Azel <span class="foot" style="display:flex;gap:6px;align-items:center"><span class="dot"></span>연결됨</span></div>
-    <div class="hero"><canvas class="jar" data-state="idle" data-sway width="64" height="64"></canvas>
-      <span class="sub" style="font-size:13px;line-height:1.4">⌥ Space를 누른 채<br>말하세요</span>
+    <div class="mrow" style="margin-top:12px" aria-label="비서 선택 (⌘1–⌘8)"><span class="sel t-celadon" title="아젤 ⌘1"><span class="po"><canvas class="jar" data-state="idle" data-sway data-tint width="30" height="30" aria-label="아젤, 선택됨"></canvas></span></span><span class="t-azalea" title="소담 ⌘2"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="30" height="30" aria-label="소담"></canvas></span></span><span class="t-sky" title="하람 ⌘3"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="30" height="30" aria-label="하람"></canvas></span></span><span class="t-amber" title="도윤 ⌘4"><span class="po"><canvas class="jar" data-state="idle" data-mini data-tint width="30" height="30" aria-label="도윤"></canvas></span></span></div>
+    <div class="hero" style="margin-top:10px">
+      <span class="sub" style="font-size:13px;line-height:1.4"><b style="color:var(--text)">아젤</b> · ⌥ Space를 누른 채<br>말하세요</span>
       <span class="pbtn">전화</span></div>
     <div class="q"><span>오늘 브리핑</span><span>새 대화</span></div>
     <div class="appr"><span>승인 2건</span><span>›</span></div>
@@ -510,7 +646,7 @@ canvas.jar { display:block; }
     <canvas class="jar" data-state="speaking" width="76" height="76" data-nowater></canvas>
     <div class="cap"><div class="me">이 PR 리뷰 코멘트 몇 개 남았어?</div>
       <div class="ai">세 개 남았어요. 두 개는 변수 이름이고, 하나는 에러 처리 쪽이에요.</div></div>
-    <div class="side"><span class="chip claude">Claude</span><span class="x" aria-label="통화 끊기"><svg width="12" height="12"><use href="#i-x"/></svg></span></div>
+    <div class="side"><span style="display:flex;gap:6px;align-items:center"><span class="foot" style="color:var(--text2);font-weight:600">아젤</span><span class="chip claude">Claude</span></span><span class="x" aria-label="통화 끊기"><svg width="12" height="12"><use href="#i-x"/></svg></span></div>
   </div>
 </div>
 <figcaption>Mac · 메뉴 막대 팝오버 + 떠 있는 말하기 패널 (말하는 중)</figcaption>
@@ -522,7 +658,7 @@ canvas.jar { display:block; }
     <canvas class="jar" data-state="thinking" width="76" height="76"></canvas>
     <div class="cap"><div class="act" aria-label="진행 중: 메일 확인 중, 완료 1개"><svg aria-hidden="true"><use href="#i-mail"/></svg>메일에서 PR 알림 찾는 중 <span class="foot" style="font-weight:500">· ✓1</span></div>
       <div class="ai" style="color:var(--text2)">PR 리뷰 코멘트 몇 개 남았어?</div></div>
-    <div class="side"><span class="chip claude">Claude</span><span class="x" aria-label="통화 끊기"><svg width="12" height="12"><use href="#i-x"/></svg></span></div>
+    <div class="side"><span style="display:flex;gap:6px;align-items:center"><span class="foot" style="color:var(--text2);font-weight:600">아젤</span><span class="chip claude">Claude</span></span><span class="x" aria-label="통화 끊기"><svg width="12" height="12"><use href="#i-x"/></svg></span></div>
   </div>
 </div>
 <figcaption>Mac · 말하기 패널 (작업 중: 한 줄 활동)</figcaption>
@@ -540,7 +676,7 @@ canvas.jar { display:block; }
   </aside>
   <section>
     <div class="dh">오늘 일정 뭐 있어?</div>
-    <div class="dm"><svg aria-hidden="true"><use href="#i-out"/></svg>오늘 오전 8:02 · 4분 · 6턴 <span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
+    <div class="dm"><span class="chip pchip t-celadon">아젤</span><svg aria-hidden="true"><use href="#i-out"/></svg>오늘 오전 8:02 · 4분 · 6턴 <span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
     <div class="tx" style="max-width:520px">
       <div class="u now">오늘 일정 뭐 있어?</div>
       <div><div class="am"><span class="chip claude">Claude</span></div>
@@ -634,7 +770,7 @@ const jars = [...document.querySelectorAll('canvas.jar')].map(c => {
   c.style.width = w + 'px'; c.style.height = h + 'px';
   c.width = w*dpr; c.height = h*dpr;
   const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
-  return { c, ctx, w, h, smooth:0, phase:Math.random()*10, last:-1e9, drawn:false, shimAt:(2 + Math.random()*6)*1000 };
+  return { c, ctx, w, h, tint:null, smooth:0, phase:Math.random()*10, last:-1e9, drawn:false, shimAt:(2 + Math.random()*6)*1000 };
 });
 function path(ctx, cx, cy, R, state, t, L, sy=1) {
   ctx.beginPath();
@@ -655,7 +791,8 @@ function draw(j, now) {
   j.last = now; j.drawn = true;
   const tReal = now/1000 + j.phase;
   const t = still ? 0 : tReal;
-  const breath = (state === 'idle' && !still) ? Math.sin(2*Math.PI*t/4.6) : 0;
+  const breath = (state === 'idle' && !still) ? Math.sin(2*Math.PI*t/4.6) * (c.hasAttribute('data-mini') ? 0.5 : 1) : 0;
+  if (c.hasAttribute('data-tint') && j.tint === null) j.tint = getComputedStyle(c).getPropertyValue('--pg').trim() || '';
   let target = level(state, t);
   if (still) target = 0.25;
   j.smooth += (target - j.smooth) * (target > j.smooth ? 0.55 : 0.12); // fast attack, slow release
@@ -663,7 +800,7 @@ function draw(j, now) {
   const scale = still && (state==='listening'||state==='speaking') ? 1.02 : 1;
   const water = state === 'speaking' && !c.hasAttribute('data-nowater');
   const cx = w/2, cy = water ? h*0.44 : h/2, R = Math.min(w, h) * (water ? 0.27 : 0.32) * scale * (1 + 0.025*breath);
-  const cel = css('--glazeCel'), ind = css('--glazeInd'), por = css('--porcelain'), amb = css('--glazeAmb'), t3 = css('--text3');
+  const cel = j.tint || css('--glazeCel'), ind = css('--glazeInd'), por = css('--porcelain'), amb = css('--glazeAmb'), t3 = css('--text3');
   const look = {
     idle:      { glow:cel, a:por, b:cel, glowA: still ? 0.40 + 0.05*Math.sin(2*Math.PI*tReal/8) : 0.35 + 0.12*breath },
     listening: { glow:cel, a:por, b:cel, glowA:0.4 + 0.4*L },
@@ -719,7 +856,7 @@ function draw(j, now) {
 }
 function frame(now) { jars.forEach(j => draw(j, now)); requestAnimationFrame(frame); }
 requestAnimationFrame(frame);
-const redrawAll = () => jars.forEach(j => { j.drawn = false; j.last = -1e9; });
+const redrawAll = () => jars.forEach(j => { j.drawn = false; j.last = -1e9; j.tint = null; });
 reduce.addEventListener('change', redrawAll);
 btn.addEventListener('click', redrawAll); // redraw static jars with new theme colors
 
