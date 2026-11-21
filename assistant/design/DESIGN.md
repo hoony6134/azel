@@ -794,7 +794,8 @@ tools); `icon/icon-preview.html` shows them on home screens, in the Dock and the
 
 - **Motif**: the in-call orb itself: exactly the §6.2 `jar(θ)` outline, drawn as a
   Catmull-Rom → cubic Bézier curve through 48 samples (no facets, no mouth or foot).
-  Porcelain body, soft glow, a soft floor shadow; on a jade gradient
+  Porcelain body and soft glow, optically centered (midpoint of bounding-box center and
+  area centroid), no floor shadow; on a jade gradient
   `#4E9A85 → #2F6F5F → #1E4A40`.
 - **iOS**: `AppIcon-1024.png` (opaque, full-bleed square; the system masks it),
   `AppIcon-1024-dark.png` (transparent background, celadon-tinted glow; iOS 18 dark
