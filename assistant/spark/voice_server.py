@@ -1399,9 +1399,15 @@ def ms(t0):
     return round((time.perf_counter() - t0) * 1000)
 
 
+CUT_NOTE = "(직전 답은 사용자가 '(여기서 끊김)'까지만 들었어. 그 뒤에 네가 쓴 내용은 전달되지 않았으니, 말한 것으로 치지 마.)"
+
+
 def recent_context(hist, n=6):
-    lines = [f"{'사용자' if m['role'] == 'user' else '비서'}: {m['content']}" for m in list(hist)[-n:]]
-    return ("최근 통화 내용:\n" + "\n".join(lines) + "\n\n") if lines else ""
+    turns = list(hist)[-n:]
+    lines = [f"{'사용자' if m['role'] == 'user' else '비서'}: {m['content']}" for m in turns]
+    # Claude's own transcript keeps the whole reply it wrote; this says how much of the last one was heard
+    cut = any(m["role"] == "assistant" and m["content"].endswith(CUT_MARK) for m in turns[-2:])
+    return ("최근 통화 내용:\n" + "\n".join(lines) + ("\n" + CUT_NOTE if cut else "") + "\n\n") if lines else ""
 
 
 TITLE_EVERY = 3  # replies without the title before it comes back
@@ -1829,9 +1835,34 @@ def real_content(text):
     return len(re.findall(r"[가-힣]", "".join(words))) >= 2 or bool(re.search(r"[A-Za-z]{3,}", text))
 
 
-def barge_verdict(text, voiced_s, vad_turn):
-    """While the assistant was speaking: 'interrupt' only for long enough speech with real content, else 'resume'."""
-    return "interrupt" if vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text) else "resume"
+TAIL_GUARD_S = 1.0  # the phone may still be playing this long after the server's estimate (network, buffering)
+PLAYED_WAIT_S = 2.0  # an app that reports "played": wait this long past the estimate for it, then go on anyway
+
+
+def _bigrams(s):
+    s = re.sub(r"[^가-힣a-z0-9]", "", s.lower())
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def is_echo(text, playing_text):
+    """The assistant's own voice coming back through the phone's speaker: most of the transcript is in what it
+    was just saying."""
+    heard = _bigrams(text)
+    return bool(heard) and len(heard & _bigrams(playing_text)) >= 0.6 * len(heard)
+
+
+def barge_verdict(text, voiced_s, vad_turn, playing_text=""):
+    """While the assistant was speaking: 'interrupt' only for long enough speech that is plainly meant for it (a stop
+    word, a question, or four syllables beyond fillers) and is not its own echo; else 'resume'. Whisper turns noise
+    into short made-up words ("오바자."), and the speaker's sound into the reply's own words."""
+    if not (vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text)):
+        return "resume"
+    if STOP_WORDS.search(text):
+        return "interrupt"
+    words = [w for w in text.split() if not FILLER_SOUNDS.fullmatch(w)]
+    meant = QUESTION.search(text) or len(re.findall(r"[가-힣]", "".join(words))) >= 4 \
+        or len(re.findall(r"[A-Za-z]{3,}", text)) >= 2
+    return "interrupt" if meant and not is_echo(text, playing_text) else "resume"
 
 
 def followup_action(text):
@@ -1884,7 +1915,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     # faster than real time, so "still talking" is judged by this, not by the task.
     # gen: the reply generation. Every reply claims a new one and an interrupt bumps it, so audio (and captions) a
     # superseded reply produces afterwards is dropped here: binary frames carry no id the app could check.
-    current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set(), "side": set()}
+    current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set(), "side": set(),
+                     "said": deque(maxlen=8),  # (sent at, text) of recent reply sentences, for the echo check
+                     # the reply whose audio went out last, and the last one the app reported fully played (an app
+                     # that sends {"type":"played"} at all: "reports")
+                     "audio_gen": 0, "played": None, "reports": False}
 
     def spawn(coro):
         """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
@@ -1916,9 +1951,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if audio is not None:
                 now = time.monotonic()
                 current["play_end"] = max(now, current["play_end"]) + len(audio) / 2 / 24000
+                current["audio_gen"] = gen or current["audio_gen"]
                 for i in range(0, len(audio), 9600):  # 200 ms chunks at 24 kHz
                     await ws.send_bytes(audio[i:i + 9600])
             else:
+                if obj.get("type") == "reply":
+                    current["said"].append((time.monotonic(), str(obj.get("text", ""))))
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
     guard = OpeningGuard()
@@ -1957,8 +1995,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     async def until_played():
         """Stay 'speaking' until the phone has played everything sent, plus a short tail: only then is it the
         user's turn. Speech meanwhile is a barge-in (pause/check), never a new turn. A pause stretches the wait."""
-        while current["paused_at"] is not None or (left := current["play_end"] + PLAY_TAIL_S - time.monotonic()) > 0:
-            await asyncio.sleep(0.05 if current["paused_at"] is not None else min(left, 0.2))
+        while current["paused_at"] is not None or (left := current["play_end"] + PLAY_TAIL_S - time.monotonic()) > 0 \
+                or (current["reports"] and current["played"] != current["audio_gen"]
+                    and time.monotonic() < current["play_end"] + PLAYED_WAIT_S):  # the estimate ended before the phone
+            await asyncio.sleep(0.05 if current["paused_at"] is not None or left <= 0 else min(left, 0.2))
+
+    def played_out():
+        """The app said the last reply's audio has finished playing on the phone (no estimate involved)."""
+        return current["reports"] and current["played"] == current["audio_gen"]
 
     async def pause():
         """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
@@ -1978,7 +2022,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         verdict, text = "resume", ""
         try:
             text = await transcribe(audio)
-            verdict = barge_verdict(text, voiced_s, vad_turn)
+            playing = " ".join(t for at, t in current["said"] if time.monotonic() - at < 60)
+            verdict = barge_verdict(text, voiced_s, vad_turn, playing)
+            print("barge-in:", verdict, f"{voiced_s:.1f}s", "echo" if is_echo(text, playing) else "", flush=True)
         except Exception as e:  # STT down: treat it as noise and play on
             print("barge-in check failed:", type(e).__name__, flush=True)
         finally:
@@ -2166,13 +2212,22 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
                     side(tap_interrupt())
+                if kind == "played":  # the phone finished reply N: playback really ends now, not at the estimate
+                    current["reports"] = True
+                    if json.loads(msg["text"]).get("reply_id") == current["audio_gen"]:
+                        current["played"] = current["audio_gen"]
+                        if current["paused_at"] is None:
+                            current["play_end"] = time.monotonic()
                 continue
             vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
                 now = time.monotonic()
                 task = current["task"]
                 busy = task and not task.done()
-                playing = now < current["play_end"] or current["paused_at"] is not None
+                # The tail guard: speech then still gets the barge-in check (echo, noise), never a free new turn
+                # whose reply_start would make the app drop the rest of a reply it is still playing.
+                playing = now < current["play_end"] + TAIL_GUARD_S * (current["play_end"] > 0 and not played_out()) \
+                    or current["paused_at"] is not None
                 if kind == "start" and guard.active(now):
                     guard.start(now)  # a placed call's opening: its own rules (first sentence, greetings)
                 elif kind == "start" and playing and current["paused_at"] is None and vad_turn.barge:
@@ -2305,6 +2360,18 @@ if __name__ == "__main__":
                                    ("그거 말고 내일 거", 1.2, "interrupt")]:
             assert barge_verdict(text, voiced, t) == want, (text, voiced)
         assert barge_verdict("잠깐만", 2.0, noisy) == "resume"  # noisy: voice never interrupts playback
+        playing = "대표님, 제가 쓸 수 있는 도구는 크게 여섯 묶음이에요. 먼저 기본 도구로는 파일 읽기가 있어요."
+        for text, want in [("오바자.", "resume"), ("여섯 점 해줘.", "interrupt"), ("쓸 수 있는 도구는 크게", "resume"),
+                           ("아니 그런 거 아니고", "interrupt"), ("어 확인했어", "interrupt"),
+                           ("그만 그만", "interrupt"), ("알았어", "resume"), ("뭐라고?", "interrupt"),
+                           ("양치해가지고 더 먹기가 좀 그래", "interrupt")]:  # from live calls: noise, echo, real
+            assert barge_verdict(text, 1.0, t, playing) == want, (text, want)
+        assert barge_verdict("you know what I mean", 1.5, t, "Well, you know what I mean, right?") == "resume"
+        assert barge_verdict("you know what I mean", 1.5, t, "다른 얘기") == "interrupt"
+        assert barge_verdict("You know...", 1.0, t, "Spicy stops, huh? Well, you know, since you're in the mood.") == "resume"
+        hist = [{"role": "user", "content": "도구 뭐 있어?"}, {"role": "assistant", "content": "도구는 여섯 묶음이에요." + CUT_MARK}]
+        assert CUT_NOTE in recent_context(hist) and CUT_NOTE not in recent_context(hist[:1] + [{"role": "assistant", "content": "네."}])
+        assert barge_verdict("파일 읽기", 1.0, t, playing) == "resume" and barge_verdict("그만 읽어", 1.0, t, playing) == "interrupt"
         for text, want in [("음", "ignore"), ("", "ignore"), ("아니 그거 말고", "replace"), ("잠깐", "replace"),
                            ("내일 날씨는 어때?", "replace"), ("그리고 메일도 확인해 줘", "replace"),
                            ("고마워요", "queue"), ("그리고 회의는 세 시예요", "queue")]:
@@ -2864,6 +2931,44 @@ if __name__ == "__main__":
             logs = [m for m in full.ws.sent if m.get("type") == "call_log" and m.get("event") == "turn"]
             links.remove(full)
             return list(history["azel:leak"]), prompts, logs
+        def played_check():
+            """An app that reports {"type":"played"}: the turn ends when the phone says the reply finished (here before
+            the estimate), and once it reports, a missing report holds the turn up to PLAYED_WAIT_S past the estimate."""
+            from fastapi.testclient import TestClient
+
+            async def fake_transcribe(audio):
+                return "안녕"
+
+            async def fake_llm(messages, max_tokens=600):
+                yield "물은 백 도에서 끓어요."
+
+            async def fake_tts(sentence):
+                return b"\0" * 48000, 24000  # one second
+            globals().update(transcribe=fake_transcribe, llm_stream=fake_llm, tts=fake_tts,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            speech = (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+            waits = []
+            with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
+                    "/v1/call?client=iphone&session=played", headers={"Authorization": "Bearer app-tok"}) as w:
+                for report in (True, False):
+                    w.send_bytes(speech)
+                    rid, t0 = None, None
+                    while True:
+                        m = w.receive()
+                        f = json.loads(m["text"]) if m.get("text") else {}
+                        if f.get("type") == "reply_start":
+                            rid, t0 = f["reply_id"], time.monotonic()
+                        if m.get("bytes") and report and rid:
+                            w.send_text(json.dumps({"type": "played", "reply_id": rid}))
+                            report = False
+                        if f.get("type") in ("turn_done", "error"):
+                            waits.append((f["type"], time.monotonic() - t0))
+                            break
+                w.send_text(json.dumps({"type": "hangup"}))
+            links.remove(full)
+            return waits
         def briefing_check(situation):
             """/v1/call?intent=briefing against a fake full gateway; returns (reply texts, frame types, call logs)."""
             from fastapi.testclient import TestClient
@@ -3100,6 +3205,8 @@ if __name__ == "__main__":
             globals().update(tts=real[1], llm_stream=real_llm)
         persona_check()
         logs = history_check()
+        (k1, early), (k2, held) = played_check()
+        assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
         hist, prompts, turn_logs = hangup_leak_check()
         assert hist[:2] == [{"role": "user", "content": "안녕"},
                             {"role": "assistant", "content": "물은 백 도에서 끓어요." + CUT_MARK}], hist
