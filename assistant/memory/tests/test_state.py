@@ -82,7 +82,9 @@ def test_leases(client):
 LIMITED_ONLY = [("put", "/v1/state/settings"), ("get", "/v1/state/push_tokens"), ("get", "/v1/state/approvals"),
                 ("post", "/v1/state/approvals/x"), ("post", "/v1/state/leases/x"), ("get", "/v1/state/sessions/v1"),
                 ("post", "/v1/state/calls"), ("post", "/v1/search"), ("get", "/v1/contacts"), ("get", "/v1/context"),
-                ("post", "/v1/records")]
+                ("post", "/v1/records"), ("get", "/v1/state/history"), ("get", "/v1/state/history/h1"),
+                ("post", "/v1/state/history/h1/start"), ("post", "/v1/state/history/h1/turns"),
+                ("post", "/v1/state/history/h1/end"), ("delete", "/v1/state/history/h1")]
 
 
 def limited_client(peer, token):
@@ -97,7 +99,7 @@ def assert_limited(lim):
     aid = lim.post("/v1/state/approvals", json={"device": "spark", "command": "rm x"}).json()["approval_id"]
     assert lim.get(f"/v1/state/approvals/{aid}").status_code == 200
     for method, path in LIMITED_ONLY:
-        r = getattr(lim, method)(path, **({"json": {}} if method in ("put", "post") else {}))
+        r = getattr(lim, method)(path, **({"json": {}} if method in ("put", "post") else {}))  # incl. history
         assert r.status_code == 403, (method, path, r.status_code)
 
 
@@ -136,6 +138,48 @@ def test_approval_ids_kept_on_migration(client):
     assert client.get("/v1/state/approvals/abcdef012345").json()["command"] == "git push"
     assert limited_client("100.64.0.8", "l1m").post("/v1/state/approvals", json={**body, "id": "0" * 12}).status_code == 403
     assert client.post("/v1/state/approvals", json={**body, "id": "nope"}).status_code == 422
+
+
+def test_call_history_round_trip(client):
+    t0 = time.time()
+    client.post("/v1/state/history/h1/start", json={"session": "s1", "call_id": "c1", "direction": "outgoing",
+                                                    "reason": "morning_briefing", "client": "iphone",
+                                                    "opening": "좋은 아침이에요.", "started_at": t0})
+    client.post("/v1/state/history/h1/turns", json={"user": "오늘 일정 알려줘", "assistant": ["10시에 회의가 있어요."],
+                                                    "route": "claude", "activity": ["캘린더 확인 중"],
+                                                    "timings": {"total_ms": 4200}})
+    client.post("/v1/state/history/h1/turns", json={"user": "고마워", "assistant": ["네."], "route": "qwen",
+                                                    "interrupted": True})
+    assert client.post("/v1/state/history/h1/turns", json={"user": ""}).status_code == 422  # no empty turns
+    assert client.post("/v1/state/history/h1/end", json={"ended_at": t0 + 95}).json() == {"ok": True, "turns": 2}
+    [row] = client.get("/v1/state/history").json()
+    assert row["id"] == "h1" and row["title"] == "오늘 일정 알려줘" and row["turns"] == 2
+    assert row["routes"] == {"claude": 1, "qwen": 1} and abs(row["duration_s"] - 95) < 1 and row["direction"] == "outgoing"
+    full = client.get("/v1/state/history/h1").json()
+    assert [t["user"] for t in full["turns"]] == ["오늘 일정 알려줘", "고마워"]
+    assert full["turns"][0]["activity"] == ["캘린더 확인 중"] and full["turns"][1]["interrupted"] is True
+    assert full["opening"] == "좋은 아침이에요." and full["client"] == "iphone"
+    assert [r["id"] for r in client.get("/v1/state/history?q=회의").json()] == ["h1"]
+    assert client.get("/v1/state/history?q=없는말").json() == []
+    assert client.get(f"/v1/state/history?before={t0 - 1}").json() == []
+    recs = client.post("/v1/search", json={"query": "오늘 일정 회의", "kinds": ["transcript"]}).json()
+    assert [r["meta"]["call"] for r in recs] == ["h1"] and "10시에 회의" in recs[0]["text"]
+
+
+def test_call_history_delete_and_prune(client):
+    for hid, age in [("old1", 400), ("new1", 1)]:
+        client.post(f"/v1/state/history/{hid}/start", json={"started_at": time.time() - age * 86400})
+        client.post(f"/v1/state/history/{hid}/turns", json={"user": f"{hid} 안녕", "assistant": ["네"]})
+        client.post(f"/v1/state/history/{hid}/end", json={})
+    assert client.delete("/v1/state/history?older_than_days=365").json() == {"deleted": 1}
+    ids = [r["id"] for r in client.get("/v1/state/history?limit=100").json()]
+    assert "old1" not in ids and "new1" in ids
+    assert client.delete("/v1/state/history/new1").json() == {"deleted": 1}
+    assert client.get("/v1/state/history/new1").status_code == 404
+    assert client.delete("/v1/state/history/new1").status_code == 404
+    recs = client.post("/v1/search", json={"query": "안녕", "kinds": ["transcript"], "limit": 100}).json()
+    assert not {"old1", "new1"} & {r["meta"].get("call") for r in recs}  # their transcripts went too
+    assert client.delete("/v1/state/history?older_than_days=0").status_code == 422
 
 
 def test_bad_tokens(client):

@@ -60,6 +60,7 @@ DEFAULTS = {
                   "triggers": {"deadline": True, "server_down": True}},
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
+    "history_days": 365,  # call history kept this long; 0 = forever
 }
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
 
@@ -164,9 +165,37 @@ def write_private(path, text):
 
 
 state = State(STATE_URL)
-PENDING_USAGE = HOME / "pending_usage.json"  # usage rows written while ruchba was down; flushed on the next write
-REJECTED_USAGE = HOME / "usage_rejected.jsonl"  # rows ruchba refused (4xx): kept for a look, never retried
-pending_usage: list[dict] = json.loads(PENDING_USAGE.read_text()) if PENDING_USAGE.exists() else []
+
+
+class Outbox:
+    """Writes to ruchba that must not be lost: queued in a 0600 file while ruchba is down and sent in order
+    on the next put. A body ruchba refuses (4xx) goes to the `rejected` file instead of blocking the queue."""
+
+    def __init__(self, name, rejected, route):
+        self.file, self.rejected, self.route = HOME / name, HOME / rejected, route
+        self.items: list[dict] = json.loads(self.file.read_text()) if self.file.exists() else []
+
+    async def put(self, body):
+        self.items.append(body)
+        try:
+            while self.items:
+                try:
+                    await state.call("POST", self.route(self.items[0]), self.items[0])
+                except HTTPException as e:  # refused, not unreachable: retrying would block the queue forever
+                    with self.rejected.open("a") as f:
+                        f.write(json.dumps({"status": e.status_code, "row": self.items[0]}, ensure_ascii=False) + "\n")
+                self.items.pop(0)
+        except StateDown:
+            pass  # kept in the file until ruchba is back
+        if self.items or self.file.exists():
+            write_private(self.file, json.dumps(self.items, ensure_ascii=False))
+
+
+usage_outbox = Outbox("pending_usage.json", "usage_rejected.jsonl", lambda b: "/v1/state/usage")
+pending_usage = usage_outbox.items  # usage rows not yet in ruchba (they still count against the budget)
+HISTORY_PATHS = {"start": "start", "turn": "turns", "end": "end"}
+history_outbox = Outbox("pending_history.json", "history_rejected.jsonl",
+                        lambda b: f"/v1/state/history/{quote(b['log_id'], safe='')}/{HISTORY_PATHS[b['event']]}")
 local_devices: dict[str, dict] = {}  # daemons that registered here, so this device works offline
 
 
@@ -207,19 +236,16 @@ async def month_cost():
 
 
 async def record_usage(row):
-    pending_usage.append({"ts": time.time(), "device": DEVICE, **row})
-    try:
-        while pending_usage:
-            try:
-                await state.call("POST", "/v1/state/usage", pending_usage[0])
-            except HTTPException as e:  # refused, not unreachable: retrying would block the queue forever
-                with REJECTED_USAGE.open("a") as f:
-                    f.write(json.dumps({"status": e.status_code, "row": pending_usage[0]}, ensure_ascii=False) + "\n")
-            pending_usage.pop(0)
-    except StateDown:
-        pass  # kept in PENDING_USAGE until ruchba is back
-    if pending_usage or PENDING_USAGE.exists():
-        write_private(PENDING_USAGE, json.dumps(pending_usage))
+    await usage_outbox.put({"ts": time.time(), "device": DEVICE, **row})
+
+
+async def record_call_log(m):
+    """A call_log event from the voice server (start / turn / end) into the shared call history."""
+    if MODE != "full" or m.get("event") not in HISTORY_PATHS or not isinstance(m.get("log_id"), str) or not m["log_id"]:
+        return  # history is personal: limited gateways never store it
+    if m["event"] == "turn" and not str(m.get("user", "")).strip():
+        return  # nothing was said
+    await history_outbox.put({k: v for k, v in m.items() if k != "type"})
 
 
 async def push_tokens():
@@ -545,7 +571,7 @@ async def place_call(reason, opening=None):
     except StateDown:
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
-    await link_send({"type": "call", "call_id": call_id, "opening": opening or ""})
+    await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason})
     caller = (await load_settings())["assistant_name"]
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": caller})
     return {"call_id": call_id, **push}
@@ -570,6 +596,13 @@ async def scheduler_tick(now, fired):
     """Fire each due job once across all gateways: whoever takes the job's per-day lease runs it."""
     s = await load_settings()
     hm, today = now.strftime("%H:%M"), now.date()
+    if hm == RETENTION_AT and fired.get("retention") != today and s.get("history_days", 0) > 0:
+        fired["retention"] = today
+        try:
+            if await take_lease(f"job:retention:{today}", 86400):
+                await state.call("DELETE", "/v1/state/history", older_than_days=s["history_days"])
+        except StateDown:
+            pass  # tomorrow, then
     jobs = {"morning_briefing": lambda: place_call("morning_briefing")}
     if s["proactive"]["triggers"].get("deadline"):
         jobs["deadline_check"] = deadline_call
@@ -584,6 +617,9 @@ async def scheduler_tick(now, fired):
                 won = False  # a missed briefing beats several phones ringing at once
             if won:
                 await job()
+
+
+RETENTION_AT = "04:00"  # call history older than history_days is deleted daily (quiet hours do not matter)
 
 
 async def scheduler():
@@ -631,6 +667,8 @@ async def handle_link(ws):
             tasks[m["id"]] = asyncio.create_task(serve_ask(m))
         elif m.get("type") == "cancel" and (t := tasks.pop(m.get("id"), None)):
             t.cancel()
+        elif m.get("type") == "call_log":
+            await record_call_log(m)  # in order, so a call's turns follow its start
         for k in [k for k, t in tasks.items() if t.done()]:
             tasks.pop(k)
     for t in tasks.values():
@@ -708,6 +746,9 @@ async def put_settings(body: dict):
         raise HTTPException(400, "assistant_name: 1-12 Hangul/Latin letters or spaces")
     if name is not None:
         body["assistant_name"] = " ".join(name.split())
+    days = body.get("history_days")
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
+        raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
     s = await load_settings() | body
     await save_settings(s)
     await link_send({"type": "settings", "value": s})
@@ -766,6 +807,44 @@ async def register(body: dict):
 @app.get("/v1/devices")
 async def devices():
     return await state.get("/v1/state/devices", list(local_devices.values()))
+
+
+def full_only():
+    if MODE != "full":
+        raise HTTPException(403, "call history is not available on a limited gateway")
+
+
+@app.get("/v1/history")
+async def history(limit: int = 20, before: float | None = None, q: str | None = None):
+    full_only()
+    params = {"limit": limit} | ({"before": before} if before is not None else {}) | ({"q": q} if q else {})
+    return await state.call("GET", "/v1/state/history", **params)
+
+
+@app.get("/v1/history/{hid}")
+async def history_item(hid: str):
+    full_only()
+    row = await state.call("GET", f"/v1/state/history/{quote(hid, safe='')}")
+    if row is None:
+        raise HTTPException(404, "no such call")
+    return row
+
+
+@app.delete("/v1/history/{hid}")
+async def history_delete(hid: str):
+    full_only()
+    row = await state.call("DELETE", f"/v1/state/history/{quote(hid, safe='')}")
+    if row is None:
+        raise HTTPException(404, "no such call")
+    return row
+
+
+@app.delete("/v1/history")
+async def history_prune(older_than_days: float):
+    full_only()
+    if older_than_days <= 0:
+        raise HTTPException(400, "older_than_days must be positive")
+    return await state.call("DELETE", "/v1/state/history", older_than_days=older_than_days)
 
 
 @app.post("/v1/push/register")

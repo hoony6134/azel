@@ -378,6 +378,77 @@ def test_migration_retries_when_ruchba_is_down(tmp_path, monkeypatch):
     assert not (tmp_path / "migrated_from_sqlite").exists()  # tried again on the next start
 
 
+CALL_LOG = [
+    {"type": "call_log", "event": "start", "log_id": "L1", "session": "s1", "call_id": "c1", "direction": "outgoing",
+     "reason": "morning_briefing", "client": "iphone", "opening": "좋은 아침이에요.", "started_at": 1.0},
+    {"type": "call_log", "event": "turn", "log_id": "L1", "user": "오늘 일정 알려줘", "assistant": ["10시 회의예요."],
+     "route": "claude", "activity": ["캘린더 확인 중"], "timings": {"total_ms": 4000}, "interrupted": False},
+    {"type": "call_log", "event": "turn", "log_id": "L1", "user": "  ", "assistant": []},  # silence: skipped
+    {"type": "call_log", "event": "end", "log_id": "L1", "ended_at": 61.0, "duration_s": 60.0},
+]
+
+
+class LinkWS:
+    def __init__(self, msgs):
+        self.msgs = msgs
+
+    async def send(self, raw):
+        pass
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for m in self.msgs:
+            yield json.dumps(m)
+
+
+def test_call_history_round_trip(gw):
+    g, c, _ = gw
+    asyncio.run(g.handle_link(LinkWS(CALL_LOG)))
+    h = g.fake.db["history"]["L1"]
+    assert [t["user"] for t in h["turns"]] == ["오늘 일정 알려줘"] and h["ended"] and h["direction"] == "outgoing"
+    assert "type" not in h and h["turns"][0]["activity"] == ["캘린더 확인 중"]
+    assert c.get("/v1/history").json() == [{"id": "L1", "title": "오늘 일정 알려줘", "turns": 1}]
+    assert c.get("/v1/history?q=일정").json()[0]["id"] == "L1" and c.get("/v1/history?q=없음").json() == []
+    assert c.get("/v1/history/L1").json()["opening"] == "좋은 아침이에요."
+    assert c.delete("/v1/history/L1").json() == {"deleted": 1}
+    assert c.get("/v1/history/L1").status_code == 404 and c.delete("/v1/history/L1").status_code == 404
+    assert c.delete("/v1/history?older_than_days=30").json() == {"deleted": 0} and g.fake.pruned == 30
+    assert c.delete("/v1/history?older_than_days=0").status_code == 400
+
+
+def test_call_history_survives_an_outage(gw):
+    g, c, tmp = gw
+    g.fake.state.down = True
+    asyncio.run(g.handle_link(LinkWS(CALL_LOG[:2])))
+    assert len(g.history_outbox.items) == 2 and (tmp / "pending_history.json").exists()
+    g.fake.state.down = False
+    asyncio.run(g.handle_link(LinkWS(CALL_LOG[3:])))
+    assert g.fake.db["history"]["L1"]["ended"] and len(g.fake.db["history"]["L1"]["turns"]) == 1
+    assert g.history_outbox.items == []
+
+
+def test_history_days_setting_and_retention(gw, monkeypatch):
+    g, c, _ = gw
+    assert c.get("/v1/settings").json()["history_days"] == 365
+    for bad in [-1, 1.5, "30", True, 99999]:
+        assert c.put("/v1/settings", json={"history_days": bad}).status_code == 400, bad
+    assert c.put("/v1/settings", json={"history_days": 30}).status_code == 200
+    g.in_quiet_hours = lambda s, now=None: True  # 04:00 is in quiet hours; retention runs anyway
+    at4 = datetime(2026, 11, 22, 4, 0, tzinfo=g.KST)
+    asyncio.run(g.scheduler_tick(at4, {}))
+    assert g.fake.pruned == 30
+    g.fake.pruned = None
+    monkeypatch.setattr(g, "INSTANCE", "albireo-x")  # another gateway, same minute: lease taken, no second prune
+    asyncio.run(g.scheduler_tick(at4, {}))
+    assert g.fake.pruned is None
+    c.put("/v1/settings", json={"history_days": 0})  # keep forever
+    monkeypatch.setattr(g, "INSTANCE", "macbook-y")
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 23, 4, 0, tzinfo=g.KST), {}))
+    assert g.fake.pruned is None
+
+
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
     g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}
@@ -461,6 +532,15 @@ def test_tokens_per_mode(tmp_path, monkeypatch):
     os.chmod(tmp_path / "link_token", 0o644)
     with pytest.raises(AssertionError, match="chmod 600"):
         start(tmp_path, monkeypatch)
+
+
+def test_limited_has_no_call_history(limited):
+    g, c, _ = limited
+    for method, path in [("get", "/v1/history"), ("get", "/v1/history/L1"), ("delete", "/v1/history/L1"),
+                         ("delete", "/v1/history?older_than_days=30")]:
+        assert getattr(c, method)(path).status_code == 403, path
+    asyncio.run(g.handle_link(LinkWS(CALL_LOG)))
+    assert g.fake.db["history"] == {} and g.history_outbox.items == []  # never stored, never queued
 
 
 def test_limited_never_seeds_settings(tmp_path, monkeypatch):

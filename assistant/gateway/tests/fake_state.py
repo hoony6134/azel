@@ -13,7 +13,7 @@ def make():
     app = FastAPI()
     app.state.down = False
     db = {"settings": {}, "usage": [], "devices": {}, "push": {}, "calls": {}, "approvals": {}, "sessions": {},
-          "leases": {}}
+          "leases": {}, "history": {}}
     app.db = db
 
     @app.middleware("http")
@@ -119,5 +119,47 @@ def make():
             return {"held": False, **cur}
         db["leases"][name] = {"holder": body["holder"], "expires": time.time() + body["ttl_s"]}
         return {"held": True, **db["leases"][name]}
+
+    @app.post("/v1/state/history/{hid}/start")
+    def h_start(hid: str, body: dict):
+        db["history"].setdefault(hid, {"id": hid, "turns": []}).update(body)
+        return {"ok": True}
+
+    @app.post("/v1/state/history/{hid}/turns")
+    def h_turn(hid: str, body: dict):
+        if not body.get("user"):
+            raise HTTPException(422, "empty turn")
+        db["history"].setdefault(hid, {"id": hid, "turns": []})["turns"].append(body)
+        return {"ok": True}
+
+    @app.post("/v1/state/history/{hid}/end")
+    def h_end(hid: str, body: dict):
+        if hid not in db["history"]:
+            raise HTTPException(404)
+        db["history"][hid].update(body, ended=True)
+        return {"ok": True, "turns": len(db["history"][hid]["turns"])}
+
+    @app.get("/v1/state/history")
+    def h_list(limit: int = 20, q: str = ""):
+        rows = [{"id": h["id"], "title": h["turns"][0]["user"] if h["turns"] else None, "turns": len(h["turns"])}
+                for h in db["history"].values() if not q or any(q in t["user"] for t in h["turns"])]
+        return rows[:limit]
+
+    @app.get("/v1/state/history/{hid}")
+    def h_get(hid: str):
+        if hid not in db["history"]:
+            raise HTTPException(404)
+        return db["history"][hid]
+
+    @app.delete("/v1/state/history/{hid}")
+    def h_delete(hid: str):
+        if db["history"].pop(hid, None) is None:
+            raise HTTPException(404)
+        return {"deleted": 1}
+
+    @app.delete("/v1/state/history")
+    def h_prune(older_than_days: float):
+        app.pruned = older_than_days
+        return {"deleted": 0}
 
     return app

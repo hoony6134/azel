@@ -27,7 +27,8 @@ The voice server stores **no plaintext token**: it compares SHA-256 digests (`hm
 
 Auth: `Authorization: Bearer <client token>` header (preferred); the `?token=` query is a fallback
 for old clients only (it can end up in proxy logs). Both are checked against the `client` hashes.
-Query: `session` (stable per conversation), optional `call_id` (set when
+Query: `session` (stable per conversation), optional `client` (`iphone`|`mac`|`terminal`, for the call
+history), optional `call_id` (set when
 answering a call the assistant placed; the server then speaks that call's opening first).
 
 - Client → server **binary**: mono PCM16 little-endian, 16 kHz, any frame size
@@ -70,9 +71,15 @@ JSON text frames:
   would replace a link of the other mode is ignored),
   `{"type":"settings","value":{…}}` (on connect and every change; from any full-mode link, the last
   one wins, since all gateways read the same shared settings; ignored from limited links),
-  `{"type":"call","call_id","opening"}` (sent before the VoIP push; accepted from any full-mode link,
+  `{"type":"call","call_id","opening","reason"}` (sent before the VoIP push; accepted from any full-mode link,
   ignored without a string `call_id`; the voice server synthesizes the opening on arrival),
   `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
+- voice → gateway: `{"type":"call_log","event":"start"|"turn"|"end","log_id",…}` — call history, sent
+  only to a full-mode link (dropped when none is up; the voice server stores no history):
+  start `{"session","call_id","direction":"outgoing"|"incoming","reason","client","opening","started_at"}`,
+  turn `{"user","assistant":["sentence",…],"route","activity":["label",…],"timings","interrupted","at"}`
+  (never for an empty transcript; fillers left out), end `{"ended_at","duration_s"}`. One `log_id` per
+  `/v1/call` connection; a turn cut short by hang-up is sent before the end.
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
@@ -91,7 +98,8 @@ get only the current utterance, never the call's earlier turns (which may be per
 For the phone without Tailscale. Exposed paths only; everything else is blocked at the proxy:
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
-  `POST /v1/approvals/{id}`, `POST /v1/push/register` (bearer header).
+  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|DELETE /v1/history`, `GET|DELETE
+  /v1/history/{id}` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -159,6 +167,14 @@ device that created them.
   the app sends its PushKit token.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
+- Call history (full gateways only; limited → 403), stored in ruchba (section 5):
+  `GET /v1/history?limit=20&before=<epoch>&q=` → `[{"id","title" (first user utterance),"started_at",
+  "duration_s","direction","reason","client","turns","routes":{"qwen":n,"claude":m}}]`, newest first;
+  `GET /v1/history/{id}` → the call with `"turns":[{"at","user","assistant","route","activity","timings",
+  "interrupted"}]`; `DELETE /v1/history/{id}`; `DELETE /v1/history?older_than_days=N`. Setting
+  `history_days` (default 365, 0 = forever): a full gateway deletes older calls daily at 04:00 (lease
+  `job:retention:<date>`). Gateways write the voice server's `call_log` events through a restart-proof
+  outbox (`pending_history.json`).
 - `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call. One call per alert set per
   10 min across gateways (lease `alert:<names>`); if ruchba is down, the gateway calls anyway.
 - Scheduled jobs (morning briefing, deadline check) run on every full gateway's clock; the one that
@@ -242,3 +258,12 @@ records, search, contacts and context, answers 403) when either:
 - `POST /v1/state/leases/{name}` `{"holder","ttl_s"}` (0 < ttl ≤ 7 days) → `{"held","holder","expires"}`.
   Atomic: taken if free or expired, renewed if `holder` already holds it, else `held:false` with the
   current holder. `DELETE /v1/state/leases/{name}?holder=` → `{"released":bool}`.
+- Call history (full callers only; personal): `POST /v1/state/history/{id}/start` (body as the voice
+  server's start event), `POST /v1/state/history/{id}/turns` (a turn; `user` must be non-empty),
+  `POST /v1/state/history/{id}/end` `{"ended_at","duration_s"}` → `{"ok","turns"}`, which also files the
+  whole transcript as a `transcript` record (`meta.call` = id) so `/v1/search` finds past calls;
+  `GET /v1/state/history?limit&before&q` (q matches opening, user and assistant text),
+  `GET /v1/state/history/{id}`, `DELETE /v1/state/history/{id}` and
+  `DELETE /v1/state/history?older_than_days=N` (also delete those calls' transcript records). Tables
+  `call_history` and `call_turns` (on delete cascade) in the state schema; the existing `calls` table
+  stays the placed-call openings.

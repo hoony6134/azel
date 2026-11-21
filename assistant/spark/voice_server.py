@@ -152,6 +152,15 @@ class GatewayLinks:
             if owner is lk:
                 q.put_nowait({"type": "error", "message": "게이트웨이 연결이 끊겼어요."})
 
+    async def log(self, event):
+        """A call_log event for the call history. Only to a full-mode link (history is personal); dropped when
+        none is up. This shared machine never keeps history itself."""
+        try:
+            lk = self.pick(personal=True)
+            await lk.send({"type": "call_log", **event})
+        except Exception as e:
+            print("call_log dropped:", event.get("event"), type(e).__name__, flush=True)
+
     def pick(self, personal: bool) -> Link:
         """The link for one ask; RuntimeError carries a speakable reason when none may take it."""
         ranked = sorted(self.links, key=lambda lk: (lk.fails >= 3, lk.priority))
@@ -191,7 +200,7 @@ class GatewayLinks:
                 old = self.openings.pop(next(iter(self.openings)))
                 if old["audio"]:
                     old["audio"].cancel()
-            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""))
+            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")))
         elif msg.get("id") in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
@@ -199,11 +208,11 @@ class GatewayLinks:
 links = GatewayLinks()
 
 
-def prepare_opening(text):
+def prepare_opening(text, reason=""):
     """Split a placed call's opening and start synthesizing it now, so the phone hears it the moment it
     connects (the push arrives seconds before the callee answers)."""
     parts = split_ready(text, final=True)[0] if text else []
-    op = {"text": text, "parts": parts, "audio": None}
+    op = {"text": text, "parts": parts, "audio": None, "reason": reason}
     if parts:
         try:
             op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts))
@@ -656,7 +665,7 @@ async def gateway_link(ws: WebSocket):
 
 
 @app.websocket("/v1/call")
-async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = ""):
+async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
     except HTTPException:
@@ -664,6 +673,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         return
     await ws.accept()
     session = session or f"call-{int(time.time())}"
+    log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
     vad_turn = Turn(SileroVoiceActivityDetector())
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
@@ -729,6 +739,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     async def answer(audio, text=None):
         t0, timings = time.perf_counter(), {}
+        turn = {"assistant": [], "activity": [], "route": "", "interrupted": False}
+
+        async def on_event(ev):
+            if ev.get("phase") in ("tool_start", "thinking"):
+                turn["activity"].append(ev.get("label", ""))
+            await send(ev)
         try:
             await send({"type": "state", "value": "thinking"})
             text = text if text is not None else await transcribe(audio)
@@ -737,24 +753,34 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 return
             await send({"type": "transcript", "text": text})
             started = False
-            async for s, route, pcm, sr in respond(text, session, t0, timings, on_event=send):
+            async for s, route, pcm, sr in respond(text, session, t0, timings, on_event=on_event):
                 if not started:
                     await send({"type": "state", "value": "speaking"})
                     started = True
+                turn["route"] = route
+                if s not in (FILLER, FILLER_LONG):
+                    turn["assistant"].append(s)
                 await send({"type": "reply", "text": s, "route": route})
                 await send(audio=pcm)
             timings["total_ms"] = ms(t0)
             await send({"type": "turn_done", "timings": timings})
         except asyncio.CancelledError:
+            turn["interrupted"] = True
             raise
         except Exception as e:  # keep the call alive on a failed turn
             await send({"type": "error", "message": f"{type(e).__name__}: {e}"})
         finally:
+            if text:  # turns with an empty transcript are not history
+                await links.log({"event": "turn", "log_id": log_id, "user": text, **turn,
+                                 "timings": timings, "at": time.time()})
             await send({"type": "state", "value": "listening"})
 
     try:
+        op = links.openings.pop(call_id, None) if call_id else None
+        await links.log({"event": "start", "log_id": log_id, "session": session, "call_id": call_id,
+                         "direction": "outgoing" if call_id else "incoming", "reason": (op or {}).get("reason", ""),
+                         "client": client[:20], "opening": (op or {}).get("text", ""), "started_at": started})
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
-            op = links.openings.pop(call_id, None)
             if op and op["parts"]:
                 history[session].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
@@ -793,6 +819,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     finally:
         if current["task"]:
             current["task"].cancel()
+            await asyncio.gather(current["task"], return_exceptions=True)  # its turn is logged before the end
+        ended = time.time()
+        await links.log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
 
 
 if __name__ == "__main__":
@@ -1091,6 +1120,47 @@ if __name__ == "__main__":
                 raise AssertionError(f"loaded {broken!r}")
             except AssertionError as e:
                 assert "loaded" not in str(e)
+        def history_check():
+            """One incoming call with one spoken turn: the full link gets start, turn and end call_log events."""
+            from fastapi.testclient import TestClient
+
+            async def fake_transcribe(audio):
+                return "안녕"
+
+            async def fake_llm(messages):
+                yield "네, 안녕하세요."
+
+            async def fake_tts(sentence):
+                return b"\0" * 480, 24000
+
+            def loud_vad():
+                return lambda frame: float(np.abs(np.frombuffer(frame, np.int16)).mean() > 1000)
+            globals().update(transcribe=fake_transcribe, llm_stream=fake_llm, tts=fake_tts,
+                             SileroVoiceActivityDetector=loud_vad)
+            full, lim = links.add(FakeWS()), links.add(FakeWS(), limited=True)
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            links.receive(lim, {"type": "hello", "device": "spark", "mode": "limited", "priority": 9})
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?client=iphone&session=h", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes((np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes())
+                while True:
+                    m = w.receive()
+                    if m.get("text") and json.loads(m["text"])["type"] == "turn_done":
+                        break
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.1)
+            logs = [m for m in full.ws.sent if m.get("type") == "call_log"]
+            links.remove(full)
+            links.remove(lim)
+            assert not [m for m in lim.ws.sent if m.get("type") == "call_log"]  # never to a limited gateway
+            return logs
+        logs = history_check()
+        assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
+        start, turn, end = logs
+        assert start["direction"] == "incoming" and start["client"] == "iphone" and start["session"] == "h"
+        assert turn["user"] == "안녕" and turn["assistant"] == ["네,", "안녕하세요."] and turn["route"] == "qwen"
+        assert turn["interrupted"] is False and "total_ms" in turn["timings"]
+        assert len({m["log_id"] for m in logs}) == 1 and end["duration_s"] >= 0
         at, after = tap_check(0.0)  # tapped during the first sentence: deferred until it has played
         assert 0.25 <= at < 1.0 and after == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.4)  # after the first sentence: immediate

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from huggingface_hub import hf_hub_download
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -87,6 +87,16 @@ create table if not exists {STATE}.sessions(
     voice_session text primary key, claude_session text not null, device text not null,
     updated timestamptz not null default now());
 create table if not exists {STATE}.leases(name text primary key, holder text not null, expires timestamptz not null);
+create table if not exists {STATE}.call_history(
+    id text primary key, session text, call_id text, direction text, reason text, client text, opening text,
+    started_at timestamptz not null default now(), ended_at timestamptz, duration_s double precision);
+create index if not exists call_history_started on {STATE}.call_history (started_at desc);
+create table if not exists {STATE}.call_turns(
+    id bigserial primary key, call text not null references {STATE}.call_history(id) on delete cascade,
+    at timestamptz not null default now(), user_text text not null, assistant jsonb not null default '[]',
+    route text, activity jsonb not null default '[]', timings jsonb not null default '{{}}',
+    interrupted boolean not null default false);
+create index if not exists call_turns_call on {STATE}.call_turns (call, id);
 """
 
 
@@ -474,6 +484,122 @@ def take_lease(name: str, lease: Lease):
 def release_lease(name: str, holder: str):
     return {"released": bool(db(f"delete from {STATE}.leases where name=%s and holder=%s returning name",
                                 (name, holder)))}
+
+
+# ---------- call history (full gateways only; personal) ----------
+HIST = f"{STATE}.call_history"
+TURNS = f"{STATE}.call_turns"
+
+
+class CallStart(BaseModel):
+    session: str = ""
+    call_id: str = ""
+    direction: str = Field("incoming", pattern="^(incoming|outgoing)$")
+    reason: str = ""
+    client: str = ""
+    opening: str = ""
+    started_at: float | None = None
+
+
+@app.post("/v1/state/history/{hid}/start", dependencies=[v1])
+def history_start(hid: str, c: CallStart):
+    db(f"insert into {HIST}(id, session, call_id, direction, reason, client, opening, started_at)"
+       " values(%s,%s,%s,%s,%s,%s,%s,coalesce(to_timestamp(%s), now())) on conflict(id) do update set"
+       " session=excluded.session, call_id=excluded.call_id, direction=excluded.direction, reason=excluded.reason,"
+       " client=excluded.client, opening=excluded.opening, started_at=excluded.started_at",
+       (hid, c.session, c.call_id, c.direction, c.reason, c.client, c.opening, c.started_at))
+    return {"ok": True}
+
+
+class CallTurn(BaseModel):
+    user: str = Field(min_length=1)
+    assistant: list[str] = []
+    route: str = ""
+    activity: list[str] = []
+    timings: dict = {}
+    interrupted: bool = False
+    at: float | None = None
+
+
+@app.post("/v1/state/history/{hid}/turns", dependencies=[v1])
+def history_turn(hid: str, t: CallTurn):
+    db(f"insert into {HIST}(id) values(%s) on conflict(id) do nothing", (hid,))  # a turn may beat its start
+    db(f"insert into {TURNS}(call, at, user_text, assistant, route, activity, timings, interrupted)"
+       " values(%s,coalesce(to_timestamp(%s), now()),%s,%s,%s,%s,%s,%s)",
+       (hid, t.at, t.user, Jsonb(t.assistant), t.route, Jsonb(t.activity), Jsonb(t.timings), t.interrupted))
+    return {"ok": True}
+
+
+class CallEnd(BaseModel):
+    ended_at: float | None = None
+    duration_s: float | None = None
+
+
+@app.post("/v1/state/history/{hid}/end", dependencies=[v1])
+def history_end(hid: str, e: CallEnd):
+    """Close the call and file its transcript as a `transcript` record, so memory search finds past calls."""
+    rows = db(f"update {HIST} set ended_at=coalesce(to_timestamp(%s), now()), duration_s=coalesce(%s,"
+              " extract(epoch from coalesce(to_timestamp(%s), now()) - started_at)) where id=%s"
+              " returning session, client, direction", (e.ended_at, e.duration_s, e.ended_at, hid))
+    if not rows:
+        raise HTTPException(404, "no such call")
+    turns = db(f"select user_text, assistant from {TURNS} where call=%s order by id", (hid,))
+    if turns:
+        text = "\n".join(f"사용자: {t['user_text']}\n비서: {' '.join(t['assistant'])}" for t in turns)
+        db("delete from records where kind='transcript' and meta->>'call' = %s", (hid,))  # an end may repeat
+        db("insert into records(kind, session, device, text, meta, embedding) values('transcript',%s,%s,%s,%s,%s)",
+           (rows[0]["session"], rows[0]["client"], text,
+            Jsonb({"call": hid, "direction": rows[0]["direction"]}), embed(text)))
+    return {"ok": True, "turns": len(turns)}
+
+
+LIST_COLS = f"""h.id, h.direction, h.reason, h.client, extract(epoch from h.started_at)::float8 as started_at,
+    h.duration_s,
+    (select user_text from {TURNS} t where t.call = h.id order by t.id limit 1) as title,
+    (select count(*) from {TURNS} t where t.call = h.id) as turns,
+    (select coalesce(jsonb_object_agg(route, n), '{{}}') from (select route, count(*) n from {TURNS} t
+        where t.call = h.id group by route) r) as routes"""
+
+
+@app.get("/v1/state/history", dependencies=[v1])
+def history_list(limit: int = 20, before: float | None = None, q: str | None = None):
+    rows = db(f"select {LIST_COLS} from {HIST} h where (%(before)s::float8 is null or h.started_at < to_timestamp(%(before)s))"
+              f" and (%(q)s::text is null or h.opening ilike %(like)s or exists (select 1 from {TURNS} t"
+              " where t.call = h.id and (t.user_text ilike %(like)s or t.assistant::text ilike %(like)s)))"
+              " order by h.started_at desc limit %(limit)s",
+              {"before": before, "q": q, "like": f"%{q}%", "limit": max(1, min(limit, 100))})
+    return rows
+
+
+@app.get("/v1/state/history/{hid}", dependencies=[v1])
+def history_get(hid: str):
+    rows = db(f"select id, session, call_id, direction, reason, client, opening, {EPOCH.format('started_at')},"
+              f" {EPOCH.format('ended_at')}, duration_s from {HIST} where id=%s", (hid,))
+    if not rows:
+        raise HTTPException(404, "no such call")
+    turns = db(f"select {EPOCH.format('at')}, user_text as user, assistant, route, activity, timings, interrupted"
+               f" from {TURNS} where call=%s order by id", (hid,))
+    return {**rows[0], "turns": turns}
+
+
+def delete_calls(ids):
+    if ids:
+        db("delete from records where kind='transcript' and meta->>'call' = any(%s)", (ids,))
+        db(f"delete from {HIST} where id = any(%s)", (ids,))  # turns go with them (on delete cascade)
+    return {"deleted": len(ids)}
+
+
+@app.delete("/v1/state/history/{hid}", dependencies=[v1])
+def history_delete(hid: str):
+    if not db(f"select 1 from {HIST} where id=%s", (hid,)):
+        raise HTTPException(404, "no such call")
+    return delete_calls([hid])
+
+
+@app.delete("/v1/state/history", dependencies=[v1])
+def history_prune(older_than_days: float = Query(gt=0)):
+    rows = db(f"select id from {HIST} where started_at < now() - make_interval(secs => %s)", (older_than_days * 86400,))
+    return delete_calls([r["id"] for r in rows])
 
 
 if __name__ == "__main__":
