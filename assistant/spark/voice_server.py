@@ -498,24 +498,50 @@ def korean_only(s: str) -> str:
     return t if re.search(r"[가-힣A-Za-z0-9]", t) else ""
 
 
-def split_ready(buf: str, final: bool, first: bool = False):
-    """Return (complete sentences, remainder) from the streamed text buffer.
+MIN_SYL = 5  # Qwen3-TTS garbles very short inputs ("네," came out as "쵸-"): never synthesize less alone
+_LETTER = re.compile(r"[가-힣A-Za-z0-9]")
 
-    first=True: nothing has been spoken yet, so a leading clause ending in a comma
-    ("네,") goes out alone. TTS time grows with length, so this starts the voice soonest.
+
+def syllables(s: str) -> int:
+    return len(_LETTER.findall(s))
+
+
+def split_ready(buf: str, final: bool, first: bool = False):
+    """Return (chunks ready for TTS, remainder) from the streamed text buffer.
+
+    Chunks end at a sentence end or at ", " (never mid-word or inside "3,000") and have at least MIN_SYL
+    syllables: a short sentence waits for the next one. first=True: nothing has been spoken yet, so a leading
+    clause ending in a comma goes out alone if it is long enough. TTS time grows with length, so this starts
+    the voice soonest. final=True: everything goes; a short tail joins the chunk before it.
     """
     if first and not final:
-        m = re.match(r"\s*([^,.!?\n]{1,12},)\s", buf)
-        if m:
-            return [m.group(1)], buf[m.end():]
-    parts = _SENT_END.split(buf)
-    done, rest = parts[:-1], parts[-1]
-    if final:
-        done, rest = parts, ""
-    elif len(rest) > 80 and "," in rest:  # flush an over-long clause at its last comma
-        cut = rest.rfind(",") + 1
-        done, rest = done + [rest[:cut]], rest[cut:]
-    return [k for k in (korean_only(s.strip()) for s in done) if k], rest
+        m = re.match(r"\s*([^,.!?\n]{1,20},)\s", buf)
+        if m and syllables(korean_only(m.group(1))) >= MIN_SYL:
+            return [korean_only(m.group(1).strip())], buf[m.end():]
+    parts = [p.strip() for p in _SENT_END.split(buf)]
+    rest = "" if final else parts.pop()
+    out, cur = [], ""
+    for p in parts:
+        p = korean_only(p)
+        if not p:
+            continue
+        cur = f"{cur} {p}".strip()
+        if syllables(cur) >= MIN_SYL:
+            out.append(cur)
+            cur = ""
+    if cur and final:
+        if out and syllables(cur) < MIN_SYL:
+            out[-1] += " " + cur
+        else:
+            out.append(cur)
+    elif cur:
+        rest = f"{cur} {rest}"
+    if not final and len(rest) > 80:  # flush an over-long clause at its last ", "
+        cuts = [m.end() for m in re.finditer(r",\s", rest)]
+        if cuts and syllables(rest[:cuts[-1]]) >= MIN_SYL:
+            out.append(korean_only(rest[:cuts[-1]].strip()))
+            rest = rest[cuts[-1]:]
+    return [c for c in out if c], rest
 
 
 def pick(table, text):
@@ -920,8 +946,8 @@ _tts_cache: dict[str, tuple[bytes, int]] = {}
 async def tts(sentence: str) -> tuple[bytes, int]:
     p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
-    # Fillers and short acknowledgements ("네,") repeat constantly: synthesize them once (per voice).
-    cacheable = sentence in (FILLER, FILLER_LONG) or len(sentence) <= 6
+    # Fillers repeat constantly: synthesize them once (per voice). Nothing short is ever sent alone now.
+    cacheable = sentence in (FILLER, FILLER_LONG)
     key = (voice, style, sentence)
     if cacheable and key in _tts_cache:
         return _tts_cache[key]
@@ -1523,12 +1549,16 @@ if __name__ == "__main__":
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
         assert split_ready("好的. 내일 봬요.", True)[0] == ["내일 봬요."] and korean_only("API 서버") == "API 서버"
-        assert split_ready("네! 알겠어요? 그럼", False) == (["네!", "알겠어요?"], "그럼")
+        assert split_ready("네! 알겠어요? 그럼", False) == (["네! 알겠어요?"], "그럼")  # "네!" alone is too short
+        assert split_ready("네. 말씀하세요", False) == ([], "네. 말씀하세요") and split_ready("네. 그럼요.", True)[0] == ["네. 그럼요."]
+        assert split_ready("오늘은 맑아요. 네.", True)[0] == ["오늘은 맑아요. 네."]
+        assert split_ready("모두 " + "3,000원이고 " * 12, False)[0] == []  # never cut inside a number
         assert split_ready("마지막 문장", True) == (["마지막 문장"], "")
-        assert split_ready("네, 알겠습니다. 오늘", False, first=True) == (["네,"], "알겠습니다. 오늘")
+        assert split_ready("네, 알겠습니다. 오늘", False, first=True) == (["네, 알겠습니다."], "오늘")
+        assert split_ready("오늘 날씨는요, 맑아요", False, first=True) == (["오늘 날씨는요,"], "맑아요")
         assert split_ready("네,", False, first=True) == ([], "네,")
         long = "가" * 70 + ", " + "나" * 20
-        assert split_ready(long, False) == (["가" * 70 + ","], " " + "나" * 20)
+        assert split_ready(long, False) == (["가" * 70 + ","], "나" * 20)
         assert now_kst().startswith(" 현재 시각: 20") and "요일" in now_kst()
         assert pick(MODEL_WORDS, "이번엔 오퍼스로 해 줘") == "opus" and pick(MODEL_WORDS, "안녕") is None
         assert pick(TASK_WORDS, "블루리프 레포 빌드 에러 고쳐 줘") == "code"
@@ -1807,7 +1837,7 @@ if __name__ == "__main__":
         said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
         assert said == ["클로드가 답해요."] and len(calls) == 2, said  # empty twice: Claude takes the turn
         said, _ = asyncio.run(ack_check(["네, 100도예요."]))
-        assert said == ["네,", "100도예요."], said  # an acknowledgement followed by content is fine
+        assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
@@ -2202,7 +2232,7 @@ if __name__ == "__main__":
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs
         assert start["direction"] == "outgoing" and start["client"] == "iphone" and start["session"] == "h"  # user called
-        assert turn["user"] == "안녕" and turn["assistant"] == ["네,", "안녕하세요."] and turn["route"] == "qwen"
+        assert turn["user"] == "안녕" and turn["assistant"] == ["네, 안녕하세요."] and turn["route"] == "qwen"
         assert turn["interrupted"] is False and "total_ms" in turn["timings"]
         assert len({m["log_id"] for m in logs}) == 1 and end["duration_s"] >= 0
         # scheduled calls: Korean time phrases (now = Saturday 2026-11-21 08:00 KST)
