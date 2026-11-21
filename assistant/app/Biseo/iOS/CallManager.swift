@@ -68,8 +68,16 @@ final class CallManager: NSObject, ObservableObject {
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
         // The system call UI's speaker button and AirPods coming and going change the route too.
-        NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.speaker = AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
+        NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self else { return }
+            let session = AVAudioSession.sharedInstance()
+            self.speaker = AudioRoute.speakerOn(session.currentRoute.outputs.map(\.portType))
+            // A headset connected mid-call takes the call, mic included.
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap(AVAudioSession.RouteChangeReason.init)
+            if self.inCall, reason == .newDeviceAvailable, let inputs = session.availableInputs,
+               let i = AudioRoute.headsetInput(inputs.map(\.portType)) {
+                try? session.setPreferredInput(inputs[i])
+            }
         }
     }
 
@@ -173,7 +181,9 @@ final class CallManager: NSObject, ObservableObject {
         connectedAt = nil
         error = nil
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .voiceChat)
+        // .allowBluetooth: AirPods and other headsets (HFP, mic and speaker) can carry the call;
+        // without it the route picker lists them but the route never moves (user bug, 2026-11-22).
+        try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
     }
 
     /// Runs from `didActivate`: the audio session is ours now. After a hold the socket is still up,
@@ -332,5 +342,15 @@ extension CallManager: PKPushRegistryDelegate {
             if err != nil { DispatchQueue.main.async { self?.incoming[uuid] = nil } }
             completion()
         }
+    }
+}
+
+/// Which route the call is on, from the session's port types (testable without a session).
+enum AudioRoute {
+    static func speakerOn(_ outputs: [AVAudioSession.Port]) -> Bool { outputs.contains(.builtInSpeaker) }
+
+    /// The headset input to prefer when one appears: Bluetooth HFP first, then a wired headset.
+    static func headsetInput(_ inputs: [AVAudioSession.Port]) -> Int? {
+        inputs.firstIndex(of: .bluetoothHFP) ?? inputs.firstIndex(of: .headsetMic)
     }
 }

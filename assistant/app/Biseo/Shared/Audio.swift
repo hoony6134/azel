@@ -117,6 +117,9 @@ final class AudioIO {
     private var pausedAt: Double?    // playback paused: the clock stands still
     let levels = Levels()
     var onMic: ((Data) -> Void)?
+    /// The hardware route or format changed under a running engine (AirPods in or out, a picked
+    /// route, 48 kHz → 16 kHz HFP). The engine has stopped itself; the owner restarts it. Main queue.
+    var onConfigurationChange: (() -> Void)?
     #if os(macOS)
     /// Core Audio device ids for the next start(); nil = system default.
     var inputDevice: AudioDeviceID?, outputDevice: AudioDeviceID?
@@ -127,6 +130,11 @@ final class AudioIO {
         engine.connect(player, to: engine.mainMixerNode, format: PCM.speakerFormat)
         engine.attach(cuePlayer)
         engine.connect(cuePlayer, to: engine.mainMixerNode, format: PCM.speakerFormat)
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            guard let self, self.started else { return }
+            Log.call.info("audio route changed: restarting the engine")
+            self.onConfigurationChange?()
+        }
     }
 
     /// working/done/error/wake replace whatever cue is playing; ticks queue.
@@ -149,8 +157,9 @@ final class AudioIO {
         let input = engine.inputNode
         #if os(macOS)
         // Set before voice processing so the echo canceller pairs the chosen devices.
-        if let id = inputDevice { try? input.auAudioUnit.setDeviceID(id) }
-        if let id = outputDevice { try? engine.outputNode.auAudioUnit.setDeviceID(id) }
+        // nil = the system default, set explicitly: a device picked earlier would otherwise stick.
+        if let id = inputDevice ?? AudioDevices.defaultID(input: true) { try? input.auAudioUnit.setDeviceID(id) }
+        if let id = outputDevice ?? AudioDevices.defaultID(input: false) { try? engine.outputNode.auAudioUnit.setDeviceID(id) }
         #endif
         // Voice processing = echo cancellation + noise suppression; AGC explicitly on, never bypassed.
         try? input.setVoiceProcessingEnabled(true)

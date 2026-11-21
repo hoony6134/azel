@@ -100,6 +100,7 @@ final class CallClient {
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
         Log.call.info("call start session=\(session, privacy: .public) intent=\(intent ?? "-", privacy: .public) host=\(task.originalRequest?.url?.host ?? "?", privacy: .public)")
         task.resume()
+        audio.onConfigurationChange = { [weak self] in self?.routeChanged() }
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
             let action = sending ? Self.micAction(muted: muted, held: held) : .drop
@@ -302,8 +303,17 @@ final class CallClient {
         r?.finish()
     }
 
+    private var routeGate = RouteRestartGate()
+
+    /// The route changed under the engine: restart it once (a restart can itself post a change).
+    private func routeChanged() {
+        guard socket != nil, routeGate.shouldRestart(now: ProcessInfo.processInfo.systemUptime) else { return }
+        do { try restartAudio() } catch { onWarning?("오디오 장치를 바꾸지 못했어요") }
+    }
+
     /// iOS: CallKit gave the audio session back (after a hold or interruption); macOS: device change.
     func restartAudio() throws {
+        routeGate.restarted(now: ProcessInfo.processInfo.systemUptime)
         audio.stop()
         do { try audio.start() } catch { throw StartError.audio }
         if held { audio.pause() }
@@ -377,5 +387,20 @@ struct AudioAdmission: Equatable {
         case "state" where value == "speaking": admits = true
         default: break
         }
+    }
+}
+
+/// A route change restarts the engine at most once per half second: restarting can post another
+/// configuration change, which must not loop.
+struct RouteRestartGate {
+    static let quiet = 0.5
+    private var last: Double?
+
+    mutating func restarted(now: Double) { last = now }
+
+    mutating func shouldRestart(now: Double) -> Bool {
+        if let last, now - last < Self.quiet { return false }
+        last = now
+        return true
     }
 }

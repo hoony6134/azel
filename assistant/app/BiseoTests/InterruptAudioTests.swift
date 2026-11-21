@@ -78,3 +78,25 @@ final class ReplyStartTests: XCTestCase {
         XCTAssertEqual(k.spoken(played: 200, stepped: false), 1.5, accuracy: 0.01, "half of \"새 답\" (3 characters) at the restarted clock")
     }
 }
+
+final class RouteChangeTests: XCTestCase {
+    func testRestartOncePerBurstOfChanges() {
+        var g = RouteRestartGate()
+        XCTAssertTrue(g.shouldRestart(now: 10))
+        XCTAssertFalse(g.shouldRestart(now: 10.2), "the restart's own change is ignored")
+        XCTAssertTrue(g.shouldRestart(now: 10.6))
+        g.restarted(now: 20)                       // e.g. CallKit didActivate restarted it
+        XCTAssertFalse(g.shouldRestart(now: 20.3))
+        XCTAssertTrue(g.shouldRestart(now: 21))
+    }
+
+    #if os(iOS)
+    func testSpeakerAndHeadsetPicks() {
+        XCTAssertTrue(AudioRoute.speakerOn([.builtInSpeaker]))
+        XCTAssertFalse(AudioRoute.speakerOn([.bluetoothHFP]), "AirPods chosen: the 스피커 toggle turns off")
+        XCTAssertEqual(AudioRoute.headsetInput([.builtInMic, .bluetoothHFP]), 1)
+        XCTAssertEqual(AudioRoute.headsetInput([.builtInMic, .headsetMic]), 1)
+        XCTAssertNil(AudioRoute.headsetInput([.builtInMic]))
+    }
+    #endif
+}
