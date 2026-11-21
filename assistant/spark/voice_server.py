@@ -1308,16 +1308,23 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "resume"})
 
     async def barge_check(audio, voiced_s):
-        """Second stage: interrupt only for real speech, else let the reply play on."""
+        """Second stage: interrupt only for real speech, else let the reply play on. Whatever fails (STT down),
+        the app never stays paused."""
         t = time.perf_counter()
-        text = await transcribe(audio)
-        if barge_verdict(text, voiced_s, vad_turn) == "interrupt":
-            current["paused_at"] = None
-            await interrupt()
-            current["task"] = asyncio.current_task()
-            await answer(audio, text, timings={"barge_stt_ms": ms(t)})
-        else:
-            await resume()
+        verdict, text = "resume", ""
+        try:
+            text = await transcribe(audio)
+            verdict = barge_verdict(text, voiced_s, vad_turn)
+        except Exception as e:  # STT down: treat it as noise and play on
+            print("barge-in check failed:", type(e).__name__, flush=True)
+        finally:
+            if verdict != "interrupt":
+                await resume()
+        if verdict != "interrupt":
+            return
+        await interrupt()
+        current["task"] = asyncio.current_task()
+        await answer(audio, text, timings={"barge_stt_ms": ms(t)})
 
     async def followup(audio, prev):
         """Speech while the assistant is thinking: a replacement cancels the current answer, a follow-up waits."""
@@ -1343,6 +1350,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             task.cancel()
         current["play_end"] = guard.play_end = 0.0
         await send({"type": "interrupt"})  # barge-in: the client drops its queue
+        if current["paused_at"] is not None:  # it was paused: un-pause the (now empty) queue, or it stays stuck
+            current["paused_at"] = None
+            await send({"type": "resume"})
 
     async def speak_briefing():
         spoken = []
@@ -2045,6 +2055,61 @@ if __name__ == "__main__":
                 w.send_text(json.dumps({"type": "hangup"}))
             links.remove(gw_ws.lk)
             return commit_s
+        def pause_edge_check(stt_fails):
+            """A tap during a pause, or STT failing during a pause: the app is never left paused."""
+            from fastapi.testclient import TestClient
+
+            class BriefGW(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "briefing_context":
+                        links.receive(self.lk, {"id": m["id"], "type": "briefing_context", "situation": "메모", "facts": []})
+
+            async def long_briefing(messages, max_tokens=600):
+                for i in range(6):
+                    yield f"브리핑 {i}번째 문장이에요. "
+
+            async def long_tts(sentence):
+                return b"\0" * 96000, 24000
+
+            async def stt(audio):
+                if stt_fails:
+                    raise httpx.ConnectError("stt down")
+                return "음"
+            globals().update(llm_stream=long_briefing, tts=long_tts, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda frame: 0.95))
+            gw_ws = BriefGW()
+            gw_ws.lk = links.add(gw_ws)
+            links.receive(gw_ws.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            got = []
+
+            def until(w, kind):
+                while True:
+                    m = w.receive()
+                    if m.get("text"):
+                        got.append(json.loads(m["text"])["type"])
+                        if got[-1] == kind:
+                            return
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?intent=briefing&session=pe", headers={"Authorization": "Bearer app-tok"}) as w:
+                until(w, "reply")
+                if stt_fails:  # speech long enough for STT, which then fails
+                    w.send_bytes(np.zeros(8000, np.int16).tobytes() + tone(0.8, 9000, 11) + np.zeros(16000, np.int16).tobytes())
+                    until(w, "resume")
+                else:  # speech starts (pause), then the user taps
+                    w.send_bytes(np.zeros(8000, np.int16).tobytes() + tone(0.3, 9000, 12))
+                    until(w, "pause")
+                    w.send_text(json.dumps({"type": "interrupt"}))
+                    until(w, "resume")
+                    assert "interrupt" in got[got.index("pause"):], got
+                w.send_text(json.dumps({"type": "hangup"}))
+            links.remove(gw_ws.lk)
+            return got
+        got = pause_edge_check(stt_fails=False)
+        assert got.index("pause") < got.index("interrupt") < len(got) - 1 - got[::-1].index("resume") + 1
+        got = pause_edge_check(stt_fails=True)
+        assert got[-1] == "resume" and "interrupt" not in got[got.index("pause"):], got
         commit_s = barge_route_check()
         assert commit_s < 3.0, commit_s  # speech 0.8 s + 0.5 s trailing silence + STT (stubbed here)
         globals().update(llm_stream=real_llm, tts=real[1])

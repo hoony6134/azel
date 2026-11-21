@@ -46,7 +46,8 @@ answering a call the assistant placed; the server then speaks that call's openin
   - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
   - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
-    playback now** (after a `pause`, or after a tap-to-interrupt)
+    playback now** (after a `pause`, or after a tap-to-interrupt). An interrupt while paused is followed by
+    `resume`, so the (now empty) queue is never left paused; a barge-in check whose STT fails also resumes.
   - `{"type":"activity","phase","label","tool","kind","route":"claude"}` — what the assistant is doing, for
     the app's status line, icon and sounds. Only Claude turns send any; a Qwen turn sends none. `kind`:
     `calendar|mail|memory|schedule|server|files|web|terminal|notes|generic` (gistra/planit → schedule,
