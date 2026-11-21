@@ -3185,7 +3185,8 @@ if __name__ == "__main__":
         async def _collect(gen):
             return [x async for x, *_ in gen]
         # 2026-11-22 transcripts: nothing was scheduled, the assistant said it would call
-        assert unconfirmed_check("오분 있다가 호출어 확인이라고 전화해줘", ["오 분 뒤에 호출어 확인이라고 전화드릴게요."]) == [ASK_WHEN]
+        # (the fast path now parses "오분 있다가 …전화해줘" itself; with no time it is Qwen's, and Qwen must not lie)
+        assert unconfirmed_check("이따가 호출어 확인이라고 전화해줘", ["오 분 뒤에 호출어 확인이라고 전화드릴게요."]) == [ASK_WHEN]
         assert "unc" in pending_schedule  # the answer ("5분 뒤") completes the schedule
         assert unconfirmed_check("끝나면 전화해줄 수 있어", ["맥북 작업이 끝나면 바로 전화드릴게요."]) == ["클로드가 답해요."] \
             or task_intent("끝나면 전화해줄 수 있어")  # or the task route takes it
