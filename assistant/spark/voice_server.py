@@ -706,6 +706,13 @@ ACTION_CLAIM = re.compile(r"전화(를)? ?(드릴게요|드릴께요|드렸|걸�
                           r"실행했|열었(어요|습니다)|보냈(어요|습니다)|취소했")
 TOOL_REFUSED = re.compile(r"이미 통화 중|다 걸었어요|없는 도구|쓸 수 없어요|틀렸어요|실패|거절|만료|허용되지 않아|할 수 없어요|없어요\.?$")
 ASK_WHEN = "몇 분 뒤에 걸어 드릴까요?"
+ACTION_TOOLS = {"call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo"}
+CLAIM_FALLBACK = "그건 제가 직접 처리하지 못했어요. 어떻게 할지 다시 말씀해 주시겠어요?"
+
+
+def action_tool(name):
+    """mcp__azel__call_user, call_user, mcp__macbook__run_command, macbook__run_command, …"""
+    return str(name).rsplit("__", 1)[-1] in ACTION_TOOLS
 
 
 class Unconfirmed(Exception):
@@ -1291,16 +1298,32 @@ async def respond(text, session, t0, timings, on_event=None):
                 except asyncio.TimeoutError:
                     await sentences.put(line)
         nudger = asyncio.create_task(nudge())
+        acted, claimed = {"ok": False}, {"n": 0}
+
+        async def watch(ev):  # Claude, the API path and NIM all report their tool calls as activity
+            if ev.get("phase") == "tool_start" and action_tool(ev.get("tool", "")):
+                acted["ok"] = True
+            if on_event:
+                await on_event(ev)
+
+        async def speak(s):  # the action-claim gate, for every model's final text
+            if ACTION_CLAIM.search(s) and not acted["ok"]:
+                timings["unconfirmed"] = s[:80]
+                claimed["n"] += 1
+                if claimed["n"] == 1:
+                    await sentences.put(CLAIM_FALLBACK)
+                return
+            await sentences.put(s)
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
             thinking.append(Unthink())  # Claude/NIM output gets the same filter as Qwen's
             async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(hist),
-                                                     on_event=on_event), thinking[-1]):
+                                                     on_event=watch), thinking[-1]):
                 got_text.set()
                 buf += delta
                 done, buf = split_ready(buf, final=False)
                 for s in done:
-                    await sentences.put(s)
+                    await speak(s)
         except RuntimeError as e:
             buf = str(e)
         except httpx.HTTPError:
@@ -1308,7 +1331,7 @@ async def respond(text, session, t0, timings, on_event=None):
         finally:
             nudger.cancel()
         for s in split_ready(buf, final=True)[0]:
-            await sentences.put(s)
+            await speak(s)
 
     async def produce():
         try:
@@ -3189,6 +3212,23 @@ if __name__ == "__main__":
         assert said == "내일 오전 10시에 깨워 드릴게요." and len(sent) == 1 and sent[0]["type"] == "tool_call"
         assert sent[0]["name"] == "call_user" and sent[0]["args"] == {"when": "2026-11-22T10:00:00+09:00",
                                                                      "reason": "깨우는 전화", "kind": "wake", "repeat": None}
+        def claude_claim_check(events):
+            """Claude's text claims a call: spoken only when a call/task tool ran in this turn."""
+            async def claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                for ev in events:
+                    await on_event(ev)
+                yield "네, 10분 뒤에 전화드릴게요. 다른 건 없으세요?"
+
+            async def fake_tts(sentence, *a, **k):
+                return b"", 24000
+            globals().update(claude_stream=claude, tts=fake_tts, FILLER_AFTER_S=5)
+            out = asyncio.run(_collect(respond("오퍼스로 10분 뒤에 전화 좀", "ccc", time.perf_counter(), {})))
+            globals().update(claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
+            return out
+        assert claude_claim_check([]) == [CLAIM_FALLBACK, "다른 건 없으세요?"]  # nothing scheduled it
+        tool = {"type": "activity", "phase": "tool_start", "tool": "mcp__azel__call_user", "label": "", "kind": "generic"}
+        assert claude_claim_check([tool]) == ["네, 10분 뒤에 전화드릴게요.", "다른 건 없으세요?"]
+        assert action_tool("macbook__run_command") and not action_tool("mcp__claude_ai_Cygnus_MCP__gistra_today")
         said, sent, prompts = gateway_tools_check()
         assert said == ["앱에서 허용해 주세요.", "크롬을 열었어요."], said
         assert sent[0]["name"] == "macbook__run_command" and sent[0]["args"] == {"command": "open -a Chrome"}
