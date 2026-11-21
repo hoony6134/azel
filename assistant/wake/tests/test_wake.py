@@ -455,3 +455,14 @@ def test_part_file_exists_while_capturing_and_is_renamed_when_done(tmp_path):
     lis.run(stream())
     assert seen == [[".pcm.part"]]
     assert [p.suffix for p in (tmp_path / "azel").iterdir()] == [".pcm"]
+
+
+def test_unwritable_utterance_dir_hands_over_without_the_file(tmp_path, capsys):
+    blocker = tmp_path / "file"
+    blocker.write_text("")  # a file where the folder should be: mkdir fails
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", utterance_dir=str(blocker / "azel"),
+                          open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
+    assert opened == ["azel://wake?persona=azel"]  # no utterance= the app would wait for
+    assert "utterance file failed" in capsys.readouterr().out and "utterance" not in log_lines(tmp_path)[0]

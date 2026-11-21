@@ -17,7 +17,6 @@ import itertools
 import json
 import os
 import queue
-import os
 import re
 import secrets
 import subprocess
@@ -180,10 +179,11 @@ class Listener:
             persona = primary_persona(self.cfg, self.http)
             entry["handoff"], entry["persona"] = "app", persona
             uid = f"{int(time.time())}-{secrets.token_hex(3)}" if one_breath else None
+            if uid and not self.begin_utterance(uid):  # the .part file tells the app a capture is under way
+                uid = None  # no file to hand over: the app just listens itself
             url = f"azel://wake?persona={quote(persona)}" + (f"&utterance={uid}" if uid else "")
             opened = self.open_url(url)
             if uid:
-                self.begin_utterance(uid)  # the .part file tells the app a capture is under way
                 pcm = self.capture_utterance(frames, ring)  # always written, empty when nobody spoke: the app waits for it
                 entry["utterance"], entry["utterance_s"] = uid, round(len(pcm) / SR, 2)
                 self.write_utterance(uid, pcm)
@@ -242,10 +242,16 @@ class Listener:
         d = Path(self.cfg["utterance_dir"]).expanduser()
         return d, d / f"wake-utterance-{uid}.pcm.part", d / f"wake-utterance-{uid}.pcm"
 
-    def begin_utterance(self, uid):
+    def begin_utterance(self, uid) -> bool:
+        """Create wake-utterance-<uid>.pcm.part; False (logged) if the folder or file can't be made."""
         d, part, _ = self.utterance_paths(uid)
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.close(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        try:
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.close(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            return True
+        except OSError as e:
+            print(f"utterance file failed ({type(e).__name__}: {e}); handing over without it", flush=True)
+            return False
 
     def write_utterance(self, uid, pcm) -> Path:
         """wake-utterance-<uid>.pcm (16 kHz mono int16 LE, 0600), renamed from .pcm.part so an existing .pcm is complete."""

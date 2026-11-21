@@ -2036,8 +2036,9 @@ def barge_verdict(text, voiced_s, vad_turn, playing_text=""):
     into short made-up words ("오바자."), and the speaker's sound into the reply's own words."""
     if not (vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text)):
         return "resume"
-    if STOP_WORDS.search(text):
-        return "interrupt"
+    if stop := STOP_WORDS.search(text):  # "아니요…" in the reply itself can come back through the speaker
+        echoed = stop.group(0).lower() in playing_text.lower() and is_echo(text, playing_text)
+        return "resume" if echoed else "interrupt"
     words = [w for w in text.split() if not FILLER_SOUNDS.fullmatch(w)]
     meant = QUESTION.search(text) or len(re.findall(r"[가-힣]", "".join(words))) >= 4 \
         or len(re.findall(r"[A-Za-z]{3,}", text)) >= 2
@@ -2452,6 +2453,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         await links.log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
         await links.brain_event({"type": "call_event", "event": "end", "session": session})
         links.session_ctx.pop(session, None)
+        for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
+            games.pop(k, None)
 
 
 if __name__ == "__main__":
@@ -2562,6 +2565,9 @@ if __name__ == "__main__":
         assert barge_verdict("You know...", 1.0, t, "Spicy stops, huh? Well, you know, since you're in the mood.") == "resume"
         hist = [{"role": "user", "content": "도구 뭐 있어?"}, {"role": "assistant", "content": "도구는 여섯 묶음이에요." + CUT_MARK}]
         assert CUT_NOTE in recent_context(hist) and CUT_NOTE not in recent_context(hist[:1] + [{"role": "assistant", "content": "네."}])
+        no = "아니요, 그건 제가 못 해요. 다른 걸 해 볼까요?"
+        assert barge_verdict("아니요 그건 제가 못 해요", 1.0, t, no) == "resume"  # its own stop word, echoed back
+        assert barge_verdict("아니 그거 말고", 1.0, t, no) == "interrupt" and barge_verdict("아니 잠깐", 1.0, t, playing) == "interrupt"
         assert barge_verdict("파일 읽기", 1.0, t, playing) == "resume" and barge_verdict("그만 읽어", 1.0, t, playing) == "interrupt"
         for text, want in [("음", "ignore"), ("", "ignore"), ("아니 그거 말고", "replace"), ("잠깐", "replace"),
                            ("내일 날씨는 어때?", "replace"), ("그리고 메일도 확인해 줘", "replace"),
@@ -3471,7 +3477,11 @@ if __name__ == "__main__":
         ctx.run(asyncio.run, rec.send({"type": "call_log", "event": "end"}))
         assert rec.ws.sent[0]["mode"] == "claude_code" and "mode" not in rec.ws.sent[1]  # requests only
         persona_check()
+        games.update({"azel:h": {"kind": "chain", "last": "사과", "used": ["사과"]},
+                      "azel:other": {"kind": "chain", "last": "기차", "used": ["기차"]}})
         logs = history_check()
+        assert "azel:h" not in games and "azel:other" in games  # hangup ends this session's game, no other
+        games.clear()
         (k1, early), (k2, held) = played_check()
         assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
         hist, prompts, turn_logs = hangup_leak_check()
