@@ -191,24 +191,58 @@ enum ScheduleAPI {
         _ = try await Gateway.send("DELETE", path(id) + "?occurrence=" + query(KST.iso(occurrence)))
     }
 
-    /// The editor's save for the whole item: `cron` for rules, `at` for one-offs.
-    static func editBody(cron: String?, at: Date?, notify: String, purpose: String) -> [String: Any] {
+    /// `schedule_update` (ACTIONS.md): exact `when` from the UI, `repeat_cron` for rules, and
+    /// `scope` for repeating items. One fire of a rule goes to `?occurrence=` and the server skips it
+    /// and books the one-off itself.
+    static func editBody(scope: String?, when: Date?, repeatCron: String?, notify: String, purpose: String, confirmed: Bool = false) -> [String: Any] {
         var b: [String: Any] = ["notify": notify, "purpose": purpose.trimmingCharacters(in: .whitespacesAndNewlines)]
-        if let cron { b["cron"] = cron }
-        if let at { b["at"] = KST.iso(at) }
+        if let scope { b["scope"] = scope }
+        if let when { b["when"] = KST.iso(when) }
+        if let repeatCron { b["repeat_cron"] = repeatCron }
+        if confirmed { b["confirmed"] = true }
         return b
     }
 
-    static func update(_ id: String, cron: String?, at: Date?, notify: String, purpose: String) async throws {
-        _ = try await Gateway.send("PUT", path(id), json: editBody(cron: cron, at: at, notify: notify, purpose: purpose))
+    static func update(_ id: String, occurrence: Date?, body: [String: Any]) async throws -> ActionResult {
+        let q = occurrence.map { "?occurrence=" + query(KST.iso($0)) } ?? ""
+        return ActionResult(try await Gateway.send("PUT", path(id) + q, json: body))
     }
 
-    /// One fire of a rule changed: skip it and book a one-off in its place.
-    static func replaceOccurrence(of item: ScheduledCall, at: Date, notify: String, purpose: String) async throws {
-        var b: [String: Any] = ["at": KST.iso(at), "kind": item.kind, "notify": notify, "purpose": purpose.trimmingCharacters(in: .whitespacesAndNewlines)]
-        if let p = item.personaID { b["persona_id"] = p }
-        _ = try await Gateway.send("POST", "/v1/schedule", json: b)
-        try await skip(item.id, occurrence: item.when)
+    /// `call_user` through `POST /v1/schedule` (the batch-5 gateway): `when` for a one-off, or
+    /// `repeat_cron` + `start_date` for a rule.
+    static func actionBody(at: Date, repeatCron: String?, kind: String, purpose: String, notify: String = "call",
+                           persona: String?, confirmed: Bool = false) -> [String: Any] {
+        var b: [String: Any] = ["kind": kind, "notify": notify, "purpose": purpose.trimmingCharacters(in: .whitespacesAndNewlines)]
+        if let repeatCron {
+            b["repeat_cron"] = repeatCron
+            b["start_date"] = String(KST.iso(at).prefix(10))
+        } else {
+            b["when"] = KST.iso(at)
+        }
+        if let persona { b["persona_id"] = persona }
+        if confirmed { b["confirmed"] = true }
+        return b
+    }
+
+    static func actionBody(at: Date, repeatRule: String?, kind: String, note: String, persona: String?, confirmed: Bool = false) -> [String: Any] {
+        actionBody(at: at, repeatCron: cron(repeatRule: repeatRule, at: at), kind: kind, purpose: note, persona: persona, confirmed: confirmed)
+    }
+
+    static func createAction(_ body: [String: Any]) async throws -> ActionResult {
+        ActionResult(try await Gateway.send("POST", "/v1/schedule", json: body))
+    }
+
+    /// The create form's old repeat values as cron, at the picked time (weekly: 0 = Monday).
+    static func cron(repeatRule: String?, at: Date) -> String? {
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = KST.zone
+        let c = cal.dateComponents([.hour, .minute], from: at)
+        let (h, m) = (c.hour ?? 0, c.minute ?? 0)
+        switch repeatRule {
+        case "daily": return RepeatPreset.daily.cron(hour: h, minute: m)
+        case "weekdays": return RepeatPreset.weekdays.cron(hour: h, minute: m)
+        case let r? where r.hasPrefix("weekly:"): return Int(r.dropFirst(7)).map { RepeatPreset.days([($0 + 1) % 7]).cron(hour: h, minute: m) }
+        default: return nil
+        }
     }
 
     static func path(_ id: String) -> String { "/v1/schedule/" + (id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id) }
@@ -252,6 +286,13 @@ final class ScheduleModel: ObservableObject {
         case .success(let items): all = items; active = items.filter(\.isActive); error = nil; status = .ok
         case .failure(let e): if let s = SectionStatus.from(e) { status = s; error = s.isFailed ? e : nil }
         }
+    }
+
+    /// The batch-5 gateway: `call_user` with a possible `needs` (the caller shows it and resends).
+    func createAction(at: Date, repeatRule: String?, kind: String, note: String, persona: String?, confirmed: Bool = false) async throws -> ActionResult {
+        let r = try await ScheduleAPI.createAction(ScheduleAPI.actionBody(at: at, repeatRule: repeatRule, kind: kind, note: note, persona: persona, confirmed: confirmed))
+        if r.needs == nil { await refreshAll() }
+        return r
     }
 
     func create(at: Date, repeatRule: String?, kind: String, note: String, persona: String? = nil) async throws {

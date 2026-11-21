@@ -449,6 +449,7 @@ final class VoiceSampler: ObservableObject {
             case .success(let wav):
                 PreviewAudio.activate()
                 player = try? AVAudioPlayer(data: wav)
+                if Config.isTestHost { player?.volume = 0 }
                 player?.prepareToPlay()
                 if player?.play() == true {
                     playing = voice

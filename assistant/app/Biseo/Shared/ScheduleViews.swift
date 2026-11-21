@@ -84,6 +84,8 @@ struct ScheduleScreen: View {
     @State private var message: String?
     @State private var showFocusHint = false
     @State private var editing: ScheduledCall?
+    /// `needs.confirm` from the server: its read-back question; 예 resends with confirmed.
+    @State private var confirmQuestion: String?
     @State private var deleting: ScheduledCall?
     @AppStorage("focusHintShown") private var focusHintShown = false
 
@@ -157,6 +159,11 @@ struct ScheduleScreen: View {
                 .frame(width: 480, height: 600)
                 #endif
         }
+        .confirmationDialog(confirmQuestion ?? "", isPresented: Binding(get: { confirmQuestion != nil }, set: { if !$0 { confirmQuestion = nil } }),
+                            titleVisibility: .visible) {
+            Button("네, 예약해요") { Task { await save(confirmed: true) } }
+            Button("다시 고를게요", role: .cancel) {}
+        }
         .confirmationDialog("반복 예약을 취소할까요?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
                             titleVisibility: .visible, presenting: deleting) { item in
             Button("이번만 취소") { Task { do { try await schedule.skip(item) } catch { message = "취소하지 못했어요: " + FriendlyError.describe(error).title } } }
@@ -201,12 +208,20 @@ struct ScheduleScreen: View {
         }
     }
 
-    private func save() async {
+    private func save(confirmed: Bool = false) async {
         saving = true
         defer { saving = false }
         do {
-            try await schedule.create(at: at, repeatRule: rule, kind: kind, note: note,
-                                      persona: PersonaModel.shared.personas.count > 1 ? personaID : nil)
+            let persona = PersonaModel.shared.personas.count > 1 ? personaID : nil
+            if schedule.canEdit {
+                let r = try await schedule.createAction(at: at, repeatRule: rule, kind: kind, note: note, persona: persona, confirmed: confirmed)
+                if let n = r.needs {
+                    if n.kind == "confirm" { confirmQuestion = n.question } else { message = n.question }
+                    return
+                }
+            } else {
+                try await schedule.create(at: at, repeatRule: rule, kind: kind, note: note, persona: persona)
+            }
             message = nil
             note = ""
             #if os(iOS)
@@ -246,6 +261,7 @@ struct ScheduleEditor: View {
     /// The rule couldn't be shown as a preset: saving the whole rule replaces it.
     @State private var custom = false
     @State private var askScope = false
+    @State private var pendingConfirm: (question: String, all: Bool)?
     @State private var saving = false
     @State private var message: String?
 
@@ -345,6 +361,11 @@ struct ScheduleEditor: View {
             Button("모든 반복") { Task { await save(all: true) } }
             Button("닫기", role: .cancel) {}
         } message: { Text("이번만 바꾸면 반복은 그대로 두고 다음 한 번만 바꿔요.") }
+        .confirmationDialog(pendingConfirm?.question ?? "", isPresented: Binding(get: { pendingConfirm != nil }, set: { if !$0 { pendingConfirm = nil } }),
+                            titleVisibility: .visible) {
+            Button("네") { let all = pendingConfirm?.all ?? true; Task { await save(all: all, confirmed: true) } }
+            Button("아니요", role: .cancel) {}
+        }
     }
 
     /// The one-off that replaces the next fire: that day, at the picked time.
@@ -353,16 +374,26 @@ struct ScheduleEditor: View {
         return cal.date(bySettingHour: hm.0, minute: hm.1, second: 0, of: item.when) ?? item.when
     }
 
-    private func save(all: Bool) async {
+    /// "이번만": the server skips this fire and books the one-off (`?occurrence=`, scope occurrence).
+    private func save(all: Bool, confirmed: Bool = false) async {
         saving = true
         defer { saving = false }
         do {
+            let r: ActionResult
             if item.isRule && !all {
-                try await ScheduleAPI.replaceOccurrence(of: item, at: occurrenceTime, notify: notify, purpose: purpose)
+                r = try await ScheduleAPI.update(item.id, occurrence: item.when, body: ScheduleAPI.editBody(
+                    scope: "occurrence", when: occurrenceTime, repeatCron: nil, notify: notify, purpose: purpose, confirmed: confirmed))
             } else if item.isRule {
-                try await ScheduleAPI.update(item.id, cron: preset.cron(hour: hm.0, minute: hm.1), at: nil, notify: notify, purpose: purpose)
+                r = try await ScheduleAPI.update(item.id, occurrence: nil, body: ScheduleAPI.editBody(
+                    scope: "rule", when: nil, repeatCron: preset.cron(hour: hm.0, minute: hm.1), notify: notify, purpose: purpose, confirmed: confirmed))
             } else {
-                try await ScheduleAPI.update(item.id, cron: nil, at: time, notify: notify, purpose: purpose)
+                r = try await ScheduleAPI.update(item.id, occurrence: nil, body: ScheduleAPI.editBody(
+                    scope: nil, when: time, repeatCron: nil, notify: notify, purpose: purpose, confirmed: confirmed))
+            }
+            if let n = r.needs {
+                // The app sends exact values, so only a read-back confirm is expected; anything else is shown.
+                if n.kind == "confirm" { pendingConfirm = (n.question, all) } else { message = n.question }
+                return
             }
             await schedule.refreshAll()
             dismiss()

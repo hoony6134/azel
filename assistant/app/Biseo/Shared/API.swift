@@ -175,6 +175,7 @@ enum GatewayError: LocalizedError {
             }
             if !parts.isEmpty { return parts.joined(separator: ", ") }
         }
+        if let e = obj["error"] as? [String: Any], let m = e["message"] as? String { return m }   // action result
         return ["detail", "message", "error"].lazy.compactMap { obj[$0] as? String }.first
     }
 
@@ -182,6 +183,9 @@ enum GatewayError: LocalizedError {
     /// endpoint, 409 = busy, 401/403 = token, 5xx = unreachable).
     static func from(status code: Int, body: Data) -> GatewayError {
         if code == 400 || code == 422, let m = message(in: body) { return .rejected(m) }
+        // Action errors (ACTIONS.md §2: 404/409/429/503 with {detail, …result}) carry a Korean message too.
+        if (400..<600).contains(code), ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["error"] is [String: Any],
+           let m = message(in: body) { return .rejected(m) }
         return .http(code)
     }
 }
@@ -259,5 +263,35 @@ enum NIMAPI {
     /// Write-only: the key goes to the gateway once and is never kept on this device.
     static func putKey(_ value: String) async throws {
         _ = try await Gateway.send("PUT", "/v1/providers/nim/key", json: ["value": value])
+    }
+}
+
+/// The unified action result (ACTIONS.md §2): `{ok, spoken, data, needs, error}`. Older routes
+/// answer with their own JSON; that counts as ok with nothing to ask.
+struct ActionResult: Equatable {
+    struct Option: Equatable { var id: String; var spoken: String }
+    struct Needs: Equatable {
+        var kind: String          // confirm | clarify | choose
+        var question: String
+        var options: [Option] = []
+    }
+
+    var ok = true
+    var spoken: String?
+    var needs: Needs?
+
+    init(ok: Bool = true, spoken: String? = nil, needs: Needs? = nil) { self.ok = ok; self.spoken = spoken; self.needs = needs }
+
+    init(_ data: Data) {
+        guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        ok = (o["ok"] as? Bool) ?? true
+        spoken = (o["spoken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        if let n = o["needs"] as? [String: Any], let kind = n["kind"] as? String {
+            let options = (n["options"] as? [[String: Any]] ?? []).compactMap { d -> Option? in
+                guard let id = d["id"].map(describe), let s = d["spoken"] as? String else { return nil }
+                return Option(id: id, spoken: s)
+            }
+            needs = Needs(kind: kind, question: (n["question"] as? String) ?? spoken ?? "", options: options)
+        }
     }
 }

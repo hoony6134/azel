@@ -28,3 +28,38 @@ final class WakeEnrollTests: XCTestCase {
         XCTAssertTrue((6...8).contains(WakeEnrollModel.prompts("아젤").count))
     }
 }
+
+final class WakeRetrainTests: XCTestCase {
+    private func status(_ json: String) throws -> WakeEnrollStatus { try JSONDecoder().decode(WakeEnrollStatus.self, from: Data(json.utf8)) }
+
+    func testResultCard() throws {
+        let better = try status(#"{"clips":24,"status":"ready","min_clips":20,"improved":true,"error":null,"metrics":{"recall_before":0.71,"recall_after":0.93,"fa_nearmiss":0.02,"threshold":0.6,"clips_train":19,"clips_held_out":5,"fp_per_hour_before":null}}"#)
+        XCTAssertTrue(better.retrains)
+        XCTAssertEqual(better.resultText, "인식률 71% → 93%")
+        XCTAssertEqual(better.metrics?["clips_held_out"], 5)
+        XCTAssertNil(better.metrics?["fp_per_hour_before"], "null metrics are dropped")
+        XCTAssertEqual(try status(#"{"clips":24,"status":"ready","min_clips":20,"improved":false,"metrics":{}}"#).resultText,
+                       "기존 모델을 유지했어요 (오인식이 늘어서)")
+        XCTAssertEqual(try status(#"{"clips":24,"status":"failed","min_clips":20,"improved":null,"error":"학습 데이터가 없어요"}"#).resultText, "학습 데이터가 없어요")
+        XCTAssertNil(try status(#"{"clips":12,"status":"none","min_clips":20,"improved":null,"error":null,"metrics":null}"#).resultText)
+    }
+
+    func testOldServerHidesTheNewFields() throws {
+        let old = try status(#"{"clips":8,"status":"ready","trained_at":"2026-11-21T10:00:00Z"}"#)
+        XCTAssertFalse(old.retrains)
+        XCTAssertNil(old.resultText)
+    }
+
+    func testSessionPlanAndPrompts() {
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 0, minClips: 20), 20)
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 12, minClips: 20), 8, "finish the first 20")
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 24, minClips: 20), 10, "add more later")
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 55, minClips: 20), 5, "never past 60")
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 60, minClips: 20), 0)
+        let p = WakeEnrollModel.retrainPrompts("아젤", count: 7)
+        XCTAssertEqual(p[0], "‘아젤’ — 보통 목소리로")
+        XCTAssertEqual(p[4], "‘아젤’ — 피곤한 톤으로")
+        XCTAssertEqual(p[5], p[0], "the five tones cycle")
+        XCTAssertEqual(WakeEnrollStatus.percent(93), "93%")
+    }
+}

@@ -7,8 +7,29 @@ struct WakeEnrollStatus: Decodable, Equatable {
     var clips: Int
     var trained_at: Date?
     var status: String              // none | training | ready | failed
+    // Retraining server (RETRAIN.md); all nil on the old one.
+    var min_clips: Int?
+    var improved: Bool?
+    var error: String?
+    /// recall_before/after, fa_nearmiss(_before), … ; nil until trained.
+    var metrics: [String: Double]?
 
-    private enum Keys: String, CodingKey { case clips, trained_at, status }
+    private enum Keys: String, CodingKey { case clips, trained_at, status, min_clips, improved, error, metrics }
+
+    /// The server retrains a model on the clips (and reports `min_clips`).
+    var retrains: Bool { min_clips != nil }
+
+    /// The result line under the status, or nil when there is nothing to report yet.
+    var resultText: String? {
+        if let error, !error.isEmpty { return error }
+        guard status == "ready", let improved else { return nil }
+        if !improved { return "기존 모델을 유지했어요 (오인식이 늘어서)" }
+        guard let b = metrics?["recall_before"], let a = metrics?["recall_after"] else { return "내 목소리로 학습한 모델로 바꿨어요" }
+        return "인식률 \(Self.percent(b)) → \(Self.percent(a))"
+    }
+
+    /// 0.82 → "82%" (a value over 1 is taken as already in percent).
+    static func percent(_ v: Double) -> String { "\(Int((v <= 1 ? v * 100 : v).rounded()))%" }
 
     init(clips: Int, trained_at: Date?, status: String) { self.clips = clips; self.trained_at = trained_at; self.status = status }
 
@@ -22,6 +43,10 @@ struct WakeEnrollStatus: Decodable, Equatable {
         } else if let n = try? c.decodeIfPresent(Double.self, forKey: .trained_at) {
             trained_at = Date(timeIntervalSince1970: n)
         } else { trained_at = nil }
+        min_clips = try? c.decodeIfPresent(Int.self, forKey: .min_clips)
+        improved = try? c.decodeIfPresent(Bool.self, forKey: .improved)
+        error = try? c.decodeIfPresent(String.self, forKey: .error)
+        metrics = (try? c.decodeIfPresent([String: Double?].self, forKey: .metrics))?.compactMapValues { $0 }
     }
 }
 
@@ -46,6 +71,8 @@ enum WakeEnrollAPI {
     }
 
     static let maxStored = 20
+    /// Retraining server: clips per request and in total.
+    static let maxTotal = 60
 
     /// 409 while training.
     static func delete() async throws { _ = try await Gateway.send("DELETE", "/v1/wake/enroll") }
@@ -94,18 +121,33 @@ final class WakeEnrollModel: ObservableObject {
         String(AssistantName.josa(name, withBatchim, without).dropFirst(name.count))
     }
 
+    /// Retraining prompts, cycled (PM, 2026-11-22).
+    nonisolated static let tones = ["보통 목소리로", "작게", "멀리서 부르듯이", "빠르게", "피곤한 톤으로"]
+
+    nonisolated static func retrainPrompts(_ name: String, count: Int) -> [String] {
+        (0..<count).map { "‘\(name)’ — " + tones[$0 % tones.count] }
+    }
+
+    /// Clips to record this time: up to `min_clips` the first time, then 10 more per session,
+    /// never past the server's 60.
+    nonisolated static func sessionLength(stored: Int, minClips: Int) -> Int {
+        let want = stored < minClips ? minClips - stored : 10
+        return max(0, min(want, WakeEnrollAPI.maxTotal - stored))
+    }
+
     @Published private(set) var step: Step = .intro
     @Published private(set) var problem: WakeClip.Problem?
     @Published private(set) var listening = false
     @Published private(set) var status: WakeEnrollStatus?
     @Published private(set) var statusNote: SectionStatus = .ok
-    let prompts: [String]
+    @Published private(set) var prompts: [String]
+    private let name: String
     let recorder = WakeClipRecorder()
     /// Good clips by prompt index; memory only, cleared after upload.
     private(set) var clips: [Int: [Float]] = [:]
     private var redo: [Int] = []
 
-    init(name: String = AssistantName.current) { prompts = Self.prompts(name) }
+    init(name: String = AssistantName.current) { self.name = name; prompts = Self.prompts(name) }
 
     func refreshStatus() async {
         switch await attempt({ try await WakeEnrollAPI.status() }) {
@@ -119,7 +161,13 @@ final class WakeEnrollModel: ObservableObject {
         redo = []
         // The server keeps at most 20 clips: a re-enrollment starts from a clean slate.
         await refreshStatus()
-        if let s = status, s.clips + prompts.count > WakeEnrollAPI.maxStored {
+        if let s = status, s.status == "training" { step = .failed(Self.busyMessage); return }
+        if let s = status, let minClips = s.min_clips {
+            // Retraining server: keep what's stored and add to it.
+            let n = Self.sessionLength(stored: s.clips, minClips: minClips)
+            guard n > 0 else { step = .failed("녹음은 \(WakeEnrollAPI.maxTotal)개까지예요. 기본 모델로 되돌리면 처음부터 다시 할 수 있어요."); return }
+            prompts = Self.retrainPrompts(name, count: n)
+        } else if let s = status, s.clips + prompts.count > WakeEnrollAPI.maxStored {
             if s.status == "training" { step = .failed(Self.busyMessage); return }
             _ = await attempt { try await WakeEnrollAPI.delete() }
         }
@@ -182,13 +230,13 @@ final class WakeEnrollModel: ObservableObject {
         }
     }
 
-    /// Training runs on the Mac; poll until ready/failed (up to ~3 minutes).
+    /// Training runs on the Mac (1–4 minutes); poll until ready/failed, up to ~5 minutes.
     func pollTraining() async {
-        for _ in 0..<60 {
+        for _ in 0..<100 {
             await refreshStatus()
             switch status?.status {
             case "ready": step = .done; return
-            case "failed": step = .failed("학습에 실패했어요. 다시 등록해 주세요."); return
+            case "failed": step = .failed(status?.error ?? "학습에 실패했어요. 다시 등록해 주세요."); return
             default: try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
@@ -218,7 +266,7 @@ struct WakeEnrollView: View {
             case .intro: intro
             case .recording(let i): recording(i)
             case .uploading: progress("올리는 중…")
-            case .training: progress("목소리를 익히는 중이에요…")
+            case .training: progress(model.status?.retrains == true ? "목소리를 익히는 중이에요… 보통 1–4분 걸려요" : "목소리를 익히는 중이에요…")
             case .done: finished
             case .failed(let why):
                 EmptyState(title: "호출어를 등록하지 못했어요", message: why, action: ("다시 시도", { Task { await model.begin() } }))
@@ -228,7 +276,7 @@ struct WakeEnrollView: View {
         .frame(maxWidth: 520, maxHeight: .infinity)
         .frame(maxWidth: .infinity)
         .background(Theme.bg.ignoresSafeArea())
-        .navigationTitle("호출어 등록")
+        .navigationTitle("내 목소리로 호출어 학습")
         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("닫기") { model.cancelRecording(); dismiss() } } }
         .onDisappear { model.cancelRecording() }
     }
@@ -238,13 +286,23 @@ struct WakeEnrollView: View {
             Spacer()
             MoonJar(state: .idle, levels: .silent).frame(width: 160, height: 160)
             Text("목소리로 \(AssistantName.josa(AssistantName.current, "을", "를")) 불러요").font(.title2.weight(.semibold)).foregroundStyle(Theme.text)
-            Text("‘\(AssistantName.current)’\(WakeEnrollModel.particle(AssistantName.current, "을", "를")) \(model.prompts.count)번, 조금씩 다르게 말해 주세요. 한 번 말할 때마다 자동으로 넘어가요.")
+            Text(introText)
                 .multilineTextAlignment(.center).foregroundStyle(Theme.text2)
             Text("녹음은 사용자의 Mac에만 저장되고, 이 기기에서는 올린 뒤 바로 지워져요.")
                 .font(.footnote).multilineTextAlignment(.center).foregroundStyle(Theme.text3)
             Spacer()
             primary("시작하기") { Task { await model.begin() } }
         }
+    }
+
+    private var introText: String {
+        let n = AssistantName.current, p = WakeEnrollModel.particle(n, "을", "를")
+        if let s = model.status, let minClips = s.min_clips {
+            let first = s.clips < minClips
+            return "‘\(n)’\(p) 보통 목소리, 작게, 멀리서, 빠르게, 피곤한 톤으로 번갈아 말해 주세요. "
+                + (first ? "\(minClips)번 녹음하면 학습을 시작해요." : "지금까지 \(s.clips)개를 녹음했어요. 10개를 더하면 다시 학습해요.")
+        }
+        return "‘\(n)’\(p) \(model.prompts.count)번, 조금씩 다르게 말해 주세요. 한 번 말할 때마다 자동으로 넘어가요."
     }
 
     private func recording(_ i: Int) -> some View {
@@ -279,8 +337,13 @@ struct WakeEnrollView: View {
         VStack(spacing: Theme.l) {
             Spacer()
             MoonJar(state: .speaking, levels: .silent).frame(width: 160, height: 160)
-            Text("이제 \(AssistantName.josa(AssistantName.current, "이", "가")) 당신 목소리에만 반응해요").font(.title3.weight(.semibold))
-                .multilineTextAlignment(.center).foregroundStyle(Theme.text)
+            if let s = model.status, s.retrains {
+                Text(s.resultText ?? "학습이 아직 끝나지 않았어요. 설정에서 결과를 볼 수 있어요.").font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center).foregroundStyle(Theme.text)
+            } else {
+                Text("이제 \(AssistantName.josa(AssistantName.current, "이", "가")) 당신 목소리에만 반응해요").font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center).foregroundStyle(Theme.text)
+            }
             Spacer()
             primary("완료") { dismiss() }
         }
@@ -304,18 +367,26 @@ struct WakeEnrollRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.s) {
             HStack {
-                Text("호출어 등록").foregroundStyle(Theme.text)
+                Text(model.status?.retrains == true ? "내 목소리로 호출어 학습" : "호출어 등록").foregroundStyle(Theme.text)
                 Spacer()
                 Text(statusText).font(.subheadline).foregroundStyle(Theme.text2)
             }
             SectionNote(status: model.statusNote) { Task { await model.refreshStatus() } }
+            if let s = model.status, s.retrains {
+                if let r = s.resultText { Text(r).font(.subheadline).foregroundStyle(s.error == nil ? Theme.text2 : Theme.danger) }
+                if s.status == "training" { Text("학습 중이에요. 보통 1–4분 걸려요.").font(.footnote).foregroundStyle(Theme.text3) }
+                if let minClips = s.min_clips, s.clips > 0 {
+                    Text("녹음 \(s.clips)개" + (s.clips < minClips ? " · \(minClips)개부터 학습해요" : "")).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
+                }
+            }
             if let m = model.removeMessage { Text(m).font(.footnote).foregroundStyle(Theme.amber) }
             HStack {
-                Button(model.status?.status == "ready" || model.status?.status == "failed" ? "다시 등록" : "등록") { enrolling = true }
+                Button(enrollTitle) { enrolling = true }
                     .tint(Theme.celadon)
+                    .disabled(model.status?.status == "training")
                 Spacer()
-                if let s = model.status, s.status != "none" {
-                    Button("삭제", role: .destructive) { confirmDelete = true }
+                if let s = model.status, s.status != "none" || s.clips > 0 {
+                    Button(s.retrains ? "기본 모델로 되돌리기" : "삭제", role: .destructive) { confirmDelete = true }
                 }
             }
             .font(.subheadline)
@@ -328,10 +399,19 @@ struct WakeEnrollRow: View {
                 .frame(width: 480, height: 620)
                 #endif
         }
-        .confirmationDialog("등록한 호출어 목소리를 지울까요?", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("삭제", role: .destructive) { Task { await model.remove() } }
+        .confirmationDialog(model.status?.retrains == true ? "기본 모델로 되돌릴까요?" : "등록한 호출어 목소리를 지울까요?",
+                            isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button(model.status?.retrains == true ? "되돌리기" : "삭제", role: .destructive) { Task { await model.remove() } }
             Button("취소", role: .cancel) {}
+        } message: {
+            if model.status?.retrains == true { Text("녹음한 목소리와 학습한 모델을 모두 지우고 처음 모델로 돌아가요.") }
         }
+    }
+
+    private var enrollTitle: String {
+        guard let s = model.status else { return "등록" }
+        if s.retrains { return s.clips == 0 ? "녹음 시작" : "더 녹음하기" }
+        return s.status == "ready" || s.status == "failed" ? "다시 등록" : "등록"
     }
 
     private var statusText: String {

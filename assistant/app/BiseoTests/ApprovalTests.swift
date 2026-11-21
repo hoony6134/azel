@@ -139,3 +139,35 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertNil(ApprovalRequest(["id": "2", "command": "ls"]).forcedNote)
     }
 }
+
+/// User bug, 2026-11-22: two stale approvals flapped pending ↔ expired between polls and the sheet
+/// flashed open and shut.
+final class ApprovalFlapTests: XCTestCase {
+    private func list(_ statuses: [String: String]) -> [ApprovalRequest] {
+        statuses.map { ApprovalRequest(["id": $0.key, "status": $0.value, "command": "ls ~/Downloads"]) }
+    }
+
+    func testFlappingListNeverPresents() {
+        var previous: Set<String> = []
+        var shown: [String] = []
+        for statuses in [["e1": "pending", "e2": "expired"], ["e1": "expired", "e2": "pending"],
+                         ["e1": "pending", "e2": "expired"], [:], ["e1": "expired", "e2": "pending"]] {
+            let (next, pending) = ApprovalCenter.stableNext(list(statuses), previous: previous, seen: [])
+            previous = pending
+            if let next { shown.append(next.id) }
+        }
+        XCTAssertEqual(shown, [], "never pending twice in a row")
+    }
+
+    func testStablePendingPresentsOnceAndNeverAgain() {
+        var previous: Set<String> = []
+        var seen: Set<String> = []
+        var shown: [String] = []
+        for statuses in [["a": "pending"], ["a": "pending"], ["a": "pending"], [:], ["a": "pending"], ["a": "pending"]] {
+            let (next, pending) = ApprovalCenter.stableNext(list(statuses), previous: previous, seen: seen)
+            previous = pending
+            if let next { shown.append(next.id); seen.insert(next.id) }   // markShown
+        }
+        XCTAssertEqual(shown, ["a"], "second poll presents it; a reappearance after vanishing doesn't")
+    }
+}
