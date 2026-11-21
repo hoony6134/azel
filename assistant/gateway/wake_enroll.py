@@ -62,9 +62,18 @@ def check_clip(data: bytes):
     return None
 
 
-def status():
+def read_status():
+    """status.json, or a failed status if it is unreadable (a crash mid-write must not turn GET into a 500)."""
     f = DIR / "status.json"
-    s = json.loads(f.read_text()) if f.exists() else {}
+    try:
+        s = json.loads(f.read_text()) if f.exists() else {}
+        return s if isinstance(s, dict) else {"status": "failed", "error": "status file is not an object"}
+    except (OSError, ValueError):
+        return {"status": "failed", "error": "status file unreadable"}
+
+
+def status():
+    s = read_status()
     n = len(list((DIR / "clips").glob("*.wav")))
     if state["running"]:
         s["status"] = "training"
@@ -77,11 +86,28 @@ def write_status(**s):
     f.chmod(0o600)
 
 
+TRAIN_TIMEOUT_S = int(os.environ.get("BISEO_WAKE_TRAIN_TIMEOUT_S", "900"))
+
+
+def wake_python():
+    return os.environ.get("BISEO_WAKE_PY", str(ROOT / "wake/.venv/bin/python"))
+
+
 def train_once():
-    py = os.environ.get("BISEO_WAKE_PY", str(ROOT / "wake/.venv/bin/python"))
+    py = wake_python()
+    if not Path(py).is_file():  # no wake venv on this host: say so instead of failing silently
+        write_status(status="failed", error=f"wake venv python not found: {py}")
+        return
     cmd = [py, str(ROOT / "wakeword/train_verifier.py"), "--clips", str(DIR / "clips"), "--out", str(VERIFIER),
            "--model", str(HOME / "azel.onnx"), "--negatives", str(HOME / "wake-negatives")]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TRAIN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        write_status(status="failed", error=f"training took longer than {TRAIN_TIMEOUT_S} s")
+        return
+    except OSError as e:
+        write_status(status="failed", error=f"could not start training: {e}")
+        return
     if r.returncode == 0:
         write_status(status="ready", trained_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     else:
@@ -89,15 +115,22 @@ def train_once():
 
 
 def train_loop():
-    """Retrain until no clip arrived while training."""
-    while True:
+    """Retrain until no clip arrived while training. `running` is reset whatever happens, so the status can
+    never stick at "training"."""
+    try:
+        while True:
+            with lock:
+                state["dirty"] = False
+            try:
+                train_once()
+            except Exception as e:  # e.g. the status file could not be written
+                write_status(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            with lock:
+                if not state["dirty"]:
+                    return
+    finally:
         with lock:
-            state["dirty"] = False
-        train_once()
-        with lock:
-            if not state["dirty"]:
-                state["running"] = False
-                return
+            state["running"] = False
 
 
 def start_training():
