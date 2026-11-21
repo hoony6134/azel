@@ -42,6 +42,8 @@
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Azel로 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

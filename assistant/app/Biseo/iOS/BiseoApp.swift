@@ -14,6 +14,10 @@ struct BiseoApp: App {
         Recordings.cleanup()
         Config.migrateAddresses()
         UNUserNotificationCenter.current().delegate = TaskNotificationHandler.shared
+        LiveActivities.shared.start()
+        #if DEBUG
+        if CommandLine.arguments.contains("-liveActivityPreview") { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { LiveActivities.shared.debugPreview() } }
+        #endif
     }
 
     var body: some Scene {
