@@ -4,18 +4,25 @@ import Foundation
 struct ScheduledCall: Codable, Identifiable, Equatable {
     let id: String
     var at: Date
-    var repeatRule: String?         // none | daily | weekdays | weekly (unknown values shown as-is)
+    var repeatRule: String?         // nil | daily | weekdays | weekly:<dow> (0 = Monday)
     var kind: String                // wake | reminder
     var note: String?
-    var status: String?             // pending | missed | done | …
+    var status: String?             // pending | fired | answered | missed | cancelled
     var attempts: Int?
+    var createdBy: String?          // voice | app
 
     var isWake: Bool { kind == "wake" }
 
-    enum CodingKeys: String, CodingKey { case id, at, repeatRule = "repeat", kind, note, status, attempts }
+    var byVoice: Bool { createdBy == "voice" }
+    /// Waiting or ringing: what the home card counts as upcoming.
+    var isActive: Bool { status == nil || status == "pending" || status == "fired" }
 
-    init(id: String, at: Date, repeatRule: String? = nil, kind: String, note: String? = nil, status: String? = nil, attempts: Int? = nil) {
-        self.id = id; self.at = at; self.repeatRule = repeatRule; self.kind = kind; self.note = note; self.status = status; self.attempts = attempts
+    enum CodingKeys: String, CodingKey { case id, at, repeatRule = "repeat", kind, note, status, attempts, createdBy = "created_by" }
+
+    init(id: String, at: Date, repeatRule: String? = nil, kind: String, note: String? = nil, status: String? = nil, attempts: Int? = nil,
+         createdBy: String? = nil) {
+        self.id = id; self.at = at; self.repeatRule = repeatRule; self.kind = kind; self.note = note; self.status = status
+        self.attempts = attempts; self.createdBy = createdBy
     }
 
     init(from decoder: Decoder) throws {
@@ -27,20 +34,22 @@ struct ScheduledCall: Codable, Identifiable, Equatable {
         note = try c.decodeIfPresent(String.self, forKey: .note)
         status = try c.decodeIfPresent(String.self, forKey: .status)
         attempts = try c.decodeIfPresent(Int.self, forKey: .attempts)
+        createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy)
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
-        try c.encode(at.timeIntervalSince1970, forKey: .at)
+        try c.encode(KST.iso(at), forKey: .at)
         try c.encodeIfPresent(repeatRule, forKey: .repeatRule)
         try c.encode(kind, forKey: .kind)
         try c.encodeIfPresent(note, forKey: .note)
         try c.encodeIfPresent(status, forKey: .status)
         try c.encodeIfPresent(attempts, forKey: .attempts)
+        try c.encodeIfPresent(createdBy, forKey: .createdBy)
     }
 
-    /// shortcut: `at` is accepted as epoch seconds or ISO-8601 until PROTOCOL.md pins one form.
+    /// The contract is ISO-8601 with an offset; epoch seconds are accepted as a fallback.
     private static func decodeTime(_ c: KeyedDecodingContainer<CodingKeys>) throws -> Date {
         if let n = try? c.decode(Double.self, forKey: .at) { return Date(timeIntervalSince1970: n) }
         let s = try c.decode(String.self, forKey: .at)
@@ -56,6 +65,24 @@ struct ScheduledCall: Codable, Identifiable, Equatable {
 /// Times are shown in KST whatever the device's time zone (the assistant and the user live there).
 enum KST {
     static let zone = TimeZone(identifier: "Asia/Seoul")!
+
+    /// "2026-11-22T10:00:00+09:00", the form `/v1/schedule` expects.
+    static func iso(_ d: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.timeZone = zone
+        f.formatOptions = [.withInternetDateTime]
+        return f.string(from: d)
+    }
+
+    /// 0 = Monday … 6 = Sunday, as in `weekly:<dow>`.
+    static let weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+
+    /// The KST weekday of `d` in the contract's numbering.
+    static func dow(_ d: Date) -> Int {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = zone
+        return (cal.component(.weekday, from: d) + 5) % 7 // Calendar: 1 = Sunday
+    }
 
     private static func formatter(_ format: String) -> DateFormatter {
         let f = DateFormatter()
@@ -80,29 +107,51 @@ enum KST {
 
     static func repeatLabel(_ rule: String?) -> String? {
         switch rule {
-        case nil, "", "none": return nil
+        case nil, "": return nil
         case "daily": return "매일"
         case "weekdays": return "주중"
-        case "weekly": return "매주"
+        case let r? where r.hasPrefix("weekly:"):
+            guard let d = Int(r.dropFirst(7)), weekdays.indices.contains(d) else { return "매주" }
+            return "매주 \(weekdays[d])요일"
+        case let other?: return other
+        }
+    }
+
+    static func statusLabel(_ status: String?) -> String {
+        switch status {
+        case nil, "pending": return "예정"
+        case "fired": return "거는 중"
+        case "answered": return "받음"
+        case "missed": return "놓침"
+        case "cancelled": return "취소됨"
         case let other?: return other
         }
     }
 }
 
 enum ScheduleAPI {
-    static func list() async throws -> [ScheduledCall] {
+    /// Default: pending and fired only (home). `all`: past items too (the list's missed history).
+    static func list(all: Bool = false) async throws -> [ScheduledCall] {
         // Accept a bare list or {"items": [...]}.
-        let data = try await Gateway.send("GET", "/v1/schedule")
+        let data = try await Gateway.send("GET", "/v1/schedule" + (all ? "?include=all" : ""))
         if let list = try? JSONDecoder().decode([ScheduledCall].self, from: data) { return list }
         struct Envelope: Decodable { let items: [ScheduledCall] }
         return try JSONDecoder().decode(Envelope.self, from: data).items
     }
 
-    static func create(at: Date, repeatRule: String, kind: String, note: String) async throws {
-        var body: [String: Any] = ["at": at.timeIntervalSince1970, "kind": kind, "repeat": repeatRule]
+    /// `repeatRule` nil = once. Returns the created item (201); a 400 (past, or > 30 days out)
+    /// throws `GatewayError.rejected` with the server's message.
+    @discardableResult
+    static func create(at: Date, repeatRule: String?, kind: String, note: String) async throws -> ScheduledCall {
+        try JSONDecoder().decode(ScheduledCall.self, from: try await Gateway.send("POST", "/v1/schedule",
+                                                                                   json: body(at: at, repeatRule: repeatRule, kind: kind, note: note)))
+    }
+
+    static func body(at: Date, repeatRule: String?, kind: String, note: String) -> [String: Any] {
+        var body: [String: Any] = ["at": KST.iso(at), "kind": kind, "repeat": repeatRule ?? NSNull()]
         let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { body["note"] = trimmed }
-        _ = try await Gateway.send("POST", "/v1/schedule", json: body)
+        return body
     }
 
     static func cancel(_ id: String) async throws {
@@ -112,31 +161,37 @@ enum ScheduleAPI {
 
 @MainActor
 final class ScheduleModel: ObservableObject {
-    @Published private(set) var items: [ScheduledCall] = []
+    /// Default list: pending and fired (home card).
+    @Published private(set) var active: [ScheduledCall] = []
+    /// `include=all`: also past items, loaded by the list sheet.
+    @Published private(set) var all: [ScheduledCall] = []
     @Published private(set) var error: Error?
-    @Published private(set) var loaded = false
 
-    /// Pending calls soonest first, then missed ones.
-    var upcoming: [ScheduledCall] {
-        items.filter { $0.status == nil || $0.status == "pending" }.sorted { $0.at < $1.at }
-    }
-    var next: ScheduledCall? { upcoming.first { $0.at > Date().addingTimeInterval(-60) } ?? upcoming.first }
-    var missed: [ScheduledCall] { items.filter { $0.status == "missed" }.sorted { $0.at > $1.at } }
+    var upcoming: [ScheduledCall] { (all.isEmpty ? active : all).filter(\.isActive).sorted { $0.at < $1.at } }
+    var next: ScheduledCall? { active.filter(\.isActive).min { $0.at < $1.at } }
+    var missed: [ScheduledCall] { all.filter { $0.status == "missed" }.sorted { $0.at > $1.at } }
+    /// Answered and cancelled ones, newest first.
+    var past: [ScheduledCall] { all.filter { $0.status == "answered" || $0.status == "cancelled" }.sorted { $0.at > $1.at } }
 
     func refresh() async {
         guard Config.token != nil else { return }
-        do { items = try await ScheduleAPI.list(); error = nil } catch { self.error = error }
-        loaded = true
+        do { active = try await ScheduleAPI.list(); error = nil } catch { self.error = error }
     }
 
-    func create(at: Date, repeatRule: String, kind: String, note: String) async throws {
-        try await ScheduleAPI.create(at: at, repeatRule: repeatRule, kind: kind, note: note)
-        await refresh()
+    func refreshAll() async {
+        guard Config.token != nil else { return }
+        do { all = try await ScheduleAPI.list(all: true); active = all.filter(\.isActive); error = nil } catch { self.error = error }
+    }
+
+    func create(at: Date, repeatRule: String?, kind: String, note: String) async throws {
+        let item = try await ScheduleAPI.create(at: at, repeatRule: repeatRule, kind: kind, note: note)
+        active.append(item)
+        if !all.isEmpty { all.append(item) }
+        await refreshAll()
     }
 
     func cancel(_ item: ScheduledCall) async {
-        items.removeAll { $0.id == item.id }
         do { try await ScheduleAPI.cancel(item.id) } catch { self.error = error }
-        await refresh()
+        await refreshAll()
     }
 }

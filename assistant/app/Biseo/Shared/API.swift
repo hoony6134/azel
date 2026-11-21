@@ -48,7 +48,20 @@ struct ServerStatus: Decodable {
 
 enum GatewayError: LocalizedError {
     case http(Int)
-    var errorDescription: String? { if case .http(let code) = self { return "서버 오류 (HTTP \(code))" }; return nil }
+    /// 400 with a server explanation (FastAPI `detail`, or `message`/`error`), meant for the user.
+    case rejected(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .http(let code): return "서버 오류 (HTTP \(code))"
+        case .rejected(let message): return message
+        }
+    }
+
+    static func message(in body: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        return ["detail", "message", "error"].lazy.compactMap { obj[$0] as? String }.first
+    }
 }
 
 enum Gateway {
@@ -63,6 +76,7 @@ enum Gateway {
         }
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 400, let message = GatewayError.message(in: data) { throw GatewayError.rejected(message) }
         guard (200..<300).contains(code) else { throw GatewayError.http(code) }
         return data
     }
