@@ -107,3 +107,17 @@ final class PersonaTests: XCTestCase {
         XCTAssertEqual(Persona.personalityLimit, 500)
     }
 }
+
+final class VoiceListTests: XCTestCase {
+    /// All nine TTS speakers come from the server and are shown in its order with label + desc only;
+    /// `lang` is never used for grouping or badges.
+    func testNineSpeakersKeepServerOrderWhateverTheirLanguage() throws {
+        let langs = ["ko", "ja", "en", "zh", "ko", "en", "ja", "ko", "zh"]
+        let json = "[" + langs.enumerated().map { #"{"id":"v\#($0.offset)","label":"목소리\#($0.offset)","desc":"설명\#($0.offset)","lang":"\#($0.element)"}"# }.joined(separator: ",") + "]"
+        let voices = try JSONDecoder().decode([Voice].self, from: Data(json.utf8))
+        XCTAssertEqual(voices.count, 9)
+        XCTAssertEqual(voices.map(\.id), (0..<9).map { "v\($0)" })
+        XCTAssertEqual(voices[1].label, "목소리1")
+        XCTAssertEqual(voices[1].desc, "설명1")
+    }
+}
