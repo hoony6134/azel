@@ -17,10 +17,61 @@ struct CallEvent: Decodable, Equatable {
 
 struct AppSettings: Codable, Equatable {
     struct TaskDefault: Codable, Equatable { var model: String; var path: String? }
+    /// When the assistant calls first. Decodes the old shape
+    /// (`morning_briefing: "08:00"`, `quiet_hours`, `triggers`) and always writes the new one;
+    /// quiet hours are gone.
     struct Proactive: Codable, Equatable {
-        var morning_briefing: String
-        var quiet_hours: [String]
-        var triggers: [String: Bool]
+        struct Timed: Codable, Equatable { var enabled: Bool; var time: String }
+        struct Autonomous: Codable, Equatable {
+            var enabled: Bool
+            var max_per_day: Int
+            var min_gap_minutes: Int
+            var window: [String]          // ["09:00", "22:00"]
+        }
+
+        var enabled: Bool
+        var morning_briefing: Timed
+        var deadline_check: Timed
+        var server_alerts: Bool
+        var autonomous: Autonomous
+
+        static let defaultAutonomous = Autonomous(enabled: false, max_per_day: 2, min_gap_minutes: 120, window: ["09:00", "21:00"])
+
+        init(enabled: Bool = true, morning_briefing: Timed = Timed(enabled: true, time: "08:00"),
+             deadline_check: Timed = Timed(enabled: true, time: "18:00"), server_alerts: Bool = true,
+             autonomous: Autonomous = defaultAutonomous) {
+            self.enabled = enabled; self.morning_briefing = morning_briefing; self.deadline_check = deadline_check
+            self.server_alerts = server_alerts; self.autonomous = autonomous
+        }
+
+        private enum Keys: String, CodingKey { case enabled, morning_briefing, deadline_check, server_alerts, autonomous, triggers }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: Keys.self)
+            if let timed = try? c.decode(Timed.self, forKey: .morning_briefing) {
+                self.init(enabled: try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true,
+                          morning_briefing: timed,
+                          deadline_check: try c.decodeIfPresent(Timed.self, forKey: .deadline_check) ?? Timed(enabled: true, time: "18:00"),
+                          server_alerts: try c.decodeIfPresent(Bool.self, forKey: .server_alerts) ?? true,
+                          autonomous: try c.decodeIfPresent(Autonomous.self, forKey: .autonomous) ?? Self.defaultAutonomous)
+            } else {
+                // Old shape: a plain briefing time and trigger switches.
+                let time = try c.decodeIfPresent(String.self, forKey: .morning_briefing) ?? "08:00"
+                let triggers = try c.decodeIfPresent([String: Bool].self, forKey: .triggers) ?? [:]
+                self.init(morning_briefing: Timed(enabled: true, time: time),
+                          deadline_check: Timed(enabled: triggers["deadline"] ?? true, time: "18:00"),
+                          server_alerts: triggers["server_down"] ?? true)
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: Keys.self)
+            try c.encode(enabled, forKey: .enabled)
+            try c.encode(morning_briefing, forKey: .morning_briefing)
+            try c.encode(deadline_check, forKey: .deadline_check)
+            try c.encode(server_alerts, forKey: .server_alerts)
+            try c.encode(autonomous, forKey: .autonomous)
+        }
     }
     var default_model: String
     var claude_path: String

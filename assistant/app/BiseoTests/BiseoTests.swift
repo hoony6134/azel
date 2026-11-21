@@ -70,7 +70,11 @@ final class EventDecodingTests: XCTestCase {
         let s = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
         XCTAssertEqual(s.task_defaults["code"]?.path, "claude_code")
         XCTAssertNil(s.task_defaults["chat"]?.path)
-        XCTAssertEqual(s.proactive.quiet_hours, ["23:30", "07:30"])
+        // Old proactive shape migrates: briefing time kept, triggers become switches, quiet hours dropped.
+        XCTAssertEqual(s.proactive.morning_briefing, .init(enabled: true, time: "08:00"))
+        XCTAssertTrue(s.proactive.deadline_check.enabled)
+        XCTAssertTrue(s.proactive.server_alerts)
+        XCTAssertFalse(s.proactive.autonomous.enabled)
         XCTAssertEqual(s.device_fallback, ["알비레오", "스파크"])
         XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(s)), s)
     }

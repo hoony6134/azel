@@ -143,7 +143,7 @@ struct SetupFlow: View {
         do {
             let s: ServerStatus = try await Gateway.get("/v1/status")
             checks = [Check(id: "게이트웨이", ok: true, reason: nil), Check(id: "토큰", ok: true, reason: nil),
-                      Check(id: "스파크", ok: s.spark.ok, reason: s.spark.ok ? nil : "음성 서버가 응답하지 않아요")]
+                      Check(id: "spark", ok: s.spark.ok, reason: s.spark.ok ? nil : "음성 서버가 응답하지 않아요")]
         } catch GatewayError.http(let code) where code == 401 || code == 403 {
             checks = [Check(id: "게이트웨이", ok: true, reason: nil), Check(id: "토큰", ok: false, reason: "토큰이 맞지 않아요")]
         } catch {
@@ -197,8 +197,7 @@ struct SetupFlow: View {
 
 private let models = [("qwen", "로컬 Qwen"), ("haiku", "Haiku"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("auto", "자동")]
 private let paths = [("api", "API"), ("claude_code", "Claude Code"), ("auto", "자동")]
-private let tasks = [("chat", "잡담"), ("schedule", "일정"), ("code", "코드"), ("mac", "맥북 작업")]
-private let triggerNames = ["deadline": "마감 임박", "server_down": "서버 장애"]
+private let tasks = [("chat", "잡담"), ("schedule", "일정"), ("code", "코드"), ("mac", "macbook 작업")]
 
 struct SettingsScreen<Extra: View>: View {
     @ObservedObject var model: AppModel
@@ -214,6 +213,7 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showRecordings = false
     @State private var showPaths = false
     @State private var pendingDays: Int?
+    @State private var showProactiveLog = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
@@ -372,9 +372,9 @@ struct SettingsScreen<Extra: View>: View {
     private var statusCard: some View {
         Card("상태", trailing: AnyView(Button("새로고침") { Task { await model.refresh() } }.font(.subheadline).tint(Theme.celadon))) {
             if let s = model.status {
-                statusRow("스파크", s.spark.ok, s.spark.ms)
+                statusRow("spark", s.spark.ok, s.spark.ms)
                 statusRow("게이트웨이", s.gateway.ok, s.gateway.ms)
-                ForEach(s.devices, id: \.name) { statusRow($0.name, $0.ok, $0.ms) }
+                ForEach(s.devices, id: \.name) { statusRow(DeviceID.normalize($0.name), $0.ok, $0.ms) }
             } else if let e = model.statusError {
                 Text(FriendlyError.describe(e).title).foregroundStyle(Theme.danger)
             } else {
@@ -443,26 +443,75 @@ struct SettingsScreen<Extra: View>: View {
         }
     }
 
+    /// §7.5 먼저 전화하기 (new shape): master switch, briefing, deadline check, server alerts,
+    /// autonomous calls with limits, and the decision log. No quiet hours.
     private func proactiveCard(_ s: Binding<AppSettings>) -> some View {
-        Card("먼저 전화하기") {
-            row("아침 브리핑") { DatePicker("", selection: time(s.proactive.morning_briefing), displayedComponents: .hourAndMinute).labelsHidden() }
-            row("방해 금지") {
-                HStack(spacing: Theme.xs) {
-                    DatePicker("시작", selection: time(quiet(s, 0)), displayedComponents: .hourAndMinute).labelsHidden()
-                    Text("–").foregroundStyle(Theme.text2)
-                    DatePicker("끝", selection: time(quiet(s, 1)), displayedComponents: .hourAndMinute).labelsHidden()
+        let p = s.proactive
+        return Card("먼저 전화하기") {
+            Toggle("먼저 전화하기", isOn: p.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
+            if p.wrappedValue.enabled {
+                timedRow("아침 브리핑", p.morning_briefing)
+                timedRow("마감 확인", p.deadline_check)
+                Toggle("서버 장애 알림", isOn: p.server_alerts).tint(Theme.celadon).foregroundStyle(Theme.text)
+                Toggle("스스로 판단해서 전화", isOn: p.autonomous.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
+                if p.wrappedValue.autonomous.enabled {
+                    VStack(alignment: .leading, spacing: Theme.s) {
+                        Stepper("하루 최대 \(p.wrappedValue.autonomous.max_per_day)번", value: p.autonomous.max_per_day, in: 1...10)
+                        Stepper("최소 간격 \(gapLabel(p.wrappedValue.autonomous.min_gap_minutes))", value: p.autonomous.min_gap_minutes, in: 30...720, step: 30)
+                        row("허용 시간") {
+                            HStack(spacing: Theme.xs) {
+                                DatePicker("시작", selection: time(window(p, 0)), displayedComponents: .hourAndMinute).labelsHidden()
+                                Text("–").foregroundStyle(Theme.text2)
+                                DatePicker("끝", selection: time(window(p, 1)), displayedComponents: .hourAndMinute).labelsHidden()
+                            }
+                        }
+                    }
+                    .foregroundStyle(Theme.text)
+                    .padding(.leading, Theme.l)
                 }
             }
-            ForEach(s.wrappedValue.proactive.triggers.keys.sorted(), id: \.self) { key in
-                Toggle(triggerNames[key] ?? key, isOn: Binding(get: { s.wrappedValue.proactive.triggers[key] ?? false },
-                                                                set: { s.wrappedValue.proactive.triggers[key] = $0 }))
-                    .tint(Theme.celadon).foregroundStyle(Theme.text)
+            Button { showProactiveLog = true } label: {
+                HStack {
+                    Text("왜 전화했는지 보기").foregroundStyle(Theme.text)
+                    Spacer()
+                    Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+        }
+        .sheet(isPresented: $showProactiveLog) {
+            NavigationStack { ProactiveLogView() }
+                #if os(macOS)
+                .frame(width: 520, height: 560)
+                #endif
         }
     }
 
+    private func timedRow(_ title: String, _ t: Binding<AppSettings.Proactive.Timed>) -> some View {
+        HStack {
+            Toggle(title, isOn: t.enabled).tint(Theme.celadon).foregroundStyle(Theme.text).fixedSize()
+            Spacer()
+            DatePicker(title, selection: time(t.time), displayedComponents: .hourAndMinute).labelsHidden()
+                .disabled(!t.wrappedValue.enabled)
+        }
+    }
+
+    private func gapLabel(_ minutes: Int) -> String {
+        minutes % 60 == 0 ? "\(minutes / 60)시간" : "\(minutes / 60)시간 \(minutes % 60)분"
+    }
+
+    private func window(_ p: Binding<AppSettings.Proactive>, _ i: Int) -> Binding<String> {
+        Binding(get: { let w = p.wrappedValue.autonomous.window; return i < w.count ? w[i] : (i == 0 ? "09:00" : "21:00") },
+                set: { var w = p.wrappedValue.autonomous.window
+                       while w.count < 2 { w.append(w.isEmpty ? "09:00" : "21:00") }
+                       w[i] = $0
+                       p.wrappedValue.autonomous.window = w })
+    }
+
     private func deviceCard(_ s: Binding<AppSettings>) -> some View {
-        let known = (model.status?.devices.map(\.name) ?? []) + [s.wrappedValue.default_device] + s.wrappedValue.device_fallback
+        let known = (model.status?.devices.map { DeviceID.normalize($0.name) } ?? []) + DeviceID.known
+            + [s.wrappedValue.default_device] + s.wrappedValue.device_fallback
         let names = known.reduce(into: [String]()) { if !$0.contains($1) && !$1.isEmpty { $0.append($1) } }
         return Card("기기") {
             row("기본 기기") { picker(names.map { ($0, $0) }, s.default_device) }
@@ -544,14 +593,6 @@ struct SettingsScreen<Extra: View>: View {
             .pickerStyle(.menu).labelsHidden().tint(Theme.celadon).fixedSize()
     }
 
-    private func quiet(_ s: Binding<AppSettings>, _ i: Int) -> Binding<String> {
-        Binding(get: { let q = s.wrappedValue.proactive.quiet_hours; return i < q.count ? q[i] : "00:00" },
-                set: { var q = s.wrappedValue.proactive.quiet_hours
-                       while q.count < 2 { q.append("00:00") }
-                       q[i] = $0
-                       s.wrappedValue.proactive.quiet_hours = q })
-    }
-
     /// "HH:mm" string ⇄ Date for DatePicker.
     private func time(_ s: Binding<String>) -> Binding<Date> {
         let f = DateFormatter()
@@ -562,7 +603,8 @@ struct SettingsScreen<Extra: View>: View {
 
     private func load() async {
         do {
-            let s: AppSettings = try await Gateway.get("/v1/settings")
+            // Device names migrate to their ids for display; nothing is saved until the user edits.
+            let s = DeviceID.normalize(try await Gateway.get("/v1/settings") as AppSettings)
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }

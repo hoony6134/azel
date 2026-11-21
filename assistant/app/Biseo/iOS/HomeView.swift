@@ -73,7 +73,7 @@ struct HomeView: View {
         } else if let s = model.status {
             HStack(spacing: Theme.s) {
                 StatusDot(ok: model.online)
-                Text(model.online ? "연결됨 · 스파크 \(Int(s.spark.ms ?? 0)) ms" : "일부 서비스가 응답하지 않아요")
+                Text(model.online ? "연결됨 · spark \(Int(s.spark.ms ?? 0)) ms" : "일부 서비스가 응답하지 않아요")
                     .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
             }
             .accessibilityElement(children: .combine)
