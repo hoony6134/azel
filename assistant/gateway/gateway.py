@@ -58,7 +58,7 @@ DEFAULTS = {
     "monthly_budget_usd": 500, "budget_warn_pct": 80,
     "proactive": {"morning_briefing": "08:00", "deadline_check": "20:00", "quiet_hours": ["23:30", "07:30"],
                   "triggers": {"deadline": True, "server_down": True}},
-    "default_device": "맥북", "device_fallback": ["알비레오", "스파크"],
+    "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
 }
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
@@ -71,7 +71,7 @@ VOICE_BASE = (
 )
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
-    "맥북이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
+    "MacBook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
 API_STYLE = VOICE_BASE + (
     "너는 일정, 메일, 메모리, GISTRA, Planit 같은 개인 데이터를 볼 수 없어. 그런 요청이면 "
@@ -238,12 +238,14 @@ def device_prompt(settings, devices):
     """Tell Claude which device to use by default and in what order to fall back."""
     if not devices:
         return " 지금 켜져 있는 작업 기기가 없어. 기기 작업은 할 수 없다고 말해."
-    on = {d["name"]: d["id"] for d in devices}
-    order = [n for n in [settings["default_device"], *settings["device_fallback"]] if n in on]
-    order += [n for n in on if n not in order]
-    names = ", ".join(f"{n}(mcp__{on[n]})" for n in order)
+    # Devices are spoken of by their English id; settings may name them by id or (older) display name.
+    alias = {d["name"]: d["id"] for d in devices} | {d["id"]: d["id"] for d in devices}
+    order = list(dict.fromkeys(alias[n] for n in [settings["default_device"], *settings["device_fallback"]]
+                               if n in alias))
+    order += [d["id"] for d in devices if d["id"] not in order]
+    names = ", ".join(f"{i}(mcp__{i})" for i in order)
     first = settings["default_device"]
-    note = "" if order[0] == first else f" 기본 기기 {first}는 꺼져 있어. {order[0]}에서 했다고 꼭 말해."
+    note = "" if order[0] == alias.get(first) else f" 기본 기기 {first}는 꺼져 있어. {order[0]}에서 했다고 꼭 말해."
     return (f" 켜져 있는 기기, 우선순위 순: {names}. 사용자가 기기를 말하지 않으면 맨 앞 기기를 써.{note}")
 
 

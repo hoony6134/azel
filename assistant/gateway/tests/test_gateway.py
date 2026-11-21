@@ -123,11 +123,14 @@ def test_quiet_hours(gw):
 def test_device_prompt_fallback(gw):
     g, _, _ = gw
     s = asyncio.run(g.load_settings())
-    devs = [{"name": "알비레오", "id": "albireo"}, {"name": "스파크", "id": "spark"}]
+    devs = [{"name": "알비레오", "id": "albireo"}, {"name": "spark", "id": "spark"}]  # old Korean names still match
     p = g.device_prompt(s, devs)
-    assert p.index("알비레오") < p.index("스파크") and "기본 기기 맥북는 꺼져" in p
+    assert p.index("albireo(") < p.index("spark(") and "기본 기기 macbook는 꺼져" in p and "알비레오" not in p
     p = g.device_prompt(s, [{"name": "맥북", "id": "macbook"}] + devs)
-    assert p.index("맥북") < p.index("알비레오") and "꺼져" not in p
+    assert p.index("macbook(") < p.index("albireo(") and "꺼져" not in p
+    s["default_device"], s["device_fallback"] = "맥북", ["스파크"]  # settings saved before the rename
+    p = g.device_prompt(s, [{"name": "맥북", "id": "macbook"}, {"name": "스파크", "id": "spark"}])
+    assert p.index("macbook(") < p.index("spark(") and "꺼져" not in p
     assert "없어" in g.device_prompt(s, [])
 
 

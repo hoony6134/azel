@@ -124,7 +124,7 @@ device that created them.
    "monthly_budget_usd":500,"budget_warn_pct":80,
    "proactive":{"morning_briefing":"08:00","quiet_hours":["23:30","07:30"],
                 "triggers":{"deadline":true,"server_down":true}},
-   "default_device":"맥북","device_fallback":["알비레오","스파크"]}
+   "default_device":"macbook","device_fallback":["albireo","spark"]}
   ```
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
@@ -147,7 +147,7 @@ device that created them.
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
-Registration body: `{"id":"macbook","name":"맥북","url","harness":[…]}` — `id` is an ASCII
+Registration body: `{"id":"macbook","name":"MacBook","url","harness":[…]}` — `id` is an ASCII
 slug used as the MCP server name on the Claude side.
 
 Approval flow: an approval-required `run_command` posts
