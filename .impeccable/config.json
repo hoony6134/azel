@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "pulsing-dot",
+        "value": "*",
+        "files": [
+          "assistant/design/mockups.html"
+        ],
+        "createdAt": "2026-11-21T09:53:33.946Z",
+        "reason": "PM-requested activity ellipsis: animates only while a real tool_start step is running (DESIGN.md §13.3), static under reduced motion"
+      }
+    ]
+  }
+}
