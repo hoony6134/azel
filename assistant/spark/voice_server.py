@@ -403,13 +403,16 @@ async def gateway_settings():
     return links.settings  # pushed by the gateways on connect and on every change
 
 
-ROUTING = {"type": "activity", "phase": "routing", "label": "Claude에게 물어보는 중", "tool": ""}
+ROUTING = {"type": "activity", "phase": "routing", "label": "Claude에게 물어보는 중", "tool": "", "kind": "generic",
+           "route": "claude"}  # only when a turn goes to Claude; a Qwen turn sends no activity at all
+KINDS = {"calendar", "mail", "memory", "schedule", "server", "files", "web", "terminal", "notes", "generic"}
 
 
 def client_activity(ev):
-    """The app-facing activity event: phase, label and tool name only (the gateway never sends arguments)."""
+    """The app-facing activity event: phase, label, tool name and kind only (the gateway never sends arguments)."""
+    kind = ev.get("kind") if ev.get("kind") in KINDS else "generic"
     return {"type": "activity", "phase": str(ev.get("phase", "")), "label": str(ev.get("label", "")),
-            "tool": str(ev.get("tool", ""))}
+            "tool": str(ev.get("tool", "")), "kind": kind, "route": "claude"}
 
 
 async def claude_stream(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
@@ -743,7 +746,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
         async def on_event(ev):
             if ev.get("phase") in ("tool_start", "thinking"):
-                turn["activity"].append(ev.get("label", ""))
+                turn["activity"].append({"label": ev.get("label", ""), "kind": ev.get("kind", "generic"),
+                                         "at": time.time()})
             await send(ev)
         try:
             await send({"type": "state", "value": "thinking"})
@@ -1003,7 +1007,10 @@ if __name__ == "__main__":
             return [s async for s, *_ in gen]
         seen, said = asyncio.run(activity_check())
         assert seen == [ROUTING, {"type": "activity", "phase": "tool_start", "label": "학사 일정 확인 중",
-                                  "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today"}], seen
+                                  "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today", "kind": "generic",
+                                  "route": "claude"}], seen  # no kind from that gateway: generic
+        assert client_activity({"phase": "tool_start", "kind": "mail"})["kind"] == "mail"
+        assert client_activity({"phase": "tool_start", "kind": "<script>"})["kind"] == "generic"
         assert "SECRET" not in json.dumps(seen) and said == ["내일은 수업이 없어요."]
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
@@ -1141,13 +1148,17 @@ if __name__ == "__main__":
             links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
             links.receive(lim, {"type": "hello", "device": "spark", "mode": "limited", "priority": 9})
             tc = TestClient(app, client=("100.64.0.8", 1))
+            kinds_seen = []
             with tc.websocket_connect("/v1/call?client=iphone&session=h", headers={"Authorization": "Bearer app-tok"}) as w:
                 w.send_bytes((np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes())
                 while True:
                     m = w.receive()
-                    if m.get("text") and json.loads(m["text"])["type"] == "turn_done":
-                        break
+                    if m.get("text"):
+                        kinds_seen.append(json.loads(m["text"])["type"])
+                        if kinds_seen[-1] == "turn_done":
+                            break
                 w.send_text(json.dumps({"type": "hangup"}))
+            assert "activity" not in kinds_seen, kinds_seen  # a Qwen turn sends no activity events
             time.sleep(0.1)
             logs = [m for m in full.ws.sent if m.get("type") == "call_log"]
             links.remove(full)

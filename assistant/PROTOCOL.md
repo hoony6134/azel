@@ -41,9 +41,12 @@ answering a call the assistant placed; the server then speaks that call's openin
   - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — sentence being spoken
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
     playback now**
-  - `{"type":"activity","phase","label","tool"}` — what the assistant is doing, for the app's status line
-    and sounds. `phase`: `routing` (the turn goes to Claude; sent before any filler, label "Claude에게
-    물어보는 중"), `thinking` (API path, label "생각 중"), `tool_start` / `tool_end` (`tool` = the raw tool
+  - `{"type":"activity","phase","label","tool","kind","route":"claude"}` — what the assistant is doing, for
+    the app's status line, icon and sounds. Only Claude turns send any; a Qwen turn sends none. `kind`:
+    `calendar|mail|memory|schedule|server|files|web|terminal|notes|generic` (gistra/planit → schedule,
+    Google Calendar → calendar, Gmail → mail, memory → memory, infra → server, list_dir/read_file/search →
+    files, browse → web, run_command/delegate → terminal, Notion → notes, anything else generic). `phase`:
+    `routing` (the turn goes to Claude; sent before any filler, label "Claude에게 물어보는 중", kind generic), `thinking` (API path, label "생각 중"), `tool_start` / `tool_end` (`tool` = the raw tool
     name, e.g. `mcp__claude_ai_Gmail__search_threads`; `label` in Korean, e.g. "메일 확인 중",
     "macbook에서 명령 실행 중"). Never carries tool arguments or results. `/v1/turn` NDJSON carries the
     same objects between its `audio` lines.
@@ -77,7 +80,8 @@ JSON text frames:
 - voice → gateway: `{"type":"call_log","event":"start"|"turn"|"end","log_id",…}` — call history, sent
   only to a full-mode link (dropped when none is up; the voice server stores no history):
   start `{"session","call_id","direction":"outgoing"|"incoming","reason","client","opening","started_at"}`,
-  turn `{"user","assistant":["sentence",…],"route","activity":["label",…],"timings","interrupted","at"}`
+  turn `{"user","assistant":["sentence",…],"route","activity":[{"label","kind","at"},…],"timings",
+  "interrupted","at"}` (`at` in epoch seconds; activity = the turn's tool_start/thinking steps)
   (never for an empty transcript; fillers left out), end `{"ended_at","duration_s"}`. One `log_id` per
   `/v1/call` connection; a turn cut short by hang-up is sent before the end.
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
@@ -136,7 +140,7 @@ device that created them.
 
 - `POST /v1/ask` `{"text","session","model"?,"path"?,"task"?}` → NDJSON stream of
   `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}`, with
-  `{"type":"activity","phase","tool","label"}` interleaved: `tool_start`/`tool_end` per tool call on the
+  `{"type":"activity","phase","tool","label","kind","route":"claude"}` interleaved (kinds as in section 1): `tool_start`/`tool_end` per tool call on the
   `claude -p` path (labels mapped from the tool name only: gistra_* 학사 일정, planit_* 할 일, Google
   Calendar 캘린더, Gmail 메일, memory_* 기억, infra_* 서버 상태, Notion 노션, daemon run_command /
   list_dir·read_file·search / browse / delegate, anything else "도구 준비 중"), one `thinking` on the API path.
@@ -168,10 +172,14 @@ device that created them.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Call history (full gateways only; limited → 403), stored in ruchba (section 5):
-  `GET /v1/history?limit=20&before=<epoch>&q=` → `[{"id","title" (first user utterance),"started_at",
-  "duration_s","direction","reason","client","turns","routes":{"qwen":n,"claude":m}}]`, newest first;
-  `GET /v1/history/{id}` → the call with `"turns":[{"at","user","assistant","route","activity","timings",
-  "interrupted"}]`; `DELETE /v1/history/{id}`; `DELETE /v1/history?older_than_days=N`. Setting
+  `GET /v1/history?limit=20&before=<epoch>&q=` → `[{"id","session","title" (first user utterance),
+  "last_reply" (last assistant reply, first 120 chars),"started_at","duration_s","direction","reason",
+  "client","turns","routes":{"qwen":n,"claude":m},"kinds":["calendar",…]}]`, newest first. With `q`:
+  full transcripts are searched with the memory records' hybrid vector + text ranking (calls still in
+  progress by substring), best first, each item adding `"match"`: a short snippet of the matching line;
+  `GET /v1/history/{id}` → the call with `"turns":[{"at","user","assistant","route",
+  "activity":[{"label","kind","at"}],"timings","interrupted"}]`, every `at` in seconds from the call's
+  start, computed by the memory service; `DELETE /v1/history/{id}`; `DELETE /v1/history?older_than_days=N`. Setting
   `history_days` (default 365, 0 = forever): a full gateway deletes older calls daily at 04:00 (lease
   `job:retention:<date>`). Gateways write the voice server's `call_log` events through a restart-proof
   outbox (`pending_history.json`).

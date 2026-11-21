@@ -145,25 +145,42 @@ def test_call_history_round_trip(client):
     client.post("/v1/state/history/h1/start", json={"session": "s1", "call_id": "c1", "direction": "outgoing",
                                                     "reason": "morning_briefing", "client": "iphone",
                                                     "opening": "좋은 아침이에요.", "started_at": t0})
-    client.post("/v1/state/history/h1/turns", json={"user": "오늘 일정 알려줘", "assistant": ["10시에 회의가 있어요."],
-                                                    "route": "claude", "activity": ["캘린더 확인 중"],
-                                                    "timings": {"total_ms": 4200}})
-    client.post("/v1/state/history/h1/turns", json={"user": "고마워", "assistant": ["네."], "route": "qwen",
-                                                    "interrupted": True})
+    client.post("/v1/state/history/h1/turns", json={
+        "user": "오늘 일정 알려줘", "assistant": ["10시에 회의가 있어요."], "route": "claude", "at": t0 + 12,
+        "activity": [{"label": "캘린더 확인 중", "kind": "calendar", "at": t0 + 13.5},
+                     {"label": "메일 확인 중", "kind": "mail", "at": t0 + 15}], "timings": {"total_ms": 4200}})
+    client.post("/v1/state/history/h1/turns", json={"user": "고마워", "assistant": ["네, 언제든 불러 주세요."],
+                                                    "route": "qwen", "interrupted": True, "at": t0 + 40,
+                                                    "activity": ["예전 형식"]})
     assert client.post("/v1/state/history/h1/turns", json={"user": ""}).status_code == 422  # no empty turns
     assert client.post("/v1/state/history/h1/end", json={"ended_at": t0 + 95}).json() == {"ok": True, "turns": 2}
     [row] = client.get("/v1/state/history").json()
     assert row["id"] == "h1" and row["title"] == "오늘 일정 알려줘" and row["turns"] == 2
     assert row["routes"] == {"claude": 1, "qwen": 1} and abs(row["duration_s"] - 95) < 1 and row["direction"] == "outgoing"
+    assert row["session"] == "s1" and row["last_reply"] == "네, 언제든 불러 주세요." and sorted(row["kinds"]) == ["calendar", "mail"]
     full = client.get("/v1/state/history/h1").json()
     assert [t["user"] for t in full["turns"]] == ["오늘 일정 알려줘", "고마워"]
-    assert full["turns"][0]["activity"] == ["캘린더 확인 중"] and full["turns"][1]["interrupted"] is True
+    assert [t["at"] for t in full["turns"]] == [12.0, 40.0]  # seconds from the call start
+    assert full["turns"][0]["activity"] == [{"label": "캘린더 확인 중", "kind": "calendar", "at": 13.5},
+                                            {"label": "메일 확인 중", "kind": "mail", "at": 15.0}]
+    assert full["turns"][1]["activity"] == [{"label": "예전 형식", "kind": "generic", "at": None}]
+    assert full["turns"][1]["interrupted"] is True
     assert full["opening"] == "좋은 아침이에요." and full["client"] == "iphone"
-    assert [r["id"] for r in client.get("/v1/state/history?q=회의").json()] == ["h1"]
+    hits = client.get("/v1/state/history?q=회의").json()  # full transcript, not just the title
+    assert [r["id"] for r in hits] == ["h1"] and "회의" in hits[0]["match"]
+    assert client.get("/v1/state/history?q=언제든").json()[0]["match"].startswith("비서: 네, 언제든")
     assert client.get("/v1/state/history?q=없는말").json() == []
     assert client.get(f"/v1/state/history?before={t0 - 1}").json() == []
     recs = client.post("/v1/search", json={"query": "오늘 일정 회의", "kinds": ["transcript"]}).json()
     assert [r["meta"]["call"] for r in recs] == ["h1"] and "10시에 회의" in recs[0]["text"]
+
+
+def test_call_history_search_running_call(client):
+    client.post("/v1/state/history/live1/start", json={"session": "s9"})
+    client.post("/v1/state/history/live1/turns", json={"user": "주차 요금 알려줘", "assistant": ["시간당 삼천 원이에요."]})
+    hits = client.get("/v1/state/history?q=주차").json()  # not ended: no transcript record yet, still found
+    assert [h["id"] for h in hits] == ["live1"] and "주차" in hits[0]["match"]
+    client.delete("/v1/state/history/live1")
 
 
 def test_call_history_delete_and_prune(client):

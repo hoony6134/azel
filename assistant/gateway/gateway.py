@@ -308,32 +308,40 @@ def device_prompt(settings, devices):
     return (f" 켜져 있는 기기, 우선순위 순: {names}. 사용자가 기기를 말하지 않으면 맨 앞 기기를 써.{note}")
 
 
-TOOL_LABELS = [  # (prefix of the tool's own name, label); the first match wins
-    ("gistra_", "학사 일정 확인 중"), ("planit_", "할 일 확인 중"), ("memory_", "기억 찾는 중"), ("infra_", "서버 상태 보는 중"),
-]
-SERVER_LABELS = [("google_calendar", "캘린더 확인 중"), ("gmail", "메일 확인 중"), ("notion", "노션 보는 중")]
-DEVICE_LABELS = {"run_command": "{}에서 명령 실행 중", "list_dir": "{} 파일 보는 중", "read_file": "{} 파일 보는 중",
-                 "search": "{} 파일 보는 중", "browse": "웹페이지 읽는 중", "delegate": "{}에 작업 맡기는 중"}
+# (prefix of the tool's own name, label, kind); the first match wins. `kind` picks the app's icon.
+TOOL_LABELS = [("gistra_", "학사 일정 확인 중", "schedule"), ("planit_", "할 일 확인 중", "schedule"),
+               ("memory_", "기억 찾는 중", "memory"), ("infra_", "서버 상태 보는 중", "server")]
+SERVER_LABELS = [("google_calendar", "캘린더 확인 중", "calendar"), ("gmail", "메일 확인 중", "mail"),
+                 ("notion", "노션 보는 중", "notes")]
+DEVICE_LABELS = {"run_command": ("{}에서 명령 실행 중", "terminal"), "list_dir": ("{} 파일 보는 중", "files"),
+                 "read_file": ("{} 파일 보는 중", "files"), "search": ("{} 파일 보는 중", "files"),
+                 "browse": ("웹페이지 읽는 중", "web"), "delegate": ("{}에 작업 맡기는 중", "terminal")}
+GENERIC = ("도구 준비 중", "generic")
+
+
+def tool_info(name):
+    """(Korean label, kind) for a tool, from its name alone (never its arguments or result)."""
+    server, _, tool = name.removeprefix("mcp__").partition("__") if name.startswith("mcp__") else ("", "", name)
+    for prefix, label, kind in TOOL_LABELS:
+        if tool.startswith(prefix):
+            return label, kind
+    for key, label, kind in SERVER_LABELS:
+        if key in server.lower() or tool.lower().startswith(key):
+            return label, kind
+    if server and not server.startswith("claude_ai_") and tool in DEVICE_LABELS:
+        label, kind = DEVICE_LABELS[tool]
+        return label.format(server), kind  # a device daemon: the server name is the device id
+    return GENERIC
 
 
 def tool_label(name):
-    """Korean label for a tool, from its name alone (never its arguments or result)."""
-    server, _, tool = name.removeprefix("mcp__").partition("__") if name.startswith("mcp__") else ("", "", name)
-    for prefix, label in TOOL_LABELS:
-        if tool.startswith(prefix):
-            return label
-    for key, label in SERVER_LABELS:
-        if key in server.lower() or tool.lower().startswith(key):
-            return label
-    if server and not server.startswith("claude_ai_") and tool in DEVICE_LABELS:
-        return DEVICE_LABELS[tool].format(server)  # a device daemon: the server name is the device id
-    return "도구 준비 중"
+    return tool_info(name)[0]
 
 
 def activity(phase, tool=""):
-    """Progress event for the app. Only the tool's name and label: arguments and results stay private."""
-    label = {"thinking": "생각 중"}.get(phase) or tool_label(tool)
-    return {"type": "activity", "phase": phase, "tool": tool, "label": label}
+    """Progress event for the app. Only the tool's name, label and kind: arguments and results stay private."""
+    label, kind = ("생각 중", "generic") if phase == "thinking" else tool_info(tool)
+    return {"type": "activity", "phase": phase, "tool": tool, "label": label, "kind": kind, "route": "claude"}
 
 
 async def ask_claude_code(text, model, session):

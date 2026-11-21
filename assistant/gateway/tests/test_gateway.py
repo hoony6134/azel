@@ -107,32 +107,34 @@ def test_tool_activity_without_arguments(gw):
     g, c, _ = gw
     ev = events(c.post("/v1/ask", json={"text": "도구 써서 오늘 수업 알려줘"}))
     acts = [e for e in ev if e["type"] == "activity"]
-    assert acts == [{"type": "activity", "phase": "tool_start", "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today",
-                     "label": "학사 일정 확인 중"},
-                    {"type": "activity", "phase": "tool_end", "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today",
-                     "label": "학사 일정 확인 중"}]
+    tool = {"tool": "mcp__claude_ai_Cygnus_MCP__gistra_today", "label": "학사 일정 확인 중", "kind": "schedule",
+            "route": "claude"}
+    assert acts == [{"type": "activity", "phase": "tool_start", **tool}, {"type": "activity", "phase": "tool_end", **tool}]
     assert "SECRET" not in json.dumps(ev)  # neither the arguments nor the result
     assert "".join(e["delta"] for e in ev if e["type"] == "text").strip() == "네, 확인했어요."
 
 
 def test_tool_labels(gw):
     g, _, _ = gw
-    for name, label in [
-        ("mcp__claude_ai_Cygnus_MCP__gistra_today", "학사 일정 확인 중"),
-        ("mcp__claude_ai_Cygnus_MCP__planit_get_day", "할 일 확인 중"),
-        ("mcp__claude_ai_Cygnus_MCP__memory_recall", "기억 찾는 중"),
-        ("mcp__claude_ai_Cygnus_MCP__infra_status", "서버 상태 보는 중"),
-        ("mcp__claude_ai_Google_Calendar__list_events", "캘린더 확인 중"),
-        ("mcp__claude_ai_Gmail__search_threads", "메일 확인 중"),
-        ("mcp__claude_ai_Notion__notion-search", "노션 보는 중"),
-        ("mcp__macbook__run_command", "macbook에서 명령 실행 중"),
-        ("mcp__albireo__read_file", "albireo 파일 보는 중"), ("mcp__albireo__list_dir", "albireo 파일 보는 중"),
-        ("mcp__gienah__search", "gienah 파일 보는 중"), ("mcp__macbook__browse", "웹페이지 읽는 중"),
-        ("mcp__deneb__delegate", "deneb에 작업 맡기는 중"), ("mcp__macbook__job_status", "도구 준비 중"),
-        ("ToolSearch", "도구 준비 중"), ("mcp__claude_ai_Cygnus_MCP__search", "도구 준비 중"), ("", "도구 준비 중"),
+    for name, label, kind in [
+        ("mcp__claude_ai_Cygnus_MCP__gistra_today", "학사 일정 확인 중", "schedule"),
+        ("mcp__claude_ai_Cygnus_MCP__planit_get_day", "할 일 확인 중", "schedule"),
+        ("mcp__claude_ai_Cygnus_MCP__memory_recall", "기억 찾는 중", "memory"),
+        ("mcp__claude_ai_Cygnus_MCP__infra_status", "서버 상태 보는 중", "server"),
+        ("mcp__claude_ai_Google_Calendar__list_events", "캘린더 확인 중", "calendar"),
+        ("mcp__claude_ai_Gmail__search_threads", "메일 확인 중", "mail"),
+        ("mcp__claude_ai_Notion__notion-search", "노션 보는 중", "notes"),
+        ("mcp__macbook__run_command", "macbook에서 명령 실행 중", "terminal"),
+        ("mcp__albireo__read_file", "albireo 파일 보는 중", "files"),
+        ("mcp__albireo__list_dir", "albireo 파일 보는 중", "files"),
+        ("mcp__gienah__search", "gienah 파일 보는 중", "files"), ("mcp__macbook__browse", "웹페이지 읽는 중", "web"),
+        ("mcp__deneb__delegate", "deneb에 작업 맡기는 중", "terminal"),
+        ("mcp__macbook__job_status", "도구 준비 중", "generic"), ("ToolSearch", "도구 준비 중", "generic"),
+        ("mcp__claude_ai_Cygnus_MCP__search", "도구 준비 중", "generic"), ("", "도구 준비 중", "generic"),
     ]:
-        assert g.tool_label(name) == label, name
-    assert g.activity("thinking") == {"type": "activity", "phase": "thinking", "tool": "", "label": "생각 중"}
+        assert g.tool_info(name) == (label, kind), name
+    assert g.activity("thinking") == {"type": "activity", "phase": "thinking", "tool": "", "label": "생각 중",
+                                      "kind": "generic", "route": "claude"}
 
 
 def test_settings_reject_unknown(gw):

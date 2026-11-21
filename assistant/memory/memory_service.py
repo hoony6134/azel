@@ -515,7 +515,7 @@ class CallTurn(BaseModel):
     user: str = Field(min_length=1)
     assistant: list[str] = []
     route: str = ""
-    activity: list[str] = []
+    activity: list[dict | str] = []  # {"label","kind","at": epoch}; plain labels from older voice servers
     timings: dict = {}
     interrupted: bool = False
     at: float | None = None
@@ -553,22 +553,65 @@ def history_end(hid: str, e: CallEnd):
     return {"ok": True, "turns": len(turns)}
 
 
-LIST_COLS = f"""h.id, h.direction, h.reason, h.client, extract(epoch from h.started_at)::float8 as started_at,
-    h.duration_s,
+LIST_COLS = f"""h.id, h.session, h.direction, h.reason, h.client,
+    extract(epoch from h.started_at)::float8 as started_at, h.duration_s,
     (select user_text from {TURNS} t where t.call = h.id order by t.id limit 1) as title,
+    (select left(array_to_string(array(select jsonb_array_elements_text(t.assistant)), ' '), 120) from {TURNS} t
+        where t.call = h.id and jsonb_array_length(t.assistant) > 0 order by t.id desc limit 1) as last_reply,
     (select count(*) from {TURNS} t where t.call = h.id) as turns,
     (select coalesce(jsonb_object_agg(route, n), '{{}}') from (select route, count(*) n from {TURNS} t
-        where t.call = h.id group by route) r) as routes"""
+        where t.call = h.id group by route) r) as routes,
+    (select coalesce(jsonb_agg(distinct a->>'kind'), '[]') from {TURNS} t, jsonb_array_elements(t.activity) a
+        where t.call = h.id and jsonb_typeof(a) = 'object' and a->>'kind' is not null) as kinds"""
+# shortcut: e5 cosine for unrelated Korean text sits around 0.75-0.8, so a vector-only hit needs more than that;
+# tune on real calls if q misses paraphrases or returns noise.
+HISTORY_VEC_MIN, HISTORY_LEX_MIN = 0.86, 0.1
+
+
+def snippet(text, q, width=80):
+    """The transcript line that best matches q, trimmed around the match."""
+    lines = [ln for ln in text.splitlines() if ln.strip()] or [text]
+    words = set(q.lower().split())
+    best = max(lines, key=lambda ln: (q.lower() in ln.lower(), len(words & set(ln.lower().split()))))
+    at = max(best.lower().find(q.lower()), 0)
+    start = max(0, min(at - width // 3, len(best) - width))
+    return ("…" if start else "") + best[start:start + width] + ("…" if start + width < len(best) else "")
 
 
 @app.get("/v1/state/history", dependencies=[v1])
 def history_list(limit: int = 20, before: float | None = None, q: str | None = None):
-    rows = db(f"select {LIST_COLS} from {HIST} h where (%(before)s::float8 is null or h.started_at < to_timestamp(%(before)s))"
-              f" and (%(q)s::text is null or h.opening ilike %(like)s or exists (select 1 from {TURNS} t"
-              " where t.call = h.id and (t.user_text ilike %(like)s or t.assistant::text ilike %(like)s)))"
-              " order by h.started_at desc limit %(limit)s",
-              {"before": before, "q": q, "like": f"%{q}%", "limit": max(1, min(limit, 100))})
-    return rows
+    limit = max(1, min(limit, 100))
+    where = "(%(before)s::float8 is null or h.started_at < to_timestamp(%(before)s))"
+    if not q:
+        return db(f"select {LIST_COLS} from {HIST} h where {where} order by h.started_at desc limit %(limit)s",
+                  {"before": before, "limit": limit})
+    # Full transcripts, ranked like memory search: ended calls have a transcript record (hybrid vector + text);
+    # calls still running do not yet, so their turns are matched by substring.
+    best: dict[str, tuple[float, str]] = {}
+    for h in search(Search(query=q, kinds=["transcript"], limit=100)):
+        cid = (h["meta"] or {}).get("call")
+        if cid and cid not in best and (h["lex"] >= HISTORY_LEX_MIN or h["vec"] >= HISTORY_VEC_MIN):
+            best[cid] = (h["score"], snippet(h["text"], q))
+    for r in db(f"select t.call, t.user_text, t.assistant from {TURNS} t join {HIST} h on h.id = t.call"
+                " where h.ended_at is null and (t.user_text ilike %(like)s or t.assistant::text ilike %(like)s)",
+                {"like": f"%{q}%"}):
+        best.setdefault(r["call"], (0.0, snippet(r["user_text"] + "\n" + " ".join(r["assistant"]), q)))
+    if not best:
+        return []
+    rows = db(f"select {LIST_COLS} from {HIST} h where {where} and h.id = any(%(ids)s)",
+              {"before": before, "ids": list(best)})
+    rows.sort(key=lambda r: -best[r["id"]][0])
+    return [{**r, "match": best[r["id"]][1]} for r in rows[:limit]]
+
+
+def offsets(steps, started):
+    """Activity steps as {label, kind, at}: `at` in seconds from the call start (older string steps become generic)."""
+    out = []
+    for st in steps or []:
+        st = st if isinstance(st, dict) else {"label": str(st), "kind": "generic"}
+        at = st.get("at")
+        out.append({**st, "at": round(at - started, 1) if isinstance(at, (int, float)) and started else None})
+    return out
 
 
 @app.get("/v1/state/history/{hid}", dependencies=[v1])
@@ -577,8 +620,12 @@ def history_get(hid: str):
               f" {EPOCH.format('ended_at')}, duration_s from {HIST} where id=%s", (hid,))
     if not rows:
         raise HTTPException(404, "no such call")
+    started = rows[0]["started_at"]
     turns = db(f"select {EPOCH.format('at')}, user_text as user, assistant, route, activity, timings, interrupted"
                f" from {TURNS} where call=%s order by id", (hid,))
+    for t in turns:  # offsets from the call start, measured here rather than trusted from the client
+        t["at"] = round(t["at"] - started, 1) if started else None
+        t["activity"] = offsets(t["activity"], started)
     return {**rows[0], "turns": turns}
 
 
