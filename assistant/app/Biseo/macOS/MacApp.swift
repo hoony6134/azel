@@ -124,6 +124,7 @@ struct Popover: View {
                         .foregroundStyle(call.inCall ? Color.white : Theme.onAccent)
                     }
                 }
+                PersonaSwitcher(model: PersonaModel.shared)
                 Grid(horizontalSpacing: Theme.s) {
                     GridRow {
                         small("오늘 브리핑", "sun.max") { startBriefing() }
@@ -165,7 +166,7 @@ struct Popover: View {
         .padding(Theme.l)
         .frame(width: 340)
         .background(Theme.bgRaised)
-        .task { await model.refresh(); await wake.refresh(); await history.refresh() }
+        .task { await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh() }
     }
 
     private func small(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -288,6 +289,12 @@ struct MacHome: View {
                             Text(Date(), format: .dateTime.month().day().weekday(.wide)).font(.subheadline).foregroundStyle(Theme.text2)
                         }
                     } else {
+                        if let p = call.activePersona {
+                            HStack(spacing: 6) {
+                                Circle().fill(p.tint).frame(width: 8, height: 8)
+                                Text(p.name).font(.headline).foregroundStyle(Theme.text)
+                            }
+                        }
                         Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }
                     MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt)
@@ -318,7 +325,7 @@ struct MacHome: View {
     private var idle: some View {
         VStack(spacing: Theme.l) {
             Button { call.start(panel: false) } label: {
-                Label("\(AssistantName.current)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
+                Label("\(PersonaModel.shared.callName)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
                     .frame(maxWidth: .infinity).frame(height: 52)
                     .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
             }

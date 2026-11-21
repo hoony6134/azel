@@ -5,8 +5,11 @@ struct StartCallIntent: AppIntent {
     static let title: LocalizedStringResource = "전화 걸기"
     static let openAppWhenRun = true
 
+    /// Optional: call a persona by name; empty calls the primary.
+    @Parameter(title: "비서") var persona: String?
+
     @MainActor func perform() async throws -> some IntentResult {
-        CallManager.shared.startCall()
+        CallManager.shared.startCall(persona: PersonaModel.shared.match(name: persona) ?? (persona == nil ? PersonaModel.shared.primary : nil))
         return .result()
     }
 }

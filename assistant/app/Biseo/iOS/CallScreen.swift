@@ -86,7 +86,10 @@ struct CallScreen: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+            HStack(spacing: 6) {
+                if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { Circle().fill(p.tint).frame(width: 8, height: 8) }
+                Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+            }
             Group {
                 if let r = call.log.lastRoute { RouteChip(route: r) }
             }

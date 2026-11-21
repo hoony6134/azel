@@ -222,6 +222,7 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showPaths = false
     @State private var pendingDays: Int?
     @State private var showProactiveLog = false
+    @State private var showPersonas = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
@@ -279,6 +280,22 @@ struct SettingsScreen<Extra: View>: View {
     // 비서 (DESIGN §7.5 card 1)
     private func assistantCard(_ s: Binding<AppSettings>) -> some View {
         Card("비서") {
+            Button { showPersonas = true } label: {
+                HStack {
+                    Text("비서 관리").foregroundStyle(Theme.text)
+                    Spacer()
+                    Text("\(max(1, PersonaModel.shared.personas.count))명").foregroundStyle(Theme.text3)
+                    Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .sheet(isPresented: $showPersonas) {
+                NavigationStack { PersonaListView(model: PersonaModel.shared) }
+                    #if os(macOS)
+                    .frame(width: 520, height: 620)
+                    #endif
+            }
             HStack {
                 Text("이름").foregroundStyle(Theme.text)
                 Spacer()

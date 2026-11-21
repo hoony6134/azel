@@ -83,6 +83,7 @@ struct HistoryRow: View {
             Spacer(minLength: Theme.s)
             if deleting { ProgressView().controlSize(.small) } else {
                 HStack(spacing: Theme.xs) {
+                    if PersonaModel.shared.personas.count > 1, let p = PersonaModel.shared.persona(id: item.persona_id) { PersonaChip(persona: p) }
                     ForEach(item.routeList, id: \.self) { RouteChip(route: $0) }
                     if !Recordings.matching(item).isEmpty { Image(systemName: "waveform").foregroundStyle(Theme.text3).accessibilityLabel("녹음 있음") }
                 }
@@ -210,6 +211,21 @@ struct HistoryList: View {
         .scrollContentBackground(.hidden)
         .background(Theme.bg.ignoresSafeArea())
         .searchable(text: $model.query, prompt: "기록 검색")
+        .toolbar {
+            if PersonaModel.shared.personas.count > 1 {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Picker("비서", selection: $model.personaFilter) {
+                            Text("모든 비서").tag(String?.none)
+                            ForEach(PersonaModel.shared.personas) { Text($0.name).tag(Optional($0.id)) }
+                        }
+                    } label: {
+                        Label(PersonaModel.shared.persona(id: model.personaFilter)?.name ?? "모든 비서", systemImage: "line.3.horizontal.decrease.circle")
+                    }
+                    .accessibilityLabel("비서별로 보기")
+                }
+            }
+        }
         .refreshable { await model.refresh() }
         .overlay(alignment: .bottom) { UndoToast(model: model).animation(Theme.enter, value: model.pendingDelete) }
         .onDisappear { model.commitPendingDelete() }

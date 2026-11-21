@@ -36,6 +36,8 @@ final class CallManager: NSObject, ObservableObject {
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
     private var incoming: [UUID: (callID: String?, reason: String?, caller: String)] = [:]
     private var activeSession: String?
+    /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
+    @Published private(set) var activePersona: Persona?
 
     private override init() {
         let config = CXProviderConfiguration()
@@ -58,11 +60,14 @@ final class CallManager: NSObject, ObservableObject {
 
     // MARK: UI actions
 
-    func startCall(prefix: String = "iphone") {
+    /// `persona`: nil = the one chosen in the app (or the primary).
+    @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil) {
         guard !inCall else { return }
         sessionPrefix = prefix
-        callerName = nil
-        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: AssistantName.current))
+        let who = persona ?? PersonaModel.shared.selected
+        activePersona = who
+        callerName = who?.name
+        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: who?.name ?? AssistantName.current))
         controller.request(CXTransaction(action: action)) { [weak self] err in
             if let err { DispatchQueue.main.async { self?.error = err.localizedDescription } }
         }
@@ -156,7 +161,7 @@ final class CallManager: NSObject, ObservableObject {
         activeSession = callID ?? Session.current(sessionPrefix)
         // Outgoing briefing calls (오늘 브리핑, Siri) tell the server what to open with.
         let intent = callID == nil && sessionPrefix == "briefing" ? "briefing" : nil
-        do { try client.start(session: activeSession!, callID: callID, intent: intent) } catch {
+        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
@@ -196,6 +201,7 @@ final class CallManager: NSObject, ObservableObject {
         client.stop()
         if activeSession != nil { NotificationCenter.default.post(name: callEndedNotification, object: nil) }
         activeSession = nil
+        activePersona = nil
         callUUID = nil
         callID = nil
         sessionPrefix = "iphone"
