@@ -125,6 +125,11 @@ validation (ahead, within 30 days, known repeat, `weekly:N` on that weekday; a t
 means KST). A weekday mismatch asks back ("무슨 요일 몇 시에 할까요?"). With no time the voice server asks back ("몇 시에 깨워
 드릴까요?") and the next utterance with a time completes it.
 
+No bare acknowledgements: when a question or request (not a greeting, thanks or yes/no confirmation) gets a
+Qwen reply with no content (only "네", "알겠습니다", "확인해 볼게요" and the like), the voice server holds it back,
+asks Qwen once more with a nudge, and hands the turn to Claude if the second reply is empty too. A leading
+acknowledgement followed by content is spoken as usual.
+
 Routing, per other ask: the full-mode link (with Claude) with the lowest `priority` among healthy links (3+ consecutive
 failed asks — timeouts or errors without a `code` — make a link unhealthy until it answers again; it
 is then tried last). With no full link, limited links take the ask only when the utterance is not

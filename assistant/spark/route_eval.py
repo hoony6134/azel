@@ -6,6 +6,7 @@ Run on a tailnet host:  python route_eval.py [--llm http://100.64.0.11:8888/v1/c
 """
 import asyncio
 import os
+import re
 import sys
 import time
 
@@ -15,6 +16,7 @@ sys.argv.append("--check")  # import voice_server without loading STT/VAD models
 import voice_server as vs  # noqa: E402
 
 Q, C = "qwen", "claude"
+ACK_ROUNDS = int(os.environ.get("ACK_ROUNDS", "3"))
 # (utterance, expected route, expected task when routed to Claude)
 CASES = [
     # chit-chat, greetings: Qwen
@@ -78,20 +80,72 @@ PERSONAL_CASES = {
 assert PERSONAL_CASES <= {c[0] for c in CASES}
 
 
+# Acknowledgement-only check: these get a real answer from Qwen, run through the real respond() pipeline (TTS and
+# Claude stubbed). A reply that is only "네" / "알겠습니다" (under 6 syllables of content) fails.
+ACK_CASES = [
+    "17 곱하기 23은?", "광합성이 뭐야?", "지금 몇 시야?", "대한민국 수도가 어디야?", "섭씨 30도는 화씨로 몇 도야?",
+    "심심한데 농담 하나 해 줘", "오늘 무슨 요일이야?", "120의 15퍼센트는 얼마야?", "물은 몇 도에서 끓어?",
+    "라면 맛있게 끓이는 법 알려줘", "피곤할 때 뭐 하면 좋아?", "영어로 고마워가 뭐야?", "하루에 물 얼마나 마셔야 해?",
+    "잠이 안 올 때 어떻게 해?", "짧은 명언 하나 말해 줘",
+    # live-data questions no keyword catches: Qwen tends to say "네" and only then hand over (or not at all)
+    "비트코인 가격 알려줘", "요즘 개봉한 영화 뭐 있어?", "엔비디아 주식 지금 얼마야?", "이번 주 로또 번호 뭐야?",
+    "손흥민 어제 골 넣었어?", "지금 미국 대통령이 누구야?",
+]
+_ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알았어요|좋아요|그럼요|물론이죠|맞아요|그렇죠|그래요|"
+                        r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
+
+
+def ack_only(reply):
+    """No content: only acknowledgements/promises ("네.", "알겠습니다", "확인해 볼게요"). Short real answers
+    ("십팔이에요.", "Thanks.") pass; a syllable count would flag them. Own copy, so older voice servers are judged
+    the same way."""
+    return not re.search(r"[가-힣A-Za-z0-9]", _ACK_WORDS.sub("", reply))
+
+
+async def full_reply(text):
+    async def fake_tts(sentence):
+        return b"", 24000
+
+    async def fake_claude(*a, **k):
+        yield "(Claude가 답함)"
+    vs.tts, vs.claude_stream = fake_tts, fake_claude
+    vs.history.pop("ack-eval", None)
+    said, route = [], ""
+    async for s, r, *_ in vs.respond(text, "ack-eval", time.perf_counter(), {}):
+        route = r
+        if s not in (vs.FILLER, vs.FILLER_LONG):
+            said.append(s)
+    return " ".join(said), route
+
+
+async def ack_eval():
+    bad = []
+    for text in ACK_CASES:
+        reply, route = await full_reply(text)
+        if route == "qwen" and (ack_only(reply) or "CLAUDE" in reply.upper()):  # "네 [CLAUDE]" spoken = no answer
+            bad.append((text, reply))
+    print(f"[ack] non-trivial questions left without an answer (only '네', or a spoken tag): {len(bad)}/{len(ACK_CASES)}")
+    for text, reply in bad:
+        print(f"  ACK  {text}  -> {reply!r}")
+    return len(bad)
+
+
 async def qwen_route(text):
     """'claude' if Qwen emits the routing tag first, else 'qwen' (stream closed as soon as it is decided)."""
     messages = [{"role": "system", "content": vs.system_prompt(vs.DEFAULT_NAME) + vs.now_kst()},
                 {"role": "user", "content": text}]
     buf, gen = "", vs.llm_stream(messages)
-    try:
+    try:  # read on past the first words: "네. [CLAUDE]" is a hand-over too (the voice server routes it)
         async for delta in gen:
             buf += delta
             state = vs.tag_state(buf.lstrip())
-            if state != "maybe":
-                return (C if state == "tag" else Q), buf
+            if state == "tag" or vs.ROUTE_TAG in buf:
+                return C, buf
+            if state != "maybe" and len(buf) > 60:
+                return Q, buf
     finally:
         await gen.aclose()
-    return Q, buf
+    return (C if vs.ROUTE_TAG in buf else Q), buf
 
 
 async def run(name, cases, personal_cases):
@@ -119,8 +173,11 @@ async def run(name, cases, personal_cases):
 async def main():
     acc, leaked = await run("main", CASES, PERSONAL_CASES)
     acc2, leaked2 = await run("held-out", HELDOUT, HELDOUT_PERSONAL)
+    acks = 0
+    for _ in range(ACK_ROUNDS):  # Qwen samples at temperature 0.7: several rounds show how often it happens
+        acks += await ack_eval()
     await vs.client.aclose()
-    return min(acc, acc2), leaked + leaked2
+    return min(acc, acc2), leaked + leaked2 + acks
 
 
 if __name__ == "__main__":

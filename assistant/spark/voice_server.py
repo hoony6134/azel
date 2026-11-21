@@ -54,7 +54,8 @@ LENGTH_STYLE = {
 LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어 존댓말로 자연스럽게 말해. 첫 문장은 열 글자 안팎으로 짧게 시작해. "
+    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해(예: '오늘 일정은 두 개예요,'). "
+    "'네'나 '알겠습니다'만 하고 끝내지 마. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
     f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
@@ -483,6 +484,26 @@ def pre_route(text, settings, local=False):
     else:
         keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
+
+
+# A reply with no content: acknowledgements and promises only ("네.", "알겠습니다", "네, 확인해 볼게요").
+ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알았어요|좋아요|그럼요|물론이죠|맞아요|그렇죠|그래요|"
+                       r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
+TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|"
+                     r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
+NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
+         f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
+
+
+def content_free(reply):
+    """True when nothing is left once acknowledgements, promises and punctuation are removed."""
+    rest = ACK_WORDS.sub("", reply)
+    return not re.search(r"[가-힣A-Za-z0-9]", rest)
+
+
+def needs_answer(text):
+    """A question or request (not a greeting, thanks or yes/no confirmation): a bare "네" is no answer."""
+    return not TRIVIAL.fullmatch(text.strip())
 
 
 def hold_tag_prefix(buf):
@@ -927,8 +948,21 @@ async def respond(text, session, t0, timings, on_event=None):
             system = brain_system(name, ctx, await recall(bare, timings), length) if ctx \
                 else system_prompt(name, length) + now_kst()
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
-            for rounds in range(3):  # at most two tool calls, then an answer
-                buf, state = "", "maybe"
+            guard = needs_answer(bare)  # a question or request must not end with a bare "네"
+            ack_held, flushed, nudged = [], False, False
+
+            async def say(s):
+                nonlocal flushed
+                if guard and not flushed and content_free(" ".join(ack_held + [s])):
+                    ack_held.append(s)  # "네," alone: keep it back until real content follows
+                    return
+                for x in ack_held + [s]:
+                    await sentences.put(x)
+                ack_held.clear()
+                flushed = True
+
+            for rounds in range(4):  # at most two tool calls and one nudge, then an answer
+                buf, state, said_round = "", "maybe", []
                 async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
                     timings.setdefault("llm_first_token_ms", ms(t0))
                     buf += delta
@@ -943,7 +977,8 @@ async def respond(text, session, t0, timings, on_event=None):
                     buf = rest + held
                     for s in done:
                         timings.setdefault("first_sentence_ms", ms(t0))
-                        await sentences.put(s)
+                        said_round.append(s)
+                        await say(s)
                 if state == "tool" and ctx and rounds < 2:
                     t_tool = time.perf_counter()
                     result = await run_tool(buf.strip().split("\n")[0], session)
@@ -954,7 +989,16 @@ async def respond(text, session, t0, timings, on_event=None):
                 if state == "tool" or ROUTE_TAG in buf:
                     return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
                 for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
-                    await sentences.put(s)
+                    said_round.append(s)
+                    await say(s)
+                if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
+                    ack_held.clear()
+                    if nudged:
+                        return await via_claude()
+                    nudged = True
+                    messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
+                                 {"role": "user", "content": NUDGE}]
+                    continue
                 break
         finally:
             await sentences.put(None)
@@ -1493,6 +1537,37 @@ if __name__ == "__main__":
         assert pre_route(strip_vocative("스파크야 안녕", "스파크"), {})[0] is False  # a name that is also a keyword
         assert [tag_state(h) for h in ("", "[CLA", "[CLAUDE]", "네")] == ["maybe", "maybe", "tag", "no"]
         assert hold_tag_prefix("수요일이요. [CL") == ("수요일이요. ", "[CL") and hold_tag_prefix("네 [1]번") == ("네 [1]번", "")
+        for reply, empty in [("네", True), ("네.", True), ("알겠습니다!", True), ("네, 확인해 볼게요.", True), ("좋아요~", True),
+                             ("십팔이야.", False), ("Thanks.", False), ("네, 18이에요.", False), ("100도예요.", False), ("", True)]:
+            assert content_free(reply) is empty, reply
+        assert needs_answer("물은 몇 도에서 끓어?") and needs_answer("라면 끓이는 법 알려줘")
+        assert not needs_answer("고마워!") and not needs_answer("응") and not needs_answer("안녕하세요") and not needs_answer("네")
+
+        async def ack_check(replies, user="물은 몇 도에서 끓어?"):  # Qwen's successive replies → what gets spoken
+            calls = []
+
+            async def acking_llm(messages, max_tokens=600):
+                calls.append(messages)
+                yield replies[min(len(calls), len(replies)) - 1]
+
+            async def answer_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                yield "클로드가 답해요."
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            globals().update(llm_stream=acking_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
+            history.pop("ack", None)
+            said = [s async for s, *_ in respond(user, "ack", time.perf_counter(), {})]
+            return said, calls
+        said, calls = asyncio.run(ack_check(["네.", "물은 100도에서 끓어요."]))
+        assert said == ["물은 100도에서 끓어요."] and calls[1][-1]["content"] == NUDGE, said  # nudged once, "네" unsaid
+        said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
+        assert said == ["클로드가 답해요."] and len(calls) == 2, said  # empty twice: Claude takes the turn
+        said, _ = asyncio.run(ack_check(["네, 100도예요."]))
+        assert said == ["네,", "100도예요."], said  # an acknowledgement followed by content is fine
+        said, calls = asyncio.run(ack_check(["네."], user="고마워"))
+        assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
 
         async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
             async def tagging_llm(messages, max_tokens=600):
