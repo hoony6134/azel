@@ -104,6 +104,8 @@ create table if not exists {STATE}.proactive_log(
     reason_hash text not null default '', called boolean not null default false, blocked_by text,
     signals jsonb not null default '{{}}', call_id text);
 create index if not exists proactive_log_at on {STATE}.proactive_log (at desc);
+alter table {STATE}.proactive_log add column if not exists persona_id text not null default 'azel';
+alter table {STATE}.scheduled_calls add column if not exists persona_id text not null default 'azel';
 create table if not exists {STATE}.call_history(
     id text primary key, session text, call_id text, direction text, reason text, client text, opening text,
     started_at timestamptz not null default now(), ended_at timestamptz, duration_s double precision);
@@ -114,6 +116,7 @@ create table if not exists {STATE}.call_turns(
     route text, activity jsonb not null default '[]', timings jsonb not null default '{{}}',
     interrupted boolean not null default false);
 create index if not exists call_turns_call on {STATE}.call_turns (call, id);
+alter table {STATE}.call_history add column if not exists persona_id text not null default 'azel';
 """
 
 
@@ -519,20 +522,21 @@ class ProactiveEntry(BaseModel):
     blocked_by: str | None = Field(None, max_length=40)
     signals: dict = {}
     call_id: str | None = None
+    persona_id: str = Field("azel", pattern=r"^[a-z0-9_-]{1,32}$")
 
 
 @app.post("/v1/state/proactive_log", dependencies=[v1])
 def add_proactive(e: ProactiveEntry):
     return db(f"insert into {STATE}.proactive_log(call, urgency, reason, opening, reason_hash, called, blocked_by,"
-              " signals, call_id) values(%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
+              " signals, call_id, persona_id) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
               (e.call, e.urgency, e.reason, e.opening, e.reason_hash, e.called, e.blocked_by, Jsonb(e.signals),
-               e.call_id))[0]
+               e.call_id, e.persona_id))[0]
 
 
 @app.get("/v1/state/proactive_log", dependencies=[v1])
 def list_proactive(since: float = 0, called: bool | None = None, limit: int = 100):
     return db(f"select id, {EPOCH.format('at')}, call, urgency, reason, opening, reason_hash, called, blocked_by,"
-              f" signals, call_id from {STATE}.proactive_log where at >= to_timestamp(%s)"
+              f" signals, call_id, persona_id from {STATE}.proactive_log where at >= to_timestamp(%s)"
               " and (%s::boolean is null or called = %s) order by at desc limit %s",
               (since, called, called, max(1, min(limit, 500))))
 
@@ -560,7 +564,7 @@ def put_kv(body: dict | list = Body(...), key: str = FPath(pattern=KV_KEY)):
 
 # ---------- scheduled calls (full gateways only) ----------
 SCHED = f"{STATE}.scheduled_calls"
-SCHED_COLS = (f"id, {EPOCH.format('at')}, repeat, kind, note, created_by, status, attempts, call_id,"
+SCHED_COLS = (f"id, {EPOCH.format('at')}, repeat, kind, note, created_by, persona_id, status, attempts, call_id,"
               f" {EPOCH.format('last_attempt')}, {EPOCH.format('created')}")
 REPEAT_RE = r"^(daily|weekdays|weekly:[0-6])$"  # weekly:<dow>, 0 = Monday
 
@@ -571,18 +575,21 @@ class Scheduled(BaseModel):
     kind: str = Field("wake", pattern="^(wake|reminder)$")
     note: str = Field("", max_length=200)
     created_by: str = Field("app", pattern="^(voice|app)$")
+    persona_id: str = Field("azel", pattern=r"^[a-z0-9_-]{1,32}$")
 
 
 @app.post("/v1/state/schedule", dependencies=[v1])
 def add_scheduled(s: Scheduled):
-    return db(f"insert into {SCHED}(id, at, repeat, kind, note, created_by) values(%s,to_timestamp(%s),%s,%s,%s,%s)"
-              f" returning {SCHED_COLS}", (uuid.uuid4().hex[:12], s.at, s.repeat, s.kind, s.note, s.created_by))[0]
+    return db(f"insert into {SCHED}(id, at, repeat, kind, note, created_by, persona_id)"
+              f" values(%s,to_timestamp(%s),%s,%s,%s,%s,%s) returning {SCHED_COLS}",
+              (uuid.uuid4().hex[:12], s.at, s.repeat, s.kind, s.note, s.created_by, s.persona_id))[0]
 
 
 @app.get("/v1/state/schedule", dependencies=[v1])
-def list_scheduled(status: str = "pending,fired"):
-    """Items in the given statuses (comma list), soonest first."""
-    return db(f"select {SCHED_COLS} from {SCHED} where status = any(%s) order by at", (status.split(","),))
+def list_scheduled(status: str = "pending,fired", persona: str | None = None):
+    """Items in the given statuses (comma list), soonest first; `persona` filters by persona_id."""
+    return db(f"select {SCHED_COLS} from {SCHED} where status = any(%s) and (%s::text is null or persona_id = %s)"
+              " order by at", (status.split(","), persona, persona))
 
 
 class ScheduledUpdate(BaseModel):
@@ -636,15 +643,16 @@ class CallStart(BaseModel):
     client: str = ""
     opening: str = ""
     started_at: float | None = None
+    persona_id: str = Field("azel", pattern=r"^[a-z0-9_-]{1,32}$")
 
 
 @app.post("/v1/state/history/{hid}/start", dependencies=[v1])
 def history_start(hid: str, c: CallStart):
-    db(f"insert into {HIST}(id, session, call_id, direction, reason, client, opening, started_at)"
-       " values(%s,%s,%s,%s,%s,%s,%s,coalesce(to_timestamp(%s), now())) on conflict(id) do update set"
+    db(f"insert into {HIST}(id, session, call_id, direction, reason, client, opening, started_at, persona_id)"
+       " values(%s,%s,%s,%s,%s,%s,%s,coalesce(to_timestamp(%s), now()),%s) on conflict(id) do update set"
        " session=excluded.session, call_id=excluded.call_id, direction=excluded.direction, reason=excluded.reason,"
-       " client=excluded.client, opening=excluded.opening, started_at=excluded.started_at",
-       (hid, c.session, c.call_id, c.direction, c.reason, c.client, c.opening, c.started_at))
+       " client=excluded.client, opening=excluded.opening, started_at=excluded.started_at, persona_id=excluded.persona_id",
+       (hid, c.session, c.call_id, c.direction, c.reason, c.client, c.opening, c.started_at, c.persona_id))
     return {"ok": True}
 
 
@@ -690,7 +698,7 @@ def history_end(hid: str, e: CallEnd):
     return {"ok": True, "turns": len(turns)}
 
 
-LIST_COLS = f"""h.id, h.session, h.direction, h.reason, h.client,
+LIST_COLS = f"""h.id, h.session, h.persona_id, h.direction, h.reason, h.client,
     extract(epoch from h.started_at)::float8 as started_at, h.duration_s,
     (select user_text from {TURNS} t where t.call = h.id order by t.id limit 1) as title,
     (select left(array_to_string(array(select jsonb_array_elements_text(t.assistant)), ' '), 120) from {TURNS} t
@@ -722,12 +730,13 @@ def snippet(text, q, width=80):
 
 
 @app.get("/v1/state/history", dependencies=[v1])
-def history_list(limit: int = 20, before: float | None = None, q: str | None = None):
+def history_list(limit: int = 20, before: float | None = None, q: str | None = None, persona: str | None = None):
     limit = max(1, min(limit, 100))
-    where = "(%(before)s::float8 is null or h.started_at < to_timestamp(%(before)s))"
+    where = "(%(before)s::float8 is null or h.started_at < to_timestamp(%(before)s))" \
+            " and (%(persona)s::text is null or h.persona_id = %(persona)s)"
     if not q:
         return db(f"select {LIST_COLS} from {HIST} h where {where} order by h.started_at desc limit %(limit)s",
-                  {"before": before, "limit": limit})
+                  {"before": before, "limit": limit, "persona": persona})
     # Full transcripts, ranked like memory search: ended calls have a transcript record (hybrid vector + text);
     # calls still running do not yet, so their turns are matched by substring.
     best: dict[str, tuple[bool, float, str]] = {}  # call -> (word match, score, snippet)
@@ -745,7 +754,7 @@ def history_list(limit: int = 20, before: float | None = None, q: str | None = N
     if not best:
         return []
     rows = db(f"select {LIST_COLS} from {HIST} h where {where} and h.id = any(%(ids)s)",
-              {"before": before, "ids": list(best)})
+              {"before": before, "ids": list(best), "persona": persona})
     rows.sort(key=lambda r: (not best[r["id"]][0], -best[r["id"]][1]))
     return [{**r, "match": best[r["id"]][2]} for r in rows[:limit]]
 
@@ -762,7 +771,7 @@ def offsets(steps, started):
 
 @app.get("/v1/state/history/{hid}", dependencies=[v1])
 def history_get(hid: str):
-    rows = db(f"select id, session, call_id, direction, reason, client, opening, {EPOCH.format('started_at')},"
+    rows = db(f"select id, session, persona_id, call_id, direction, reason, client, opening, {EPOCH.format('started_at')},"
               f" {EPOCH.format('ended_at')}, duration_s from {HIST} where id=%s", (hid,))
     if not rows:
         raise HTTPException(404, "no such call")

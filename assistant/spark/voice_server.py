@@ -8,6 +8,7 @@ Contract: ../PROTOCOL.md sections 1-2.
 """
 import asyncio
 import base64
+import contextvars
 import hashlib
 import hmac
 import io
@@ -69,6 +70,32 @@ def assistant_name(settings):
 
 def reply_length(settings):
     return settings.get("reply_length") if settings.get("reply_length") in LENGTH_STYLE else "normal"
+
+
+# ---------- personas (PROTOCOL.md section 3): the call's persona sets name, character and voice ----------
+CALL_PERSONA: contextvars.ContextVar = contextvars.ContextVar("call_persona", default=None)  # set per /v1/call
+
+
+def personas_of(settings):
+    """Live personas from the shared settings; a gateway from before personas gives the one assistant."""
+    ps = [p for p in settings.get("personas") or [] if isinstance(p, dict) and p.get("id") and not p.get("deleted_at")]
+    return ps or [{"id": "azel", "name": assistant_name(settings), "voice": TTS_VOICE, "voice_style": "",
+                   "personality": settings.get("personality") or "", "primary": True}]
+
+
+def pick_persona(settings, pid=None):
+    ps = personas_of(settings)
+    return next((p for p in ps if p["id"] == pid), None) or next((p for p in ps if p.get("primary")), ps[0])
+
+
+def persona_text(p, settings):
+    """A persona's character ("" = the default the gateway sends as personality_default)."""
+    t = p.get("personality")
+    return t.strip() if isinstance(t, str) and t.strip() else str(settings.get("personality_default") or "")
+
+
+def current_persona(settings):
+    return CALL_PERSONA.get() or pick_persona(settings)
 
 
 def personality(settings):
@@ -182,7 +209,7 @@ class GatewayLinks:
         self.queues: dict[str, tuple[asyncio.Queue, Link]] = {}
         self.settings: dict = {}
         self.openings: dict[str, str] = {}
-        self.brain_ctx: tuple[float, str] | None = None  # (received at, block) from the brain, for every call
+        self.persona_ctx: dict[str, tuple[float, str]] = {}  # (received at, block) per persona ("" = the primary)
         self.session_ctx: dict[str, tuple[float, str]] = {}  # per call session (e.g. why the assistant called)
 
     def add(self, ws, limited=False):
@@ -255,7 +282,7 @@ class GatewayLinks:
                 self.remove(old)  # that gateway reconnected; its old socket is dead
         elif t == "context":
             if lk.brain and isinstance(msg.get("value"), str):
-                self.take_context(msg.get("session"), msg["value"])
+                self.take_context(msg.get("session"), msg["value"], msg.get("persona"))
         elif t in ("settings", "call") and lk.mode != "full":
             return  # shared settings and call openings come from full gateways only
         elif t == "settings":
@@ -268,7 +295,8 @@ class GatewayLinks:
                 old = self.openings.pop(next(iter(self.openings)))
                 if old["audio"]:
                     old["audio"].cancel()
-            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")))
+            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")),
+                                                            str(msg.get("persona") or ""))
         elif isinstance(msg.get("id"), str) and isinstance(t, str) and msg["id"] in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
@@ -285,21 +313,24 @@ MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|�
 BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")
 
 
-def _take_context(self, session, value):
+def _take_context(self, session, value, persona=None):
     value = value[:6000]
     if isinstance(session, str) and session:
         if len(self.session_ctx) > 200:
             self.session_ctx.pop(next(iter(self.session_ctx)))
         self.session_ctx[session] = (time.time(), value)
-    else:
-        self.brain_ctx = (time.time(), value)
+    else:  # a persona's shared block; frames without `persona` are the primary's (as before personas)
+        self.persona_ctx[persona if isinstance(persona, str) and persona else ""] = (time.time(), value)
 
 
-def _context_for(self, session):
-    """The freshest block for this call ('' when no brain is up): the session's own, else the shared one."""
+def _context_for(self, session, persona=None):
+    """The freshest block for this call ('' when no brain is up): the session's own, else the persona's."""
     if not self.brain_link():
         return ""
-    got = [c for c in (self.session_ctx.get(session), self.brain_ctx) if c and time.time() - c[0] < BRAIN_FRESH_S]
+    pid = persona or (CALL_PERSONA.get() or {}).get("id") or ""
+    shared = self.persona_ctx.get(pid) or (self.persona_ctx.get("") if (CALL_PERSONA.get() or {}).get("primary", True)
+                                           else None)
+    got = [c for c in (self.session_ctx.get(session), shared) if c and time.time() - c[0] < BRAIN_FRESH_S]
     return max(got)[1] if got else ""
 
 
@@ -361,7 +392,8 @@ async def run_tool(raw, session):
     if name not in BRAIN_TOOLS:
         return f"없는 도구예요: {name}"
     try:
-        reply = await links.brain_request({"type": "tool", "name": name, "args": args}, TOOL_WAIT_S)
+        reply = await links.brain_request({"type": "tool", "name": name, "args": args,
+                                           "persona": (CALL_PERSONA.get() or {}).get("id")}, TOOL_WAIT_S)
         return str(reply.get("result", ""))[:2000]
     except (RuntimeError, asyncio.TimeoutError):
         return "지금은 그 도구를 쓸 수 없어요."
@@ -371,7 +403,8 @@ async def recall(text, timings):
     """Up to two memory hits for this utterance, or none if the brain cannot answer within RECALL_WAIT_S."""
     t = time.perf_counter()
     try:
-        reply = await links.brain_request({"type": "recall", "text": text[:300]}, RECALL_WAIT_S)
+        reply = await links.brain_request({"type": "recall", "text": text[:300],
+                                           "persona": (CALL_PERSONA.get() or {}).get("id")}, RECALL_WAIT_S)
         hits = [str(h)[:300] for h in reply.get("hits", [])][:2] if isinstance(reply.get("hits"), list) else []
     except (RuntimeError, asyncio.TimeoutError):
         hits = []
@@ -379,20 +412,21 @@ async def recall(text, timings):
     return hits
 
 
-def prepare_opening(text, reason=""):
+def prepare_opening(text, reason="", persona=""):
     """Split a placed call's opening and start synthesizing it now, so the phone hears it the moment it
     connects (the push arrives seconds before the callee answers)."""
     parts = split_ready(text, final=True)[0] if text else []
-    op = {"text": text, "parts": parts, "audio": None, "reason": reason}
+    op = {"text": text, "parts": parts, "audio": None, "reason": reason, "persona": persona}
     if parts:
         try:
-            op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts))
+            op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts, persona))
         except RuntimeError:
             pass  # no event loop (self-checks): synthesize on connect instead
     return op
 
 
-async def _synth_all(parts):
+async def _synth_all(parts, persona=""):
+    CALL_PERSONA.set(pick_persona(links.settings, persona))  # this task only: the voice the call rings with
     return [(await tts(p))[0] for p in parts]
 
 
@@ -634,7 +668,8 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
     rid, q, finished = uuid.uuid4().hex, asyncio.Queue(), False
     links.queues[rid] = (q, lk)
     try:
-        await lk.send({"type": "ask", "id": rid, "text": text, "session": session, "model": model, "task": task})
+        await lk.send({"type": "ask", "id": rid, "text": text, "session": session, "model": model, "task": task,
+                       "persona": (CALL_PERSONA.get() or {}).get("id")})
         while True:
             try:
                 ev = await asyncio.wait_for(q.get(), timeout)
@@ -857,7 +892,7 @@ async def schedule_reply(text, action, session, now=None):
             return "지금부터 30일 안쪽의 시간으로만 예약할 수 있어요."
         note = "" if kind == "wake" else text[:100]
         msg = {"type": "schedule", "action": "create", "at": at.isoformat(), "repeat": repeat, "kind": kind,
-               "note": note}
+               "note": note, "persona_id": (CALL_PERSONA.get() or {}).get("id")}
     try:
         reply = await links.request(msg)
     except (RuntimeError, asyncio.TimeoutError):
@@ -869,15 +904,19 @@ _tts_cache: dict[str, tuple[bytes, int]] = {}
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
-    # Fillers and short acknowledgements ("네,") repeat constantly: synthesize them once.
+    p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
+    voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
+    # Fillers and short acknowledgements ("네,") repeat constantly: synthesize them once (per voice).
     cacheable = sentence in (FILLER, FILLER_LONG) or len(sentence) <= 6
-    if cacheable and sentence in _tts_cache:
-        return _tts_cache[sentence]
-    r = await client.post(TTS_URL, json={"input": sentence, "voice": TTS_VOICE, "response_format": "wav"})
+    key = (voice, style, sentence)
+    if cacheable and key in _tts_cache:
+        return _tts_cache[key]
+    body = {"input": sentence, "voice": voice, "response_format": "wav", **({"instructions": style} if style else {})}
+    r = await client.post(TTS_URL, json=body)
     r.raise_for_status()
     wav, sr = sf.read(io.BytesIO(r.content), dtype="int16")
     if cacheable and len(_tts_cache) < 500:
-        _tts_cache[sentence] = (wav.tobytes(), sr)
+        _tts_cache[key] = (wav.tobytes(), sr)
     return wav.tobytes(), sr
 
 
@@ -898,9 +937,11 @@ def recent_context(hist, n=6):
 
 async def respond(text, session, t0, timings, on_event=None):
     """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
-    hist = history[session]
     settings = await gateway_settings()
-    name = assistant_name(settings)
+    persona = current_persona(settings)
+    hkey = f"{persona['id']}:{session}"  # history and the Claude session map are per persona
+    hist = history[hkey]
+    name = persona["name"]
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
@@ -925,7 +966,7 @@ async def respond(text, session, t0, timings, on_event=None):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            async for delta in claude_stream(text, session, model, task, personal, recent_context(hist),
+            async for delta in claude_stream(text, hkey, model, task, personal, recent_context(hist),
                                              on_event=on_event):
                 got_text.set()
                 buf += delta
@@ -950,7 +991,7 @@ async def respond(text, session, t0, timings, on_event=None):
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = system_prompt(name, length, ctx, personality(settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
+            system = system_prompt(name, length, ctx, persona_text(persona, settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
@@ -1196,7 +1237,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = ""):
+               intent: str = "", persona: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -1300,7 +1341,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         try:
             await send({"type": "state", "value": "speaking"})
             st = await gateway_settings()
-            async for s in briefing_sentences(session, assistant_name(st), send, personality(st)):
+            p = current_persona(st)
+            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st)):
                 pcm, _ = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"})
                 await send(audio=pcm)
@@ -1308,7 +1350,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     spoken.append(s)
         finally:  # what was actually said becomes the call's opening in history (the start event is an upsert)
             if spoken:
-                history[session].append({"role": "assistant", "content": " ".join(spoken)})
+                history[f"{current_persona(await gateway_settings())['id']}:{session}"].append(
+                    {"role": "assistant", "content": " ".join(spoken)})
                 await links.log({**start_log, "opening": " ".join(spoken)})
             await send({"type": "state", "value": "listening"})
 
@@ -1368,12 +1411,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
+        # The persona: a placed call's own (it rang as that persona), else ?persona=, else the primary. Every task
+        # this call starts inherits it (name, character, TTS voice, history key, Claude session, tags).
+        CALL_PERSONA.set(pick_persona(links.settings, (op or {}).get("persona") or persona))
+        pid = CALL_PERSONA.get()["id"]
         briefing = intent == "briefing" and not call_id
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
-        await links.brain_event({"type": "call_event", "event": "start", "session": session,
+        await links.brain_event({"type": "call_event", "event": "start", "session": session, "persona": pid,
                                  "reason": (op or {}).get("reason", ""), "opening": (op or {}).get("text", "")})
-        start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started,
+        start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started, persona_id=pid,
                          # the user's point of view, like a phone's call log: the assistant calling = incoming
                          direction="incoming" if call_id else "outgoing",
                          reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
@@ -1382,7 +1429,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             current["task"] = asyncio.create_task(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
-                history[session].append({"role": "assistant", "content": op["text"]})
+                history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
                 current["task"] = asyncio.create_task(speak_opening(op))
         await send({"type": "state", "value": "listening"})
@@ -1643,7 +1690,7 @@ if __name__ == "__main__":
             await asyncio.gather(first, return_exceptions=True)
             await gen.aclose()
         asyncio.run(cut_before_speaking())
-        assert list(history["cut"]) == [{"role": "user", "content": "내일 일정 알려줘"}]  # no placeholder turn
+        assert list(history["azel:cut"]) == [{"role": "user", "content": "내일 일정 알려줘"}]  # no placeholder turn
         assert not any("끊김" in m["content"] for h in history.values() for m in h)
         claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S = real
 
@@ -1719,7 +1766,7 @@ if __name__ == "__main__":
             async def fake_tts(sentence):
                 return b"", 24000
             globals().update(llm_stream=acking_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
-            history.pop("ack", None)
+            history.pop("azel:ack", None)
             said = [s async for s, *_ in respond(user, "ack", time.perf_counter(), {})]
             return said, calls
         said, calls = asyncio.run(ack_check(["네.", "물은 100도에서 끓어요."]))
@@ -2007,6 +2054,62 @@ if __name__ == "__main__":
         assert replies == ["오늘 브리핑이에요.", "회의가 하나 있어요."] and "activity" not in types, replies
         last_claude_briefing[:] = [0.0, ""]
         globals()["llm_stream"] = real_llm
+        def persona_check():
+            """/v1/call?persona=luna: Qwen speaks as 루나 in her voice, history and logs are hers; a call placed as
+            luna (no ?persona) is hers too, opening voice included."""
+            from fastapi.testclient import TestClient
+            voices, prompts = [], []
+
+            async def voice_tts(sentence):
+                voices.append((CALL_PERSONA.get() or {}).get("voice"))
+                return b"\0" * 480, 24000
+
+            async def hi_llm(messages, max_tokens=600):
+                prompts.append(messages[0]["content"])
+                yield "안녕하세요, 루나예요."
+
+            async def stt(audio):
+                return "안녕"
+            globals().update(tts=voice_tts, llm_stream=hi_llm, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            links.receive(full, {"type": "settings", "value": {"personality_default": "기본 성격", "personas": [
+                {"id": "azel", "name": "아젤", "voice": "sohee", "personality": "", "primary": True},
+                {"id": "luna", "name": "루나", "voice": "vivian", "voice_style": "부드럽게", "personality": "느긋함"},
+                {"id": "old", "name": "옛비서", "voice": "ryan", "deleted_at": 1.0}]}})
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            speech = np.zeros(8000, np.int16).tobytes() + (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+
+            def one_turn(path):
+                with tc.websocket_connect(path, headers={"Authorization": "Bearer app-tok"}) as w:
+                    w.send_bytes(speech)
+                    while True:
+                        m = w.receive()
+                        if m.get("text") and json.loads(m["text"])["type"] in ("turn_done", "error"):
+                            break
+                    w.send_text(json.dumps({"type": "hangup"}))
+                time.sleep(0.05)
+            one_turn("/v1/call?session=ps&persona=luna")
+            assert "'루나'" in prompts[-1] and "성격: 느긋함" in prompts[-1] and set(voices) == {"vivian"}, (prompts, voices)
+            assert "luna:ps" in history and "azel:ps" not in history
+            start = [m for m in full.ws.sent if m.get("type") == "call_log" and m["event"] == "start"][-1]
+            assert start["persona_id"] == "luna"
+            voices.clear()
+            one_turn("/v1/call?session=ps2&persona=old")  # deleted persona: the primary
+            assert "'아젤'" in prompts[-1] and "성격: 기본 성격" in prompts[-1] and set(voices) == {"sohee"}
+            voices.clear()
+
+            async def placed():  # the gateway rings as luna: the opening is synthesized in her voice up front
+                links.receive(full, {"type": "call", "call_id": "cl", "opening": "루나예요. 일어날 시간이에요.",
+                                     "persona": "luna"})
+                await links.openings["cl"]["audio"]
+            asyncio.run(placed())
+            assert set(voices) == {"vivian"}
+            links.remove(full)
+            links.settings = {}
+            globals().update(tts=real[1], llm_stream=real_llm)
+        persona_check()
         logs = history_check()
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs

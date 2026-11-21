@@ -276,6 +276,26 @@ def test_fix_call_directions_is_idempotent(client):
         client.delete(f"/v1/state/history/{hid}")
 
 
+def test_persona_tags(client):
+    client.post("/v1/state/history/pA/start", json={"session": "s", "persona_id": "luna"})
+    client.post("/v1/state/history/pB/start", json={"session": "s"})  # older voice servers: the primary
+    ids = lambda q: [r["id"] for r in client.get(f"/v1/state/history?limit=100{q}").json()]  # noqa: E731
+    assert "pA" in ids("&persona=luna") and "pB" not in ids("&persona=luna") and "pB" in ids("&persona=azel")
+    assert client.get("/v1/state/history/pA").json()["persona_id"] == "luna"
+    assert client.post("/v1/state/history/pC/start", json={"persona_id": "Bad Id!"}).status_code == 422
+    at = time.time() + 3600
+    a = client.post("/v1/state/schedule", json={"at": at, "persona_id": "luna"}).json()
+    b = client.post("/v1/state/schedule", json={"at": at + 60}).json()
+    assert a["persona_id"] == "luna" and b["persona_id"] == "azel"
+    assert [r["id"] for r in client.get("/v1/state/schedule?persona=luna").json()] == [a["id"]]
+    client.post("/v1/state/proactive_log", json={"reason": "x", "persona_id": "azel"})
+    assert client.get("/v1/state/proactive_log").json()[0]["persona_id"] == "azel"
+    for hid in ("pA", "pB"):
+        client.delete(f"/v1/state/history/{hid}")
+    client.delete(f"/v1/state/schedule/{a['id']}")
+    client.delete(f"/v1/state/schedule/{b['id']}")
+
+
 def test_bad_tokens(client):
     for token in ["nope", "", "l1m-", "t0k-"]:
         assert limited_client("100.64.0.8", token).get("/v1/state/settings").status_code == 401

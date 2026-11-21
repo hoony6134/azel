@@ -10,6 +10,7 @@ Contract: ../PROTOCOL.md section 3. Run: uv run gateway.py  (binds the Tailscale
            uv run gateway.py --migrate  (copy the old local gateway.db into ruchba; also runs once on first start)
 """
 import asyncio
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -79,7 +80,8 @@ DEFAULTS = {
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
-    "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT
+    "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
+    "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
     "noise_mode": "normal",  # normal | noisy: the voice server's voice-activity thresholds and barge-in
     "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
@@ -110,8 +112,53 @@ def personality(settings):
 
 
 def persona_block(settings):
-    """Who is talking: name and character. Used for Claude's voice style and every prompt that speaks to the user."""
-    return f"너의 이름은 '{settings['assistant_name']}'이야. 성격: {personality(settings)} "
+    """Who is talking: name and character of the persona this ask belongs to (the primary by default). Used for
+    Claude's voice style and every prompt that speaks to the user."""
+    p = active_persona(settings)
+    text = p["personality"].strip() if isinstance(p.get("personality"), str) and p["personality"].strip() \
+        else PERSONALITY_DEFAULT
+    return f"너의 이름은 '{p['name']}'이야. 성격: {text} "
+
+
+# ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
+PERSONA_ID = re.compile(r"[a-z0-9_-]{1,32}")
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+MAX_PERSONAS = 8
+DEFAULT_TTS_VOICE = os.environ.get("BISEO_TTS_VOICE", "sohee")
+current_persona: contextvars.ContextVar = contextvars.ContextVar("persona", default=None)  # set per ask/call
+
+
+def migrate_personas(s):
+    """Settings from before personas: the assistant becomes persona `azel` (primary), keeping its name and
+    character; `assistant_name`/`personality` stay readable as the primary's for older clients."""
+    ps = [p for p in s.get("personas") or [] if isinstance(p, dict) and p.get("id")]
+    if not any(p.get("primary") and not p.get("deleted_at") for p in ps):
+        ps = [p for p in ps if p.get("id") != "azel"]
+        ps.insert(0, {"id": "azel", "name": s.get("assistant_name") or DEFAULTS["assistant_name"],
+                      "voice": DEFAULT_TTS_VOICE, "voice_style": "", "personality": s.get("personality") or "",
+                      "color": "#7C5CFF", "default_model": None, "share_memory": False, "created_at": 0,
+                      "primary": True})
+    s["personas"] = ps
+    prim = primary_persona(s)
+    s["assistant_name"], s["personality"] = prim["name"], prim["personality"]
+    return s
+
+
+def live_personas(s):
+    return [p for p in s["personas"] if not p.get("deleted_at")]
+
+
+def primary_persona(s):
+    return next(p for p in s["personas"] if p.get("primary") and not p.get("deleted_at"))
+
+
+def persona_by_id(s, pid, include_deleted=False):
+    return next((p for p in s["personas"] if p["id"] == pid and (include_deleted or not p.get("deleted_at"))), None)
+
+
+def active_persona(s):
+    pid = current_persona.get()
+    return (persona_by_id(s, pid) if pid else None) or primary_persona(s)
 
 
 def name_prompt(settings):
@@ -316,6 +363,7 @@ async def load_settings():
         doc = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
     s.update(doc)
     s["proactive"] = migrate_proactive(s.get("proactive"))
+    migrate_personas(s)
     s["personality_default"] = PERSONALITY_DEFAULT  # shown, never stored (the app's placeholder, the voice server's text)
     s["default_device"] = OLD_DEVICE_NAMES.get(s["default_device"], s["default_device"])
     s["device_fallback"] = [OLD_DEVICE_NAMES.get(d, d) for d in s["device_fallback"]]
@@ -722,8 +770,9 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
-async def place_call(reason, opening=None, call_id=None):
-    """Ring the phone. `call_id`: chosen by the caller when it must be recorded before the phone rings."""
+async def place_call(reason, opening=None, call_id=None, persona_id=None):
+    """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
+    `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
         raise HTTPException(403, "limited gateways do not place calls")
     if opening is None and reason == "morning_briefing":
@@ -737,9 +786,12 @@ async def place_call(reason, opening=None, call_id=None):
     except StateDown:
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
-    await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason})
-    caller = (await load_settings())["assistant_name"]
-    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": caller})
+    settings = await load_settings()
+    persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
+    await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
+                     "persona": persona["id"]})
+    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
+                                 "persona": persona["id"]})
     return {"call_id": call_id, **push}
 
 
@@ -992,7 +1044,8 @@ async def autonomous_tick(now_dt, a):
     if not isinstance(recent, list):  # unreadable history = unknown cap and gap: fail closed, no call
         raise StateDown("proactive_log unreadable")
     blocked = guard(decision, now, recent, a)
-    entry = {**decision, "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
+    entry = {**decision, "persona_id": primary_persona(await load_settings())["id"],
+             "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
              "blocked_by": blocked, "signals": {k: v[:10] for k, v in signals.items()}}
     if blocked is None:  # write the row first: if it cannot be recorded, the cap cannot count it, so no call
         entry["call_id"] = uuid.uuid4().hex
@@ -1047,7 +1100,7 @@ def public_item(row):
     """The /v1/schedule item shape (app and voice alike): `at` as ISO 8601 in KST, no internal fields."""
     return {"id": row["id"], "at": datetime.fromtimestamp(row["at"], KST).isoformat(), "repeat": row["repeat"],
             "kind": row["kind"], "note": row["note"], "status": row["status"], "attempts": row["attempts"],
-            "created_by": row["created_by"]}
+            "created_by": row["created_by"], "persona_id": row.get("persona_id", "azel")}
 
 
 def next_at(at, repeat, now=None):
@@ -1083,7 +1136,11 @@ def confirm_text(item, now=None):
 
 async def schedule_create(body, created_by, now=None):
     """(public item, sentence to speak)."""
-    row = await state.call("POST", "/v1/state/schedule", check_schedule(body, created_by, now))
+    settings = await load_settings()
+    pid = body.get("persona_id") or primary_persona(settings)["id"]
+    if not persona_by_id(settings, pid):
+        raise HTTPException(400, "persona_id: no such persona")
+    row = await state.call("POST", "/v1/state/schedule", {**check_schedule(body, created_by, now), "persona_id": pid})
     return public_item(row), confirm_text(row, now)
 
 
@@ -1171,7 +1228,7 @@ async def attempt(item, now):
     call_id = uuid.uuid4().hex  # in the claim itself, so call_answered always finds this attempt
     claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now, call_id=call_id)
     if claimed:
-        await place_call(item["kind"], opening_for(item), call_id=call_id)
+        await place_call(item["kind"], opening_for(item), call_id=call_id, persona_id=item.get("persona_id"))
 
 
 async def missed(item, now, late=False):
@@ -1225,6 +1282,7 @@ async def link_send(obj):
 
 
 async def serve_ask(m):
+    current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)  # this task only
     try:
         async for ev in ask_stream(m["text"], m.get("session") or "default", m.get("model"), None, m.get("task")):
             await link_send({"id": m["id"], **ev})
@@ -1325,6 +1383,7 @@ async def ask(body: dict):
         raise HTTPException(400, "text required")
 
     async def gen():
+        current_persona.set(body.get("persona") if isinstance(body.get("persona"), str) else None)
         async for ev in ask_stream(body["text"], body.get("session", "default"), body.get("model"),
                                    body.get("path"), body.get("task")):
             yield json.dumps(ev, ensure_ascii=False) + "\n"
@@ -1339,6 +1398,7 @@ async def get_settings():
 @app.put("/v1/settings")
 async def put_settings(body: dict):
     body.pop("personality_default", None)  # read-only: an app may send the whole document back
+    body.pop("personas", None)  # managed through /v1/personas
     unknown = set(body) - set(DEFAULTS)
     if unknown:
         raise HTTPException(400, f"unknown keys: {sorted(unknown)}")
@@ -1375,6 +1435,8 @@ async def put_settings(body: dict):
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
     s = await load_settings() | body
+    prim = primary_persona(s)  # older clients edit the primary persona through assistant_name / personality
+    prim["name"], prim["personality"] = s["assistant_name"], s["personality"]
     await save_settings({k: v for k, v in s.items() if k != "personality_default"})
     await link_send({"type": "settings", "value": s})
     return s
@@ -1439,6 +1501,145 @@ def full_only():
         raise HTTPException(403, "not available on a limited gateway")
 
 
+_tts_voices: dict = {"at": 0.0, "voices": []}
+
+
+async def tts_voices():
+    """The TTS server's speakers (cached 10 min); BISEO_TTS_VOICES as the list when it cannot be reached."""
+    if time.time() - _tts_voices["at"] < 600 and _tts_voices["voices"]:
+        return _tts_voices["voices"]
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{TTS_URL}/v1/audio/voices")
+        r.raise_for_status()
+        _tts_voices.update(at=time.time(), voices=[str(v).lower() for v in r.json()["voices"]])
+    except (httpx.HTTPError, ValueError, KeyError):
+        fallback = [v.strip().lower() for v in os.environ.get("BISEO_TTS_VOICES", "").split(",") if v.strip()]
+        if not fallback:
+            raise HTTPException(503, "TTS server unreachable: cannot check the voice")
+        return fallback
+    return _tts_voices["voices"]
+
+
+PERSONA_FIELDS = {"name", "voice", "voice_style", "personality", "color", "default_model", "share_memory"}
+
+
+async def check_persona(body, s, pid=None):
+    """Validate persona fields (a trust boundary: the app writes them). `pid`: the persona being edited."""
+    unknown = set(body) - PERSONA_FIELDS - ({"id"} if pid is None else set())
+    if unknown:
+        raise HTTPException(400, f"unknown persona fields: {sorted(unknown)}")
+    if "name" in body:
+        if not (isinstance(body["name"], str) and NAME_RE.fullmatch(body["name"]) and body["name"].strip()):
+            raise HTTPException(400, "name: 1-12 Hangul/Latin letters or spaces")
+        body["name"] = " ".join(body["name"].split())
+        if any(p["name"] == body["name"] and p["id"] != pid for p in live_personas(s)):
+            raise HTTPException(400, "name: another persona already has it")
+    if "voice" in body and (not isinstance(body["voice"], str) or body["voice"].lower() not in await tts_voices()):
+        raise HTTPException(400, "voice: not a TTS speaker (GET the TTS server's /v1/audio/voices)")
+    if not isinstance(body.get("voice_style", ""), str) or len(body.get("voice_style", "")) > 200:
+        raise HTTPException(400, "voice_style: text up to 200 characters")
+    if body.get("personality") is None and "personality" in body:
+        body["personality"] = ""
+    if not isinstance(body.get("personality", ""), str) or len(body.get("personality", "")) > 600:
+        raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
+    if "color" in body and not (isinstance(body["color"], str) and COLOR_RE.fullmatch(body["color"])):
+        raise HTTPException(400, "color: #rrggbb")
+    if body.get("default_model") not in (None, *MODELS):
+        raise HTTPException(400, f"default_model: null or one of {sorted(MODELS)}")
+    if not isinstance(body.get("share_memory", False), bool):
+        raise HTTPException(400, "share_memory: true or false")
+
+
+def persona_view(p):
+    return {k: p.get(k) for k in ("id", "name", "voice", "voice_style", "personality", "color", "default_model",
+                                  "share_memory", "created_at", "primary", "deleted_at")}
+
+
+async def save_personas(s):
+    await save_settings({k: v for k, v in migrate_personas(s).items() if k != "personality_default"})
+    await link_send({"type": "settings", "value": s})
+
+
+@app.get("/v1/personas")
+async def personas_list(include: str = ""):
+    full_only()
+    s = await load_settings()
+    return [persona_view(p) for p in (s["personas"] if include == "deleted" else live_personas(s))]
+
+
+@app.post("/v1/personas", status_code=201)
+async def personas_create(body: dict):
+    full_only()
+    s = await load_settings()
+    if len(live_personas(s)) >= MAX_PERSONAS:
+        raise HTTPException(400, f"at most {MAX_PERSONAS} personas")
+    for k in ("name", "voice"):
+        if not body.get(k):
+            raise HTTPException(400, f"{k} required")
+    await check_persona(body, s)
+    pid = body.pop("id", None) or f"p{uuid.uuid4().hex[:7]}"
+    if not (isinstance(pid, str) and PERSONA_ID.fullmatch(pid)) or persona_by_id(s, pid, include_deleted=True):
+        raise HTTPException(400, "id: a new ASCII slug (a-z, 0-9, _ -)")
+    p = {"id": pid, "voice_style": "", "personality": "", "color": "#7C5CFF", "default_model": None,
+         "share_memory": False, **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
+    s["personas"].append(p)
+    await save_personas(s)
+    return persona_view(p)
+
+
+@app.get("/v1/personas/{pid}")
+async def personas_get(pid: str):
+    full_only()
+    p = persona_by_id(await load_settings(), pid, include_deleted=True)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    return persona_view(p)
+
+
+@app.put("/v1/personas/{pid}")
+async def personas_put(pid: str, body: dict):
+    full_only()
+    s = await load_settings()
+    p = persona_by_id(s, pid)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    await check_persona(body, s, pid)
+    p.update(body)
+    if "voice" in body:
+        p["voice"] = body["voice"].lower()
+    await save_personas(s)
+    return persona_view(p)
+
+
+@app.delete("/v1/personas/{pid}")
+async def personas_delete(pid: str):
+    """Marks it deleted (its history and schedule keep persona_id, and the name stays resolvable); never the primary."""
+    full_only()
+    s = await load_settings()
+    p = persona_by_id(s, pid)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    if p.get("primary"):
+        raise HTTPException(400, "the primary persona cannot be deleted; make another one primary first")
+    p["deleted_at"] = time.time()
+    await save_personas(s)
+    return persona_view(p)
+
+
+@app.post("/v1/personas/{pid}/primary")
+async def personas_primary(pid: str):
+    full_only()
+    s = await load_settings()
+    p = persona_by_id(s, pid)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    for q in s["personas"]:
+        q["primary"] = q is p
+    await save_personas(s)
+    return persona_view(p)
+
+
 @app.get("/v1/proactive/log")
 async def proactive_log(limit: int = 50, since: float = 0):
     """Why the assistant called, or decided not to: every autonomous decision, newest first."""
@@ -1477,11 +1678,12 @@ async def connectors_secret(name: str, body: dict):
 
 
 @app.get("/v1/schedule")
-async def schedule_get(include: str = ""):
+async def schedule_get(include: str = "", persona: str | None = None):
     """Pending and fired items, soonest first; `include=all` adds answered, missed and cancelled ones."""
     full_only()
     status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
-    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", status=status) or []]
+    params = {"status": status} | ({"persona": persona} if persona else {})
+    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", **params) or []]
 
 
 @app.post("/v1/schedule", status_code=201)
@@ -1500,9 +1702,10 @@ async def schedule_delete(sid: str):
 
 
 @app.get("/v1/history")
-async def history(limit: int = 20, before: float | None = None, q: str | None = None):
+async def history(limit: int = 20, before: float | None = None, q: str | None = None, persona: str | None = None):
     full_only()
-    params = {"limit": limit} | ({"before": before} if before is not None else {}) | ({"q": q} if q else {})
+    params = {"limit": limit} | ({"before": before} if before is not None else {}) | ({"q": q} if q else {}) \
+        | ({"persona": persona} if persona else {})
     return await state.call("GET", "/v1/state/history", **params)
 
 

@@ -280,8 +280,29 @@ device that created them.
   the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
+- Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
+  `{"id" (slug a-z0-9_-),"name" (1–12 Hangul/Latin/space, unique),"voice" (a TTS speaker),"voice_style"
+  (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb", orb tint),
+  "default_model" (null|haiku|sonnet|opus),"share_memory" (bool, default false),"created_at","primary",
+  "deleted_at"}`. Stored in the shared settings as `personas`; settings without it migrate to one persona
+  `azel` (primary) holding `assistant_name` and `personality`, which stay readable (and writable) as the
+  primary's for older clients. `GET /v1/personas` (`?include=deleted`), `POST /v1/personas` → 201
+  (`name`, `voice` required; max 8 live personas), `GET|PUT /v1/personas/{id}` (PUT: any field but id,
+  primary, created_at), `DELETE /v1/personas/{id}` (marks `deleted_at`: its calls, history and schedule
+  keep `persona_id` and the name stays resolvable; the primary cannot be deleted → 400),
+  `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices`
+  (fallback `BISEO_TTS_VOICES`; neither reachable → 503).
+  Calls: `/v1/call?persona=<id>` (default the primary; a placed call keeps the persona it rang as) builds
+  Qwen's system prompt from that persona (name, character, reply_length) and speaks with its voice and
+  style. Conversation history and the Claude session map are keyed by (persona, session). Asks over the
+  link carry `"persona"`, so Claude's voice style is that persona's. Push `caller` is the persona's name.
+  Briefing, deadline, alert and autonomous calls come from the primary. Every call_log start, history
+  item, schedule item and proactive_log row carries `persona_id`; `/v1/history` and `/v1/schedule` take
+  `?persona=`. The brain gets `"persona"` on `call_event`, `tool` and `recall` frames and may send
+  `context` frames with `"persona"` (no `session` = that persona's shared block; frames without it are the
+  primary's).
 - Scheduled calls (full gateways only; limited → 403). Item (the same shape on the voice path):
-  `{"id","at","repeat","kind","note","status","attempts","created_by"}` with `at` an ISO 8601 string with
+  `{"id","at","repeat","kind","note","status","attempts","created_by","persona_id"}` with `at` an ISO 8601 string with
   offset in KST (e.g. `"2026-11-22T10:00:00+09:00"`, accepted and returned), `repeat` null | `"daily"` |
   `"weekdays"` | `"weekly:<dow>"` (0 = Monday … 6 = Sunday; must match the weekday of `at`, else 400),
   `kind` `wake`|`reminder`, `status`

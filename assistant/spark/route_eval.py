@@ -109,7 +109,7 @@ async def full_reply(text):
     async def fake_claude(*a, **k):
         yield "(Claude가 답함)"
     vs.tts, vs.claude_stream = fake_tts, fake_claude
-    vs.history.pop("ack-eval", None)
+    vs.history.pop("azel:ack-eval", None)
     said, route = [], ""
     async for s, r, *_ in vs.respond(text, "ack-eval", time.perf_counter(), {}):
         route = r

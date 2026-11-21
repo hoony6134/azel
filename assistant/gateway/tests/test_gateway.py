@@ -178,7 +178,7 @@ def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypa
     c.put("/v1/settings", json={"proactive": {"enabled": False}})
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append(reason)
         return {"call_id": f"c{len(placed)}"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -223,6 +223,85 @@ def test_personality(gw):
         assert s["personality"] == ("" if reset is None else reset) and g.personality(s) == g.PERSONALITY_DEFAULT
     assert c.put("/v1/settings", json={"personality": "가" * 601}).status_code == 400
     assert c.put("/v1/settings", json={"personality": 3}).status_code == 400
+
+
+# ---------- personas ----------
+def persona_gw(g, monkeypatch):
+    async def voices():
+        return ["sohee", "ryan", "vivian"]
+    monkeypatch.setattr(g, "tts_voices", voices)
+
+
+def test_personas_migrate_from_one_assistant(gw):
+    g, c, _ = gw
+    g.fake.db["settings"] = {"assistant_name": "루나", "personality": "다정함"}  # stored before personas
+    [p] = c.get("/v1/personas").json()
+    assert p["id"] == "azel" and p["primary"] and p["name"] == "루나" and p["personality"] == "다정함"
+    s = c.get("/v1/settings").json()
+    assert s["assistant_name"] == "루나" and s["personality"] == "다정함"  # older clients still read these
+    c.put("/v1/settings", json={"assistant_name": "아젤"})  # and write the primary through them
+    assert c.get("/v1/personas/azel").json()["name"] == "아젤"
+
+
+def test_personas_crud_and_limits(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "Vivian", "personality": "느긋함",
+                                     "color": "#22aa88", "share_memory": True})
+    assert r.status_code == 201 and r.json()["voice"] == "vivian" and not r.json()["primary"]
+    for bad in [{"name": "루나", "voice": "sohee"},  # name taken
+                {"name": "새비서", "voice": "nova"},  # not a TTS speaker
+                {"name": "a" * 13, "voice": "sohee"}, {"name": "새비서"}, {"name": "새비서", "voice": "sohee", "color": "red"},
+                {"name": "새비서", "voice": "sohee", "default_model": "gpt"}, {"name": "새비서", "voice": "sohee", "id": "Bad!"},
+                {"name": "새비서", "voice": "sohee", "id": "luna"}, {"name": "새비서", "voice": "sohee", "evil": 1},
+                {"name": "새비서", "voice": "sohee", "personality": "가" * 601}]:
+        assert c.post("/v1/personas", json=bad).status_code == 400, bad
+    assert c.put("/v1/personas/luna", json={"personality": "꼼꼼함", "voice": "ryan"}).json()["voice"] == "ryan"
+    assert c.put("/v1/personas/luna", json={"primary": True}).status_code == 400  # only via /primary
+    for i in range(6):
+        assert c.post("/v1/personas", json={"name": f"비서{'가나다라마바'[i]}", "voice": "sohee"}).status_code == 201
+    assert c.post("/v1/personas", json={"name": "아홉째", "voice": "sohee"}).status_code == 400  # max 8
+    assert c.delete("/v1/personas/azel").status_code == 400  # the primary stays
+    assert c.post("/v1/personas/luna/primary").json()["primary"]
+    assert [p["id"] for p in c.get("/v1/personas").json() if p["primary"]] == ["luna"]
+    assert c.get("/v1/settings").json()["assistant_name"] == "루나"
+    gone = c.delete("/v1/personas/azel").json()  # no longer primary: marked deleted, not removed
+    assert gone["deleted_at"] and "azel" not in [p["id"] for p in c.get("/v1/personas").json()]
+    assert c.get("/v1/personas/azel").json()["name"] == "아젤"  # still resolvable for its old calls
+    assert "azel" in [p["id"] for p in c.get("/v1/personas?include=deleted").json()]
+    assert c.post("/v1/personas", json={"name": "아젤", "voice": "sohee"}).status_code == 201  # name free again
+    assert c.get("/v1/personas/nope").status_code == 404
+
+
+def test_persona_calls_schedule_and_asks(gw, monkeypatch):
+    g, c, tmp = gw
+    persona_gw(g, monkeypatch)
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋하고 다정함"})
+    sent, pushes = [], []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+
+    async def fake_push(payload):
+        pushes.append(payload)
+        return {"sent": 1}
+    g.link_send, g.send_voip_push = capture, fake_push
+    asyncio.run(g.place_call("manual", "안녕하세요.", persona_id="luna"))
+    assert pushes[-1]["caller"] == "루나" and sent[-1]["persona"] == "luna"
+    asyncio.run(g.place_call("deadline", "마감이에요."))  # proactive calls: the primary
+    assert pushes[-1]["caller"] == "아젤" and sent[-1]["persona"] == "azel"
+    at = (datetime.now(g.KST) + timedelta(hours=2)).replace(second=0, microsecond=0).isoformat()
+    item = c.post("/v1/schedule", json={"at": at, "persona_id": "luna"}).json()
+    assert item["persona_id"] == "luna"
+    assert c.post("/v1/schedule", json={"at": at, "persona_id": "ghost"}).status_code == 400
+    assert c.get("/v1/schedule?persona=luna").status_code == 200
+    asyncio.run(g.serve_ask({"type": "ask", "id": "a1", "text": "안녕", "session": "luna:s", "persona": "luna"}))
+    prompt = (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]
+    assert "'루나'" in prompt and "느긋하고 다정함" in prompt and "'아젤'" not in prompt
+    c.post("/v1/ask", json={"text": "b"})
+    prompt = (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]
+    assert "'아젤'" in prompt  # no persona: the primary
 
 
 def test_settings_reject_unknown(gw):
@@ -278,7 +357,7 @@ def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append((reason, opening))
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -542,7 +621,7 @@ def test_schedule_api_validates_and_confirms(gw):
     assert r.status_code == 201
     item = r.json()
     assert item == {"id": item["id"], "at": tomorrow10.isoformat(), "repeat": None, "kind": "wake", "note": "",
-                    "status": "pending", "attempts": 0, "created_by": "app"}
+                    "status": "pending", "attempts": 0, "created_by": "app", "persona_id": "azel"}
     iso = lambda t: datetime.fromtimestamp(t, g.KST).isoformat()  # noqa: E731
     for bad in [{"at": iso(now - 60)}, {"at": iso(now + 31 * 86400)}, {"at": "2026-12-01T10:00:00"},  # no offset
                 {"at": now + 3600}, {"at": iso(now + 3600), "repeat": "hourly"},
@@ -600,7 +679,8 @@ def test_schedule_over_the_link(gw):
     by = {m["id"]: m for m in sent}
     assert by["r1"]["say"] == "내일 오전 7시 30분에 깨워 드릴게요." and by["r1"]["ok"]
     assert by["r1"]["item"]["at"] == at.isoformat() and by["r1"]["item"]["created_by"] == "voice"
-    assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by"}
+    assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by",
+                                     "persona_id"}
     assert by["r2"]["say"] == "예약된 전화는 내일 오전 7시 30분 기상이에요."
     assert by["r3"]["say"] == "내일 오전 7시 30분 예약을 취소했어요."
     assert by["r4"]["say"] == "취소할 예약이 없어요."
@@ -611,7 +691,7 @@ def test_schedule_over_the_link(gw):
 def fire_setup(g, monkeypatch, **item):
     placed, alerts = [], []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append((reason, opening))
         assert g.fake.db["schedule"]["s1"]["call_id"] == call_id  # claimed with the attempt, before ringing
         return {"call_id": call_id}
@@ -700,7 +780,7 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
         assert ev == [{"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}]
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         ran.append(reason)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -734,7 +814,7 @@ def test_guardrails(gw):
 def auto_setup(g, monkeypatch, verdict):
     placed, asked = [], []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
@@ -927,7 +1007,7 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
     g, _, _ = gw
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         ran.append(g.INSTANCE)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -949,7 +1029,7 @@ def test_alert_limits(gw, monkeypatch):
     g, c, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append(opening)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -1023,7 +1103,7 @@ def test_limited_has_no_call_history(limited):
     g, c, _ = limited
     for method, path in [("get", "/v1/history"), ("get", "/v1/history/L1"), ("delete", "/v1/history/L1"),
                          ("delete", "/v1/history?older_than_days=30"), ("get", "/v1/schedule"),
-                         ("get", "/v1/proactive/log"),
+                         ("get", "/v1/proactive/log"), ("get", "/v1/personas"), ("delete", "/v1/personas/azel"),
                          ("delete", "/v1/schedule/s1")]:
         assert getattr(c, method)(path).status_code == 403, path
     asyncio.run(g.handle_link(LinkWS(CALL_LOG)))
