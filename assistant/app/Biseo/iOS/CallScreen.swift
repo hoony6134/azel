@@ -1,0 +1,197 @@
+import AVKit
+import SwiftUI
+
+/// DESIGN §7.3: full-bleed call screen over the tabs.
+struct CallScreen: View {
+    @ObservedObject private var call = CallManager.shared
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showTranscript = false
+    @State private var banner: String?
+    @State private var askRecord = false
+    @AppStorage("recordingNoticeShown") private var recordingNoticeShown = false
+    @AppStorage(AssistantName.key) private var name = AssistantName.fallback
+
+    private var jarState: JarState { JarState(callState: call.state, inCall: call.inCall, held: call.held) }
+
+    var body: some View {
+        withFeedback
+            .sheet(isPresented: $showTranscript) {
+                NavigationStack { TranscriptView(lines: call.lines).navigationTitle("대화 내용").navigationBarTitleDisplayMode(.inline) }
+                    .presentationDetents([.medium, .large])
+            }
+            .alert("이 통화를 이 기기에만 녹음해요", isPresented: $askRecord) {
+                Button("녹음") { recordingNoticeShown = true; call.toggleRecording() }
+                Button("취소", role: .cancel) {}
+            }
+    }
+
+    private var withFeedback: some View {
+        screen
+            .preferredColorScheme(.dark)
+            .sensoryFeedback(.impact(weight: .light), trigger: jarState) { (old: JarState, new: JarState) -> Bool in
+                old == .listening && new == .thinking
+            }
+            .sensoryFeedback(.warning, trigger: call.error) { (_: String?, new: String?) -> Bool in new != nil }
+            .onChange(of: call.error) { _, new in showBanner(new) }
+            .onChange(of: call.held) { _, held in AccessibilityNotification.Announcement(held ? "대기 중" : "통화 재개").post() }
+    }
+
+    private func showBanner(_ message: String?) {
+        guard let message else { return }
+        withAnimation(Theme.enter) { banner = message }
+        AccessibilityNotification.Announcement(message).post()
+        Task { try? await Task.sleep(nanoseconds: 4_000_000_000); withAnimation { banner = nil } }
+    }
+
+    private var screen: some View {
+        ZStack {
+            GlazeBackground(state: jarState)
+            VStack(spacing: Theme.l) {
+                topBar
+                if let banner {
+                    Label(banner, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(Theme.danger)
+                        .padding(.horizontal, Theme.l).padding(.vertical, Theme.s)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
+                    .contentTransition(.opacity).animation(Theme.state, value: jarState)
+                GeometryReader { geo in
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: geo.size.width, height: geo.size.height)
+                        .contentShape(Rectangle())
+                        .onTapGesture { call.interrupt() }
+                        .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
+                        .accessibilityAction(named: "말 끊기") { call.interrupt() }
+                }
+                .frame(maxHeight: typeSize >= .accessibility1 ? 140 : .infinity)
+                if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                captions
+                dock
+                hangUp
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, Theme.s)
+        }
+    }
+
+    private var topBar: some View {
+        HStack {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                let t = Int(ctx.date.timeIntervalSince(call.connectedAt ?? ctx.date))
+                HStack(spacing: Theme.xs) {
+                    if call.recording { Circle().fill(Theme.danger).frame(width: 8, height: 8).accessibilityLabel("녹음 중") }
+                    Text(String(format: "%02d:%02d", t / 60, t % 60)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text2)
+                        .accessibilityLabel("통화 시간 \(t / 60)분 \(t % 60)초")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+            Group {
+                if let r = call.log.lastRoute { RouteChip(route: r) }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(.top, Theme.s)
+    }
+
+    /// Last user line in text2, the reply paragraph large; older turns dim and scroll up.
+    private var captions: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(spacing: Theme.m) {
+                    ForEach(Array(call.lines.enumerated()), id: \.element.id) { i, line in
+                        let recent = i >= call.lines.count - 2
+                        Text(line.text + (line.interrupted ? " …" : ""))
+                            .font(line.mine ? .body : .title2.weight(.medium))
+                            .lineSpacing(line.mine ? 4 : 6)
+                            .foregroundStyle(line.mine ? Theme.text2 : (recent && !line.interrupted ? Theme.text : Theme.text3))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                            .id(line.id)
+                            .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 6)))
+                    }
+                }
+                .padding(.vertical, Theme.m)
+                .animation(Theme.caption, value: call.lines)
+            }
+            .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.18)], startPoint: .top, endPoint: .bottom))
+            .background(Theme.bg.opacity(0.55).blur(radius: 20))
+            .frame(maxHeight: UIScreen.main.bounds.height * 0.3)
+            .onChange(of: call.lines) { if let last = call.lines.last { withAnimation(Theme.caption) { proxy.scrollTo(last.id, anchor: .bottom) } } }
+            .contentShape(Rectangle())
+            .onTapGesture { showTranscript = true }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("대화 내용")
+            .accessibilityHint("두 번 탭하면 전체 대화 보기")
+        }
+    }
+
+    private var dock: some View {
+        let buttons = Group {
+            dockButton("음소거", call.muted ? "mic.slash.fill" : "mic.fill", on: call.muted, onColor: Theme.amber) { call.toggleMute() }
+            dockButton("스피커", call.speaker ? "speaker.wave.3.fill" : "speaker.wave.2", on: call.speaker) { call.toggleSpeaker() }
+            VStack(spacing: Theme.xs) {
+                RoutePicker().frame(width: 56, height: 56)
+                    .background(Circle().fill(Theme.card.opacity(0.6)))
+                    .accessibilityLabel("오디오 출력 선택")
+                Text("출력").font(.footnote).foregroundStyle(Theme.text2)
+            }
+            dockButton("녹음", call.recording ? "stop.circle.fill" : "record.circle", on: call.recording, onColor: Theme.danger,
+                       value: call.recording ? "녹음 중" : "꺼짐") {
+                if call.recording || recordingNoticeShown { call.toggleRecording() } else { askRecord = true }
+            }
+            dockButton("대기", call.held ? "play.fill" : "pause", on: call.held, a11y: "통화 대기",
+                       value: call.held ? "대기 중" : "통화 중") { call.toggleHold() }
+        }
+        return Group {
+            if typeSize >= .accessibility1 {
+                VStack(spacing: Theme.m) { HStack(spacing: Theme.m) { buttons } }
+            } else {
+                HStack(spacing: Theme.m) { buttons }
+            }
+        }
+        .padding(.horizontal, Theme.l).padding(.vertical, Theme.m)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Theme.stroke, lineWidth: 0.5))
+    }
+
+    private func dockButton(_ title: String, _ icon: String, on: Bool, onColor: Color = Theme.celadon,
+                            a11y: String? = nil, value: String? = nil, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: Theme.xs) {
+                Image(systemName: icon).font(.title3)
+                    .foregroundStyle(on ? Theme.onAccent : Theme.text)
+                    .frame(width: 56, height: 56)
+                    .background(Circle().fill(on ? onColor : Theme.card.opacity(0.6)))
+                Text(title).font(.footnote).foregroundStyle(Theme.text2)
+            }
+        }
+        .buttonStyle(.plain)
+        .animation(Theme.quick, value: on)
+        .accessibilityLabel(a11y ?? title)
+        .accessibilityValue(value ?? (on ? "켜짐" : "꺼짐"))
+        .accessibilityAddTraits(.isToggle)
+    }
+
+    private var hangUp: some View {
+        Button { call.hangUp() } label: {
+            Image(systemName: "phone.down.fill").font(.title).foregroundStyle(.white)
+                .frame(width: 72, height: 72).background(Circle().fill(Theme.hangup))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("통화 끊기")
+    }
+}
+
+/// AirPods / Bluetooth / receiver / speaker picker.
+struct RoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let v = AVRoutePickerView()
+        v.prioritizesVideoDevices = false
+        v.tintColor = UIColor(Theme.text)
+        v.activeTintColor = UIColor(Theme.celadon)
+        return v
+    }
+    func updateUIView(_ view: AVRoutePickerView, context: Context) {}
+}

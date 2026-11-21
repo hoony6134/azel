@@ -4,11 +4,15 @@ import Foundation
 
 /// One JSON text message from `WS /v1/call`.
 struct CallEvent: Decodable, Equatable {
-    let type: String          // state | transcript | reply | interrupt | turn_done | error
+    let type: String          // state | transcript | reply | interrupt | turn_done | error | activity
     var value: String?        // state
     var text: String?         // transcript, reply
     var route: String?        // reply
     var message: String?      // error
+    var phase: String?        // activity: routing | tool_start | tool_end | thinking (others ignored)
+    var label: String?        // activity, server wording
+    var tool: String?         // activity
+    var kind: String?         // activity: calendar | mail | memory | … (DESIGN §13.2)
 }
 
 struct AppSettings: Codable, Equatable {
@@ -26,6 +30,8 @@ struct AppSettings: Codable, Equatable {
     var proactive: Proactive
     var default_device: String
     var device_fallback: [String]
+    /// DESIGN §0: what the assistant is called (default 아젤). Optional so older gateways still decode.
+    var assistant_name: String?
 }
 
 struct ServerStatus: Decodable {

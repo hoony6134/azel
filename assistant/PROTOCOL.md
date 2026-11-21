@@ -21,7 +21,7 @@ The voice server stores **no plaintext token**: it compares SHA-256 digests (`hm
 | Qwen3-TTS | vd-spark | `http://100.64.0.11:8890` | `spark/tts/` |
 | Claude gateway (Claude, settings, usage, devices, push, scheduler) | every device: Mac, albireo, gienah, deneb (full); vd-spark, vd-core (limited) | `http://<host tailnet IP>:8892` (Mac `100.64.0.8`) | `gateway/` |
 | Agent daemon | Mac (later every host) | `http://100.64.0.8:8893/mcp` | `daemon/` |
-| iPhone app | iPhone | — | `ios/` |
+| iPhone / Mac app | iPhone, Mac | — | `app/` |
 
 ## 1. Live call — `WS /v1/call` on the voice server
 
