@@ -186,8 +186,9 @@ is the shared breath.
 
 - **Frame rate**: `TimelineView(.animation(minimumInterval: 1/30, paused: !isVisible ||
   scenePhase != .active))`. `isVisible` comes from `onAppear`/`onDisappear`; on Mac also pause
-  while the popover is closed. The shimmer's next start time is chosen when the previous
-  one ends (store it in `@State`), not with a timer.
+  while the popover is closed. Shimmer start times come from a seeded schedule: one shimmer per 10 s
+  slot at a random 0–2 s offset (so gaps are 8–12 s and they never overlap), keeping the
+  canvas a pure function of time and the schedule unit-testable.
 - **Hand-off to a call**: when a call starts, blend from idle to listening over `state`
   (0.45 s) as in §6.2, breath scale easing to 1.
 - **Reduce Motion**: a static orb (no scale, wobble, shimmer or sway); only the glow opacity

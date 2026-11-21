@@ -35,8 +35,11 @@ def test_devices_and_push_tokens(client):
     assert d["writer"] == "full"
     assert client.put("/v1/state/devices/x", json={"name": "", "url": "u"}).status_code == 422
     client.put("/v1/state/push_tokens/abc", json={"bundle_id": "xyz.scian.biseo", "env": "production"})
+    client.put("/v1/state/push_tokens/al1", json={"bundle_id": "xyz.scian.biseo", "kind": "alert"})
     assert client.get("/v1/state/push_tokens").json() == [
-        {"token": "abc", "bundle_id": "xyz.scian.biseo", "env": "production"}]
+        {"token": "abc", "bundle_id": "xyz.scian.biseo", "env": "production", "kind": "voip"},
+        {"token": "al1", "bundle_id": "xyz.scian.biseo", "env": "sandbox", "kind": "alert"}]
+    assert client.put("/v1/state/push_tokens/x", json={"bundle_id": "b", "kind": "sms"}).status_code == 422
 
 
 def test_calls(client):
@@ -77,6 +80,12 @@ def test_leases(client):
     time.sleep(0.05)  # expired: anyone may take it
     assert client.post("/v1/state/leases/job", json={"holder": "gienah", "ttl_s": 60}).json()["held"]
     assert client.post("/v1/state/leases/job", json={"holder": "x", "ttl_s": 0}).status_code == 422
+    # priority: a preferred gateway (deneb) takes an unexpired lease from a worse one (mac), never the reverse
+    assert client.post("/v1/state/leases/sched", json={"holder": "mac", "ttl_s": 60, "priority": 10}).json()["held"]
+    assert not client.post("/v1/state/leases/sched", json={"holder": "gienah", "ttl_s": 60, "priority": 20}).json()["held"]
+    took = client.post("/v1/state/leases/sched", json={"holder": "deneb", "ttl_s": 60, "priority": 1}).json()
+    assert took["held"] and took["priority"] == 1
+    assert not client.post("/v1/state/leases/sched", json={"holder": "mac", "ttl_s": 60, "priority": 10}).json()["held"]
 
 
 LIMITED_ONLY = [("put", "/v1/state/settings"), ("get", "/v1/state/push_tokens"), ("get", "/v1/state/approvals"),
@@ -142,7 +151,7 @@ def test_approval_ids_kept_on_migration(client):
 
 def test_call_history_round_trip(client):
     t0 = time.time()
-    client.post("/v1/state/history/h1/start", json={"session": "s1", "call_id": "c1", "direction": "outgoing",
+    client.post("/v1/state/history/h1/start", json={"session": "s1", "call_id": "c1", "direction": "incoming",
                                                     "reason": "morning_briefing", "client": "iphone",
                                                     "opening": "좋은 아침이에요.", "started_at": t0})
     client.post("/v1/state/history/h1/turns", json={
@@ -156,7 +165,7 @@ def test_call_history_round_trip(client):
     assert client.post("/v1/state/history/h1/end", json={"ended_at": t0 + 95}).json() == {"ok": True, "turns": 2}
     [row] = client.get("/v1/state/history").json()
     assert row["id"] == "h1" and row["title"] == "오늘 일정 알려줘" and row["turns"] == 2
-    assert row["routes"] == {"claude": 1, "qwen": 1} and abs(row["duration_s"] - 95) < 1 and row["direction"] == "outgoing"
+    assert row["routes"] == {"claude": 1, "qwen": 1} and abs(row["duration_s"] - 95) < 1 and row["direction"] == "incoming"
     assert row["session"] == "s1" and row["last_reply"] == "네, 언제든 불러 주세요." and sorted(row["kinds"]) == ["calendar", "mail"]
     full = client.get("/v1/state/history/h1").json()
     assert [t["user"] for t in full["turns"]] == ["오늘 일정 알려줘", "고마워"]
@@ -207,6 +216,62 @@ def test_state_schema_upgrades_an_older_table(client):
                                            (m.STATE,))}
     assert {"writer", "import_key"} <= cols
     m.db(m.STATE_SCHEMA)  # and again: idempotent
+
+
+def test_scheduled_calls(client):
+    at = time.time() + 3600
+    a = client.post("/v1/state/schedule", json={"at": at, "repeat": "weekly:0", "kind": "wake",
+                                                "created_by": "voice"}).json()
+    b = client.post("/v1/state/schedule", json={"at": at - 600, "kind": "reminder", "note": "약 먹기"}).json()
+    assert a["status"] == "pending" and a["attempts"] == 0 and abs(a["at"] - at) < 1
+    assert [r["id"] for r in client.get("/v1/state/schedule").json()] == [b["id"], a["id"]]  # soonest first
+    for bad in [{"at": at, "repeat": "hourly"}, {"at": at, "repeat": "weekly:mon"}, {"at": at, "repeat": "weekly:7"},
+                {"at": at, "kind": "nap"}, {"at": at, "note": "x" * 201}, {"at": at, "created_by": "evil"}]:
+        assert client.post("/v1/state/schedule", json=bad).status_code == 422
+    f = client.post(f"/v1/state/schedule/{a['id']}", json={"status": "fired", "attempts": 1, "call_id": "c9",
+                                                           "last_attempt": time.time(), "expect_status": "pending"})
+    assert f.json()["status"] == "fired" and f.json()["call_id"] == "c9"
+    again = client.post(f"/v1/state/schedule/{a['id']}", json={"status": "fired", "expect_status": "pending"})
+    assert again.status_code == 409  # compare-and-set: a second firing gateway loses
+    assert client.post("/v1/state/schedule/nope", json={"status": "fired"}).status_code == 404
+    assert client.post(f"/v1/state/schedule/{a['id']}", json={}).status_code == 400
+    assert client.delete(f"/v1/state/schedule/{b['id']}").json()["status"] == "cancelled"
+    assert client.delete(f"/v1/state/schedule/{b['id']}").status_code == 404
+    assert [r["id"] for r in client.get("/v1/state/schedule?status=cancelled").json()] == [b["id"]]
+    assert limited_client("100.64.0.8", "l1m").get("/v1/state/schedule").status_code == 403
+
+
+def test_proactive_log_and_kv(client):
+    t0 = time.time()
+    client.post("/v1/state/proactive_log", json={"call": True, "urgency": 5, "reason": "서버 다운", "reason_hash": "ab",
+                                                 "called": True, "call_id": "c1", "signals": {"alerts": ["NodeDown"]}})
+    client.post("/v1/state/proactive_log", json={"call": False, "urgency": 2, "reason": "별일 없음",
+                                                 "blocked_by": "no_call"})
+    rows = client.get(f"/v1/state/proactive_log?since={t0 - 5}").json()
+    assert [r["reason"] for r in rows] == ["별일 없음", "서버 다운"]  # newest first
+    assert [r["reason"] for r in client.get("/v1/state/proactive_log?called=true").json()] == ["서버 다운"]
+    assert rows[1]["signals"] == {"alerts": ["NodeDown"]} and rows[0]["blocked_by"] == "no_call"
+    assert client.post("/v1/state/proactive_log", json={"urgency": 9}).status_code == 422
+    assert client.get("/v1/state/kv/alerts_recent").status_code == 404
+    assert client.put("/v1/state/kv/alerts_recent", json=[{"names": "NodeDown", "at": t0}]).json()[0]["names"] == "NodeDown"
+    assert client.get("/v1/state/kv/alerts_recent").json() == [{"names": "NodeDown", "at": t0}]
+    assert client.put("/v1/state/kv/settings", json={}).status_code == 400  # settings have their own route
+    assert client.get("/v1/state/kv/Bad-Key").status_code == 422
+    lim = limited_client("100.64.0.8", "l1m")
+    assert lim.get("/v1/state/proactive_log").status_code == 403 and lim.get("/v1/state/kv/alerts_recent").status_code == 403
+
+
+def test_fix_call_directions_is_idempotent(client):
+    m = sys.modules["memory_service"]
+    client.post("/v1/state/history/old_in/start", json={"call_id": "c7", "direction": "outgoing"})  # written reversed
+    client.post("/v1/state/history/old_out/start", json={"call_id": "", "direction": "incoming"})
+    client.post("/v1/state/history/new_in/start", json={"call_id": "c8", "direction": "incoming"})  # already right
+    assert m.fix_call_directions() == 2
+    assert m.fix_call_directions() == 0  # again: nothing changes
+    rows = {r["id"]: r["direction"] for r in client.get("/v1/state/history?limit=100").json()}
+    assert rows["old_in"] == "incoming" and rows["old_out"] == "outgoing" and rows["new_in"] == "incoming"
+    for hid in ("old_in", "old_out", "new_in"):
+        client.delete(f"/v1/state/history/{hid}")
 
 
 def test_bad_tokens(client):

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Path as FPath, Query, Request
 from huggingface_hub import hf_hub_download
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -90,6 +90,20 @@ create table if not exists {STATE}.leases(name text primary key, holder text not
 -- columns added after the first state schema (93aacc6): upgrade tables created by that version
 alter table {STATE}.usage add column if not exists import_key text unique;
 alter table {STATE}.devices add column if not exists writer text not null default 'limited';
+alter table {STATE}.leases add column if not exists priority int not null default 100;
+alter table {STATE}.push_tokens add column if not exists kind text not null default 'voip';
+create table if not exists {STATE}.scheduled_calls(
+    id text primary key, at timestamptz not null, repeat text, kind text not null default 'wake',
+    note text not null default '', created_by text not null default '', status text not null default 'pending',
+    attempts int not null default 0, call_id text, last_attempt timestamptz,
+    created timestamptz not null default now());
+create index if not exists scheduled_calls_at on {STATE}.scheduled_calls (status, at);
+create table if not exists {STATE}.proactive_log(
+    id bigserial primary key, at timestamptz not null default now(), call boolean not null default false,
+    urgency int not null default 0, reason text not null default '', opening text not null default '',
+    reason_hash text not null default '', called boolean not null default false, blocked_by text,
+    signals jsonb not null default '{{}}', call_id text);
+create index if not exists proactive_log_at on {STATE}.proactive_log (at desc);
 create table if not exists {STATE}.call_history(
     id text primary key, session text, call_id text, direction text, reason text, client text, opening text,
     started_at timestamptz not null default now(), ended_at timestamptz, duration_s double precision);
@@ -362,18 +376,20 @@ def list_devices():
 class PushToken(BaseModel):
     bundle_id: str = Field(min_length=1)
     env: str = "sandbox"
+    kind: str = Field("voip", pattern="^(voip|alert)$")  # alert: ordinary notifications (missed scheduled calls)
 
 
 @app.put("/v1/state/push_tokens/{token}", dependencies=[v1])
 def put_push_token(token: str, p: PushToken):
-    db(f"insert into {STATE}.push_tokens values(%s,%s,%s,now()) on conflict(token) do update"
-       " set bundle_id=excluded.bundle_id, env=excluded.env, ts=now()", (token, p.bundle_id, p.env))
+    db(f"insert into {STATE}.push_tokens(token, bundle_id, env, ts, kind) values(%s,%s,%s,now(),%s)"
+       " on conflict(token) do update set bundle_id=excluded.bundle_id, env=excluded.env, ts=now(), kind=excluded.kind",
+       (token, p.bundle_id, p.env, p.kind))
     return {"ok": True}
 
 
 @app.get("/v1/state/push_tokens", dependencies=[v1])
 def list_push_tokens():
-    return db(f"select token, bundle_id, env from {STATE}.push_tokens")
+    return db(f"select token, bundle_id, env, kind from {STATE}.push_tokens")
 
 
 class Call(BaseModel):
@@ -468,18 +484,21 @@ def put_session(voice_session: str, s: Session):
 class Lease(BaseModel):
     holder: str = Field(min_length=1)
     ttl_s: float = Field(gt=0, le=7 * 86400)
+    priority: int = 100  # lower wins: a lower-priority caller takes an unexpired lease from a higher one
 
 
 @app.post("/v1/state/leases/{name}", dependencies=[v1])
 def take_lease(name: str, lease: Lease):
-    """Take or renew a lease. Atomic: only one holder wins while it is unexpired."""
-    rows = db(f"insert into {STATE}.leases values(%s,%s,now() + make_interval(secs => %s))"
-              " on conflict(name) do update set holder=excluded.holder, expires=excluded.expires"
-              f" where {STATE}.leases.expires < now() or {STATE}.leases.holder = excluded.holder"
-              f" returning holder, {EPOCH.format('expires')}", (name, lease.holder, lease.ttl_s))
+    """Take or renew a lease. Atomic: one holder at a time; free, expired, own, or held at a worse priority."""
+    L = f"{STATE}.leases"
+    rows = db(f"insert into {L}(name, holder, expires, priority) values(%s,%s,now() + make_interval(secs => %s),%s)"
+              " on conflict(name) do update set holder=excluded.holder, expires=excluded.expires,"
+              f" priority=excluded.priority where {L}.expires < now() or {L}.holder = excluded.holder"
+              f" or excluded.priority < {L}.priority"
+              f" returning holder, priority, {EPOCH.format('expires')}", (name, lease.holder, lease.ttl_s, lease.priority))
     if rows:
         return {"held": True, **rows[0]}
-    cur = db(f"select holder, {EPOCH.format('expires')} from {STATE}.leases where name=%s", (name,))
+    cur = db(f"select holder, priority, {EPOCH.format('expires')} from {STATE}.leases where name=%s", (name,))
     return {"held": False, **(cur[0] if cur else {})}
 
 
@@ -487,6 +506,121 @@ def take_lease(name: str, lease: Lease):
 def release_lease(name: str, holder: str):
     return {"released": bool(db(f"delete from {STATE}.leases where name=%s and holder=%s returning name",
                                 (name, holder)))}
+
+
+# ---------- autonomous calls: every decision, and small shared values (full gateways only) ----------
+class ProactiveEntry(BaseModel):
+    call: bool = False
+    urgency: int = Field(0, ge=0, le=5)
+    reason: str = Field("", max_length=500)
+    opening: str = Field("", max_length=500)
+    reason_hash: str = Field("", max_length=64)
+    called: bool = False
+    blocked_by: str | None = Field(None, max_length=40)
+    signals: dict = {}
+    call_id: str | None = None
+
+
+@app.post("/v1/state/proactive_log", dependencies=[v1])
+def add_proactive(e: ProactiveEntry):
+    return db(f"insert into {STATE}.proactive_log(call, urgency, reason, opening, reason_hash, called, blocked_by,"
+              " signals, call_id) values(%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
+              (e.call, e.urgency, e.reason, e.opening, e.reason_hash, e.called, e.blocked_by, Jsonb(e.signals),
+               e.call_id))[0]
+
+
+@app.get("/v1/state/proactive_log", dependencies=[v1])
+def list_proactive(since: float = 0, called: bool | None = None, limit: int = 100):
+    return db(f"select id, {EPOCH.format('at')}, call, urgency, reason, opening, reason_hash, called, blocked_by,"
+              f" signals, call_id from {STATE}.proactive_log where at >= to_timestamp(%s)"
+              " and (%s::boolean is null or called = %s) order by at desc limit %s",
+              (since, called, called, max(1, min(limit, 500))))
+
+
+KV_KEY = r"^[a-z0-9_]{1,40}$"
+
+
+@app.get("/v1/state/kv/{key}", dependencies=[v1])
+def get_kv(key: str = FPath(pattern=KV_KEY)):
+    if key == "settings":
+        raise HTTPException(400, "use /v1/state/settings")
+    rows = db(f"select value from {STATE}.kv where key=%s", (key,))
+    if not rows:
+        raise HTTPException(404, "no such key")
+    return rows[0]["value"]
+
+
+@app.put("/v1/state/kv/{key}", dependencies=[v1])
+def put_kv(body: dict | list = Body(...), key: str = FPath(pattern=KV_KEY)):
+    if key == "settings":
+        raise HTTPException(400, "use /v1/state/settings")
+    return db(f"insert into {STATE}.kv values(%s, %s, now()) on conflict(key) do update set value=excluded.value,"
+              " updated=now() returning value", (key, Jsonb(body)))[0]["value"]
+
+
+# ---------- scheduled calls (full gateways only) ----------
+SCHED = f"{STATE}.scheduled_calls"
+SCHED_COLS = (f"id, {EPOCH.format('at')}, repeat, kind, note, created_by, status, attempts, call_id,"
+              f" {EPOCH.format('last_attempt')}, {EPOCH.format('created')}")
+REPEAT_RE = r"^(daily|weekdays|weekly:[0-6])$"  # weekly:<dow>, 0 = Monday
+
+
+class Scheduled(BaseModel):
+    at: float  # epoch seconds; the gateway checks it is ahead and within 30 days
+    repeat: str | None = Field(None, pattern=REPEAT_RE)
+    kind: str = Field("wake", pattern="^(wake|reminder)$")
+    note: str = Field("", max_length=200)
+    created_by: str = Field("app", pattern="^(voice|app)$")
+
+
+@app.post("/v1/state/schedule", dependencies=[v1])
+def add_scheduled(s: Scheduled):
+    return db(f"insert into {SCHED}(id, at, repeat, kind, note, created_by) values(%s,to_timestamp(%s),%s,%s,%s,%s)"
+              f" returning {SCHED_COLS}", (uuid.uuid4().hex[:12], s.at, s.repeat, s.kind, s.note, s.created_by))[0]
+
+
+@app.get("/v1/state/schedule", dependencies=[v1])
+def list_scheduled(status: str = "pending,fired"):
+    """Items in the given statuses (comma list), soonest first."""
+    return db(f"select {SCHED_COLS} from {SCHED} where status = any(%s) order by at", (status.split(","),))
+
+
+class ScheduledUpdate(BaseModel):
+    status: str | None = Field(None, pattern="^(pending|fired|answered|missed|cancelled)$")
+    attempts: int | None = Field(None, ge=0, le=10)
+    call_id: str | None = None
+    at: float | None = None
+    last_attempt: float | None = None
+    expect_status: str | None = None  # compare-and-set: only update while the row is still in this status
+
+
+@app.post("/v1/state/schedule/{sid}", dependencies=[v1])
+def update_scheduled(sid: str, u: ScheduledUpdate):
+    sets, args = [], []
+    for col in ("status", "attempts", "call_id"):
+        if getattr(u, col) is not None:
+            sets.append(f"{col}=%s")
+            args.append(getattr(u, col))
+    for col in ("at", "last_attempt"):
+        if getattr(u, col) is not None:
+            sets.append(f"{col}=to_timestamp(%s)")
+            args.append(getattr(u, col))
+    if not sets:
+        raise HTTPException(400, "nothing to update")
+    rows = db(f"update {SCHED} set {', '.join(sets)} where id=%s and (%s::text is null or status=%s)"
+              f" returning {SCHED_COLS}", (*args, sid, u.expect_status, u.expect_status))
+    if not rows:
+        raise HTTPException(409 if db(f"select 1 from {SCHED} where id=%s", (sid,)) else 404, "not updated")
+    return rows[0]
+
+
+@app.delete("/v1/state/schedule/{sid}", dependencies=[v1])
+def cancel_scheduled(sid: str):
+    rows = db(f"update {SCHED} set status='cancelled' where id=%s and status in ('pending','fired')"
+              f" returning {SCHED_COLS}", (sid,))
+    if not rows:
+        raise HTTPException(404, "no such scheduled call")
+    return rows[0]
 
 
 # ---------- call history (full gateways only; personal) ----------
@@ -566,9 +700,9 @@ LIST_COLS = f"""h.id, h.session, h.direction, h.reason, h.client,
         where t.call = h.id group by route) r) as routes,
     (select coalesce(jsonb_agg(distinct a->>'kind'), '[]') from {TURNS} t, jsonb_array_elements(t.activity) a
         where t.call = h.id and jsonb_typeof(a) = 'object' and a->>'kind' is not null) as kinds"""
-# shortcut: e5 cosine for unrelated Korean text sits around 0.75-0.8, so a vector-only hit needs more than that;
-# tune on real calls if q misses paraphrases or returns noise.
-HISTORY_VEC_MIN, HISTORY_LEX_MIN = 0.86, 0.1
+# A vector-only hit (no word match) counts only when no call matches the words at all, and then needs a high
+# cosine: on ruchba's e5, an unrelated call scored above 0.86 for "주차". shortcut: tune 0.9 on real calls.
+HISTORY_VEC_MIN, HISTORY_LEX_MIN = 0.9, 0.1
 
 
 def snippet(text, q, width=80):
@@ -590,21 +724,23 @@ def history_list(limit: int = 20, before: float | None = None, q: str | None = N
                   {"before": before, "limit": limit})
     # Full transcripts, ranked like memory search: ended calls have a transcript record (hybrid vector + text);
     # calls still running do not yet, so their turns are matched by substring.
-    best: dict[str, tuple[float, str]] = {}
+    best: dict[str, tuple[bool, float, str]] = {}  # call -> (word match, score, snippet)
     for h in search(Search(query=q, kinds=["transcript"], limit=100)):
         cid = (h["meta"] or {}).get("call")
         if cid and cid not in best and (h["lex"] >= HISTORY_LEX_MIN or h["vec"] >= HISTORY_VEC_MIN):
-            best[cid] = (h["score"], snippet(h["text"], q))
+            best[cid] = (h["lex"] >= HISTORY_LEX_MIN, h["score"], snippet(h["text"], q))
     for r in db(f"select t.call, t.user_text, t.assistant from {TURNS} t join {HIST} h on h.id = t.call"
                 " where h.ended_at is null and (t.user_text ilike %(like)s or t.assistant::text ilike %(like)s)",
                 {"like": f"%{q}%"}):
-        best.setdefault(r["call"], (0.0, snippet(r["user_text"] + "\n" + " ".join(r["assistant"]), q)))
+        best.setdefault(r["call"], (True, 0.0, snippet(r["user_text"] + "\n" + " ".join(r["assistant"]), q)))
+    if any(word for word, _, _ in best.values()):  # words matched somewhere: meaning-only neighbours are noise
+        best = {k: v for k, v in best.items() if v[0]}
     if not best:
         return []
     rows = db(f"select {LIST_COLS} from {HIST} h where {where} and h.id = any(%(ids)s)",
               {"before": before, "ids": list(best)})
-    rows.sort(key=lambda r: -best[r["id"]][0])
-    return [{**r, "match": best[r["id"]][1]} for r in rows[:limit]]
+    rows.sort(key=lambda r: (not best[r["id"]][0], -best[r["id"]][1]))
+    return [{**r, "match": best[r["id"]][2]} for r in rows[:limit]]
 
 
 def offsets(steps, started):
@@ -652,7 +788,23 @@ def history_prune(older_than_days: float = Query(gt=0)):
     return delete_calls([r["id"] for r in rows])
 
 
+def fix_call_directions():
+    """One-off for rows written before direction was pinned to the user's point of view (voice servers before
+    the fix sent the opposite). Idempotent: direction follows call_id presence, so repeating changes nothing.
+    Run: docker compose run --rm memory .venv/bin/python memory_service.py --fix-call-directions"""
+    return len(db(f"update {HIST} set direction = case when coalesce(call_id, '') <> '' then 'incoming'"
+                  " else 'outgoing' end where direction is distinct from"
+                  " (case when coalesce(call_id, '') <> '' then 'incoming' else 'outgoing' end) returning id"))
+
+
 if __name__ == "__main__":
+    import sys
+    if "--fix-call-directions" in sys.argv:
+        from psycopg.rows import dict_row
+        pool = ConnectionPool(DB_URL, min_size=1, max_size=1, open=True,
+                              kwargs={"autocommit": True, "row_factory": dict_row})
+        print(f"call directions fixed: {fix_call_directions()} rows")
+        raise SystemExit
     import uvicorn
     assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"
     uvicorn.run(app, host=HOST, port=PORT)
