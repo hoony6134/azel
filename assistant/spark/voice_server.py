@@ -757,10 +757,17 @@ last_claude_briefing: list = [0.0, ""]
 # ---------- scheduled calls: "내일 10시에 깨워 줘" (local; the gateway stores and fires them) ----------
 KO_NUM = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10,
           "열한": 11, "열두": 12, "삼십": 30, "십": 10, "이십": 20, "사십": 40, "오십": 50}
-_N = r"(\d{1,2}|열한|열두|열|한|두|세|네|다섯|여섯|일곱|여덟|아홉|삼십|이십|사십|오십|십)"
+_NATIVE = r"열한|열두|열|한|두|세|네|다섯|여섯|일곱|여덟|아홉"
+_SINO = r"[이삼사오]?십[일이삼사오육칠팔구]?|[일이삼사오육칠팔구]"  # 오, 십오, 이십오; "일"/"이" also mean work/this, so units must follow
+_N = rf"(\d{{1,2}}|{_NATIVE}|{_SINO})"
+_BEFORE_UNIT = rf"(\d{{1,2}}|{_NATIVE}|(?<![가-힣])(?:{_SINO}))"  # a Sino numeral never starts mid-word
+# "오시면" (if you come) is not 5 o'clock: a Sino hour is not followed by a verb ending
+_SI = r"시(?!간|[면는고다어지겠죠니오세려라길서가])"
+_HOUR = (rf"(\d{{1,2}}|{_NATIVE}|(?<![가-힣])(?:[이삼사오]?십[일이삼사오육칠팔구]?(?=\s*{_SI})|[삼오육칠팔](?=\s*{_SI})"
+         rf"|[일이사구](?=\s+{_SI})))")  # "일시" (date/time) needs a space to be 1 o'clock
 DAYS = "월화수목금토일"
-REL_RE = re.compile(_N + r"\s*(분|시간)\s*(뒤|후|있다가|지나서)")
-CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _N + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
+REL_RE = re.compile(_BEFORE_UNIT + r"\s*(분|시간)\s*만?\s*(뒤|후|있다가|지나서)")
+CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _HOUR + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
 WEEKDAY_RE = re.compile(r"(다음\s*주|담주|이번\s*주)?\s*([월화수목금토일])요일")
 REPEATS = {"daily", "weekdays"} | {f"weekly:{d}" for d in range(7)}  # weekly:<dow>, 0 = Monday
 SCHED_LIST = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거).{0,8}(목록|뭐|있|확인|알려|된 거|돼 있)")
@@ -771,8 +778,18 @@ OTHER_TARGET = re.compile(r"(\S+)(한테|에게|께)")
 pending_schedule: dict[str, tuple[float, dict]] = {}  # session -> (asked at, partial request) after "몇 시에…?"
 
 
+SINO_DIGITS = {c: i for i, c in enumerate("일이삼사오육칠팔구", 1)}
+
+
 def ko_int(tok):
-    return int(tok) if tok.isdigit() else KO_NUM[tok]
+    if tok.isdigit():
+        return int(tok)
+    if tok in KO_NUM:
+        return KO_NUM[tok]
+    if "십" not in tok:  # Sino: 오, 십오, 이십오
+        return SINO_DIGITS[tok]
+    tens, ones = tok.split("십")
+    return (SINO_DIGITS[tens] if tens else 1) * 10 + (SINO_DIGITS[ones] if ones else 0)
 
 
 def schedule_intent(text, session=""):
@@ -921,9 +938,14 @@ async def tts(sentence: str) -> tuple[bytes, int]:
     return wav.tobytes(), sr
 
 
+def day_part(hour):
+    """The spoken part of day: 00:xx is 밤 12시 and 12:xx 낮 12시, never 오전 12시."""
+    return "밤" if hour == 0 else "낮" if hour == 12 else "오전" if hour < 12 else "오후"
+
+
 def now_kst():
     now = datetime.now(KST)
-    ampm, h12 = ("오전" if now.hour < 12 else "오후"), (now.hour % 12 or 12)  # Qwen misreads 24-hour "17시"
+    ampm, h12 = day_part(now.hour), (now.hour % 12 or 12)  # Qwen misreads 24-hour "17시"
     return f" 현재 시각: {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {ampm} {h12}시 {now.minute}분."
 
 
@@ -2207,16 +2229,31 @@ if __name__ == "__main__":
             ("저녁 7시에 전화해 줘", sat8, (11, 21, 19, 0), None),
             ("밤 11시에 깨워 줘", sat8, (11, 21, 23, 0), None),
             ("일곱 시에 깨워 줘", sat8, (11, 22, 7, 0), None),
+            ("오분 있다가 호출어 확인이라고 전화해줘", sat8, (11, 21, 8, 5), None),
+            ("오 분만 있다가 전화해줘", sat8, (11, 21, 8, 5), None),
+            ("5분만 있다가 전화해 줘", sat8, (11, 21, 8, 5), None),
+            ("이십 분 뒤에 전화해 줘", sat8, (11, 21, 8, 20), None),
+            ("이십오 분 후에 전화해 줘", sat8, (11, 21, 8, 25), None),
+            ("십오분 뒤에 깨워 줘", sat8, (11, 21, 8, 15), None),
+            ("한 시간만 지나서 전화해 줘", sat8, (11, 21, 9, 0), None),
+            ("삼 시간 뒤에 전화해 줘", sat8, (11, 21, 11, 0), None),
+            ("오후 삼 시 오십 분에 전화해 줘", sat8, (11, 21, 15, 50), None),
+            ("내일 오전 칠 시에 깨워 줘", sat8, (11, 22, 7, 0), None),
         ]:
             at, repeat = parse_when(said, now)
             assert (at.month, at.day, at.hour, at.minute) == want and repeat == rep, (said, at, repeat)
         assert parse_when("깨워 줘", sat8) == (None, None) and parse_when("세 시간째 기다려", sat8)[0] is None
+        for said in ["일 끝나면 전화해줘", "이 분 누구야", "오시면 전화해 줘", "일시 알려 줘", "이 시간에 전화해 줘", "사 분의 일"]:
+            assert parse_when(said, sat8)[0] is None and schedule_intent(said) is None, said
+        assert [day_part(h) for h in (0, 1, 11, 12, 13, 23)] == ["밤", "오전", "오전", "낮", "오후", "오후"]
         for said, want in [("내일 10시에 깨워 줘", "create"), ("깨워 줘", "create"), ("알람 7시로 맞춰 줘", "create"),
                            ("내일 3시에 전화해 줘", "create"), ("나한테 30분 뒤에 전화해 줘", "create"),
                            ("엄마한테 전화해 줘", None), ("엄마한테 내일 3시에 전화해 줘", None),
                            ("예약 취소해 줘", "cancel"), ("취소", "cancel"), ("내일 10시 알람 취소해 줘", "cancel"),
                            ("예약된 거 뭐 있어?", "list"), ("알람 목록 알려줘", "list"), ("내일 일정 알려줘", None),
-                           ("10시에 회의 있어", None), ("클로드가 뭐야?", None)]:
+                           ("10시에 회의 있어", None), ("클로드가 뭐야?", None),
+                           ("오분 있다가 호출어 확인이라고 전화해줘", "create"), ("오 분만 있다가 전화해줘", "create"),
+                           ("일 끝나면 전화해줘", None), ("이 분 누구야", None)]:
             assert schedule_intent(said) == want, (said, schedule_intent(said))
         assert valid_schedule(sat8 + timedelta(days=29), None, sat8) and not valid_schedule(sat8 - timedelta(minutes=1), None, sat8)
         assert to_kst(datetime(2026, 11, 22, 10, 0)).isoformat() == "2026-11-22T10:00:00+09:00"  # naive = KST
