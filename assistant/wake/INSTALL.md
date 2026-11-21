@@ -1,4 +1,4 @@
-# 김비서 wake-word listener: install (Mac)
+# 아젤 wake-word listener: install (Mac)
 
 Listens on the default mic for the wake word, says "네?", records the request, sends it to the
 voice server (`POST /v1/turn`), plays the reply, then keeps listening 6 s for a follow-up.
@@ -35,8 +35,8 @@ job to get the dialog again: `tccutil reset Microphone`, then the kickstart comm
 
 ## Switching to the Korean wake word
 
-When `kim_biseo.onnx` is trained, put it at `~/.config/biseo/kim_biseo.onnx`, set
-`model = "~/.config/biseo/kim_biseo.onnx"` (and tune `threshold`) in `wake.toml`, and run the
+When `azel.onnx` is trained, put it at `~/.config/biseo/azel.onnx`, set
+`model = "~/.config/biseo/azel.onnx"` (and tune `threshold`) in `wake.toml`, and run the
 kickstart command. Check a clip first: `uv run python biseo_wake.py --score clip.wav`.
 
 ## Wake log

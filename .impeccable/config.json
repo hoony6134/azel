@@ -1,0 +1,26 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "pulsing-dot",
+        "value": "*",
+        "files": [
+          "assistant/design/mockups.html"
+        ],
+        "createdAt": "2026-11-21T09:53:33.946Z",
+        "reason": "PM-requested activity ellipsis: animates only while a real tool_start step is running (DESIGN.md §13.3), static under reduced motion"
+      },
+      {
+        "rule": "radial-halo",
+        "value": "*",
+        "files": [
+          "assistant/design/mockups.html"
+        ],
+        "createdAt": "2026-11-21T10:00:51.857Z",
+        "reason": "Design session decision: the call-screen state glaze is the spec'd background (DESIGN.md §6.4, §7.3), not decoration; text sits on a bg scrim. Detector offers no narrower value for this rule"
+      }
+    ]
+  }
+}

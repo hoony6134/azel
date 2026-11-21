@@ -1,4 +1,6 @@
-# 김비서 memory service. Tailnet only: the port is published on ruchba's Tailscale IP.
+# Azel memory service. Tailnet only: host networking, uvicorn binds ruchba's Tailscale IP (BISEO_HOST default
+# 100.64.0.10). Host networking (not a published port) so the app sees real tailnet client IPs, which the
+# BISEO_LIMITED_IPS gate needs; Docker's userland proxy would show every peer as a bridge address.
 services:
   memory:
     build: .
@@ -6,16 +8,19 @@ services:
     container_name: biseo-memory
     restart: unless-stopped
     user: "1001:1001"   # ubuntu, owner of the 0600 token and db_url files
+    network_mode: host
     environment:
       TZ: Asia/Seoul
+      # Team machines' tailnet IPs (vd-spark, vd-core): limited state routes only, whatever token they send.
+      # BISEO_LIMITED_IPS: "100.64.0.11,<vd-core IP>"
     volumes:
       - /home/ubuntu/.config/biseo/token:/config/token:ro
       - ./db_url:/config/db_url:ro
-    ports:
-      - "100.64.0.10:8894:8894"
+      # Scoped token for limited gateways (0600; must differ from token). Create the file before enabling.
+      # - /home/ubuntu/.config/biseo/state_token_limited:/config/state_token_limited:ro
     mem_limit: 600m
     healthcheck:
-      test: ["CMD", ".venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8894/health')"]
+      test: ["CMD", ".venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://100.64.0.10:8894/health')"]
       interval: 60s
       timeout: 5s
     logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }

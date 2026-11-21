@@ -1,7 +1,7 @@
 # copy to ~/.config/biseo/wake.toml (every key is optional; these are the defaults)
 
 # Built-in openWakeWord name for testing. When the Korean model is trained, set
-#   model = "~/.config/biseo/kim_biseo.onnx"
+#   model = "~/.config/biseo/azel.onnx"
 model = "hey_jarvis"
 threshold = 0.5
 

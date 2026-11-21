@@ -1,6 +1,6 @@
 # Copy to ~/.config/biseo/daemon.toml (chmod 600). Unset keys use the defaults in biseo_daemon.py.
 id = "macbook"            # ASCII slug: MCP server name on the Claude side
-name = "맥북"              # display name
+name = "macbook"          # display name: English, same as the id (macbook, albireo, gienah, deneb, spark)
 host = "100.64.0.8"       # Tailscale IP; 0.0.0.0 is refused
 port = 8893
 token_file = "~/.config/biseo/token"

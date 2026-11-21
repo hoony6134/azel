@@ -1,4 +1,4 @@
-"""Always-on wake-word listener for 김비서 (Mac).
+"""Always-on wake-word listener for 아젤 (Mac).
 
 wake word (openWakeWord) -> "네?" -> record with Silero VAD -> POST /v1/turn ->
 play the streamed reply -> 6 s follow-up window without the wake word -> back to wake.
@@ -30,7 +30,7 @@ FRAME = 2560  # 160 ms: a multiple of both Silero's 512 and openWakeWord's 1280 
 FRAME_S = FRAME / SR
 CONFIG_PATH = Path.home() / ".config/biseo/wake.toml"
 DEFAULTS = {
-    "model": "hey_jarvis",  # built-in openWakeWord name, or a path to an .onnx (kim_biseo.onnx)
+    "model": "hey_jarvis",  # built-in openWakeWord name, or a path to an .onnx (azel.onnx)
     "threshold": 0.5,
     "verifier": "~/.config/biseo/azel_verifier.pkl",  # personal voice verifier; "" turns it off
     "verifier_gate": 0.3,  # base score that makes the verifier run; wake needs both gate and threshold
