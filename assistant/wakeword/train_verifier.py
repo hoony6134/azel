@@ -13,10 +13,11 @@ from pathlib import Path
 
 def train(clips, negatives, model, out, max_neg=400, seed=0):
     from openwakeword.custom_verifier_model import train_custom_verifier
+    assert Path(model).is_file(), f"base wake model not found: {model} (train it first, see run_train.sh)"
     pos = sorted(Path(clips).glob("*.wav"))
     neg = sorted(Path(negatives).glob("*.wav"))
     assert pos, f"no enrollment clips in {clips}"
-    assert neg, f"no negative clips in {negatives}"
+    assert neg, f"no negative clips in {negatives} (see make_negatives.py)"
     random.Random(seed).shuffle(neg)
     tmp = Path(f"{out}.tmp")
     train_custom_verifier(positive_reference_clips=[str(p) for p in pos],
