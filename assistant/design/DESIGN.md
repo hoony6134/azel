@@ -260,6 +260,8 @@ Full-bleed, no navigation bar, status bar light content.
 - **State label** under the top bar (headline, state color + symbol):
   `ear` 듣고 있어요 · `ellipsis` 생각 중 · `waveform` 말하는 중 · `pause.fill` 대기 중 (hold).
 - **Jar**: centered in the upper half, `R = 0.32 × width`.
+- **Activity row** directly under the jar: what 아젤 is doing right now plus the steps
+  already done this turn (§13).
 - **Captions** (lower half, above the dock, max 40% of height, scrolls, fades top edge
   with a mask):
   - Last user transcript: body, text2, prefixed by nothing (alignment tells who spoke).
@@ -305,6 +307,8 @@ Card header: headline + optional trailing text button.
    text field (max 12 characters, trimmed, empty → back to "아젤"). Footer helper (footnote,
    text3): "호출어는 다시 학습하기 전까지 '아젤'로 유지돼요." Saved like the other settings; the
    new name shows on the call screen, CallKit and menus from the next call.
+   Second row: toggle **"작업 효과음"** (default on, app-local `UserDefaults`) with a
+   "들어 보기" text button that plays the five cues in sequence (§14).
 2. **사용량 card**: month ("11월") and `calls` ("통화 42회") in the header, big cost
    `cost_usd` `$123.40` (title, monospacedDigit) with "/ $500" from `budget_usd` (text2), a 6 pt capsule progress bar (celadon; amber past `budget_warn_pct`;
    danger past 100%) with a tick at the warn %. Below, `by_model` rows as thin bars
@@ -368,7 +372,8 @@ bottom-center of the active screen, 80 pt above the Dock.
 
 Layout: jar (68 pt, full state behaviour) left · captions middle (latest reply in title3
 medium, user transcript above in footnote text2, both 2 lines, newest wins) · right column:
-route chip and a small hang-up button (`xmark`, 28 pt).
+route chip and a small hang-up button (`xmark`, 28 pt). While an activity is running the
+user-transcript line is replaced by the one-line activity (§13.4).
 - Appears on hotkey down with `enter` motion (scale 0.96 → 1, opacity), listens while the
   key is held, shows thinking/speaking after release, fades out 4 s after `turn_done`
   unless the pointer is over it. Esc or the `xmark` ends the call.
@@ -448,6 +453,8 @@ call fail.
 | Status row | "스파크, 정상, 42밀리초" | — |
 | Usage bar | 이번 달 사용량 | value: "500달러 중 123달러, 25퍼센트" |
 | PTT panel (Mac) | 아젤 말하기 패널 | — |
+| Activity row | 진행 중: 캘린더 확인 중 | value: "완료: 기억 확인, 노션 확인" (§13.5) |
+| 작업 효과음 toggle | 작업 효과음 | hint: 아젤이 일하는 동안 짧은 소리를 냅니다 |
 
 - **Announcements**: VoiceOver users already hear the TTS, so don't announce every state
   change. Post `AccessibilityNotification.Announcement` only for errors, hold, and
@@ -472,3 +479,145 @@ call fail.
 5. **Mac push-to-talk**: gaps don't end a turn; on key-up send ~700 ms of zero PCM, then
    stop sending until the next press.
 6. **Approvals** carry `created` (Unix seconds, float) and `decided` once answered.
+
+## 13. Activity display ("what is 아젤 doing?")
+
+### 13.1 Input
+
+Call-socket text event (voice server, in progress):
+`{"type":"activity","phase":"routing"|"tool_start"|"tool_end"|"thinking","label":"캘린더 확인 중","tool":"…"}`.
+`CallManager` keeps, per turn (reset on the next `transcript`):
+`current: Activity?` and `done: [Activity]` (in order, max 8 kept).
+
+| phase | current | done | jar | sound (§14) |
+|---|---|---|---|---|
+| `routing` | label (e.g. "Claude에게 묻는 중"), glyph `generic` | — | thinking | **working** cue, once per turn |
+| `tool_start` | label + tool glyph | — | swirl surge (§13.3) | — |
+| `tool_end` | cleared (or next) | append ✓ step | one glow pulse | **tick** |
+| `thinking` | label (e.g. "답 정리 중"), glyph `generic` | — | thinking | — |
+| `state: speaking` | cleared | kept, dimmed | speaking | **done** cue if the turn had any activity |
+| `error` | cleared | kept | offline tint 1 s | **error** cue |
+
+Done-step text: the `tool_end` label if it has one, else the start label with a trailing
+" 중" removed ("캘린더 확인 중" → "캘린더 확인"). The server owns the wording; the client never
+invents labels.
+
+### 13.2 Glyphs
+
+Match on `tool` lowercased (first hit wins); 16 pt SF Symbol, `indigo` while current,
+`text2` in the trail:
+
+| Category | `tool` contains | SF Symbol |
+|---|---|---|
+| calendar | calendar, gcal, event, schedule | `calendar` |
+| mail | mail, gmail | `envelope` |
+| memory | memory, recall, cygnus, context | `brain` |
+| server | status, infra, server, alert, uptime | `server.rack` |
+| files | read_file, list_dir, search, notion, drive, file, doc | `doc.text` |
+| web | browse, web, fetch, http | `globe` |
+| terminal / device | run_command, delegate, job, shell | `apple.terminal` (Mac work: `laptopcomputer` when `tool` names a device) |
+| generic | anything else, `routing`, `thinking` | `ellipsis.circle` |
+
+### 13.3 Call screen (iPhone, and Mac main window)
+
+Between the jar and the captions, centered, 12 pt below the jar's bottom (above the
+speaking water line's position, which is unused while thinking):
+
+- **Current step**: a capsule (height 32, `card` at 70% + `stroke`, padding 12) with the glyph
+  in indigo and the label in subheadline semibold `text`, followed by an animated 3-dot
+  ellipsis (dots fade in sequence, 1.2 s loop; static "…" with Reduce Motion). New labels
+  replace the old with `caption` motion (crossfade + 6 pt rise).
+- **Trail**: one line under it, footnote `text2`: "✓ 기억 확인 · ✓ 노션 확인". Show the last 3,
+  older ones collapse to "+2" at the start. `lineLimit(1)`; at accessibility sizes it wraps
+  to 2 lines and the jar shrinks (§3).
+- **With the jar**: thinking already has the indigo swirl. `tool_start` briefly speeds the
+  swirl from 0.25 to 0.6 rev/s, easing back over 400 ms, so the jar visibly "takes on work";
+  `tool_end` gives one glow pulse (glow opacity +0.25, 300 ms `smooth`). The jar never
+  shows the glyph itself; the jar stays a pure object and the row carries the meaning.
+- **When speaking starts** the capsule fades out (220 ms) and the trail stays, dimmed to
+  `text3`, until the next user turn, so the user can see where the answer came from.
+- Activity can arrive in any state (e.g. 아젤 says "확인해 볼게요" and keeps working); the row
+  shows whenever `current` or `done` is non-empty.
+
+### 13.4 Mac push-to-talk panel
+
+One line replaces the user-transcript line while `current` is set: glyph (13 pt indigo) +
+label (footnote semibold `text`) + "· ✓2" count of done steps (text3). It falls back to the
+transcript line when `current` clears.
+
+### 13.5 Recents card
+
+The local call record (§12.1) also stores each call's done steps (category + text). The card
+shows them as one footnote `text3` line under the meta row: up to 3 glyphs + "캘린더 · 노션
+확인" (texts joined with " · ", category nouns only, ellipsized). Omitted when a call had no
+steps.
+
+### 13.6 Accessibility
+
+- The activity row is one element: label "진행 중: {current}", value "완료: {done joined
+  by , }". It is not a live region.
+- Announcements: only for `tool_start` labels, only in the thinking state (in speaking the
+  user is hearing the TTS), at most one per 2.5 s (later ones replace a pending one), with
+  `AttributedString` `accessibilitySpeechAnnouncementPriority = .low` so VoiceOver never
+  interrupts itself. No announcement for ticks, `tool_end` or `routing`.
+- Reduce Motion: no swirl surge or glow pulse, label changes crossfade only, static "…".
+- Colour isn't the only signal: completed steps carry "✓" and the word, the current one
+  the ellipsis.
+
+## 14. Earcons (work sounds)
+
+Original cues synthesized in-app; no sample files, no system or third-party sounds. The
+palette is built on D (D5/A5 fifth, an open, unfinished interval for "working"; F♯ down for
+"done"), short and soft, so they read as 아젤's own voice-adjacent texture rather than
+notifications.
+
+### 14.1 The five cues
+
+Levels are peak dBFS at the player node; TTS speech is normalized around −18 dBFS RMS
+(≈ −6 dBFS peak), so every cue sits 14–24 dB under speech.
+
+| Cue | When | Oscillator | Notes / pitch | Envelope (per note) | Peak | Max length |
+|---|---|---|---|---|---|---|
+| **working** | `routing` (once per turn) | sine + 2nd harmonic at −18 dB | D5 587.33 Hz → A5 880.00 Hz (rising fifth), 20 ms gap | attack 8 ms, hold 20, exp decay 70 ms | −26 dBFS | 220 ms |
+| **tick** | each `tool_end` | triangle | E6 1318.5 Hz, single | attack 2 ms, exp decay 45 ms | −32 dBFS | 50 ms |
+| **done** | `state: speaking` after a turn with activity | sine + 2nd harmonic at −20 dB | A5 880 Hz → F♯5 739.99 Hz (falling minor third), notes overlap 20 ms | attack 6 ms, decay 90 ms / 130 ms | −24 dBFS | 200 ms |
+| **error** | `error` event / call dropped | triangle, 1-pole low-pass 2 kHz | G4 392.00 Hz → F♯4 369.99 Hz (semitone down) | attack 10 ms, hold 40, decay 100 ms | −22 dBFS | 300 ms |
+| **wake** (Mac) | PTT hotkey down / wake word | sine + inharmonic partial 2.76× at −20 dB (bell) | D6 1174.66 Hz, single | attack 3 ms, exp decay 220 ms | −20 dBFS | 250 ms |
+
+Exponential decay = `gain *= exp(-1/(τ·sr))` with τ = decay/5 (so it is ~−43 dB at the stated
+time); end every cue with a 5 ms linear fade to zero to avoid clicks. Ticks are rate-limited
+to one per 350 ms (extra ticks are dropped, not queued).
+
+### 14.2 Building it (AVAudioEngine, no dependencies)
+
+- Render each cue once at launch into an `AVAudioPCMBuffer` (mono Float32, 24 kHz, the
+  speaker format) with a pure function `Earcon.render(_ cue) -> [Float]` (unit-testable:
+  length ≤ max, peak ≈ target, last sample 0).
+- Add a second `AVAudioPlayerNode` (`cuePlayer`) to the existing engine, connected to
+  `mainMixerNode` with the speaker format. Schedule a buffer with
+  `.interrupts` for working/done/error/wake (a newer cue replaces an older one) and plain
+  scheduling for ticks.
+- **Ducking**: `cuePlayer.volume` = 1.0 normally, ramps to 0.4 (−8 dB) in 30 ms while the
+  speech player is outputting (`outLevel > 0.05`), back in 150 ms after.
+- **Never over the user**: if `state == listening` and `micLevel > 0.25` within the last
+  250 ms, ticks are dropped and working/done/error wait up to 300 ms, then drop. Wake is
+  exempt (it precedes speech by design).
+- `interrupt` (server or tap) stops `cuePlayer` too.
+- Toggle "작업 효과음" off → no cues at all; the visuals are unchanged.
+- **Silent mode (iPhone)**: in a call the CallKit session is `.playAndRecord`, which
+  ignores the ring switch; cues play (they are part of the call). Outside a call (the
+  "들어 보기" preview) use a short-lived `.ambient` session, which respects the silent
+  switch. Mac: play through the same engine; no cue when the system output is muted.
+
+### 14.3 Accessibility
+
+Cues are additive: every cue has a visual twin (routing → label, tick → ✓ step, done →
+speaking state, error → banner, wake → panel). With VoiceOver running, keep cues on (they
+are useful non-speech feedback) but drop ticks while an announcement is pending.
+
+### 14.4 Open questions (for the PM)
+
+1. Is `routing` sent only for Claude turns? The working cue assumes yes; if it also comes
+   for local Qwen turns, add `"route"` to the event (cue only for `claude`).
+2. Could the event carry a `"kind"` (calendar, mail, memory, server, files, web, terminal)
+   so the client doesn't map tool names by substring (§13.2)?
