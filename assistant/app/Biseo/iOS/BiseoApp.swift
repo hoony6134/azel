@@ -15,11 +15,21 @@ struct BiseoApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
+                #if DEBUG
+                if let i = CommandLine.arguments.firstIndex(of: "-callPreview"), i + 1 < CommandLine.arguments.count {
+                    CallScreen().onAppear { CallManager.shared.debugPreview(state: CommandLine.arguments[i + 1]) }
+                } else if model.configured {
+                    RootView(model: model, history: history, schedule: schedule)
+                } else {
+                    SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
+                }
+                #else
                 if model.configured {
                     RootView(model: model, history: history, schedule: schedule)
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
+                #endif
             }
             .preferredColorScheme(nil)
             .tint(Theme.celadon)

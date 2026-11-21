@@ -265,6 +265,7 @@ struct CallPanelView: View {
     var body: some View {
         HStack(spacing: Theme.m) {
             MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: 68, height: 68)
+                .contentShape(Circle())
                 .onTapGesture { call.interrupt() }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
             VStack(alignment: .leading, spacing: 2) {

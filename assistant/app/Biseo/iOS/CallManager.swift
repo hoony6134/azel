@@ -79,6 +79,16 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// Goes through CallKit so the system call UI shows the hold state too.
+    #if DEBUG
+    /// `-callPreview <state>`: shows the call screen without a call, for screenshots.
+    func debugPreview(state: String) {
+        inCall = true
+        self.state = state
+        connectedAt = Date().addingTimeInterval(-72)
+        log.lines = [CallLine(mine: true, text: "내일 일정 알려줘"), CallLine(mine: false, text: "내일은 오전 10시에 팀 회의가 있어요.", route: "claude")]
+    }
+    #endif
+
     /// Tap on the jar while it speaks.
     func interrupt() {
         guard inCall, state == "speaking" else { return }

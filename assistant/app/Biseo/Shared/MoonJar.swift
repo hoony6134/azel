@@ -143,14 +143,33 @@ struct MoonJar: View {
     @State private var changedAt = Date.distantPast
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 60, paused: paused || phase == .background)) { tl in
-            let now = tl.date
-            let t = now.timeIntervalSinceReferenceDate
-            Canvas { ctx, size in
+        // The glow's blur and the water line reach well past the jar, so the canvas overscans its
+        // layout frame by `pad` on every side; drawing inside a tight frame cut them with hard
+        // edges (user screenshot, 2026-11-21). Layout and hit testing keep the original frame.
+        GeometryReader { geo in
+            let pad = max(geo.size.width, geo.size.height) * 0.6
+            TimelineView(.animation(minimumInterval: 1 / 60, paused: paused || phase == .background)) { tl in
+                canvas(now: tl.date, frame: CGRect(origin: CGPoint(x: pad, y: pad), size: geo.size))
+            }
+            .frame(width: geo.size.width + 2 * pad, height: geo.size.height + 2 * pad)
+            .offset(x: -pad, y: -pad)
+            .allowsHitTesting(false)
+        }
+        .onChange(of: state) { old, _ in previous = old; changedAt = Date() }
+        .accessibilityElement()
+        .accessibilityLabel(name)
+        .accessibilityValue(state.spokenLabel)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    /// `frame` is the jar's layout frame inside the larger canvas.
+    private func canvas(now: Date, frame: CGRect) -> some View {
+        let t = now.timeIntervalSinceReferenceDate
+        return Canvas { ctx, _ in
                 let mix = JarPath.smoothstep(now.timeIntervalSince(changedAt) / 0.45)
                 let level = Double(state == .speaking ? levels.out : levels.mic)
-                let R = min(size.width, size.height) * 0.34
-                let center = CGPoint(x: size.width / 2, y: size.height * (state == .speaking ? 0.44 : 0.5))
+                let R = min(frame.width, frame.height) * 0.34
+                let center = CGPoint(x: frame.midX, y: frame.minY + frame.height * (state == .speaking ? 0.44 : 0.5))
                 let path = JarPath.make(center: center, R: R, t: reduceMotion ? 0 : t, level: level,
                                         from: previous, to: state, mix: mix, reduceMotion: reduceMotion)
                 let boost = reduceMotion ? (0.0, 0.0) : JarPath.workBoost(now: now, surge: surge, pulse: pulse)
@@ -163,12 +182,6 @@ struct MoonJar: View {
                     ctx.stroke(ring, with: .color(Theme.celadon.opacity(1 - e / 0.4)), lineWidth: 2)
                 }
             }
-        }
-        .onChange(of: state) { old, _ in previous = old; changedAt = Date() }
-        .accessibilityElement()
-        .accessibilityLabel(name)
-        .accessibilityValue(state.spokenLabel)
-        .accessibilityAddTraits(.updatesFrequently)
     }
 
     /// boost: (extra swirl turns, extra glow opacity) from tool activity.
