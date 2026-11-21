@@ -726,7 +726,8 @@ a `Window("기록", id: "history")`, default 820 × 560, min 640 × 420.
 
 - `NavigationSplitView`: sidebar list (width 300) with the same day sections and rows
   (title + meta, route chips trailing), a search field in the toolbar (`.searchable`,
-  placement `.toolbar`); detail pane = §15.3 header, player and transcript, content max
+  placement `.toolbar`; the selected row's meta text switches from text3 to text2 so it keeps
+  4.5:1 on the celadon selection); detail pane = §15.3 header, player and transcript, content max
   width 640, centered.
 - Delete: ⌫ on the selected row or context menu "삭제" (with the same undo toast, bottom of
   the window). Context menu also "녹음 Finder에서 보기" when a local recording exists.
