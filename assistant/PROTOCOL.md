@@ -162,7 +162,8 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
   `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
   `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
-  `GET /v1/proactive/log` (bearer header).
+  `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
+  `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -259,14 +260,14 @@ device that created them.
   http), `enabled` (default true), optional `auth_ref` (slug) naming the secret. Secrets never go into settings. Each
   run also loads the device daemons, no plugin MCP servers, and every tool up front (no ToolSearch). A custom server
   whose secret file is missing or not 0600 is skipped. Full gateways only; limited → 403 on every route below.
-  - `GET /v1/connectors[?refresh=true]` → `{"claude_ai": [{"name","url","status":"connected"|"needs_auth"|"failed"|
-    "unknown","enabled"}], "custom": [{…the item…, "has_secret": bool}], "discovered_at": <epoch>|null}`. The
-    claude.ai list is this gateway's login as `claude mcp list` sees it (cached from startup; `refresh=true` re-reads,
-    ~15 s); `unknown` = switched in settings but not visible to this login.
-  - `PUT /v1/connectors` with the setting's shape → the same view as GET (400 with a reason on a bad shape). Replaces
-    both fields.
+  - `GET /v1/connectors[?refresh=true]` → `{"claude_ai":[{"name","enabled","status":"connected"|"needs_auth"}],
+    "custom":[{"name","url","transport","enabled","has_secret"}]}` (the app's pinned shape). The claude.ai list is
+    this gateway's login as `claude mcp list` sees it (cached from startup; `refresh=true` re-reads, ~15 s); anything
+    not connected is `needs_auth`.
+  - `PUT /v1/connectors` with the same shape without `status` / `has_secret` → the GET shape (400 with a reason on a
+    bad shape). Replaces both lists; stored as the setting above, a custom server's secret named after the server.
   - `PUT /v1/connectors/secret/{name}` `{"value": "<token>"}` (a raw token is sent as `Authorization: Bearer <token>`)
-    or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → `{"ok": true}`. Write-only: stored in
+    or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
     `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
     Claude processes. Each full gateway that should use the server needs its own copy.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
@@ -291,7 +292,16 @@ device that created them.
   primary, created_at), `DELETE /v1/personas/{id}` (marks `deleted_at`: its calls, history and schedule
   keep `persona_id` and the name stays resolvable; the primary cannot be deleted → 400),
   `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices`
-  (fallback `BISEO_TTS_VOICES`; neither reachable → 503).
+  (fallback `BISEO_TTS_VOICES`; neither reachable → 503). `DELETE /v1/personas/{id}?delete_history=true|false`
+  (default false): the persona's own notes and call summaries (memory records with `meta.persona_id`) and
+  its calls' follow-up contexts are always deleted; its call history is deleted with `delete_history=true`,
+  otherwise it stays with `"persona_deleted": true` on each item (the app shows "삭제된 비서"). If ruchba
+  cannot do that (503), the persona is not deleted either. `GET /v1/voices` →
+  `[{"id","label","desc","lang"}]`, the TTS speakers with Korean labels (e.g. `{"id":"sohee","label":"소희",
+  "desc":"따뜻한 한국어 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
+  (text 1–60 chars) → `audio/wav` for the editor's "들어보기"; at most one per 2 s per gateway (429);
+  502 if the TTS server cannot be reached. `assistant_name` stays a read/write alias of the primary persona's
+  name.
   Calls: `/v1/call?persona=<id>` (default the primary; a placed call keeps the persona it rang as) builds
   Qwen's system prompt from that persona (name, character, reply_length) and speaks with its voice and
   style. Conversation history and the Claude session map are keyed by (persona, session). Asks over the
@@ -502,3 +512,7 @@ Memory written by the brain (no schema change; record kind `note`, contexts):
   checkpoint note), scheduled calls, pending approvals, full-writer devices, open call follow-ups (3 days),
   `azel-todos`, and recent call summaries (3 days). First line `## 상황 (…)`; a note there without it is a gateway's
   checkpoint and is moved to `azel-checkpoint`.
+- Persona data (full callers only): `DELETE /v1/state/personas/{id}/data?history=true|false` → deletes records
+  with `meta.persona_id` = id and the `call-followup-<call>` contexts of its calls; with `history=true` also its
+  calls (and their transcript records), otherwise flags them `persona_deleted` → `{"notes_deleted","calls",
+  "history_deleted"}`. History items carry `persona_deleted`.

@@ -28,7 +28,7 @@ from urllib.parse import quote
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import connectors
 from claude_warm import Pool, base_cmd
@@ -1501,7 +1501,52 @@ def full_only():
         raise HTTPException(403, "not available on a limited gateway")
 
 
+# Korean labels for the TTS server's speakers (Qwen3-TTS CustomVoice); unknown speakers show their id.
+VOICE_INFO = {
+    "sohee": ("소희", "따뜻한 한국어 여성", "ko"), "vivian": ("비비안", "밝고 또렷한 중국어 여성", "zh"),
+    "serena": ("세레나", "부드럽고 차분한 중국어 여성", "zh"), "uncle_fu": ("푸 아저씨", "나이 지긋하고 묵직한 중국어 남성", "zh"),
+    "dylan": ("딜런", "베이징 말씨의 젊은 남성", "zh"), "eric": ("에릭", "쓰촨 말씨의 쾌활한 남성", "zh"),
+    "ryan": ("라이언", "힘 있는 영어 남성", "en"), "aiden": ("에이든", "밝고 친근한 영어 남성", "en"),
+    "ono_anna": ("오노 안나", "경쾌한 일본어 여성", "ja"),
+}
 _tts_voices: dict = {"at": 0.0, "voices": []}
+_sample_at: list = [0.0]  # voice samples: one per 2 s on this gateway
+
+
+@app.get("/v1/voices")
+async def voices():
+    """The TTS speakers for the persona editor, with Korean labels."""
+    full_only()
+    return [{"id": v, "label": VOICE_INFO.get(v, (v, "", ""))[0], "desc": VOICE_INFO.get(v, (v, "", ""))[1],
+             "lang": VOICE_INFO.get(v, (v, "", ""))[2]} for v in await tts_voices()]
+
+
+async def tts_sample(text, voice, style):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(f"{TTS_URL}/v1/audio/speech", json={"input": text, "voice": voice, "response_format": "wav",
+                                                             **({"instructions": style} if style else {})})
+    r.raise_for_status()
+    return r.content
+
+
+@app.post("/v1/personas/voice-sample")
+async def voice_sample(body: dict):
+    """"들어보기" in the persona editor: a short line in a voice and style → audio/wav. One per 2 s."""
+    full_only()
+    text, voice, style = body.get("text"), body.get("voice"), body.get("voice_style") or ""
+    if not (isinstance(text, str) and 0 < len(text.strip()) <= 60):
+        raise HTTPException(400, "text: 1-60 characters")
+    if not isinstance(voice, str) or voice.lower() not in await tts_voices():
+        raise HTTPException(400, "voice: not a TTS speaker")
+    if not isinstance(style, str) or len(style) > 200:
+        raise HTTPException(400, "voice_style: text up to 200 characters")
+    if time.time() - _sample_at[0] < 2:
+        raise HTTPException(429, "one sample per 2 seconds")
+    _sample_at[0] = time.time()
+    try:
+        return Response(await tts_sample(text.strip(), voice.lower(), style), media_type="audio/wav")
+    except httpx.HTTPError:
+        raise HTTPException(502, "TTS server unreachable")
 
 
 async def tts_voices():
@@ -1613,8 +1658,9 @@ async def personas_put(pid: str, body: dict):
 
 
 @app.delete("/v1/personas/{pid}")
-async def personas_delete(pid: str):
-    """Marks it deleted (its history and schedule keep persona_id, and the name stays resolvable); never the primary."""
+async def personas_delete(pid: str, delete_history: bool = False):
+    """Marks it deleted (the name stays resolvable; never the primary). Its own notes and call summaries always go;
+    its call history stays, flagged "삭제된 비서", unless delete_history=true."""
     full_only()
     s = await load_settings()
     p = persona_by_id(s, pid)
@@ -1622,6 +1668,8 @@ async def personas_delete(pid: str):
         raise HTTPException(404, "no such persona")
     if p.get("primary"):
         raise HTTPException(400, "the primary persona cannot be deleted; make another one primary first")
+    # data first: if ruchba cannot do it (StateDown → 503), the persona is not marked deleted either
+    await state.call("DELETE", f"/v1/state/personas/{quote(pid, safe='')}/data", history=str(delete_history).lower())
     p["deleted_at"] = time.time()
     await save_personas(s)
     return persona_view(p)
@@ -1647,6 +1695,30 @@ async def proactive_log(limit: int = 50, since: float = 0):
     return await state.call("GET", "/v1/state/proactive_log", limit=max(1, min(limit, 500)), since=since)
 
 
+def connectors_out(conn):
+    """The pinned app shape (PROTOCOL.md section 3): status is connected | needs_auth, no URLs of claude.ai
+    connectors, never a secret."""
+    v = connectors.view(conn, discovery, HOME)
+    return {"claude_ai": [{"name": c["name"], "enabled": c["enabled"],
+                           "status": "connected" if c["status"] == "connected" else "needs_auth"} for c in v["claude_ai"]],
+            "custom": [{"name": c["name"], "url": c["url"], "transport": c.get("transport", "http"),
+                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"]} for c in v["custom"]]}
+
+
+def connectors_in(body):
+    """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name."""
+    ai, custom = body.get("claude_ai", []), body.get("custom", [])
+    if not isinstance(ai, list) or not all(isinstance(c, dict) and set(c) <= {"name", "enabled", "status"} for c in ai) \
+            or not isinstance(custom, list) or set(body) - {"claude_ai", "custom"}:
+        raise HTTPException(400, 'connectors: {"claude_ai":[{"name","enabled"}],"custom":[{"name","url","transport","enabled"}]}')
+    try:
+        return connectors.check({"claude_ai": {c.get("name"): c.get("enabled") for c in ai},
+                                 "custom": [{**{k: v for k, v in c.items() if k != "has_secret"},
+                                             "auth_ref": c.get("name")} if isinstance(c, dict) else c for c in custom]})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/v1/connectors")
 async def connectors_get(refresh: bool = False):
     """The claude.ai connectors this gateway's login has (status from `claude mcp list`), the custom servers and
@@ -1654,15 +1726,15 @@ async def connectors_get(refresh: bool = False):
     full_only()
     if refresh or not discovery.at:
         await discovery.refresh()
-    return connectors.view((await load_settings())["connectors"], discovery, HOME)
+    return connectors_out((await load_settings())["connectors"])
 
 
 @app.put("/v1/connectors")
 async def connectors_put(body: dict):
-    """Replace the switches and the custom list (same shape as the `connectors` setting)."""
+    """Replace the switches and the custom list (the GET shape without status / has_secret)."""
     full_only()
-    await put_settings({"connectors": body})
-    return connectors.view((await load_settings())["connectors"], discovery, HOME)
+    await put_settings({"connectors": connectors_in(body)})
+    return connectors_out((await load_settings())["connectors"])
 
 
 @app.put("/v1/connectors/secret/{name}")
@@ -1674,7 +1746,7 @@ async def connectors_secret(name: str, body: dict):
     except ValueError as e:
         raise HTTPException(400, str(e))
     await warm_pool.close_all()  # running processes still hold the old secret
-    return {"ok": True}
+    return Response(status_code=204)
 
 
 @app.get("/v1/schedule")

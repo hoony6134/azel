@@ -304,6 +304,60 @@ def test_persona_calls_schedule_and_asks(gw, monkeypatch):
     assert "'아젤'" in prompt  # no persona: the primary
 
 
+def test_persona_delete_voices_and_samples(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian"})
+    c.post("/v1/personas", json={"id": "mira", "name": "미라", "voice": "ryan"})
+    assert c.delete("/v1/personas/luna").json()["deleted_at"] and g.fake.persona_data == ("luna", False)
+    c.delete("/v1/personas/mira?delete_history=true")
+    assert g.fake.persona_data == ("mira", True)
+    c.post("/v1/personas", json={"id": "nova", "name": "노바", "voice": "sohee"})
+    g.fake.state.down = True  # data cannot be deleted: the persona is not deleted either
+    assert c.delete("/v1/personas/nova").status_code == 503
+    g.fake.state.down = False
+    assert not c.get("/v1/personas/nova").json()["deleted_at"]
+    v = c.get("/v1/voices").json()
+    assert {"id": "sohee", "label": "소희", "desc": "따뜻한 한국어 여성", "lang": "ko"} in v and len(v) == 3
+    calls = []
+
+    async def fake_sample(text, voice, style):
+        calls.append((text, voice, style))
+        return b"RIFFfakewav"
+    monkeypatch.setattr(g, "tts_sample", fake_sample)
+    g._sample_at[0] = 0.0
+    r = c.post("/v1/personas/voice-sample", json={"voice": "Sohee", "voice_style": "밝게", "text": "안녕하세요, 루나예요."})
+    assert r.status_code == 200 and r.headers["content-type"] == "audio/wav" and r.content == b"RIFFfakewav"
+    assert calls == [("안녕하세요, 루나예요.", "sohee", "밝게")]
+    assert c.post("/v1/personas/voice-sample", json={"voice": "sohee", "text": "또"}).status_code == 429  # 1 per 2 s
+    g._sample_at[0] = 0.0
+    for bad in [{"voice": "sohee", "text": "가" * 61}, {"voice": "nova", "text": "안녕"}, {"voice": "sohee", "text": " "}]:
+        assert c.post("/v1/personas/voice-sample", json=bad).status_code == 400, bad
+
+
+def test_connectors_app_shape(gw, monkeypatch):
+    g, c, tmp = gw
+    g.discovery.connectors = [{"name": "Gmail", "url": "https://gmail.mcp.claude.com/mcp", "status": "connected"},
+                              {"name": "Notion", "url": "https://mcp.notion.com/mcp", "status": "failed"}]
+    g.discovery.at = time.time()
+    got = c.get("/v1/connectors").json()
+    assert got == {"claude_ai": [{"name": "Gmail", "enabled": True, "status": "connected"},
+                                 {"name": "Notion", "enabled": False, "status": "needs_auth"}], "custom": []}
+    put = {"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
+           "custom": [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True}]}
+    got = c.put("/v1/connectors", json=put).json()
+    assert [x["enabled"] for x in got["claude_ai"]] == [False, True]
+    assert got["custom"] == [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True,
+                              "has_secret": False}]
+    r = c.put("/v1/connectors/secret/linear", json={"value": "lin_secret"})
+    assert r.status_code == 204 and r.content == b""
+    assert c.get("/v1/connectors").json()["custom"][0]["has_secret"] is True
+    assert "lin_secret" not in json.dumps(c.get("/v1/connectors").json())
+    for bad in [{"claude_ai": {"Gmail": True}}, {"claude_ai": [{"name": "Gmail", "enabled": "yes"}]},
+                {"custom": [{"name": "Bad Name", "url": "https://x"}]}, {"extra": 1}]:
+        assert c.put("/v1/connectors", json=bad).status_code == 400, bad
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400
@@ -1238,8 +1292,8 @@ def test_runs_load_only_enabled_connectors(gw):
     assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp"}  # defaults
     assert st["enabledPlugins"] == {"figma@official": False, "legal@x": False}
     assert "mcp__claude_ai_Gmail" in args and "mcp__claude_ai_Notion" not in args
-    r = c.put("/v1/connectors", json={"claude_ai": {"Gmail": False, "Notion": True},
-                                      "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "auth_ref": "wiki"},
+    r = c.put("/v1/connectors", json={"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
+                                      "custom": [{"name": "wiki", "url": "https://wiki.example/mcp"},
                                                  {"name": "off", "url": "https://off.example/mcp", "enabled": False}]})
     assert r.status_code == 200
     view = {x["name"]: x for x in r.json()["claude_ai"]}
@@ -1254,8 +1308,8 @@ def test_runs_load_only_enabled_connectors(gw):
 
 def test_connector_secret_is_write_only(gw):
     g, c, tmp = gw
-    c.put("/v1/connectors", json={"custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "auth_ref": "wiki"}]})
-    assert c.put("/v1/connectors/secret/wiki", json={"value": "SECRET-TOKEN"}).json() == {"ok": True}
+    c.put("/v1/connectors", json={"custom": [{"name": "wiki", "url": "https://wiki.example/mcp"}]})
+    assert c.put("/v1/connectors/secret/wiki", json={"value": "SECRET-TOKEN"}).status_code == 204
     f = tmp / "mcp" / "wiki"
     assert f.read_text() == "SECRET-TOKEN" and f.stat().st_mode & 0o777 == 0o600
     for path in ("/v1/connectors", "/v1/settings"):
@@ -1275,7 +1329,7 @@ def test_connector_secret_is_write_only(gw):
 
 def test_connectors_validation(gw):
     g, c, _ = gw
-    for bad in [{"claude_ai": {"Gmail": "yes"}}, {"custom": [{"name": "a b", "url": "https://x"}]},
+    for bad in [{"claude_ai": [{"name": "Gmail", "enabled": "yes"}]}, {"custom": [{"name": "a b", "url": "https://x"}]},
                 {"custom": [{"name": "a", "url": "ftp://x"}]}, {"custom": [{"name": "a", "url": "https://x", "token": "t"}]},
                 {"custom": [{"name": "a", "url": "https://x"}, {"name": "a", "url": "https://y"}]}, {"other": 1}]:
         assert c.put("/v1/connectors", json=bad).status_code == 400, bad

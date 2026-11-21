@@ -296,6 +296,29 @@ def test_persona_tags(client):
     client.delete(f"/v1/state/schedule/{b['id']}")
 
 
+def test_delete_persona_data(client):
+    for hid in ("dz1", "dz2"):
+        client.post(f"/v1/state/history/{hid}/start", json={"persona_id": "doomed"})
+        client.post(f"/v1/state/history/{hid}/turns", json={"user": "안녕 둠드", "assistant": ["네"]})
+        client.post(f"/v1/state/history/{hid}/end", json={})
+    client.post("/v1/state/history/keep1/start", json={"persona_id": "azel"})
+    client.post("/v1/records", json={"kind": "note", "text": "둠드의 메모", "meta": {"persona_id": "doomed"}})
+    client.post("/v1/records", json={"kind": "note", "text": "아젤의 메모", "meta": {"persona_id": "azel"}})
+    client.put("/v1/context/call-followup-dz1", json={"summary": "후속", "open_questions": ["?"]})
+    r = client.delete("/v1/state/personas/doomed/data").json()
+    assert r == {"notes_deleted": 1, "calls": 2, "history_deleted": False}
+    rows = {h["id"]: h for h in client.get("/v1/state/history?limit=100&persona=doomed").json()}
+    assert set(rows) == {"dz1", "dz2"} and all(h["persona_deleted"] for h in rows.values())  # "삭제된 비서"
+    assert client.get("/v1/state/history/keep1").json()["persona_deleted"] is False
+    assert client.get("/v1/context/call-followup-dz1").status_code == 404
+    notes = [h["text"] for h in client.post("/v1/search", json={"query": "메모", "kinds": ["note"], "limit": 50}).json()]
+    assert "둠드의 메모" not in notes and "아젤의 메모" in notes
+    assert client.delete("/v1/state/personas/doomed/data?history=true").json()["history_deleted"]
+    assert client.get("/v1/state/history?limit=100&persona=doomed").json() == []
+    assert client.delete("/v1/state/personas/Bad!/data").status_code == 422
+    client.delete("/v1/state/history/keep1")
+
+
 def test_bad_tokens(client):
     for token in ["nope", "", "l1m-", "t0k-"]:
         assert limited_client("100.64.0.8", token).get("/v1/state/settings").status_code == 401

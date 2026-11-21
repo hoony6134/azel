@@ -117,6 +117,7 @@ create table if not exists {STATE}.call_turns(
     interrupted boolean not null default false);
 create index if not exists call_turns_call on {STATE}.call_turns (call, id);
 alter table {STATE}.call_history add column if not exists persona_id text not null default 'azel';
+alter table {STATE}.call_history add column if not exists persona_deleted boolean not null default false;
 """
 
 
@@ -698,7 +699,7 @@ def history_end(hid: str, e: CallEnd):
     return {"ok": True, "turns": len(turns)}
 
 
-LIST_COLS = f"""h.id, h.session, h.persona_id, h.direction, h.reason, h.client,
+LIST_COLS = f"""h.id, h.session, h.persona_id, h.persona_deleted, h.direction, h.reason, h.client,
     extract(epoch from h.started_at)::float8 as started_at, h.duration_s,
     (select user_text from {TURNS} t where t.call = h.id order by t.id limit 1) as title,
     (select left(array_to_string(array(select jsonb_array_elements_text(t.assistant)), ' '), 120) from {TURNS} t
@@ -771,7 +772,7 @@ def offsets(steps, started):
 
 @app.get("/v1/state/history/{hid}", dependencies=[v1])
 def history_get(hid: str):
-    rows = db(f"select id, session, persona_id, call_id, direction, reason, client, opening, {EPOCH.format('started_at')},"
+    rows = db(f"select id, session, persona_id, persona_deleted, call_id, direction, reason, client, opening, {EPOCH.format('started_at')},"
               f" {EPOCH.format('ended_at')}, duration_s from {HIST} where id=%s", (hid,))
     if not rows:
         raise HTTPException(404, "no such call")
@@ -789,6 +790,22 @@ def delete_calls(ids):
         db("delete from records where kind='transcript' and meta->>'call' = any(%s)", (ids,))
         db(f"delete from {HIST} where id = any(%s)", (ids,))  # turns go with them (on delete cascade)
     return {"deleted": len(ids)}
+
+
+@app.delete("/v1/state/personas/{pid}/data", dependencies=[v1])
+def delete_persona_data(pid: str = FPath(pattern=r"^[a-z0-9_-]{1,32}$"), history: bool = False):
+    """A persona is being deleted: its own notes and call summaries (records with meta.persona_id, written by the
+    brain) and the follow-up contexts of its calls always go. Its call history goes too with history=true; otherwise
+    the rows stay, flagged persona_deleted, so the app shows them as "삭제된 비서"."""
+    calls = [r["id"] for r in db(f"select id from {HIST} where persona_id=%s", (pid,))]
+    notes = len(db("delete from records where meta->>'persona_id' = %s returning id", (pid,)))
+    if calls:
+        db("delete from context where task_id = any(%s)", ([f"call-followup-{c}" for c in calls],))
+    if history:
+        delete_calls(calls)
+    else:
+        db(f"update {HIST} set persona_deleted = true where persona_id=%s", (pid,))
+    return {"notes_deleted": notes, "calls": len(calls), "history_deleted": history}
 
 
 @app.delete("/v1/state/history/{hid}", dependencies=[v1])
