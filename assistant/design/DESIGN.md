@@ -1,12 +1,25 @@
-# 박비서 — design spec
+# Azel — design spec
 
 For the cross-platform SwiftUI app (iOS 17+, macOS 14+). Open `mockups.html` next to this
 file to see every screen with these tokens. Nothing here needs a new server API; the few
 places that would benefit from one are listed in §12.
 
+## 0. Names
+
+- **App name / wordmark: "Azel"** (bundle display name, menu-bar title, welcome screen,
+  About). Fixed.
+- **Assistant name: `assistant_name`, default "아젤"**, a user setting (§7.5). Every place
+  this spec writes "아젤" means `assistant_name`: call-screen title, CallKit caller name
+  (`CXHandle` value / `localizedCallerName`), call button "아젤에게 전화", menus, VoiceOver
+  labels, error copy, the PTT panel label.
+- Korean particles depend on the name's last syllable. Use a tiny josa helper: for the
+  last Hangul scalar `u`, `hasBatchim = (u - 0xAC00) % 28 != 0` → 이/가, 은/는, 을/를, 과/와;
+  "에게" never changes. Non-Hangul names: treat as no batchim. Prefer particle-free copy
+  where it reads naturally.
+
 ## 1. Direction: 달항아리 (the moon jar)
 
-박비서 is a voice you call, so the app is mostly one object: a softly lit **moon jar**, the
+Azel is a voice you call, so the app is mostly one object: a softly lit **moon jar**, the
 slightly lopsided white porcelain jar of Joseon ceramics, floating on 먹 (ink) black. It's
 round but never a perfect circle. Its glaze shifts with the call: **청자 celadon** while it
 listens, **쪽빛 indigo** while it thinks, warm **달빛 porcelain** while it speaks. Everything
@@ -61,7 +74,7 @@ styles so Dynamic Type works; the sizes below are the default (Large) sizes.
 
 | Role | SwiftUI | Size / weight | Line spacing |
 |---|---|---|---|
-| Wordmark "박비서" | `.largeTitle.weight(.semibold)` | 34 / semibold | — |
+| Wordmark "Azel" | `.largeTitle.weight(.semibold)` | 34 / semibold | — |
 | Greeting | `.title.weight(.semibold)` | 28 | `.lineSpacing(4)` |
 | Live reply caption | `.title2.weight(.medium)` | 22 / medium | `.lineSpacing(6)` |
 | User transcript caption | `.body` in `text2` | 17 | `.lineSpacing(4)` |
@@ -187,7 +200,7 @@ struct MoonJar: View {
             }
         }
         .accessibilityElement()
-        .accessibilityLabel("박비서")
+        .accessibilityLabel("아젤")
         .accessibilityValue(state.spokenLabel)     // "듣고 있어요" …
         .accessibilityAddTraits(.updatesFrequently)
     }
@@ -223,7 +236,7 @@ Top to bottom, on `bg` with a faint celadon glaze top-center:
    date below in subheadline text2 ("11월 21일 금요일").
 3. **The jar**, idle state, 0.5 × screen width, centered. Tapping it starts a call too.
 4. **Call button**: full-width capsule, 64 pt tall, celadon fill, `onAccent` label
-   "박비서에게 전화" with `phone.fill`. Primary action; the only filled element on screen.
+   "아젤에게 전화" with `phone.fill`. Primary action; the only filled element on screen.
 5. **Quick actions** (horizontal row of 3 bordered capsules, 44 pt):
    "오늘 브리핑" (`sun.max`, `startCall(prefix: "briefing")`), "새 대화"
    (`square.and.pencil`, `Session.rotate()`, shows a toast "새 대화를 시작해요"),
@@ -240,7 +253,7 @@ Full-bleed, no navigation bar, status bar light content.
 - **Background**: `bg` + state glaze (mesh/radial) at 35% opacity, colors cross-fading over
   `state`.
 - **Top bar** (safe-area inset, 20 pt margins): left — elapsed time `03:12`
-  (footnote, monospacedDigit, text2) with a red dot when recording; center — "박비서"
+  (footnote, monospacedDigit, text2) with a red dot when recording; center — "아젤"
   (headline); right — route chip of the latest reply (hidden until the first reply).
 - **State label** under the top bar (headline, state color + symbol):
   `ear` 듣고 있어요 · `ellipsis` 생각 중 · `waveform` 말하는 중 · `pause.fill` 대기 중 (hold).
@@ -263,7 +276,7 @@ Full-bleed, no navigation bar, status bar light content.
   | Hold | `pause` / `play.fill` | 대기 | `CXSetHeldCallAction`, §7.4 |
 - **Hang up**: 72 pt circle, `hangup` fill, `phone.down.fill` white, centered under the
   dock, 16 pt gap. Long-press not required; single tap hangs up.
-- **Interrupt**: see §5. No button needed: talking over 박비서 interrupts it (server VAD).
+- **Interrupt**: see §5. No button needed: talking over 아젤 interrupts it (server VAD).
 - **Error during call** (`error` event): a small banner slides under the top bar,
   danger color, 4 s auto-dismiss, VoiceOver announcement.
 
@@ -283,24 +296,28 @@ Full-bleed, no navigation bar, status bar light content.
 `ScrollView` of grouped cards on `bg` (not `Form`), 16 pt between cards, card padding 16.
 Card header: headline + optional trailing text button.
 
-1. **사용량 card** (top): month ("11월"), big cost `$123.40` (title, monospacedDigit) with
+1. **비서 card** (top): row "이름" with the current `assistant_name` ("아젤") as a trailing
+   text field (max 12 characters, trimmed, empty → back to "아젤"). Footer helper (footnote,
+   text3): "호출어는 다시 학습하기 전까지 '아젤'로 유지돼요." Saved like the other settings; the
+   new name shows on the call screen, CallKit and menus from the next call.
+2. **사용량 card**: month ("11월"), big cost `$123.40` (title, monospacedDigit) with
    "/ $500" (text2), a 6 pt capsule progress bar (celadon; amber past `budget_warn_pct`;
    danger past 100%) with a tick at the warn %. Below, `by_model` rows as thin bars
    (label · value). `by_path` collapsed under "경로별 보기".
-2. **상태 card**: rows "스파크", "게이트웨이", then devices; each with a 8 pt dot (celadon ok /
+3. **상태 card**: rows "스파크", "게이트웨이", then devices; each with a 8 pt dot (celadon ok /
    danger down), name, latency right-aligned ("42 ms", monospacedDigit, text2). Pull to refresh.
-3. **모델 card**: 기본 모델, Claude 경로 as menu pickers (`Picker` `.menu`), options with
+4. **모델 card**: 기본 모델, Claude 경로 as menu pickers (`Picker` `.menu`), options with
    friendly names (로컬 Qwen, Haiku, Sonnet, Opus, 자동).
-4. **작업별 card**: four rows (잡담, 일정, 코드, 맥북 작업), each a row with the model menu and a
+5. **작업별 card**: four rows (잡담, 일정, 코드, 맥북 작업), each a row with the model menu and a
    small path menu on the right. No indented "  경로" pseudo-rows.
-5. **예산 card**: 월 예산 field (decimal pad, trailing), 경고 기준 stepper "80%".
-6. **먼저 전화하기 card**: 아침 브리핑 time, 방해 금지 start–end shown as one row "23:30 – 07:30"
+6. **예산 card**: 월 예산 field (decimal pad, trailing), 경고 기준 stepper "80%".
+7. **먼저 전화하기 card**: 아침 브리핑 time, 방해 금지 start–end shown as one row "23:30 – 07:30"
    that opens two compact DatePickers, trigger toggles (마감 임박, 서버 장애).
-7. **기기 card**: 기본 기기 (menu from `/v1/devices` names when available, else text field),
+8. **기기 card**: 기본 기기 (menu from `/v1/devices` names when available, else text field),
    대체 순서 as reorderable chips.
-8. **연결 card**: 음성 서버, 게이트웨이 (read-only, monospaced footnote), "토큰 바꾸기",
+9. **연결 card**: 음성 서버, 게이트웨이 (read-only, monospaced footnote), "토큰 바꾸기",
    "연결 다시 확인".
-9. **녹음 card** (only if recordings exist).
+10. **녹음 card** (only if recordings exist).
 
 Saving: auto-save 600 ms after the last change (debounced `PUT /v1/settings`) with a tiny
 "저장됨" checkmark in the card header; on failure the card shows an inline danger line and a
@@ -324,12 +341,12 @@ One card per pending approval (newest first):
 
 ### 8.1 Menu-bar extra (popover)
 
-`MenuBarExtra("박비서", systemImage: …) { … }.menuBarExtraStyle(.window)`, width 340.
+`MenuBarExtra("Azel", systemImage: …) { … }.menuBarExtraStyle(.window)`, width 340.
 Menu-bar icon: a template image of the jar silhouette (16 pt), filled when a call is up,
 with a dot when approvals are pending.
 
 Content (`bgRaised`, 16 pt padding):
-1. Header: "박비서" headline + status dot and text ("연결됨") on the right.
+1. Header: "Azel" headline + status dot and text ("연결됨") on the right.
 2. Mini jar (64 pt) + "⌥ Space를 누른 채 말하세요" (subheadline text2) + a celadon
    "전화" button (`phone.fill`) for a hands-free call.
 3. Quick actions as a 2-column grid of small bordered buttons: 오늘 브리핑, 새 대화.
@@ -363,13 +380,13 @@ the audio route picker (use the system output) and speaker.
 
 Three pages in a `TabView(.page)` on iOS / a stepped sheet on Mac, progress dots at the bottom.
 
-1. **환영**: idle jar large, "박비서" wordmark, "전화하듯 말을 걸면 돼요." (title3, text2),
+1. **환영**: idle jar large, "Azel" wordmark, "아젤에게 전화하듯 말을 걸면 돼요." (title3, text2),
    button "시작하기".
 2. **연결**: 음성 서버 and 게이트웨이 URL fields (prefilled from `Config`), 토큰 `SecureField`
    ("키체인에만 저장돼요" footnote). Button "연결 확인" calls `/v1/status`; results appear as
    three check rows (스파크, 게이트웨이, 토큰) with spinner → `checkmark.circle.fill` celadon /
    `xmark.circle.fill` danger + one-line reason. "다음" enabled only when all pass.
-3. **권한**: microphone (required, "말을 들으려면 필요해요"), notifications/VoIP calls ("박비서가
+3. **권한**: microphone (required, "말을 들으려면 필요해요"), notifications/VoIP calls ("아젤이
    먼저 전화하려면 필요해요"); on Mac also Accessibility/Input Monitoring for the global hotkey.
    Each is a row with a "허용" button that turns into a checkmark. "완료" → home.
 
@@ -381,9 +398,9 @@ title; the raw `localizedDescription` goes in a disclosure "자세히" (footnote
 
 | Case | Detect | Title | Body | Action |
 |---|---|---|---|---|
-| Server unreachable | URLError timeout/cannotConnect, or status `ok:false` | 박비서에게 닿지 않아요 | 스파크(또는 게이트웨이)에 연결할 수 없어요. Tailscale이 켜져 있는지 확인해 주세요. | 다시 시도 |
+| Server unreachable | URLError timeout/cannotConnect, or status `ok:false` | 아젤에게 닿지 않아요 | 스파크(또는 게이트웨이)에 연결할 수 없어요. Tailscale이 켜져 있는지 확인해 주세요. | 다시 시도 |
 | Wrong token | HTTP 401/403, WS close 4401/1008 | 토큰이 맞지 않아요 | 설정의 토큰을 다시 입력해 주세요. | 토큰 다시 입력 |
-| Mic denied | `AVAudioApplication.recordPermission == .denied` | 마이크 권한이 필요해요 | 박비서가 말을 들으려면 마이크를 허용해 주세요. | 설정 열기 (`UIApplication.openSettingsURLString` / x-apple.systempreferences privacy URL) |
+| Mic denied | `AVAudioApplication.recordPermission == .denied` | 마이크 권한이 필요해요 | 아젤이 말을 들으려면 마이크를 허용해 주세요. | 설정 열기 (`UIApplication.openSettingsURLString` / x-apple.systempreferences privacy URL) |
 | Budget warn | `cost_usd ≥ budget × warn%` | (banner) 이번 달 예산의 85%를 썼어요 | — | 사용량 보기 |
 | Call dropped | WS closed unexpectedly | 통화가 끊겼어요 | 네트워크가 잠깐 끊긴 것 같아요. | 다시 걸기 |
 | No approvals | empty list | 모두 처리했어요 | 승인이 필요하면 알려 드릴게요. | — |
@@ -403,12 +420,12 @@ call fail.
 
 | Element | Label | Value / hint |
 |---|---|---|
-| Call button | 박비서에게 전화 | hint: 통화를 시작합니다 |
-| Home jar | 박비서 | hint: 두 번 탭하면 전화를 겁니다 |
-| Call jar | 박비서 | value: 듣고 있어요 / 생각 중 / 말하는 중 / 대기 중 |
+| Call button | 아젤에게 전화 | hint: 통화를 시작합니다 |
+| Home jar | 아젤 | hint: 두 번 탭하면 전화를 겁니다 |
+| Call jar | 아젤 | value: 듣고 있어요 / 생각 중 / 말하는 중 / 대기 중 |
 | 오늘 브리핑 | 오늘 브리핑 듣기 | — |
 | 새 대화 | 새 대화 시작 | hint: 이전 대화 맥락을 비웁니다 |
-| Recent card | "오전 9시 12분, 나: …, 박비서: …" (combine children) | hint: 전체 대화 보기 |
+| Recent card | "오전 9시 12분, 나: …, 아젤: …" (combine children) | hint: 전체 대화 보기 |
 | Route chip | 로컬 모델 응답 / Claude 응답 | — |
 | Timer | 통화 시간 3분 12초 | — |
 | Mute | 음소거 | value: 켜짐/꺼짐 (`.isToggle` trait on iOS 17) |
@@ -420,9 +437,10 @@ call fail.
 | Caption area | 대화 내용 | hint: 두 번 탭하면 전체 대화 보기 |
 | Approval card | "맥북, run_command, 명령: …, 위치: …" | actions: 승인, 거절 (`accessibilityAction(named:)`) |
 | 승인 / 거절 | 승인 / 거절 | — |
+| Name field | 비서 이름 | value: 아젤; hint: 호출어는 바뀌지 않습니다 |
 | Status row | "스파크, 정상, 42밀리초" | — |
 | Usage bar | 이번 달 사용량 | value: "500달러 중 123달러, 25퍼센트" |
-| PTT panel (Mac) | 박비서 말하기 패널 | — |
+| PTT panel (Mac) | 아젤 말하기 패널 | — |
 
 - **Announcements**: VoiceOver users already hear the TTS, so don't announce every state
   change. Post `AccessibilityNotification.Announcement` only for errors, hold, and
@@ -453,3 +471,6 @@ Everything above uses existing endpoints and local state, except:
    in the PCM stream (or send zeros).
 5. **Approval timestamps**. The card shows relative time if the item has `created`;
    PROTOCOL doesn't define it. Hidden when absent.
+6. **Where `assistant_name` lives**. The spec assumes it is a field in `GET/PUT
+   /v1/settings` (so the voice server can use it in openings and every device agrees). If it
+   is app-local instead, the 비서 card just saves to `UserDefaults`; the UI is the same.
