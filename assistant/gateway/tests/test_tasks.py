@@ -45,7 +45,8 @@ def test_task_runs_logs_steps_and_calls(tgw):
     assert "SECRET" not in json.dumps(t)  # tool arguments and results never reach the log
     assert notes == [("call", "task", "맡기신 작업 끝났어요. 파일 세 개를 정리했어요.", "azel")]
     assert [x["id"] for x in c.get("/v1/tasks").json()] == [t["id"]]
-    assert g.fake.db["usage"][-1]["path"] == "task"
+    row = g.fake.db["usage"][-1]  # a task runs on claude -p: counted as the subscription path, labelled as a task
+    assert (row["path"], row["task"], row["model"]) == ("claude_code", "task", "sonnet")
 
 
 def test_task_waits_for_approval_then_resumes(tgw):

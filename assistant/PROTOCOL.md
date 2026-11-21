@@ -234,7 +234,7 @@ device that created them.
   {"default_model":"auto","claude_path":"auto",
    "task_defaults":{"chat":{"model":"qwen"},"schedule":{"model":"sonnet"},
                     "code":{"model":"opus","path":"claude_code"},"mac":{"model":"sonnet"}},
-   "monthly_budget_usd":500,"budget_warn_pct":80,
+   "monthly_budget_usd":500,"budget_warn_pct":80,"budget_paths":["api","nim"],
    "proactive":{"enabled":true,
                 "morning_briefing":{"enabled":true,"time":"08:00"},
                 "deadline_check":{"enabled":true,"time":"20:00"},
@@ -315,6 +315,13 @@ device that created them.
   `{"accepted","rejected":[{"index","reason"}],"training"}`; `GET /v1/wake/enroll` → `{"clips","trained_at",
   "status":"none"|"training"|"ready"|"failed"}`; `DELETE /v1/wake/enroll` → 204. Clips stay on that gateway's host.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
+  `budget_paths` (a list of `api|nim|claude_code`, default `["api","nim"]`) are the usage paths that count toward
+  `monthly_budget_usd` and its warning; `claude_code` runs on the subscription and costs no money, so by default it
+  does not count. `cost_usd` is the counted (paid) total; `by_*` still cover every row. Also
+  `"paid":{"cost_usd","by_path"}` and `"subscription":{"claude_code":{"turns","input_tokens","output_tokens",
+  "equivalent_usd","quota"}}`, where `quota` is null until a `claude -p` run has reported the subscription windows
+  (`rate_limit_event`), else `{"window":"5h"|"weekly" (the fullest),"utilization_pct","resets_at" (epoch s),
+  "windows":{"5h":{…},"weekly":{…}}}`; kept in memory per gateway, windows past their reset are dropped.
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
   haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.
 - `GET /v1/status` → `{"spark":{"ok","ms"},"tts":…,"state":…,"gateway":{"device","mode","link"},
