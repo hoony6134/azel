@@ -93,7 +93,7 @@ DEFAULTS = {
     "assistant_name": "아젤",
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
-    "task_backend": "claude_code",  # background tasks: claude_code | claude_api | nim | qwen (agent_loop.py)
+    "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
@@ -896,7 +896,7 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
     yield activity("thinking")
     async for kind, v in claude_api.ask(API_KEY, model, system, text, defs, run):
         if kind == "text":
-            yield v
+            yield strip_marks(v)
         elif kind == "tool":
             yield activity("tool_start", v)
         else:
@@ -932,7 +932,7 @@ async def ask_nim(text, model, session):
         return activity(phase, f"mcp__{tool}" if "__" in tool else tool)
     try:
         async for item in nim.stream(cfg, nim.read_key(HOME), system, text, tools, run, act):
-            yield SPOKEN_MARKDOWN.sub("", item) if isinstance(item, str) else item
+            yield strip_marks(item) if isinstance(item, str) else item
     except nim.NimError as e:
         yield {"type": "error", "code": e.code, "message": e.message}
     except httpx.HTTPError as e:
@@ -1939,6 +1939,10 @@ async def put_settings(body: dict):
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
         raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
+    if body.get("task_backend") == "nim":  # the shared default must be able to run
+        nim_cfg = (body.get("providers") or (await load_settings())["providers"])["nim"]
+        if not nim_cfg.get("enabled") or not nim.has_key(HOME):
+            raise HTTPException(400, "task_backend: nim needs the NIM provider on and its key set")
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -2761,9 +2765,7 @@ async def task_create(body, source="api"):
     full_only()
     spec = check_task(body)
     settings = await load_settings()
-    spec["backend"] = spec["backend"] or settings.get("task_backend", "claude_code")
-    if spec["backend"] != "claude_code" and MAIL_CAL.search(spec["goal"]) and google_status() != "connected" and CLAUDE_OK:
-        spec["backend"] = "claude_code"  # calendar and mail are only on the claude.ai connectors then
+    spec["backend"], spec["fallback_reason"] = await task_backend_for(spec, settings)
     if spec["backend"] == "claude_code" and not CLAUDE_OK:
         raise HTTPException(503, "Claude is not available on this gateway")
     if spec["persona"] and not persona_by_id(settings, spec["persona"]):
@@ -2775,6 +2777,22 @@ async def task_create(body, source="api"):
     await task_index_add(t)
     task_runs[t["id"]] = asyncio.create_task(run_task(t))
     return t
+
+
+async def task_backend_for(spec, settings):
+    """(backend actually used, why it differs from the one asked for or None). Falls back to claude_code only
+    where that can run: mail/calendar without a live Google grant, no API key, or the API budget spent."""
+    want = spec["backend"] or settings.get("task_backend", "claude_api")
+    if want == "claude_code" or not CLAUDE_OK:
+        return want, None
+    if MAIL_CAL.search(spec["goal"]) and google_status() != "connected":
+        return "claude_code", "구글이 연결되지 않아 Claude Code로 했어요."
+    if want == "claude_api" and not API_KEY:
+        return "claude_code", "API 키가 없어 Claude Code로 했어요."
+    if want == "claude_api" and "api" in settings["budget_paths"] and \
+            await month_cost(settings) >= settings["monthly_budget_usd"]:
+        return "claude_code", "API 예산을 다 써서 Claude Code로 했어요."
+    return want, None
 
 
 def task_prompt(t, devices):
@@ -2858,6 +2876,10 @@ async def task_round(t, prompt, resume, deadline):
     return session, pending
 
 
+class ApiAuth(Exception):
+    """The API refused the key (401/403)."""
+
+
 class TaskLimit(Exception):
     def __init__(self, kind, message):
         super().__init__(message)
@@ -2895,8 +2917,15 @@ async def run_task(t):
             await task_save(t)
             deadline = time.monotonic() + t["max_minutes"] * 60
             if t.get("backend", "claude_code") != "claude_code":
-                await run_task_api(t)
-                return
+                try:
+                    await run_task_api(t)
+                    return
+                except ApiAuth:  # 401/403 mid-run: the same goal on claude_code, recorded
+                    if not CLAUDE_OK:
+                        raise TaskLimit("error", "API 키가 맞지 않아요.")
+                    t.update(backend="claude_code", fallback_reason="API 키가 맞지 않아 Claude Code로 했어요.")
+                    task_step(t, "fallback", reason="auth")
+                    await task_save(t)
             session, prompt = None, None
             for _ in range(TASK_MAX_ROUNDS):
                 session, pending = await task_round(t, prompt, session, deadline)
@@ -2929,12 +2958,31 @@ async def run_task(t):
             await task_notify(t)
 
 
-def task_summary(t):
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\u2B50\u2B55\u2705\u274C]")
+LIST_MARK = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+", re.M)
+
+
+def strip_marks(text):
+    """Markdown and emoji out of anything spoken or pushed (every backend writes some)."""
+    return EMOJI.sub("", SPOKEN_MARKDOWN.sub("", text))
+
+
+def spoken_text(text):
+    """A whole result as one spoken paragraph: no markdown, list marks or emoji; lines joined."""
+    return re.sub(r"\s*\n\s*", " ", LIST_MARK.sub("", strip_marks(text or ""))).strip()
+
+
+def task_summary(t, title=""):
+    """What a task's call says: the goal as a purpose (never the request read back), then the result."""
+    hi = f"{title}, " if title else ""
     if t["status"] == "waiting_approval":
-        return "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요."
+        return f"{hi}맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요."
+    goal = openings.purpose_rule(t["goal"]) or "작업"
     if t["status"] == "done":
-        return f"맡기신 작업 끝났어요. {t['result'] or '결과는 앱에서 확인해 주세요.'}"[:600]
-    return f"맡기신 작업이 끝나지 못했어요. {t['error'] or ''}"[:600]
+        first = openings.template("task", title, 0, 0, goal=goal)
+        return f"{first} {spoken_text(t['result']) or '결과는 앱에서 확인해 주세요.'}"[:600]
+    what = goal if goal.endswith("작업") else f"{goal} 작업"
+    return f"{hi}맡기신 {what}이 끝나지 못했어요. {spoken_text(t['error'])}".strip()[:600]
 
 
 async def task_notify(t, approval=False):
@@ -2942,12 +2990,15 @@ async def task_notify(t, approval=False):
     as azel://task/<id>."""
     try:
         if t["notify"] == "call":
-            await place_call("task_approval" if approval else "task", opening=task_summary(t), persona_id=t["persona"])
+            settings = await load_settings()
+            persona = persona_by_id(settings, t["persona"] or "") or primary_persona(settings)
+            await place_call("task_approval" if approval else "task",
+                             opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"])
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
             goal = t["goal"] if len(t["goal"]) <= 40 else t["goal"][:39] + "…"
-            await send_alert_push(title, f"{what}: {goal}", type="task", task_id=t["id"])  # no model output
+            await send_alert_push(title, spoken_text(f"{what}: {goal}"), type="task", task_id=t["id"])  # no model output
     except Exception as e:
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 
@@ -2962,7 +3013,8 @@ async def fail_orphan_tasks():
 
 
 def task_view(t, steps=True):
-    keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "budget_usd", "max_minutes", "created", "started",
+    keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
+            "max_minutes", "created", "started",
             "finished", "result", "error", "cost_usd", "owner")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
@@ -3246,4 +3298,6 @@ async def run_task_api(t):
             t["cost_usd"] += ev["cost_usd"]
             if ev["kind"] == "cancelled":
                 raise asyncio.CancelledError
+            if ev["kind"] == "auth" and t["backend"] == "claude_api":
+                raise ApiAuth()
             raise TaskLimit(ev["kind"], ev["message"])

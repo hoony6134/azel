@@ -80,18 +80,38 @@ def test_api_backed_task_calls_when_done(tgw, monkeypatch):  # noqa: F811
     t = wait_for(c, r.json()["id"], ("done", "failed"))
     assert t["status"] == "done" and t["backend"] == "qwen" and t["result"] == "정리했어요." and t["cost_usd"] == 0.02
     assert seen["backend"] == "qwen" and seen["cfg"]["url"].endswith("/v1/chat/completions") and seen["persona"] == "azel"
-    assert notes == [("call", "task", "맡기신 작업 끝났어요. 정리했어요.", "azel")]  # "call" on finish rings
+    assert notes == [("call", "task", "맡기신 다운로드 정리 끝났어요. 정리했어요.", "azel")]  # "call" on finish rings
+    assert t["fallback_reason"] is None
     assert c.post("/v1/tasks", json={"goal": "x", "backend": "gpt"}).status_code == 400
 
 
 def test_task_backend_setting(tgw, monkeypatch):  # noqa: F811
     g, c, notes = tgw
-    assert c.get("/v1/settings").json()["task_backend"] == "claude_code"
+    assert c.get("/v1/settings").json()["task_backend"] == "claude_api"  # the default since batch 5
     assert c.put("/v1/settings", json={"task_backend": "nope"}).status_code == 400
-    assert c.put("/v1/settings", json={"task_backend": "claude_api"}).status_code == 200
+    assert c.put("/v1/settings", json={"task_backend": "nim"}).status_code == 400  # NIM is off and has no key
     r = c.post("/v1/tasks", json={"goal": "x", "notify": "none"})
     t = wait_for(c, r.json()["id"], ("done", "failed"))
-    assert t["backend"] == "claude_api" and t["status"] == "failed" and "키" in t["error"]  # no API key in tests
+    assert t["backend"] == "claude_code" and t["fallback_reason"] == "API 키가 없어 Claude Code로 했어요."
+    g.API_KEY = "sk-test"  # a key, but the budget is spent
+    monkeypatch.setattr(g, "month_cost", lambda settings=None: asyncio.sleep(0, result=10**6))
+    t = c.post("/v1/tasks", json={"goal": "x", "notify": "none"}).json()
+    assert t["backend"] == "claude_code" and t["fallback_reason"] == "API 예산을 다 써서 Claude Code로 했어요."
+    t = c.post("/v1/tasks", json={"goal": "이번 주 캘린더 일정 정리해 줘", "notify": "none"}).json()
+    assert t["fallback_reason"] == "구글이 연결되지 않아 Claude Code로 했어요."
+
+
+def test_api_task_falls_back_when_the_key_is_refused(tgw, monkeypatch):  # noqa: F811
+    g, c, notes = tgw
+    g.API_KEY = "sk-revoked"
+
+    async def refused(backend, system, goal, bridge, cfg, budget, minutes, cancelled, persona_id=None):
+        yield {"type": "failed", "kind": "auth", "message": "API 키가 맞지 않아요.", "cost_usd": 0.0}
+    monkeypatch.setattr(g.agent_loop, "run", refused)
+    t = wait_for(c, c.post("/v1/tasks", json={"goal": "정리", "notify": "none"}).json()["id"], ("done", "failed"))
+    assert t["status"] == "done" and t["backend"] == "claude_code"  # the same goal, on claude -p
+    assert t["fallback_reason"] == "API 키가 맞지 않아 Claude Code로 했어요."
+    assert [s["kind"] for s in t["steps"]][0] == "fallback"
 
 
 def test_google_tools_only_with_a_live_grant(tgw, tmp_path):  # noqa: F811

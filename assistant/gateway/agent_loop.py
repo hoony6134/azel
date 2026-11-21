@@ -70,6 +70,11 @@ async def run(backend, system, goal, bridge, cfg, budget_usd, max_minutes, cance
                 reply.append({**call, "content": r["content"], "is_error": r["is_error"]})
     except Limit as e:
         yield {"type": "failed", "kind": e.kind, "message": e.message, "cost_usd": spent}
+    except httpx.HTTPStatusError as e:  # 401/403: the key is wrong or revoked (the gateway may fall back)
+        auth = e.response.status_code in (401, 403)
+        yield {"type": "failed", "kind": "auth" if auth else "error",
+               "message": "API 키가 맞지 않아요." if auth else f"모델 호출이 실패했어요 (HTTP {e.response.status_code}).",
+               "cost_usd": spent}
     except httpx.HTTPError as e:
         yield {"type": "failed", "kind": "error", "message": f"모델 호출이 실패했어요 ({type(e).__name__}).",
                "cost_usd": spent}

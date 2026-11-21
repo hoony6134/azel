@@ -56,7 +56,8 @@ def test_task_runs_logs_steps_and_calls(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:  # the status is saved a moment before the call goes out
         time.sleep(0.02)
-    assert notes == [("call", "task", "맡기신 작업 끝났어요. 파일 세 개를 정리했어요.", "azel")]
+    assert notes == [("call", "task", "맡기신 맥북 다운로드 폴더 정리 끝났어요. 파일 세 개를 정리했어요.", "azel")]
+    assert t["backend"] == "claude_code" and t["fallback_reason"] == "API 키가 없어 Claude Code로 했어요."  # no key here
     assert [x["id"] for x in c.get("/v1/tasks").json()] == [t["id"]]
     row = g.fake.db["usage"][-1]  # a task runs on claude -p: counted as the subscription path, labelled as a task
     assert (row["path"], row["task"], row["model"]) == ("claude_code", "task", "sonnet")
@@ -200,4 +201,13 @@ def test_call_mode_rings_on_failure(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:
         time.sleep(0.02)
-    assert t["status"] == "failed" and notes == [("call", "task", "맡기신 작업이 끝나지 못했어요. " + t["error"], "azel")]
+    assert t["status"] == "failed" and notes == [("call", "task", "맡기신 TASK-SPEND 큰 작업이 끝나지 못했어요. " + t["error"],
+                                                  "azel")]
+
+
+def test_spoken_results_lose_markdown_and_emoji(tgw):
+    g, c, notes = tgw
+    assert g.spoken_text("## 결과 ✅\n- **세 개** 정리 🎉\n1. `a.txt`") == "결과 세 개 정리 a.txt"
+    assert g.strip_marks("**오늘** 맑아요 ☀️") == "오늘 맑아요 "
+    t = {"status": "done", "goal": "다운로드 정리해 줘", "result": "- **3개** 옮겼어요 👍"}
+    assert g.task_summary(t, "정훈님") == "정훈님, 맡기신 다운로드 정리 끝났어요. 3개 옮겼어요"
