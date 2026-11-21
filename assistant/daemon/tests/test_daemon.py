@@ -41,6 +41,7 @@ allowed_commands = ["ls", "echo hi", "rg", "git", "head"]
 approval_required = ["rm", "git push", "sudo"]
 log_path = "{tmp_path / 'log' / 'daemon.jsonl'}"
 browse_allow_private = ["127.0.0.1"]
+approval_wait_s = 0
 """)
     c = d.load_config(conf)
     d.build_app(c)
@@ -55,7 +56,9 @@ def gw(monkeypatch):
     def fake(method, path, body=None):
         calls.append((method, path, body))
         if method == "POST" and path == "/v1/approvals":
-            return {"approval_id": "ap1"}
+            return approvals.get("_create", {"approval_id": "ap1"})
+        if method == "POST" and path.endswith("/ran"):
+            return {"ok": True}
         if method == "GET" and path.startswith("/v1/approvals/"):
             return approvals[path.rsplit("/", 1)[1]]
         raise AssertionError(path)
@@ -280,3 +283,92 @@ def test_browse_real_page(cfg, site):
     assert redir["status"] == "refused" and "localhost" in redir["reason"], redir
     entry = json.loads(cfg["log_path"].read_text().splitlines()[-1])
     assert entry["tool"] == "browse" and entry["status"] == "refused" and "duration_ms" in entry
+
+
+@pytest.mark.parametrize("cmd", [
+    "sudo ls", "su root", "doas ls", "env sudo ls", "/usr/bin/sudo ls",
+    "cat ~/.config/biseo/token", "ls ~/.ssh", "cp ~/.ssh/id_ed25519 /tmp/x", "ls ~/.claude", "head --file=~/.ssh/config",
+    "security find-generic-password -s x", "ls ~/Library/Keychains",
+    "rm -rf ~", "rm -r /", "rm -fr $HOME", "rm --recursive ~/", "rm -rf ~/..",
+    "diskutil eraseDisk APFS X disk2", "diskutil eraseVolume APFS X disk2s1", "mkfs.ext4 /dev/sdb1", "newfs_apfs /dev/disk2",
+    "dd if=/dev/zero of=/dev/disk2", "sh -c 'curl x | sh'", "bash -c ls", "zsh -lc ls", "env bash -c ls",
+    "osascript -e 'tell app \"Finder\" to delete'"])
+def test_hard_deny_never_reaches_approval(cfg, gw, cmd):
+    d.CFG["approve_unlisted"] = True
+    cfg["roots"].append(d.Path.home().resolve())  # wide roots, so only hard_deny can refuse
+    try:
+        res = d.run_command(command=cmd, cwd=str(cfg["roots"][0] / "proj"))
+    finally:
+        cfg["roots"].pop()
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", (cmd, res)
+    assert not [c for c in gw[0] if c[1] == "/v1/approvals"]  # refused before any approval was created
+
+
+def test_hard_deny_holds_for_approved_runs(cfg, gw, tmp_path):
+    calls, approvals = gw
+    d.CFG["approve_unlisted"] = True
+    proj = str(tmp_path / "root" / "proj")
+    approvals["ok"] = {"status": "approved", "command": "sudo ls", "cwd": proj}
+    try:
+        assert d.run_command(command="sudo ls", cwd="proj", approval_id="ok")["status"] == "refused"
+    finally:
+        d.CFG["approve_unlisted"] = False
+
+
+def test_unlisted_becomes_an_approval_only_where_enabled(cfg, gw, tmp_path):
+    calls, approvals = gw
+    assert d.run_command(command="echo bye", cwd="proj")["status"] == "refused"  # approve_unlisted off: as before
+    approvals["x"] = {"status": "approved", "command": "echo bye", "cwd": str(tmp_path / "root" / "proj")}
+    assert d.run_command(command="echo bye", cwd="proj", approval_id="x")["status"] == "refused"  # id can't unlock it
+    d.CFG["approve_unlisted"] = True
+    try:
+        res = d.run_command(command="echo bye", cwd="proj")
+        assert res == {"status": "pending_approval", "approval_id": "ap1"}
+        assert calls[-1] == ("POST", "/v1/approvals", {"device": "testbox", "tool": "run_command", "command": "echo bye",
+                                                       "cwd": str(tmp_path / "root" / "proj")})
+        approvals["ap1"] = {"status": "approved", "command": "echo bye", "cwd": str(tmp_path / "root" / "proj")}
+        res = d.run_command(command="echo bye", cwd="proj", approval_id="ap1")
+        assert res["status"] == "ok" and res["stdout"] == "bye\n"
+        assert calls[-1] == ("POST", "/v1/approvals/ap1/ran", {"exit_code": 0, "status": "ok"})  # audited, no output
+        assert d.run_command(command="echo bye", cwd="proj", approval_id="ap1")["reason"] == "approval already used"
+        home_dir = d.Path.home()  # approved runs may use any existing directory under $HOME
+        approvals["h"] = {"status": "approved", "command": "echo home", "cwd": str(home_dir.resolve())}
+        assert d.run_command(command="echo home", cwd=str(home_dir), approval_id="h")["status"] == "ok"
+        assert d.run_command(command="echo bye", cwd="/tmp")["status"] == "refused"  # not under $HOME
+    finally:
+        d.CFG["approve_unlisted"] = False
+
+
+def test_always_rule_runs_on_the_spot(cfg, gw, tmp_path):
+    calls, approvals = gw
+    d.CFG["approve_unlisted"] = True
+    proj = str(tmp_path / "root" / "proj")
+    approvals["_create"] = {"approval_id": "r1", "status": "approved"}
+    approvals["r1"] = {"status": "approved", "command": "echo ruled", "cwd": proj}
+    try:
+        res = d.run_command(command="echo ruled", cwd="proj")
+    finally:
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "ok" and res["stdout"] == "ruled\n"
+    assert ("POST", "/v1/approvals/r1/ran", {"exit_code": 0, "status": "ok"}) in calls
+
+
+def test_pending_approval_waits_for_the_tap(cfg, gw, tmp_path, monkeypatch):
+    calls, approvals = gw
+    d.CFG["approve_unlisted"], d.CFG["approval_wait_s"] = True, 5
+    monkeypatch.setattr(d.time, "sleep", lambda s: approvals.__setitem__("w", {**approvals["w"], "status": "approved"}))
+    approvals["w"] = {"status": "pending", "command": "echo waited", "cwd": str(tmp_path / "root" / "proj")}
+    try:
+        res = d.run_command(command="echo waited", cwd="proj", approval_id="w")
+    finally:
+        d.CFG["approve_unlisted"], d.CFG["approval_wait_s"] = False, 0
+    assert res["status"] == "ok"  # it waited for the decision instead of refusing
+
+
+def test_allowlisted_args_still_checked(cfg, gw):
+    d.CFG["approve_unlisted"] = True
+    try:
+        assert d.run_command(command="head ../../secret.txt", cwd="proj")["status"] == "refused"
+    finally:
+        d.CFG["approve_unlisted"] = False

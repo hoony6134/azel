@@ -39,7 +39,11 @@ DEFAULTS = {
     "gateway_url": "http://100.64.0.8:8892",
     "allowed_roots": ["~/dev"],
     "allowed_commands": ["git status", "git log", "git diff", "ls", "rg"],
-    "approval_required": ["rm", "git push", "git reset --hard", "sudo", "mv", "chmod", "chown"],
+    "approval_required": ["rm", "git push", "git reset --hard", "mv", "chmod", "chown"],
+    # true on jh-only devices: a command not in allowed_commands becomes an approval request instead of a refusal.
+    # Team devices (vd-spark, vd-core) and sadr keep false.
+    "approve_unlisted": False,
+    "approval_wait_s": 120,  # run_command(…, approval_id) on a still-pending approval waits this long for the tap
     "log_path": "~/.local/state/biseo/daemon.jsonl",
     "read_max_bytes": 256_000,
     "output_max_bytes": 64_000,
@@ -110,6 +114,70 @@ def check_args(tokens: list[str], wd: Path) -> None:
             p = (wd / Path(v).expanduser()).resolve()
             if not any(p.is_relative_to(r) for r in CFG["roots"]):
                 raise Refused(f"argument outside allowed_roots: {v}")
+
+
+# Never runnable, approval or not: privilege escalation, secrets, wiping, and shell or AppleScript one-liners
+# (argv only, no shell: `sh -c` would smuggle a whole script past the exact-command approval).
+ESCALATE = {"sudo", "su", "doas", "pkexec", "runas"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
+SECRET_DIRS = ("~/.config/biseo", "~/.ssh", "~/.claude", "~/Library/Keychains")
+SECRET_WORDS = (".config/biseo", ".ssh/", "/.ssh", "Keychains", ".keychain")  # also inside --flag=… values
+
+
+def hard_deny(tokens: list[str], wd: Path) -> None:
+    """Refuse (before any approval exists) what no approval may unlock."""
+    names = [os.path.basename(t) for t in tokens]
+    if ESCALATE & set(names):
+        raise Refused("privilege escalation is never allowed")
+    for i, n in enumerate(names):
+        rest = tokens[i + 1:]
+        if n in SHELLS and any(t == "-c" or (t.startswith("-") and not t.startswith("--") and "c" in t) for t in rest):
+            raise Refused("shell -c is never allowed (run the command itself)")
+        if n == "osascript" and any(t == "-e" or t.startswith("-e") for t in rest):
+            raise Refused("osascript -e is never allowed")
+        if n == "security":
+            raise Refused("keychain access is never allowed")
+    home = Path.home().resolve()
+    secrets = [Path(d).expanduser().resolve() for d in SECRET_DIRS]
+    if any(wd == s or wd.is_relative_to(s) for s in secrets):
+        raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
+    for t in tokens[1:]:
+        v = t.split("=", 1)[1] if t.startswith("-") and "=" in t else t
+        if any(w in t for w in SECRET_WORDS) or t.rstrip("/").endswith(".ssh"):
+            raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
+        if v and not v.startswith("-"):
+            p = (wd / Path(v).expanduser()).resolve()
+            if any(p == s or p.is_relative_to(s) for s in secrets):
+                raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
+    if names[0] == "rm" and any(t in ("--recursive",) or (t.startswith("-") and not t.startswith("--") and set(t[1:]) & {"r", "R"})
+                                for t in tokens[1:]):
+        for t in tokens[1:]:
+            if t.startswith("-"):
+                continue
+            p = (wd / Path(t.replace("$HOME", "~")).expanduser()).resolve()
+            if p == Path("/") or home.is_relative_to(p):  # / or the home directory (or anything above it)
+                raise Refused("rm -r on / or the home directory is never allowed")
+    if names[0] == "diskutil" and len(tokens) > 1 and tokens[1].lower().startswith(("erase", "zerodisk", "secureerase", "reformat")):
+        raise Refused("erasing disks is never allowed")
+    if names[0].startswith(("mkfs", "newfs")):
+        raise Refused("formatting is never allowed")
+    if names[0] == "dd" and any(t.startswith("of=/dev/") for t in tokens):
+        raise Refused("dd to a device is never allowed")
+
+
+def run_dir(cwd: str | None, approved: bool) -> Path:
+    """Working directory: inside allowed_roots, or (approved runs and unlisted commands awaiting approval) any
+    existing directory under $HOME. Relative paths start at the first root."""
+    try:
+        return safe_path(cwd or str(CFG["roots"][0]))
+    except Refused:
+        if not approved:
+            raise
+    p = Path(cwd).expanduser()
+    p = (p if p.is_absolute() else CFG["roots"][0] / p).resolve()
+    if not p.is_dir() or not p.is_relative_to(Path.home().resolve()):
+        raise Refused(f"cwd must be an existing directory under $HOME: {cwd}")
+    return p
 
 
 def _cap(b: bytes) -> str:
@@ -225,27 +293,46 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     tokens = shlex.split(command)
     if not tokens:
         raise Refused("empty command")
-    wd = safe_path(cwd or str(CFG["roots"][0]))
+    listed = any(_has_seq(tokens, pat, anywhere=False) for pat in CFG["allowed_commands"])
+    risky = any(_has_seq(tokens, pat, anywhere=True) for pat in CFG["approval_required"])
+    unlisted = not listed and not risky
+    if unlisted and not CFG["approve_unlisted"]:  # an approval id cannot unlock it here either
+        raise Refused("command not in allowed_commands")
+    wd = run_dir(cwd, approved=bool(approval_id) or (unlisted and CFG["approve_unlisted"]))
+    hard_deny(tokens, wd)  # before any approval is created, and for approved runs too
+    if not approval_id and (risky or unlisted):
+        r = gateway("POST", "/v1/approvals",
+                    {"device": CFG["id"], "tool": "run_command", "command": command, "cwd": str(wd)})
+        if r.get("status") != "approved":  # an "always" rule approves it on the spot
+            return {"status": "pending_approval", "approval_id": r["approval_id"]}
+        approval_id = r["approval_id"]
     if approval_id:
         a = gateway("GET", f"/v1/approvals/{approval_id}")
+        waited = time.monotonic()
+        while a.get("status") == "pending" and time.monotonic() - waited < CFG["approval_wait_s"]:
+            time.sleep(2)  # the user is deciding in the app
+            a = gateway("GET", f"/v1/approvals/{approval_id}")
+        if a.get("status") == "pending" and CFG["approval_wait_s"] > 0:
+            return {"status": "pending_approval", "approval_id": approval_id}
         if a.get("status") != "approved":
             raise Refused(f"approval not granted (status={a.get('status')})")
         if a.get("command") != command or a.get("cwd") != str(wd):
             raise Refused("approval does not match this command/cwd")
         _claim_approval(approval_id)
-    elif any(_has_seq(tokens, pat, anywhere=True) for pat in CFG["approval_required"]):
-        r = gateway("POST", "/v1/approvals",
-                    {"device": CFG["id"], "tool": "run_command", "command": command, "cwd": str(wd)})
-        return {"status": "pending_approval", "approval_id": r["approval_id"]}
-    elif not any(_has_seq(tokens, pat, anywhere=False) for pat in CFG["allowed_commands"]):
-        raise Refused("command not in allowed_commands")
     else:
         check_args(tokens, wd)
     try:
         out = subprocess.run(tokens, cwd=wd, capture_output=True, timeout=CFG["command_timeout"])
     except subprocess.TimeoutExpired:
-        return {"status": "timeout", "timeout_s": CFG["command_timeout"]}
-    return {"status": "ok", "exit_code": out.returncode, "stdout": _cap(out.stdout), "stderr": _cap(out.stderr)}
+        res = {"status": "timeout", "timeout_s": CFG["command_timeout"]}
+    else:
+        res = {"status": "ok", "exit_code": out.returncode, "stdout": _cap(out.stdout), "stderr": _cap(out.stderr)}
+    if approval_id:  # audit: what ran under an approval (never its output)
+        try:
+            gateway("POST", f"/v1/approvals/{approval_id}/ran", {"exit_code": res.get("exit_code"), "status": res["status"]})
+        except Exception as e:
+            log.warning("approval audit not recorded: %s", type(e).__name__)
+    return res
 
 
 def _run_job(job: dict, argv: list[str], cwd: Path) -> None:

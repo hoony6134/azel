@@ -174,7 +174,8 @@ get only the current utterance, never the call's earlier turns (which may be per
 For the phone without Tailscale. Exposed paths only; everything else is blocked at the proxy:
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
-  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
+  `POST /v1/approvals/{id}`, `GET /v1/approvals/rules`, `DELETE /v1/approvals/rules/{id}`, `GET /v1/approvals/audit`,
+  `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
   `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
   `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
@@ -451,19 +452,46 @@ device that created them.
 - Scheduled jobs (morning briefing, deadline check) run on every full gateway's clock; the one that
   takes lease `job:<name>:<date>` (24 h) fires it. Lease holder = `<device>-<random per process>`,
   so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
-- `GET /v1/approvals` / `POST /v1/approvals/{id}` `{"approve":true|false}` — risky
-  daemon actions waiting for the user (the app shows them).
+- Approvals: risky or (on `approve_unlisted` devices) unlisted daemon commands waiting for the user's tap.
+  - `POST /v1/approvals` `{"device","tool","command","cwd"}` (daemons) → `{"approval_id","status":"pending",
+    "expires_at"}` and an alert push (`"type":"approval","approval_id"`, body `"<device>: <command, 80 chars>"`, never
+    output). If an `always` rule matches (same device and exact command) → `{"approval_id","status":"approved",
+    "rule_id"}` at once, no push (still audited when it runs).
+  - `GET /v1/approvals` → pending ones only: `[{"id","device","tool","command","cwd","status","created","decided",
+    "expires_at","decision","requester","rule_id"}]`. `requester`: the ask or task this gateway was running when the
+    approval came in (`{"session","persona"}` or `{"task_id","persona"}`), else null. `GET /v1/approvals/{id}` → the
+    same object; `status` `pending|approved|rejected|expired` (a pending one expires 5 minutes after it was made).
+  - `POST /v1/approvals/{id}` `{"decision":"once"|"always"|"deny"}` (older apps: `{"approve":bool}` = once / deny)
+    → `{"id","status","decision","rule_id"?}`; 409 when it is no longer pending (decided or expired). `always` also
+    stores a rule `{"id","device","command","created"}`.
+  - `GET /v1/approvals/rules` → the rules; `DELETE /v1/approvals/rules/{id}` revokes one (404 if unknown).
+  - `POST /v1/approvals/{id}/ran` `{"exit_code","status"}` (daemons, after an approved run) appends to the audit log;
+    `GET /v1/approvals/audit?limit=50` → `[{"approval_id","device","command","cwd","exit_code","status","at",
+    "decision":"once"|"always"|"rule"}]` (newest 500 kept; never output).
+  - Kept in ruchba's approvals table plus kv (`approval-<id>`, `approval-rules`, `approval-audit`): no schema change.
+  - In a call, Claude says "앱에서 허용해 주세요", then calls `run_command` again with the `approval_id`, which waits for
+    the decision (below); rejected or expired → it tells the user it was not allowed. Tasks wait as described under
+    Tasks.
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
 Registration body: `{"id":"macbook","name":"macbook","url","harness":[…]}` — `id` and `name` are the same English device name (macbook, albireo, gienah, deneb, spark); `id` is an ASCII
 slug used as the MCP server name on the Claude side.
 
-Approval flow: an approval-required `run_command` posts
-`{"device","tool":"run_command","command","cwd"}` to `POST /v1/approvals` and returns
-`pending_approval`. After the user approves in the app, Claude calls `run_command` again
-with `approval_id`; the daemon checks `GET /v1/approvals/{id}` → `{"status":"approved",
-"command","cwd"}`, requires an exact command/cwd match, and accepts each id once.
+Approval flow: an approval-required `run_command` (or, with `approve_unlisted = true`, any command not in
+`allowed_commands`) posts `{"device","tool":"run_command","command","cwd"}` to `POST /v1/approvals` and returns
+`pending_approval` (an `always` rule answers `approved` and it runs at once). Claude calls `run_command` again with
+`approval_id`; the daemon waits up to `approval_wait_s` (120) for the decision (`pending_approval` again after that),
+then checks `GET /v1/approvals/{id}` → `{"status":"approved","command","cwd"}`, requires an exact command/cwd match,
+accepts each id once, runs it, and reports `POST /v1/approvals/{id}/ran` `{"exit_code","status"}` (no output).
+Approved runs may use any existing directory under `$HOME` as cwd; allowlisted runs without approval stay inside
+`allowed_roots` with `check_args`.
+`approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,
+vd-core and sadr (unlisted commands are refused there, approval id or not).
+Never runnable, refused before any approval exists (and for approved runs): `sudo`/`su`/`doas` anywhere in the argv;
+anything under `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains` (as argument or cwd) and the
+`security` tool; `rm -r` on `/` or the home directory (or above it); `diskutil erase*`, `mkfs*`/`newfs*`,
+`dd of=/dev/…`; `sh|bash|zsh|… -c` and `osascript -e`. Still no shell: argv only.
 
 Tools: `list_dir(path)`, `read_file(path, max_bytes?)`, `search(query, path?)`,
 `run_command(command, cwd?, approval_id?)`, `delegate(task, cwd, harness?, model?)` →

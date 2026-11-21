@@ -215,6 +215,8 @@ VOICE_BASE = (
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
+    "기기 명령이 pending_approval을 돌려주면 먼저 '앱에서 허용해 주세요'라고 짧게 말한 다음, 같은 명령을 그 "
+    "approval_id와 함께 다시 호출해서 승인을 기다려. 거절되거나(rejected) 만료되면(expired) 허용되지 않았다고 말해. "
 )
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
@@ -880,6 +882,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if MODE == "limited" and model == "nim":
         model = None  # a limited gateway has no NIM: its usual Claude path
     model, path = resolve(settings, model, path, task, text)
+    note_requester(session=session, persona=current_persona.get() or primary_persona(settings)["id"])
     gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
     said = False
     async for item in gen(text, model, session):
@@ -2152,14 +2155,85 @@ async def alerts_to_ring(names, now):
         return new
 
 
+# ---------- approvals: risky or unlisted device commands wait for the user's tap ----------
+# The approval row (device, tool, command, cwd, status) lives in ruchba's approvals table; what the table has no
+# column for sits in kv: `approval-<id>` (expiry, requester, decision), `approval-rules` ("always" rules) and
+# `approval-audit` (approved runs). A pending approval expires after APPROVAL_TTL_S.
+APPROVAL_TTL_S = 300
+DECISIONS = ("once", "always", "deny")
+last_ask: dict = {}  # the most recent ask or task on this gateway: who an approval created meanwhile belongs to
+
+
+def note_requester(**who):
+    last_ask.clear()
+    last_ask.update(who, at=time.time())
+
+
+async def approval_meta(aid):
+    return await state.call("GET", f"/v1/state/kv/approval-{aid}") or {}
+
+
+def approval_view(row, meta, now=None):
+    now = now or time.time()
+    expires = meta.get("expires_at") or (row.get("created") or now) + APPROVAL_TTL_S
+    status = "expired" if row["status"] == "pending" and now >= expires else row["status"]
+    return {**row, "status": status, "expires_at": expires, "decision": meta.get("decision"),
+            "requester": meta.get("requester"), "rule_id": meta.get("rule_id")}
+
+
 @app.post("/v1/approvals")
 async def create_approval(body: dict):
-    return await state.call("POST", "/v1/state/approvals", {k: body.get(k, "") for k in ("device", "tool", "command", "cwd")})
+    row = {k: str(body.get(k) or "") for k in ("device", "tool", "command", "cwd")}
+    if not row["device"] or not row["command"]:
+        raise HTTPException(400, "device and command required")
+    now = time.time()
+    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    rule = next((r for r in rules if r["device"] == row["device"] and r["command"] == row["command"]), None)
+    created = await state.call("POST", "/v1/state/approvals", row)
+    aid = created["approval_id"]
+    requester = {k: v for k, v in last_ask.items() if k != "at"} if now - last_ask.get("at", 0) < 600 else None
+    meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None}
+    if rule:  # an "always" rule: approved on the spot, still audited when it runs
+        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+        meta.update(decision="rule", rule_id=rule["id"])
+        await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+        return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
+    await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+    try:  # the app shows it; the command text only (never output), shortened
+        await send_alert_push("승인 요청", f"{row['device']}: {row['command'][:80]}", type="approval", approval_id=aid)
+    except Exception as e:
+        print("approval push failed:", type(e).__name__, flush=True)
+    return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
 
 
 @app.get("/v1/approvals")
 async def list_approvals():
-    return await state.call("GET", "/v1/state/approvals")
+    now, out = time.time(), []
+    for row in await state.call("GET", "/v1/state/approvals") or []:
+        v = approval_view(row, await approval_meta(row["id"]), now)
+        if v["status"] == "pending":
+            out.append(v)
+    return out
+
+
+@app.get("/v1/approvals/rules")
+async def approval_rules():
+    return await state.call("GET", "/v1/state/kv/approval-rules") or []
+
+
+@app.delete("/v1/approvals/rules/{rid}")
+async def approval_rule_delete(rid: str):
+    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    keep = [r for r in rules if r["id"] != rid]
+    if len(keep) == len(rules):
+        raise HTTPException(404, "no such rule")
+    await state.call("PUT", "/v1/state/kv/approval-rules", keep)
+    return {"deleted": rid}
+
+
+@app.get("/v1/approvals/audit")
+async def approval_audit(limit: int = 50):
+    return (await state.call("GET", "/v1/state/kv/approval-audit") or [])[:max(1, min(limit, 500))]
 
 
 @app.get("/v1/approvals/{aid}")
@@ -2167,12 +2241,47 @@ async def get_approval(aid: str):
     row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
     if row is None:
         raise HTTPException(404, "no such approval")
-    return row
+    return approval_view(row, await approval_meta(aid))
 
 
 @app.post("/v1/approvals/{aid}")
 async def decide(aid: str, body: dict):
-    return await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": bool(body.get("approve"))})
+    """`{"decision": "once"|"always"|"deny"}` (older apps: `{"approve": bool}` = once / deny)."""
+    decision = body.get("decision") or ("once" if body.get("approve") else "deny")
+    if decision not in DECISIONS:
+        raise HTTPException(400, f"decision: one of {list(DECISIONS)}")
+    row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+    if row is None:
+        raise HTTPException(404, "no such approval")
+    meta = await approval_meta(aid)
+    view = approval_view(row, meta)
+    if view["status"] != "pending":
+        raise HTTPException(409, f"approval is {view['status']}")
+    out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
+    if decision == "always":
+        rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+        rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "created": time.time()}
+        await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
+        meta["rule_id"] = rule["id"]
+    meta["decision"] = decision
+    await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+    return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {})}
+
+
+@app.post("/v1/approvals/{aid}/ran")
+async def approval_ran(aid: str, body: dict):
+    """A daemon ran an approved command: the audit log gets device, command, exit code, time and decision."""
+    row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+    if row is None or row["status"] != "approved":
+        raise HTTPException(404, "no such approved approval")
+    code = body.get("exit_code")
+    entry = {"approval_id": aid, "device": row["device"], "command": row["command"], "cwd": row["cwd"],
+             "exit_code": code if isinstance(code, int) and not isinstance(code, bool) else None,
+             "status": str(body.get("status") or "")[:20], "at": time.time(),
+             "decision": (await approval_meta(aid)).get("decision")}
+    audit = await state.call("GET", "/v1/state/kv/approval-audit") or []
+    await state.call("PUT", "/v1/state/kv/approval-audit", [entry, *audit][:500])
+    return {"ok": True}
 
 
 # ---------- tasks: background Claude Code runs on the devices ("…해 줘, 끝나면 알려 줘") ----------
@@ -2344,8 +2453,9 @@ async def wait_approval(t, aid):
     await task_save(t)
     await task_notify(t, approval=True)
     while True:
-        a = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}") or {}
-        if a.get("status") in ("approved", "rejected"):
+        row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+        a = approval_view(row, await approval_meta(aid)) if row else {"status": "rejected"}
+        if a["status"] in ("approved", "rejected", "expired"):
             t["status"] = "running"
             task_step(t, "approval_" + a["status"], approval_id=aid)
             await task_save(t)
@@ -2364,6 +2474,7 @@ async def run_task(t):
             if t["cancel_requested"]:
                 raise asyncio.CancelledError
             t.update(status="running", started=time.time())
+            note_requester(task_id=t["id"], persona=t["persona"])
             await task_save(t)
             deadline = time.monotonic() + t["max_minutes"] * 60
             session, prompt = None, None
