@@ -346,6 +346,20 @@ final class CallClient {
         sending = true
     }
 
+    /// Audio the user already said (the wake listener's recording) sent as mic frames, 100 ms each,
+    /// ahead of the live mic. The caller keeps `sending` off until this returns.
+    func sendUserAudio(_ pcm16: Data) {
+        guard let task = socket else { return }
+        let chunk = 3_200
+        var i = pcm16.startIndex
+        while i < pcm16.endIndex {
+            let end = min(i + chunk, pcm16.endIndex)
+            task.send(.data(pcm16.subdata(in: i..<end))) { _ in }
+            i = end
+        }
+        statsLock.lock(); sentBytes += pcm16.count; sentPeak = max(sentPeak, Self.peak(pcm16)); statsLock.unlock()
+    }
+
     /// Mid-call brain switch (`{"type":"mode","value":…}`); the server confirms with a mode event.
     func switchMode(_ mode: String) {
         socket?.send(.string(#"{"type":"mode","value":"\#(mode)"}"#)) { _ in }

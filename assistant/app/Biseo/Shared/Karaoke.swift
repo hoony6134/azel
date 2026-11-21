@@ -86,10 +86,13 @@ struct KaraokeTimeline: Equatable {
 /// close it or start a new turn earlier.
 enum CallOverlay {
     static let linger = 1.5
+    /// Hands-free calls (wake, push-to-talk) end when the user says nothing this long after the
+    /// last reply finished playing (PM, 2026-11-22), then the panel lingers `linger` and closes.
+    static let quiet = 8.0
 
-    static func shouldClose(turnDone: Bool, playing: Bool, drainedFor: TimeInterval?) -> Bool {
+    static func shouldClose(turnDone: Bool, playing: Bool, drainedFor: TimeInterval?, after: TimeInterval = linger) -> Bool {
         guard turnDone, !playing, let drainedFor else { return false }
-        return drainedFor >= linger
+        return drainedFor >= after
     }
 }
 

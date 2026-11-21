@@ -8,7 +8,7 @@ import SwiftUI
 final class MacCall: ObservableObject {
     static let shared = MacCall()
 
-    @Published private(set) var inCall = false { didSet { if inCall != oldValue { inCall ? InCallMarker.create() : InCallMarker.remove() } } }
+    @Published private(set) var inCall = false { didSet { if inCall != oldValue { inCall ? AzelFiles.inCall.create() : AzelFiles.inCall.remove() } } }
     @Published private(set) var state = ""          // listening | thinking | speaking
     /// Reply audio still playing (the server can move on before the last of it is heard).
     @Published private(set) var playing = false
@@ -127,32 +127,50 @@ final class MacCall: ObservableObject {
     private var turnDone = false
     private var drainedAt: Date?
 
-    /// Closes the push-to-talk panel only once the last chunk has played and 1.5 s have passed
-    /// (user request, 2026-11-21: it closed while the reply was still being spoken). A new turn
-    /// or the user's dismissal (Esc, ×) cancels it.
+    /// Hands-free calls (push-to-talk, wake) end on their own: once the last reply has played, 8 s
+    /// with no user speech, then the panel lingers 1.5 s, fades and the call ends (the in-call and
+    /// mic-live files go with it). A new turn, the key, or the pointer over the panel cancels it.
     private func scheduleFade() {
-        guard pttCall else { return }
+        guard pttCall || wakeCall else { return }
         fadeTask?.cancel()
         guard turnDone, !playing else { return }
         let since = drainedAt ?? Date()
         drainedAt = since
+        let wait = CallOverlay.quiet + CallOverlay.linger
         fadeTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(CallOverlay.linger * 1e9))
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1e9))
             guard let self, !Task.isCancelled, !self.talking, let p = self.panel else { return }
-            guard CallOverlay.shouldClose(turnDone: turnDone, playing: playing, drainedFor: Date().timeIntervalSince(since)) else { return }
+            guard CallOverlay.shouldClose(turnDone: turnDone, playing: playing, drainedFor: Date().timeIntervalSince(since), after: wait) else { return }
             if NSPointInRect(NSEvent.mouseLocation, p.frame) { drainedAt = nil; return self.scheduleFade() }
-            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 }) { p.orderOut(nil) }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 }) { [weak self] in
+                MainActor.assumeIsolated { self?.end(error: nil, keepPanel: false) }
+            }
         }
     }
 
     /// `azel://wake?persona=…` from the wake listener: it already said "네?", so no earcon; the panel
     /// shows without taking focus and the mic is live at once for the sentence after the name.
-    func wake(persona key: String?) {
+    func wake(persona key: String?, utterance: String? = nil) {
         if inCall { showPanel(); return }
         let p = key.flatMap { k in PersonaModel.shared.personas.first { $0.id == k || $0.name == k } } ?? PersonaModel.shared.primary
         wakeCall = true
+        pendingUtterance = utterance
         start(panel: true, persona: p)
         scheduleIdle()
+    }
+
+    /// The listener's recording of what followed the name; sent before the live mic.
+    private var pendingUtterance: String?
+
+    /// Sends the waiting utterance, then opens the live mic.
+    private func sendUtterance(_ id: String) {
+        client.sending = false
+        Task { [weak self] in
+            let data = await AzelFiles.takeUtterance(id)
+            guard let self, self.inCall else { return }
+            if let data { self.client.sendUserAudio(data) }
+            self.client.sending = true
+        }
     }
 
     func start(panel usePanel: Bool, session: String? = nil, intent: String? = nil, persona: Persona? = nil) {
@@ -233,8 +251,11 @@ final class MacCall: ObservableObject {
         do {
             let mode = BrainModeChoice.shared.takeForCall()
             brainMode = mode
+            if pendingUtterance != nil { client.sending = false }   // nothing live goes ahead of the utterance
             try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode)
             connectedAt = Date()
+            AzelFiles.micLive.create()
+            if let id = pendingUtterance { pendingUtterance = nil; sendUtterance(id) }
             if pttCall || talking { client.cue(.wake, listening: false) }
         } catch {
             end(error: error.localizedDescription, keepPanel: true)
@@ -280,6 +301,8 @@ final class MacCall: ObservableObject {
         talking = false
         pttCall = false
         wakeCall = false
+        pendingUtterance = nil
+        AzelFiles.micLive.remove()
         brainMode = nil
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
@@ -470,29 +493,17 @@ struct PanelReply: View {
     }
 }
 
-/// `~/Library/Application Support/Azel/in-call`: present while any call runs, so the wake listener
-/// keeps the mic free. The real home, not the sandbox container (an entitlement allows this folder).
-enum InCallMarker {
-    static var url: URL = {
-        let home = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_dir) } ?? NSHomeDirectory()
-        return URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/Azel/in-call")
-    }()
-
-    static func create() {
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.createFile(atPath: url.path, contents: Data("\(getpid())\n".utf8)) {
-            Log.call.error("in-call marker not written: \(url.path, privacy: .public)")
-        }
-    }
-
-    static func remove() { try? FileManager.default.removeItem(at: url) }
-}
-
-/// `azel://wake?persona=<id or name>` → the persona key; nil for any other URL.
+/// `azel://wake?persona=<id or name>&utterance=<id>` from the wake listener.
 enum WakeURL {
-    static func persona(_ url: URL) -> String?? {
+    struct Request: Equatable { var persona: String?; var utterance: String? }
+
+    /// nil for any URL that isn't a wake.
+    static func parse(_ url: URL) -> Request? {
         guard url.scheme == "azel", url.host == "wake" else { return nil }
-        let p = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "persona" }?.value
-        return .some(p.flatMap { $0.isEmpty ? nil : $0 })
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ k: String) -> String? { items.first { $0.name == k }?.value.flatMap { $0.isEmpty ? nil : $0 } }
+        // The id becomes part of a file name: only [A-Za-z0-9_-], at most 64.
+        let u = value("utterance").flatMap { $0.range(of: #"^[A-Za-z0-9_-]{1,64}$"#, options: .regularExpression) != nil ? $0 : nil }
+        return Request(persona: value("persona"), utterance: u)
     }
 }
