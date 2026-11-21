@@ -5,7 +5,10 @@ import Foundation
 @MainActor
 final class HistoryModel: ObservableObject {
     @Published private(set) var pager = HistoryPager()
-    @Published private(set) var loading = false
+    /// Not published: flipping it at the start of a pull-to-refresh re-rendered the list and
+    /// cancelled the refresh.
+    private var loading = false
+    @Published private(set) var status: SectionStatus = .ok
     @Published private(set) var loadedOnce = false
     /// Set when the list on screen is the cache because the server didn't answer.
     @Published private(set) var offlineSince: Date?
@@ -37,23 +40,32 @@ final class HistoryModel: ObservableObject {
     var recent: [HistoryItem] { Array(pager.items.filter { $0.id != pendingDelete?.id }.prefix(3)) }
     var isOffline: Bool { offlineSince != nil }
 
+    /// Keeps what's on screen until the new page arrives; cancellation changes nothing; 404 (an old
+    /// gateway) is a quiet note; other failures fall back to the cache with an offline banner.
     func refresh() async {
         guard Config.token != nil else { return }
         loading = true
-        defer { loading = false; loadedOnce = true }
-        do {
-            let first = try await HistoryAPI.page()
+        defer { loading = false }
+        switch await attempt({ try await HistoryAPI.page() }) {
+        case .success(let first):
             pager.reset(with: first)
             cache.saveList(pager.items)
             offlineSince = nil
             error = nil
-        } catch {
-            self.error = error
-            if let snap = cache.loadList() {
-                pager.reset(with: snap.items, pageSize: 0)
-                offlineSince = snap.fetchedAt
+            status = .ok
+        case .failure(let e):
+            guard let s = SectionStatus.from(e) else { return }
+            status = s
+            if s == .unavailable { offlineSince = nil; error = nil }
+            else {
+                error = e
+                if let snap = cache.loadList() {
+                    pager.reset(with: snap.items, pageSize: 0)
+                    offlineSince = snap.fetchedAt
+                }
             }
         }
+        loadedOnce = true
     }
 
     /// Called when the last section appears.
@@ -61,7 +73,7 @@ final class HistoryModel: ObservableObject {
         guard !loading, !pager.exhausted, !isOffline, results == nil, let before = pager.nextBefore else { return }
         loading = true
         defer { loading = false }
-        if let page = try? await HistoryAPI.page(before: before) {
+        if case .success(let page) = await attempt({ try await HistoryAPI.page(before: before) }) {
             pager.append(page)
             cache.saveList(pager.items)
         }
@@ -77,13 +89,12 @@ final class HistoryModel: ObservableObject {
             guard !Task.isCancelled else { return }
             searching = true
             defer { searching = false }
-            do {
-                let hits = try await HistoryAPI.page(query: q, limit: 50)
-                guard !Task.isCancelled else { return }
-                results = hits
-                offlineSearch = false
-            } catch {
-                guard !Task.isCancelled else { return }
+            let result = await attempt { try await HistoryAPI.page(query: q, limit: 50) }
+            guard !Task.isCancelled else { return }
+            switch result {
+            case .success(let hits): results = hits; offlineSearch = false
+            case .failure(let e):
+                guard SectionStatus.from(e) != nil else { return }
                 results = HistoryCache.filter(pager.items, query: q)
                 offlineSearch = true
             }
@@ -168,14 +179,15 @@ final class HistoryDetailModel: ObservableObject {
     }
 
     func load() async {
-        do {
-            let fresh = try await HistoryAPI.call(item.id)
+        let id = item.id
+        switch await attempt({ try await HistoryAPI.call(id) }) {
+        case .success(let fresh):
             call = fresh
             cache.saveCall(fresh)
             state = .loaded
-        } catch GatewayError.http(404) {
-            state = .deleted
-        } catch {
+        case .failure(let e):
+            guard let s = SectionStatus.from(e) else { return } // cancelled: keep what's shown
+            if s == .unavailable { state = .deleted; return }
             if let cached = cache.loadCall(item.id) { call = cached; state = .offlineCached(cache.loadList()?.fetchedAt) }
             else { state = .unavailable }
         }

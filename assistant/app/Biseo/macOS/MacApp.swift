@@ -174,7 +174,7 @@ struct Popover: View {
 
     private func startBriefing() {
         // Briefing uses its own session prefix, like the iPhone's 오늘 브리핑.
-        call.start(panel: true, session: Session.current("briefing"))
+        call.start(panel: true, session: Session.current("briefing"), intent: "briefing")
     }
 
     private func show() {

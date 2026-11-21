@@ -212,6 +212,7 @@ struct SettingsScreen<Extra: View>: View {
     @State private var loaded: AppSettings?
     @State private var usage: [String: Any] = [:]
     @State private var loadError: Error?
+    @State private var usageStatus: SectionStatus = .ok
     @State private var saveState: SaveState = .idle
     @State private var saveTask: Task<Void, Never>?
     @State private var showSetup = false
@@ -340,6 +341,7 @@ struct SettingsScreen<Extra: View>: View {
                 .accessibilityLabel("이번 달 사용량")
                 .accessibilityValue("\(Int(budget))달러 중 \(Int(cost))달러, \(Int(frac * 100))퍼센트")
             }
+            SectionNote(status: usageStatus) { Task { await load() } }
             breakdown(usage["by_model"])
             if usage["by_path"] is [String: Any] {
                 DisclosureGroup("경로별 보기", isExpanded: $showPaths) { breakdown(usage["by_path"]) }
@@ -613,17 +615,29 @@ struct SettingsScreen<Extra: View>: View {
         return Binding(get: { f.date(from: s.wrappedValue) ?? Date() }, set: { s.wrappedValue = f.string(from: $0) })
     }
 
+    /// Settings, usage and the shared status load in parallel and independently; the old values
+    /// stay on screen until new ones arrive, and a cancelled pull-to-refresh changes nothing.
     private func load() async {
-        do {
+        async let settingsResult = attempt { try await Gateway.get("/v1/settings") as AppSettings }
+        async let usageResult = attempt { try await Gateway.send("GET", "/v1/usage") }
+        async let refreshed: Void = model.refresh()
+        switch await settingsResult {
+        case .success(let raw):
             // Device names migrate to their ids for display; nothing is saved until the user edits.
-            let s = DeviceID.normalize(try await Gateway.get("/v1/settings") as AppSettings)
+            let s = DeviceID.normalize(raw)
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
             loadError = nil
-        } catch { loadError = error }
-        usage = (try? await Gateway.getJSON("/v1/usage") as? [String: Any]) ?? usage
-        await model.refresh()
+        case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }
+        }
+        switch await usageResult {
+        case .success(let data):
+            usage = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? usage
+            usageStatus = .ok
+        case .failure(let e): usageStatus = SectionStatus.from(e) ?? usageStatus
+        }
+        await refreshed
     }
 
     /// Debounced auto-save: 600 ms after the last change (§7.5).
@@ -693,7 +707,8 @@ struct ApprovalsScreen: View {
         ScrollView {
             LazyVStack(spacing: Theme.l) {
                 if let error { Text(error).font(.footnote).foregroundStyle(Theme.danger) }
-                if model.approvals.isEmpty {
+                SectionNote(status: model.approvalsStatus) { Task { await model.refresh() } }
+                if model.approvals.isEmpty && model.approvalsStatus == .ok {
                     EmptyState(title: "모두 처리했어요", message: "승인이 필요하면 알려 드릴게요.")
                 }
                 ForEach(model.approvals.indices, id: \.self) { i in card(model.approvals[i]) }

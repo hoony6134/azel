@@ -57,5 +57,7 @@ final class CallRequestTests: XCTestCase {
         XCTAssertEqual(req.url?.absoluteString, "wss://azel.scian.xyz/v1/call?session=mac-2026-11-21&call_id=c1")
         XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer t0k")
         XCTAssertThrowsError(try CallClient.request(voiceURL: "https://azel.scian.xyz", token: "t", session: "s", callID: nil))
+        let briefing = try CallClient.request(voiceURL: "wss://azel.scian.xyz", token: "t", session: "briefing-2026-11-22", callID: nil, intent: "briefing")
+        XCTAssertEqual(briefing.url?.absoluteString, "wss://azel.scian.xyz/v1/call?session=briefing-2026-11-22&intent=briefing")
     }
 }
