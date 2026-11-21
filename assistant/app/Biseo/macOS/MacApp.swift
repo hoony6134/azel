@@ -114,9 +114,11 @@ struct Popover: View {
             } else {
                 HStack(spacing: Theme.m) {
                     MoonJar(state: call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
-                            levels: call.levels, sway: true).frame(width: 64, height: 64)
+                            levels: call.levels, sway: true, tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon)
+                        .frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: Theme.s) {
-                        Text(MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요").font(.subheadline).foregroundStyle(Theme.text2)
+                        Text((PersonaModel.shared.personas.count > 1 ? "\(PersonaModel.shared.callName) · " : "")
+                             + (MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요")).font(.subheadline).foregroundStyle(Theme.text2)
                         Button { call.inCall ? call.hangUp() : call.start(panel: true) } label: {
                             Label(call.inCall ? "끊기" : "전화", systemImage: call.inCall ? "phone.down.fill" : "phone.fill")
                         }
@@ -124,6 +126,7 @@ struct Popover: View {
                         .foregroundStyle(call.inCall ? Color.white : Theme.onAccent)
                     }
                 }
+                MiniOrbRow(model: PersonaModel.shared, size: 28, showNames: false)
                 Grid(horizontalSpacing: Theme.s) {
                     GridRow {
                         small("오늘 브리핑", "sun.max") { startBriefing() }
@@ -165,7 +168,7 @@ struct Popover: View {
         .padding(Theme.l)
         .frame(width: 340)
         .background(Theme.bgRaised)
-        .task { await model.refresh(); await wake.refresh(); await history.refresh() }
+        .task { await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh() }
     }
 
     private func small(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -174,7 +177,7 @@ struct Popover: View {
 
     private func startBriefing() {
         // Briefing uses its own session prefix, like the iPhone's 오늘 브리핑.
-        call.start(panel: true, session: Session.current("briefing"), intent: "briefing")
+        call.start(panel: true, session: Session.current("briefing"), intent: "briefing", persona: PersonaModel.shared.primary)
     }
 
     private func show() {
@@ -279,7 +282,7 @@ struct MacHome: View {
 
     var body: some View {
         ZStack {
-            if call.inCall { GlazeBackground(state: jarState) } else { Theme.bg.ignoresSafeArea() }
+            if call.inCall { GlazeBackground(state: jarState, tint: call.activePersona?.glaze ?? Theme.glazeCeladon) } else { Theme.bg.ignoresSafeArea() }
             ScrollView {
                 VStack(spacing: Theme.xl) {
                     if !call.inCall {
@@ -288,9 +291,16 @@ struct MacHome: View {
                             Text(Date(), format: .dateTime.month().day().weekday(.wide)).font(.subheadline).foregroundStyle(Theme.text2)
                         }
                     } else {
+                        if let p = call.activePersona {
+                            HStack(spacing: 6) {
+                                Circle().fill(p.tint).frame(width: 8, height: 8)
+                                Text(p.name).font(.headline).foregroundStyle(Theme.text)
+                            }
+                        }
                         Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }
-                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt,
+                            tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
@@ -299,6 +309,9 @@ struct MacHome: View {
                         .animation(Theme.enter, value: call.inCall)
                     if call.inCall {
                         if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                        if UserDefaults.standard.string(forKey: "noiseMode") == "noisy" && jarState == .speaking {
+                            Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
+                        }
                         captions; dock
                     } else { idle }
                     if let e = call.error { Text(e).font(.footnote).foregroundStyle(Theme.danger) }
@@ -318,7 +331,7 @@ struct MacHome: View {
     private var idle: some View {
         VStack(spacing: Theme.l) {
             Button { call.start(panel: false) } label: {
-                Label("\(AssistantName.current)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
+                Label("\(PersonaModel.shared.callName)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
                     .frame(maxWidth: .infinity).frame(height: 52)
                     .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
             }

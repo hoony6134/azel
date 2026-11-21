@@ -27,6 +27,7 @@ struct ScheduleRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: Theme.xs) {
                     Text(KST.dayAndTime(item.at)).font(.body.monospacedDigit()).foregroundStyle(Theme.text)
+                    if PersonaModel.shared.personas.count > 1, let p = PersonaModel.shared.persona(id: item.personaID) { PersonaChip(persona: p) }
                     if item.byVoice {
                         Image(systemName: "mic.fill").font(.caption).foregroundStyle(Theme.text3).accessibilityLabel("음성으로 예약함")
                     }
@@ -74,6 +75,7 @@ struct ScheduleScreen: View {
     @State private var kind = "wake"
     @State private var repeatChoice = "none"      // none | daily | weekdays | weekly
     @State private var weekday = 0                // 0 = Monday
+    @State private var personaID: String? = PersonaModel.shared.selected?.id
     @State private var note = ""
     @State private var saving = false
     @State private var message: String?
@@ -106,6 +108,16 @@ struct ScheduleScreen: View {
                             ForEach(KST.weekdays.indices, id: \.self) { Text(KST.weekdays[$0]).tag($0) }
                         }
                         .pickerStyle(.segmented)
+                    }
+                    if PersonaModel.shared.personas.count > 1 {
+                        HStack {
+                            Text("비서").foregroundStyle(Theme.text)
+                            Spacer()
+                            Picker("", selection: $personaID) {
+                                ForEach(PersonaModel.shared.personas) { Text($0.name).tag(Optional($0.id)) }
+                            }
+                            .pickerStyle(.menu).labelsHidden().tint(Theme.celadon).fixedSize()
+                        }
                     }
                     TextField(kind == "wake" ? "메모 (예: 첫 수업)" : "무엇을 알려 드릴까요?", text: $note).textFieldStyle(.roundedBorder)
                     Text("시각은 한국 시간(KST)이에요.").font(.footnote).foregroundStyle(Theme.text3)
@@ -164,7 +176,8 @@ struct ScheduleScreen: View {
         saving = true
         defer { saving = false }
         do {
-            try await schedule.create(at: at, repeatRule: rule, kind: kind, note: note)
+            try await schedule.create(at: at, repeatRule: rule, kind: kind, note: note,
+                                      persona: PersonaModel.shared.personas.count > 1 ? personaID : nil)
             message = nil
             note = ""
             #if os(iOS)

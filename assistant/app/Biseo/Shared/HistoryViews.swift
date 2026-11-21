@@ -70,7 +70,15 @@ struct HistoryRow: View {
             DirectionGlyph(incoming: item.incoming)
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.title ?? "제목 없음").foregroundStyle(Theme.text).lineLimit(1)
-                Text(HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(selected ? Theme.text2 : Theme.text3)
+                HStack(spacing: 4) {
+                    // §17.7: "● 소담 · 오전 8:02 · 4분 · 6턴"; a removed persona reads "삭제된 비서".
+                    if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id, deleted: item.persona_deleted == true) {
+                        Circle().fill(who.tint).frame(width: 8, height: 8)
+                        Text(who.name + " ·").foregroundStyle(who.name == "삭제된 비서" ? Theme.text3 : Theme.text2)
+                    }
+                    Text(HistoryFormat.meta(item)).foregroundStyle(selected ? Theme.text2 : Theme.text3)
+                }
+                .font(.footnote.monospacedDigit())
                 if let match = item.match { Text(highlight(match)).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
                 if failed {
                     HStack(spacing: Theme.xs) {
@@ -218,6 +226,9 @@ struct HistoryList: View {
     @ViewBuilder private var list: some View {
         let sections = HistoryFormat.byDay(model.items)
         let rows = List(selection: selection) {
+            if PersonaModel.shared.personas.count > 1 {
+                PersonaFilterRow(selected: $model.personaFilter).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            }
             if let since = model.offlineSince {
                 OfflineBanner(since: since) { Task { await model.refresh() } }.listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
@@ -364,6 +375,9 @@ struct HistoryDetailView: View {
             Text(item.title ?? "제목 없음").font(.title3.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(3)
             HStack(spacing: Theme.xs) {
                 DirectionGlyph(incoming: item.incoming).font(.footnote)
+                if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id, deleted: item.persona_deleted == true) {
+                    PersonaChip(name: who.name, tint: who.tint)
+                }
                 Text(HistoryFormat.dayTitle(item.start) + " " + HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text2)
                 ForEach(item.routeList, id: \.self) { RouteChip(route: $0) }
             }
@@ -563,5 +577,37 @@ struct InterruptedMark: View {
     var body: some View {
         Label("끊김", systemImage: "scissors").font(.footnote).foregroundStyle(Theme.text3)
             .accessibilityLabel("말이 끊김")
+    }
+}
+
+/// §17.7 filter: "전체" + one chip per existing persona; single select; accent fill when chosen.
+struct PersonaFilterRow: View {
+    @Binding var selected: String?
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.s) {
+                chip("전체", tint: Theme.celadon, on: selected == nil) { selected = nil }
+                ForEach(PersonaModel.shared.ordered) { p in
+                    chip(p.name, tint: p.tint, dot: p.tint, on: selected == p.id) { selected = p.id }
+                }
+            }
+        }
+        .accessibilityLabel("비서별로 보기")
+    }
+
+    private func chip(_ title: String, tint: Color, dot: Color? = nil, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let dot { Circle().fill(on ? Theme.onAccent : dot).frame(width: 8, height: 8) }
+                Text(title).font(.subheadline.weight(on ? .semibold : .regular))
+            }
+            .foregroundStyle(on ? Theme.onAccent : Theme.text)
+            .padding(.horizontal, Theme.m).frame(minHeight: 32)
+            .background(on ? tint : .clear, in: Capsule())
+            .overlay(Capsule().strokeBorder(on ? .clear : Theme.stroke))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 }

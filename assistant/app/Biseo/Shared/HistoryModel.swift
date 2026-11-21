@@ -14,6 +14,10 @@ final class HistoryModel: ObservableObject {
     @Published private(set) var offlineSince: Date?
     @Published private(set) var error: Error?
     @Published var query = "" { didSet { if query != oldValue { scheduleSearch() } } }
+    /// Persona filter (nil = everyone): `?persona=` on the server, cached rows filtered offline.
+    @Published var personaFilter: String? {
+        didSet { if personaFilter != oldValue { Task { await refresh() } } }
+    }
     @Published private(set) var results: [HistoryItem]?
     @Published private(set) var searching = false
     @Published private(set) var offlineSearch = false
@@ -36,7 +40,9 @@ final class HistoryModel: ObservableObject {
     }
 
     /// What the list shows: search results or pages, minus a row waiting for its DELETE.
-    var items: [HistoryItem] { (results ?? pager.items).filter { $0.id != pendingDelete?.id } }
+    var items: [HistoryItem] {
+        HistoryCache.filter(results ?? pager.items, persona: personaFilter).filter { $0.id != pendingDelete?.id }
+    }
     var recent: [HistoryItem] { Array(pager.items.filter { $0.id != pendingDelete?.id }.prefix(3)) }
     var isOffline: Bool { offlineSince != nil }
 
@@ -46,10 +52,11 @@ final class HistoryModel: ObservableObject {
         guard Config.token != nil else { return }
         loading = true
         defer { loading = false }
-        switch await attempt({ try await HistoryAPI.page() }) {
+        let persona = personaFilter
+        switch await attempt({ try await HistoryAPI.page(persona: persona) }) {
         case .success(let first):
             pager.reset(with: first)
-            cache.saveList(pager.items)
+            if persona == nil { cache.saveList(pager.items) }
             offlineSince = nil
             error = nil
             status = .ok
@@ -73,7 +80,8 @@ final class HistoryModel: ObservableObject {
         guard !loading, !pager.exhausted, !isOffline, results == nil, let before = pager.nextBefore else { return }
         loading = true
         defer { loading = false }
-        if case .success(let page) = await attempt({ try await HistoryAPI.page(before: before) }) {
+        let persona = personaFilter
+        if case .success(let page) = await attempt({ try await HistoryAPI.page(before: before, persona: persona) }) {
             pager.append(page)
             cache.saveList(pager.items)
         }
@@ -89,7 +97,8 @@ final class HistoryModel: ObservableObject {
             guard !Task.isCancelled else { return }
             searching = true
             defer { searching = false }
-            let result = await attempt { try await HistoryAPI.page(query: q, limit: 50) }
+            let persona = personaFilter
+            let result = await attempt { try await HistoryAPI.page(query: q, persona: persona, limit: 50) }
             guard !Task.isCancelled else { return }
             switch result {
             case .success(let hits): results = hits; offlineSearch = false

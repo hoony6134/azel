@@ -35,7 +35,7 @@ struct BiseoApp: App {
             .preferredColorScheme(nil)
             .tint(Theme.celadon)
             .onChange(of: scenePhase, initial: true) {
-                if scenePhase == .active { Task { await model.refresh(); await history.refresh() } }
+                if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
             }
         }
     }

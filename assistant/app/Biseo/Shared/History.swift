@@ -17,13 +17,16 @@ struct HistoryItem: Codable, Identifiable, Equatable {
     var routes: [String: Int]?
     var kinds: [String]?
     var match: String?              // only in search results
+    var persona_id: String?
+    /// The persona was deleted with its history kept: shown as "삭제된 비서".
+    var persona_deleted: Bool?
 
     var start: Date { Date(timeIntervalSince1970: started_at) }
     var incoming: Bool { direction == "incoming" }
     var routeList: [String] { ["qwen", "claude"].filter { (routes?[$0] ?? 0) > 0 } }
 
     enum CodingKeys: String, CodingKey {
-        case id, session, title, last_reply, started_at, duration_s, direction, reason, turns, routes, kinds, match
+        case id, session, title, last_reply, started_at, duration_s, direction, reason, turns, routes, kinds, match, persona_id, persona_deleted
     }
 
     init(id: String, session: String? = nil, title: String? = nil, last_reply: String? = nil, started_at: Double, duration_s: Double? = nil,
@@ -47,6 +50,9 @@ struct HistoryItem: Codable, Identifiable, Equatable {
         routes = try c.decodeIfPresent([String: Int].self, forKey: .routes)
         kinds = try c.decodeIfPresent([String].self, forKey: .kinds)
         match = try c.decodeIfPresent(String.self, forKey: .match)
+        if let s = try? c.decodeIfPresent(String.self, forKey: .persona_id) { persona_id = s }
+        else if let n = try? c.decodeIfPresent(Int.self, forKey: .persona_id) { persona_id = String(n) }
+        persona_deleted = try? c.decodeIfPresent(Bool.self, forKey: .persona_deleted)
     }
 }
 
@@ -120,11 +126,12 @@ private extension KeyedDecodingContainer {
 enum HistoryAPI {
     static let pageSize = 20
 
-    static func page(before: Double? = nil, query: String? = nil, limit: Int = pageSize) async throws -> [HistoryItem] {
+    static func page(before: Double? = nil, query: String? = nil, persona: String? = nil, limit: Int = pageSize) async throws -> [HistoryItem] {
         var c = URLComponents()
         c.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
         if let before { c.queryItems?.append(URLQueryItem(name: "before", value: String(before))) }
         if let query, !query.isEmpty { c.queryItems?.append(URLQueryItem(name: "q", value: query)) }
+        if let persona { c.queryItems?.append(URLQueryItem(name: "persona", value: persona)) }
         return try await Gateway.get("/v1/history" + (c.url?.absoluteString ?? ""))
     }
 
@@ -201,6 +208,12 @@ struct HistoryCache {
 
     private func file(_ id: String) -> URL {
         directory.appendingPathComponent("call-" + id.map { $0.isLetter || $0.isNumber || $0 == "-" ? String($0) : "_" }.joined() + ".json")
+    }
+
+    /// Offline persona filter (nil = everyone).
+    static func filter(_ items: [HistoryItem], persona: String?) -> [HistoryItem] {
+        guard let persona else { return items }
+        return items.filter { $0.persona_id == persona }
     }
 
     /// Offline search: titles only.

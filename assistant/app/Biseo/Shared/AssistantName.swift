@@ -22,10 +22,26 @@ enum AssistantName {
         return ok ? name : nil
     }
 
+    static let personalityLimit = 600
+
+    /// What gets saved for `personality`: trimmed and cut to the limit; "" means the server default.
+    static func personality(_ raw: String) -> String {
+        String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(personalityLimit))
+    }
+
     /// Korean particle after `name`: 이/가, 은/는, 을/를, 과/와, 아/야 by the last syllable's batchim.
     /// Non-Hangul endings count as no batchim (DESIGN §0).
     static func josa(_ name: String, _ withBatchim: String, _ without: String) -> String {
         guard let u = name.unicodeScalars.last, (0xAC00...0xD7A3).contains(u.value) else { return name + without }
         return name + ((u.value - 0xAC00) % 28 != 0 ? withBatchim : without)
+    }
+}
+
+/// `personality_default` from `GET /v1/settings`: read-only, so it stays out of `AppSettings`
+/// (which is PUT back whole).
+enum PersonalityDefault {
+    static func read(_ settingsJSON: Data) -> String? {
+        struct Shape: Decodable { var personality_default: String? }
+        return (try? JSONDecoder().decode(Shape.self, from: settingsJSON))?.personality_default
     }
 }

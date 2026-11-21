@@ -9,6 +9,7 @@ struct HomeView: View {
     @ObservedObject private var call = CallManager.shared
     @State private var toast: String?
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
+    @ObservedObject private var personas = PersonaModel.shared
 
     var body: some View {
         ScrollView {
@@ -19,7 +20,9 @@ struct HomeView: View {
                     Text(Date(), format: .dateTime.month().day().weekday(.wide)).font(.subheadline).foregroundStyle(Theme.text2)
                 }
                 GeometryReader { geo in
-                    MoonJar(state: model.statusError == nil ? .idle : .offline, levels: .silent)
+                    MoonJar(state: model.statusError == nil ? .idle : .offline, levels: .silent,
+                            tint: personas.selected?.glaze ?? Theme.glazeCeladon)
+                        .animation(Theme.state, value: personas.selectedID)
                         .frame(width: geo.size.width, height: geo.size.width)
                         .contentShape(Circle())
                         .onTapGesture { if model.statusError == nil { call.startCall() } }
@@ -28,6 +31,7 @@ struct HomeView: View {
                 }
                 .aspectRatio(1, contentMode: .fit)
                 .padding(.horizontal, 60)
+                MiniOrbRow(model: personas)
                 callButton
                 if let e = call.error, !call.inCall {
                     Label(e, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(Theme.danger)
@@ -59,7 +63,7 @@ struct HomeView: View {
             }
         }
         .navigationDestination(for: HistoryItem.self) { HistoryDetailView(item: $0, history: history) }
-        .refreshable { await model.refresh(); await history.refresh(); await schedule.refresh() }
+        .refreshable { await model.refresh(); await history.refresh(); await schedule.refresh(); await personas.refresh() }
     }
 
     @ViewBuilder private var statusLine: some View {
@@ -84,10 +88,11 @@ struct HomeView: View {
 
     private var callButton: some View {
         Button { call.startCall() } label: {
-            Label("\(name)에게 전화", systemImage: "phone.fill")
+            Label("\(personas.selected?.name ?? name)에게 전화", systemImage: "phone.fill")
                 .font(.headline).foregroundStyle(Theme.onAccent)
                 .frame(maxWidth: .infinity).frame(height: 64)
-                .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
+                .background(personas.personas.count > 1 ? (personas.selected?.tint ?? Theme.celadon) : Theme.celadon,
+                            in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(model.statusError != nil)
@@ -97,7 +102,10 @@ struct HomeView: View {
 
     private var quickActions: some View {
         HStack(spacing: Theme.s) {
-            quick("오늘 브리핑", "sun.max", label: "오늘 브리핑 듣기") { call.startCall(prefix: "briefing") }
+            // §17.3: the briefing always comes from the primary.
+            let briefingTitle = personas.personas.count > 1 && personas.selected?.id != personas.primary?.id
+                ? "\(personas.primary?.name ?? name)의 오늘 브리핑" : "오늘 브리핑"
+            quick(briefingTitle, "sun.max", label: briefingTitle + " 듣기") { call.startCall(prefix: "briefing", persona: personas.primary) }
             quick("새 대화", "square.and.pencil", label: "새 대화 시작") {
                 model.newConversation()
                 withAnimation(Theme.quick) { toast = "새 대화를 시작해요" }

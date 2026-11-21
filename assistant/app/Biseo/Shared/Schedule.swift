@@ -10,6 +10,7 @@ struct ScheduledCall: Codable, Identifiable, Equatable {
     var status: String?             // pending | fired | answered | missed | cancelled
     var attempts: Int?
     var createdBy: String?          // voice | app
+    var personaID: String?
 
     var isWake: Bool { kind == "wake" }
 
@@ -17,7 +18,7 @@ struct ScheduledCall: Codable, Identifiable, Equatable {
     /// Waiting or ringing: what the home card counts as upcoming.
     var isActive: Bool { status == nil || status == "pending" || status == "fired" }
 
-    enum CodingKeys: String, CodingKey { case id, at, repeatRule = "repeat", kind, note, status, attempts, createdBy = "created_by" }
+    enum CodingKeys: String, CodingKey { case id, at, repeatRule = "repeat", kind, note, status, attempts, createdBy = "created_by", personaID = "persona_id" }
 
     init(id: String, at: Date, repeatRule: String? = nil, kind: String, note: String? = nil, status: String? = nil, attempts: Int? = nil,
          createdBy: String? = nil) {
@@ -35,6 +36,8 @@ struct ScheduledCall: Codable, Identifiable, Equatable {
         status = try c.decodeIfPresent(String.self, forKey: .status)
         attempts = try c.decodeIfPresent(Int.self, forKey: .attempts)
         createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy)
+        if let s = try? c.decodeIfPresent(String.self, forKey: .personaID) { personaID = s }
+        else if let n = try? c.decodeIfPresent(Int.self, forKey: .personaID) { personaID = String(n) }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -47,6 +50,7 @@ struct ScheduledCall: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(status, forKey: .status)
         try c.encodeIfPresent(attempts, forKey: .attempts)
         try c.encodeIfPresent(createdBy, forKey: .createdBy)
+        try c.encodeIfPresent(personaID, forKey: .personaID)
     }
 
     /// The contract is ISO-8601 with an offset; epoch seconds are accepted as a fallback.
@@ -142,13 +146,14 @@ enum ScheduleAPI {
     /// `repeatRule` nil = once. Returns the created item (201); a 400 (past, or > 30 days out)
     /// throws `GatewayError.rejected` with the server's message.
     @discardableResult
-    static func create(at: Date, repeatRule: String?, kind: String, note: String) async throws -> ScheduledCall {
+    static func create(at: Date, repeatRule: String?, kind: String, note: String, persona: String? = nil) async throws -> ScheduledCall {
         try JSONDecoder().decode(ScheduledCall.self, from: try await Gateway.send("POST", "/v1/schedule",
-                                                                                   json: body(at: at, repeatRule: repeatRule, kind: kind, note: note)))
+                                                                                   json: body(at: at, repeatRule: repeatRule, kind: kind, note: note, persona: persona)))
     }
 
-    static func body(at: Date, repeatRule: String?, kind: String, note: String) -> [String: Any] {
+    static func body(at: Date, repeatRule: String?, kind: String, note: String, persona: String? = nil) -> [String: Any] {
         var body: [String: Any] = ["at": KST.iso(at), "kind": kind, "repeat": repeatRule ?? NSNull()]
+        if let persona { body["persona_id"] = persona }
         let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { body["note"] = trimmed }
         return body
@@ -190,8 +195,8 @@ final class ScheduleModel: ObservableObject {
         }
     }
 
-    func create(at: Date, repeatRule: String?, kind: String, note: String) async throws {
-        let item = try await ScheduleAPI.create(at: at, repeatRule: repeatRule, kind: kind, note: note)
+    func create(at: Date, repeatRule: String?, kind: String, note: String, persona: String? = nil) async throws {
+        let item = try await ScheduleAPI.create(at: at, repeatRule: repeatRule, kind: kind, note: note, persona: persona)
         active.append(item)
         if !all.isEmpty { all.append(item) }
         await refreshAll()

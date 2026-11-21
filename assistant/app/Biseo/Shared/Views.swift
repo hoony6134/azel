@@ -213,6 +213,8 @@ struct SettingsScreen<Extra: View>: View {
     @State private var usage: [String: Any] = [:]
     @State private var loadError: Error?
     @State private var usageStatus: SectionStatus = .ok
+    /// Server's default personality text (read-only, never sent back), shown as the placeholder.
+    @State private var personalityDefault: String?
     @State private var saveState: SaveState = .idle
     @State private var saveTask: Task<Void, Never>?
     @State private var showSetup = false
@@ -220,9 +222,13 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showPaths = false
     @State private var pendingDays: Int?
     @State private var showProactiveLog = false
+    @ObservedObject private var personas = PersonaModel.shared
+    @State private var showConnectors = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
+    /// Cached so the call screen can show the tap-to-interrupt hint without a fetch.
+    @AppStorage("noiseMode") private var noiseMode = "normal"
 
     enum SaveState: Equatable { case idle, saving, saved, failed(String) }
 
@@ -234,6 +240,27 @@ struct SettingsScreen<Extra: View>: View {
                     EmptyState(title: f.title, message: f.message, detail: loadError.localizedDescription, action: ("다시 시도", { Task { await load() } }))
                 }
                 if let s = Binding($settings) { assistantCard(s) }
+                Card("호출어") { WakeEnrollRow() }
+                Card("커넥터") {
+                    Button { showConnectors = true } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Claude가 쓸 커넥터").foregroundStyle(Theme.text)
+                                Text("적을수록 답이 빨라요").font(.footnote).foregroundStyle(Theme.text3)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(isPresented: $showConnectors) {
+                        NavigationStack { ConnectorsView() }
+                            #if os(macOS)
+                            .frame(width: 560, height: 640)
+                            #endif
+                    }
+                }
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
@@ -275,7 +302,39 @@ struct SettingsScreen<Extra: View>: View {
     }
 
     // 비서 (DESIGN §7.5 card 1)
-    private func assistantCard(_ s: Binding<AppSettings>) -> some View {
+    /// §17.4: with personas, the top card lists them (names and personalities are edited per
+    /// persona); an older gateway without /v1/personas keeps the single name and 성격 fields.
+    @ViewBuilder private func assistantCard(_ s: Binding<AppSettings>) -> some View {
+        if personas.status == .unavailable || personas.personas.isEmpty {
+            legacyAssistantCard(s)
+        } else {
+            PersonaListCard(model: personas)
+        }
+        Card("대화") {
+            row("답변 길이") {
+                Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
+                                                   set: { s.wrappedValue.reply_length = $0 })) {
+                    Text("간결").tag("brief"); Text("보통").tag("normal"); Text("자세히").tag("detailed")
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 220)
+            }
+            Toggle("시끄러운 곳 모드", isOn: Binding(get: { s.wrappedValue.noise_mode == "noisy" },
+                                                 set: { s.wrappedValue.noise_mode = $0 ? "noisy" : "normal"; noiseMode = $0 ? "noisy" : "normal" }))
+                .tint(Theme.celadon).foregroundStyle(Theme.text)
+            if s.wrappedValue.noise_mode == "noisy" {
+                Text("주변 소리에 말이 끊기지 않게 해요. 말을 끊으려면 통화 중에 구를 눌러 주세요.").font(.footnote).foregroundStyle(Theme.text3)
+            }
+        }
+        Card("소리") {
+            HStack {
+                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
+                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
+            }
+            .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
+        }
+    }
+
+    private func legacyAssistantCard(_ s: Binding<AppSettings>) -> some View {
         Card("비서") {
             HStack {
                 Text("이름").foregroundStyle(Theme.text)
@@ -288,19 +347,30 @@ struct SettingsScreen<Extra: View>: View {
                     .accessibilityHint("호출어는 바뀌지 않습니다")
             }
             if let nameError { Text(nameError).font(.footnote).foregroundStyle(Theme.danger) }
-            row("답변 길이") {
-                Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
-                                                   set: { s.wrappedValue.reply_length = $0 })) {
-                    Text("간결").tag("brief"); Text("보통").tag("normal"); Text("자세히").tag("detailed")
+            VStack(alignment: .leading, spacing: Theme.xs) {
+                HStack {
+                    Text("성격").foregroundStyle(Theme.text)
+                    Spacer()
+                    Text("\((s.wrappedValue.personality ?? "").count)/\(AssistantName.personalityLimit)")
+                        .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 220)
+                TextField(personalityDefault ?? "기본 성격", text: Binding(
+                    get: { s.wrappedValue.personality ?? "" },
+                    set: { s.wrappedValue.personality = String($0.prefix(AssistantName.personalityLimit)) }), axis: .vertical)
+                    .lineLimit(3...8)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { s.wrappedValue.personality = AssistantName.personality(s.wrappedValue.personality ?? "") }
+                    .accessibilityLabel("성격")
+                HStack {
+                    Text("\(AssistantName.josa(AssistantName.current, "이", "가")) 말하는 성격이에요. 진지한 일에는 장난치지 않아요.")
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                    Spacer()
+                    Button("기본값으로 되돌리기") { s.wrappedValue.personality = "" }
+                        .font(.footnote).buttonStyle(.borderless).tint(Theme.celadon)
+                        .disabled((s.wrappedValue.personality ?? "").isEmpty)
+                }
             }
             Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
-            HStack {
-                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
-                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
-            }
-                .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
         }
     }
 
@@ -618,16 +688,19 @@ struct SettingsScreen<Extra: View>: View {
     /// Settings, usage and the shared status load in parallel and independently; the old values
     /// stay on screen until new ones arrive, and a cancelled pull-to-refresh changes nothing.
     private func load() async {
-        async let settingsResult = attempt { try await Gateway.get("/v1/settings") as AppSettings }
+        async let settingsResult = attempt { try await Gateway.send("GET", "/v1/settings") }
         async let usageResult = attempt { try await Gateway.send("GET", "/v1/usage") }
         async let refreshed: Void = model.refresh()
         switch await settingsResult {
-        case .success(let raw):
+        case .success(let data):
+            guard let raw = try? JSONDecoder().decode(AppSettings.self, from: data) else { loadError = URLError(.cannotParseResponse); break }
+            personalityDefault = PersonalityDefault.read(data) ?? personalityDefault
             // Device names migrate to their ids for display; nothing is saved until the user edits.
             let s = DeviceID.normalize(raw)
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
+            noiseMode = s.noise_mode ?? "normal"
             loadError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }
         }

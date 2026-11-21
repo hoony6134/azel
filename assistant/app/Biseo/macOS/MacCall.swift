@@ -31,6 +31,8 @@ final class MacCall: ObservableObject {
     private let client = CallClient()
     private var activeSession = Session.current("mac")
     private var activeIntent: String?
+    /// Name and tint of the assistant on this call.
+    @Published private(set) var activePersona: Persona?
     private var panel: NSPanel?
 
     private init() {
@@ -109,9 +111,10 @@ final class MacCall: ObservableObject {
         }
     }
 
-    func start(panel usePanel: Bool, session: String? = nil, intent: String? = nil) {
+    func start(panel usePanel: Bool, session: String? = nil, intent: String? = nil, persona: Persona? = nil) {
         guard !inCall else { return }
         activeIntent = intent
+        activePersona = persona ?? PersonaModel.shared.selected
         activeSession = session ?? Session.current("mac")
         log = CallLog()
         activity = ActivityLog()
@@ -180,7 +183,7 @@ final class MacCall: ObservableObject {
         inCall = true
         applyDevices()
         do {
-            try client.start(session: activeSession, intent: activeIntent)
+            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id)
             connectedAt = Date()
             if pttCall || talking { client.cue(.wake, listening: false) }
         } catch {
@@ -269,7 +272,8 @@ struct CallPanelView: View {
 
     var body: some View {
         HStack(spacing: Theme.m) {
-            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: 68, height: 68)
+            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt,
+                    tint: call.activePersona?.glaze ?? Theme.glazeCeladon).frame(width: 68, height: 68)
                 .contentShape(Circle())
                 .onTapGesture { call.interrupt() }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
@@ -313,7 +317,11 @@ struct CallPanelView: View {
                     }
                     .buttonStyle(.plain).keyboardShortcut(.cancelAction).accessibilityLabel(call.inCall ? "통화 끊기" : "닫기")
                 }
-                if let r = call.log.lastRoute { RouteChip(route: r) }
+                HStack(spacing: Theme.xs) {
+                    // §17.8: the persona's name before the route chip.
+                    if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
+                    if let r = call.log.lastRoute { RouteChip(route: r) }
+                }
             }
         }
         .padding(.horizontal, Theme.l)

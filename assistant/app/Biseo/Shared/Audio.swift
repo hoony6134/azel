@@ -148,7 +148,10 @@ final class AudioIO {
         if let id = inputDevice { try? input.auAudioUnit.setDeviceID(id) }
         if let id = outputDevice { try? engine.outputNode.auAudioUnit.setDeviceID(id) }
         #endif
-        try? input.setVoiceProcessingEnabled(true) // echo cancellation on top of .voiceChat
+        // Voice processing = echo cancellation + noise suppression; AGC explicitly on, never bypassed.
+        try? input.setVoiceProcessingEnabled(true)
+        input.isVoiceProcessingBypassed = false
+        input.isVoiceProcessingAGCEnabled = true
         let format = input.outputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0,
               let mono = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),
@@ -156,7 +159,7 @@ final class AudioIO {
             Log.call.error("mic format unusable: \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz")
             throw AVError(.unknown)
         }
-        Log.call.info("mic \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz, voice processing \(input.isVoiceProcessingEnabled, privacy: .public)")
+        Log.call.info("mic \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz, voice processing \(input.isVoiceProcessingEnabled, privacy: .public), agc \(input.isVoiceProcessingAGCEnabled, privacy: .public)")
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.levels.update(mic: buffer)
             if let one = PCM.firstChannel(buffer), let data = PCM.pcm16Data(from: one, converter: converter) { self?.onMic?(data) }

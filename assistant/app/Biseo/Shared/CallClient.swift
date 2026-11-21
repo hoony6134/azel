@@ -48,8 +48,12 @@ final class CallClient {
     var muted = false
     /// Hold: no mic goes up, playback pauses, the recording pauses. The socket stays open.
     var held = false {
-        didSet { if held != oldValue { held ? audio.pause() : audio.resume() } }
+        didSet { if held != oldValue { playback.held = held; applyGate() } }
     }
+    /// Playback runs only when neither the user (hold) nor the server (pause) stopped it.
+    private var playback = PlaybackGate()
+
+    private func applyGate() { playback.playing ? audio.resume() : audio.pause() }
     var isConnected: Bool { socket != nil }
     /// Mac push-to-talk: false between key presses, so nothing goes up (the socket stays open).
     var sending = true
@@ -73,11 +77,13 @@ final class CallClient {
 
     /// The token goes in the Authorization header, never the query: query strings end up in proxy logs.
     /// `intent`: e.g. "briefing" for 오늘 브리핑 / the Siri briefing, so the server opens with it.
-    static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil) throws -> URLRequest {
+    static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil,
+                        persona: String? = nil) throws -> URLRequest {
         guard var url = URLComponents(string: voiceURL + "/v1/call") else { throw StartError.notConfigured }
         url.queryItems = [URLQueryItem(name: "session", value: session)]
         if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
         if let intent { url.queryItems?.append(URLQueryItem(name: "intent", value: intent)) }
+        if let persona { url.queryItems?.append(URLQueryItem(name: "persona", value: persona)) }
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -85,10 +91,10 @@ final class CallClient {
     }
 
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
-    func start(session: String, callID: String? = nil, intent: String? = nil) throws {
+    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
-                                                                         session: session, callID: callID, intent: intent))
+                                                                         session: session, callID: callID, intent: intent, persona: persona))
         socket = task
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; statsLock.unlock()
@@ -134,10 +140,17 @@ final class CallClient {
                 guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { break }
                 if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
                 if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
-                if event.type == "interrupt" {
+                // Event order matters for audio, so these run here, before the UI hop.
+                switch event.type {
+                case "interrupt":
                     audio.flush()
-                    if held { audio.pause() }
+                    playback.apply(event.type)
+                    if !playback.playing { audio.pause() }
                     recorder?.interrupt()
+                case "pause", "resume":
+                    playback.apply(event.type)   // tentative barge-in: stop playback, keep the queue
+                    applyGate()
+                default: break
                 }
                 recorder?.note(event)
                 DispatchQueue.main.async { self.onEvent?(event) }
@@ -181,7 +194,8 @@ final class CallClient {
     func interrupt() {
         socket?.send(.string(#"{"type":"interrupt"}"#)) { _ in }
         audio.flush()
-        if held { audio.pause() }
+        playback.apply("interrupt")
+        if !playback.playing { audio.pause() }
         recorder?.interrupt()
     }
 
@@ -220,9 +234,27 @@ final class CallClient {
         audio.stop()
         muted = false
         held = false
+        playback = PlaybackGate()
         sending = true
     }
 
     /// iOS `didDeactivate`: the system took the audio session away.
     func stopAudio() { audio.stop() }
+}
+
+/// Who may stop playback: the user (hold) and the server (`pause` on a tentative barge-in).
+/// `pause` keeps the queued audio; `resume` continues it; `interrupt` drops it and clears pause.
+struct PlaybackGate: Equatable {
+    var held = false
+    private(set) var serverPaused = false
+
+    var playing: Bool { !held && !serverPaused }
+
+    mutating func apply(_ eventType: String) {
+        switch eventType {
+        case "pause": serverPaused = true
+        case "resume", "interrupt": serverPaused = false
+        default: break
+        }
+    }
 }

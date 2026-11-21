@@ -61,3 +61,21 @@ final class SetupTests: XCTestCase {
         XCTAssertNil(CallClient.closeMessage(status: nil, receivedAny: true), "a normal remote hang-up stays quiet")
     }
 }
+
+final class PersonalityTests: XCTestCase {
+    func testPersonalityIsOptionalTrimmedAndCapped() throws {
+        let base = #"{"default_model":"auto","claude_path":"auto","task_defaults":{},"monthly_budget_usd":500,"budget_warn_pct":80,"default_device":"macbook","device_fallback":[],"proactive":{"morning_briefing":"08:00"}"#
+        XCTAssertNil(try JSONDecoder().decode(AppSettings.self, from: Data((base + "}").utf8)).personality)
+        var s = try JSONDecoder().decode(AppSettings.self, from: Data((base + #","personality":"차분하고 다정하게"}"#).utf8))
+        XCTAssertEqual(s.personality, "차분하고 다정하게")
+        s.personality = ""                                   // 기본값으로 되돌리기
+        XCTAssertTrue(String(decoding: try JSONEncoder().encode(s), as: UTF8.self).contains(#""personality":"""#))
+        XCTAssertEqual(AssistantName.personality("  밝게\n"), "밝게")
+        let withDefault = Data((base + #","personality":"","personality_default":"차분하고 짧게 말해요"}"#).utf8)
+        XCTAssertEqual(PersonalityDefault.read(withDefault), "차분하고 짧게 말해요")
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: withDefault)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self).contains("personality_default"),
+                       "the read-only default is never PUT back")
+        XCTAssertEqual(AssistantName.personality(String(repeating: "가", count: 700)).count, 600)
+    }
+}
