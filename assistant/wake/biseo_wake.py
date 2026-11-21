@@ -62,6 +62,7 @@ DEFAULTS = {
     "in_call_stale_s": 7200,  # an in-call file older than this is a leftover
     "app_check_s": 2,  # how often the app-running check runs
     "utterance": True,  # one-breath commands: capture what follows the wake word and hand it to the app
+    "mic_live_path": "~/Library/Application Support/Azel/mic-live",  # the app is capturing: the listener's capture ends
     "utterance_dir": "~/Library/Application Support/Azel",  # wake-utterance-<id>.pcm goes here
     "utterance_wait_s": 2,  # give up this long after the wake word if nobody speaks
     "utterance_max_s": 10,
@@ -182,6 +183,7 @@ class Listener:
             url = f"azel://wake?persona={quote(persona)}" + (f"&utterance={uid}" if uid else "")
             opened = self.open_url(url)
             if uid:
+                self.begin_utterance(uid)  # the .part file tells the app a capture is under way
                 pcm = self.capture_utterance(frames, ring)  # always written, empty when nobody spoke: the app waits for it
                 entry["utterance"], entry["utterance_s"] = uid, round(len(pcm) / SR, 2)
                 self.write_utterance(uid, pcm)
@@ -218,7 +220,7 @@ class Listener:
         pre, speech, silent = list(ring[-keep:]), [], 0
         self.vad.reset()
         for n, frame in enumerate(frames, 1):
-            if self.in_call():
+            if Path(c["mic_live_path"]).expanduser().exists():  # the app hears the rest itself
                 break
             voiced = any(self.vad(frame[i:i + VAD_CHUNK].tobytes()) >= c["vad_threshold"]
                          for i in range(0, FRAME, VAD_CHUNK))
@@ -235,9 +237,18 @@ class Listener:
                 break
         return np.concatenate(speech) if speech else np.zeros(0, dtype=np.int16)
 
-    def write_utterance(self, uid, pcm) -> Path:
-        """wake-utterance-<uid>.pcm (16 kHz mono int16 LE, 0600), renamed into place so an existing file is complete."""
+    def utterance_paths(self, uid):
         d = Path(self.cfg["utterance_dir"]).expanduser()
+        return d, d / f"wake-utterance-{uid}.pcm.part", d / f"wake-utterance-{uid}.pcm"
+
+    def begin_utterance(self, uid):
+        d, part, _ = self.utterance_paths(uid)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.close(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+
+    def write_utterance(self, uid, pcm) -> Path:
+        """wake-utterance-<uid>.pcm (16 kHz mono int16 LE, 0600), renamed from .pcm.part so an existing .pcm is complete."""
+        d, tmp, final = self.utterance_paths(uid)
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
         for old in d.glob("wake-utterance-*"):  # the app deletes what it read; this is for a crashed app
             try:
@@ -245,7 +256,6 @@ class Listener:
                     old.unlink()
             except OSError:
                 pass
-        final, tmp = d / f"wake-utterance-{uid}.pcm", d / f".wake-utterance-{uid}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(pcm.astype("<i2").tobytes())

@@ -37,10 +37,11 @@ in_call_path = "~/Library/Application Support/Azel/in-call"
 gateway = "http://100.64.0.8:8892"  # where the primary persona id comes from (falls back to "azel")
 
 # One-breath commands ("아젤, 내일 날씨 알려줘"): right after the wake word the listener opens the app with
-# azel://wake?persona=..&utterance=<id>, keeps capturing (until the app's mic is live = the in-call file appears,
+# azel://wake?persona=..&utterance=<id>, keeps capturing (until the app's mic-live file appears,
 # end of speech, or the cap) and writes it to wake-utterance-<id>.pcm (16 kHz mono int16, 0600; empty = nobody spoke)
 # for the app to send as the first turn. No "네?" ack then. utterance = false: ack + plain azel://wake.
 utterance = true
+mic_live_path = "~/Library/Application Support/Azel/mic-live"
 utterance_dir = "~/Library/Application Support/Azel"
 utterance_wait_s = 2
 utterance_max_s = 10

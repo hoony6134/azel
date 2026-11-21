@@ -65,7 +65,7 @@ def make(tmp_path, handler=None, wall=None, open_url=None, **cfg):
                         headers={"Authorization": "Bearer t"})
     c = bw.DEFAULTS | {"log_path": str(tmp_path / "wake.jsonl"), "handoff": "headless",
                        "in_call_path": str(tmp_path / "in-call"), "enrolling_path": str(tmp_path / "enrolling"),
-                       "utterance_dir": str(tmp_path / "azel")} | cfg
+                       "utterance_dir": str(tmp_path / "azel"), "mic_live_path": str(tmp_path / "mic-live")} | cfg
     extra = {k: v for k, v in {"wall": wall, "open_url": open_url}.items() if v}
     lis = Listener(c, FakeOww(), FakeVad(), http, play, ack=(np.zeros(8000, np.int16), 16000),
                    flush=lambda: flushed.append(1), clock=clock, **extra)
@@ -401,7 +401,7 @@ def test_capture_ends_when_the_app_mic_is_live(tmp_path):
 
     def stream():
         yield from frames(clock, [(WAKE, 1), (SPEECH, 3)])
-        (tmp_path / "in-call").write_text("")  # the app's mic is live: it hears the rest itself
+        (tmp_path / "mic-live").write_text("")  # the app's mic is live: it hears the rest itself
         yield from frames(clock, [(SPEECH, 5), (SIL, 40)])
 
     lis.run(stream())
@@ -441,3 +441,17 @@ def test_utterance_off_keeps_the_ack_and_the_plain_url(tmp_path):
     lis, clock, played, *_ = make(tmp_path, handoff="app", utterance=False, open_url=lambda u: opened.append(u) or True)
     lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
     assert played == [16000] and opened == ["azel://wake?persona=azel"] and not (tmp_path / "azel").exists()
+
+
+def test_part_file_exists_while_capturing_and_is_renamed_when_done(tmp_path):
+    seen = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: True)
+
+    def stream():
+        yield from frames(clock, [(WAKE, 1), (SPEECH, 2)])
+        seen.append(sorted(p.name[-9:] for p in (tmp_path / "azel").iterdir()))
+        yield from frames(clock, [(SIL, 40)])
+
+    lis.run(stream())
+    assert seen == [[".pcm.part"]]
+    assert [p.suffix for p in (tmp_path / "azel").iterdir()] == [".pcm"]
