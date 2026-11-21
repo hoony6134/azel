@@ -552,10 +552,32 @@ async def take_lease(name, ttl_s, priority=100, holder=None):
                              {"holder": holder or INSTANCE, "ttl_s": ttl_s, "priority": priority}))["held"]
 
 
+EXTERNAL_TOKEN_PATH = HOME / "mcp_external_token"  # the user's own Claude Code: /v1/mcp's external scope only
+EXTERNAL_PER_HOUR = 60
+_external_calls: list[float] = []
+
+
+def external_token():
+    """Read on every request, so deleting or rotating the file revokes at once. Ignored unless chmod 600."""
+    try:
+        if EXTERNAL_TOKEN_PATH.stat().st_mode & 0o077:
+            return ""
+        return EXTERNAL_TOKEN_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
 def auth(request: Request):
     got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(got.encode(), TOKEN.encode()):
-        raise HTTPException(401, "bad token")
+    if hmac.compare_digest(got.encode(), TOKEN.encode()):
+        request.state.scope = "full"
+        return
+    ext = external_token()
+    if ext and len(ext) >= 32 and hmac.compare_digest(got.encode(), ext.encode()) \
+            and request.method == "POST" and request.url.path == "/v1/mcp":
+        request.state.scope = "external"
+        return
+    raise HTTPException(401, "bad token")
 
 
 # ---------- Claude ----------
@@ -3143,7 +3165,17 @@ async def mcp_server(request: Request):
     full_only()
     tailnet_only(request)
     msg = await request.json()
-    out = await tools_bridge.mcp_handle(bridge, msg if isinstance(msg, dict) else {}, current_persona.get())
+    msg = msg if isinstance(msg, dict) else {}
+    scope = getattr(request.state, "scope", "full")
+    if scope == "external" and msg.get("method") == "tools/call":
+        now = time.time()
+        _external_calls[:] = [t for t in _external_calls if now - t < 3600]
+        if len(_external_calls) >= EXTERNAL_PER_HOUR:
+            return JSONResponse({"jsonrpc": "2.0", "id": msg.get("id"),
+                                 "error": {"code": -32000, "message": "한 시간에 60번까지만 쓸 수 있어요."}})
+        _external_calls.append(now)
+        print("external mcp:", str((msg.get("params") or {}).get("name"))[:40], flush=True)  # the name only
+    out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope)
     return Response(status_code=202) if out is None else JSONResponse(out)
 
 

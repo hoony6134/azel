@@ -119,3 +119,34 @@ def test_limited_gateway_serves_no_tools(tmp_path, monkeypatch):
         assert c.post("/v1/tools/call", json={"name": "call_user", "args": {"reason": "x"}}).status_code == 403
         assert c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 403
     assert g.google_status() == "none" and g.bridge.d["google"]() == ([], None)
+
+
+def test_external_token_sees_only_its_scope_on_mcp(tgw):  # noqa: F811
+    g, _, notes = tgw
+    ext = "e" * 40
+    path = g.HOME / "mcp_external_token"
+    path.write_text(ext + "\n")
+    path.chmod(0o600)
+    full = tailnet(g)
+    outside = TestClient(g.app, headers={"Authorization": f"Bearer {ext}"}, client=("100.64.0.8", 5))
+
+    def names(c):
+        r = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        return [t["name"] for t in r.json()["result"]["tools"]]
+    assert "approval_status" in names(full) and "approval_status" not in names(outside)
+    assert set(names(outside)) == g.tools_bridge.SCOPES["external"]
+    r = outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                      "params": {"name": "approval_status", "arguments": {}}})
+    assert r.json()["error"] == {"code": -32602, "message": "unknown tool"}  # same as a tool that doesn't exist
+    for method, route in (("GET", "/v1/settings"), ("GET", "/v1/tools"), ("GET", "/v1/schedule"),
+                          ("POST", "/v1/tools/call"), ("POST", "/v1/ask"), ("GET", "/v1/mcp")):
+        assert outside.request(method, route, json={}).status_code in (401, 405), route  # only POST /v1/mcp
+    ok = outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                       "params": {"name": "create_task", "arguments": {"goal": "x", "notify": "none"}}})
+    assert ok.json()["result"]["isError"] is False
+    path.chmod(0o644)  # readable by others: not a token any more
+    assert outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "ping"}).status_code == 401
+    path.chmod(0o600)
+    path.unlink()  # revoked
+    assert outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 5, "method": "ping"}).status_code == 401
+    assert full.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 6, "method": "ping"}).status_code == 200
