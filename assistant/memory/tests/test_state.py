@@ -35,8 +35,11 @@ def test_devices_and_push_tokens(client):
     assert d["writer"] == "full"
     assert client.put("/v1/state/devices/x", json={"name": "", "url": "u"}).status_code == 422
     client.put("/v1/state/push_tokens/abc", json={"bundle_id": "xyz.scian.biseo", "env": "production"})
+    client.put("/v1/state/push_tokens/al1", json={"bundle_id": "xyz.scian.biseo", "kind": "alert"})
     assert client.get("/v1/state/push_tokens").json() == [
-        {"token": "abc", "bundle_id": "xyz.scian.biseo", "env": "production"}]
+        {"token": "abc", "bundle_id": "xyz.scian.biseo", "env": "production", "kind": "voip"},
+        {"token": "al1", "bundle_id": "xyz.scian.biseo", "env": "sandbox", "kind": "alert"}]
+    assert client.put("/v1/state/push_tokens/x", json={"bundle_id": "b", "kind": "sms"}).status_code == 422
 
 
 def test_calls(client):
@@ -77,6 +80,12 @@ def test_leases(client):
     time.sleep(0.05)  # expired: anyone may take it
     assert client.post("/v1/state/leases/job", json={"holder": "gienah", "ttl_s": 60}).json()["held"]
     assert client.post("/v1/state/leases/job", json={"holder": "x", "ttl_s": 0}).status_code == 422
+    # priority: a preferred gateway (deneb) takes an unexpired lease from a worse one (mac), never the reverse
+    assert client.post("/v1/state/leases/sched", json={"holder": "mac", "ttl_s": 60, "priority": 10}).json()["held"]
+    assert not client.post("/v1/state/leases/sched", json={"holder": "gienah", "ttl_s": 60, "priority": 20}).json()["held"]
+    took = client.post("/v1/state/leases/sched", json={"holder": "deneb", "ttl_s": 60, "priority": 1}).json()
+    assert took["held"] and took["priority"] == 1
+    assert not client.post("/v1/state/leases/sched", json={"holder": "mac", "ttl_s": 60, "priority": 10}).json()["held"]
 
 
 LIMITED_ONLY = [("put", "/v1/state/settings"), ("get", "/v1/state/push_tokens"), ("get", "/v1/state/approvals"),
@@ -207,6 +216,28 @@ def test_state_schema_upgrades_an_older_table(client):
                                            (m.STATE,))}
     assert {"writer", "import_key"} <= cols
     m.db(m.STATE_SCHEMA)  # and again: idempotent
+
+
+def test_scheduled_calls(client):
+    at = time.time() + 3600
+    a = client.post("/v1/state/schedule", json={"at": at, "repeat": "weekly:mon", "kind": "wake",
+                                                "created_by": "voice"}).json()
+    b = client.post("/v1/state/schedule", json={"at": at - 600, "kind": "reminder", "note": "약 먹기"}).json()
+    assert a["status"] == "pending" and a["attempts"] == 0 and abs(a["at"] - at) < 1
+    assert [r["id"] for r in client.get("/v1/state/schedule").json()] == [b["id"], a["id"]]  # soonest first
+    for bad in [{"at": at, "repeat": "hourly"}, {"at": at, "kind": "nap"}, {"at": at, "note": "x" * 201}]:
+        assert client.post("/v1/state/schedule", json=bad).status_code == 422
+    f = client.post(f"/v1/state/schedule/{a['id']}", json={"status": "fired", "attempts": 1, "call_id": "c9",
+                                                           "last_attempt": time.time(), "expect_status": "pending"})
+    assert f.json()["status"] == "fired" and f.json()["call_id"] == "c9"
+    again = client.post(f"/v1/state/schedule/{a['id']}", json={"status": "fired", "expect_status": "pending"})
+    assert again.status_code == 409  # compare-and-set: a second firing gateway loses
+    assert client.post("/v1/state/schedule/nope", json={"status": "fired"}).status_code == 404
+    assert client.post(f"/v1/state/schedule/{a['id']}", json={}).status_code == 400
+    assert client.delete(f"/v1/state/schedule/{b['id']}").json()["status"] == "cancelled"
+    assert client.delete(f"/v1/state/schedule/{b['id']}").status_code == 404
+    assert [r["id"] for r in client.get("/v1/state/schedule?status=cancelled").json()] == [b["id"]]
+    assert limited_client("100.64.0.8", "l1m").get("/v1/state/schedule").status_code == 403
 
 
 def test_bad_tokens(client):

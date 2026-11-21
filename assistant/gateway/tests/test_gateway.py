@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -452,6 +452,156 @@ def test_history_days_setting_and_retention(gw, monkeypatch):
     assert g.fake.pruned is None
 
 
+# ---------- scheduled calls ----------
+def kst(*a):
+    return datetime(*a, tzinfo=timezone(timedelta(hours=9)))
+
+
+def test_schedule_api_validates_and_confirms(gw):
+    g, c, _ = gw
+    now = time.time()
+    tomorrow10 = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+    r = c.post("/v1/schedule", json={"at": tomorrow10.isoformat(), "kind": "wake"}).json()
+    assert r["say"] == "내일 오전 10시에 깨워 드릴게요." and r["status"] == "pending"
+    for bad in [{"at": now - 60}, {"at": now + 31 * 86400}, {"at": "2026-12-01T10:00:00"},  # no time zone
+                {"at": now + 3600, "repeat": "hourly"}, {"at": now + 3600, "kind": "nap"},
+                {"at": now + 3600, "note": "x" * 201}, {"at": "내일"}]:
+        assert c.post("/v1/schedule", json=bad).status_code == 400, bad
+    [item] = c.get("/v1/schedule").json()
+    assert item["at_iso"] == tomorrow10.isoformat()
+    assert c.get("/v1/schedule?status=bogus").status_code == 400
+    assert c.delete(f"/v1/schedule/{item['id']}").json()["say"] == "내일 오전 10시 예약을 취소했어요."
+    assert c.delete(f"/v1/schedule/{item['id']}").status_code == 404 and c.get("/v1/schedule").json() == []
+
+
+def test_spoken_times(gw):
+    g, _, _ = gw
+    now = kst(2026, 11, 21, 22, 0).timestamp()
+    for at, repeat, want in [
+        (kst(2026, 11, 22, 10, 0), None, "내일 오전 10시"), (kst(2026, 11, 22, 7, 30), None, "내일 오전 7시 30분"),
+        (kst(2026, 11, 21, 22, 30), None, "오늘 오후 10시 30분"), (kst(2026, 11, 23, 15, 0), None, "모레 오후 3시"),
+        (kst(2026, 11, 30, 9, 0), None, "11월 30일 오전 9시"), (kst(2026, 11, 22, 7, 0), "daily", "매일 오전 7시"),
+        (kst(2026, 11, 23, 6, 40), "weekdays", "평일 오전 6시 40분"), (kst(2026, 11, 23, 9, 0), "weekly:mon", "매주 월요일 오전 9시"),
+        (kst(2026, 11, 22, 0, 5), None, "내일 오전 12시 5분")]:
+        assert g.spoken_when(at.timestamp(), repeat, now) == want, want
+    fri7 = kst(2026, 11, 27, 7, 0).timestamp()  # a Friday
+    assert g.next_at(fri7, "weekdays", fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
+    assert g.next_at(fri7, "daily", fri7) == kst(2026, 11, 28, 7, 0).timestamp()
+    assert g.next_at(fri7, "weekly:fri", fri7) == kst(2026, 12, 4, 7, 0).timestamp()
+    assert g.next_at(fri7, "daily", fri7 + 3 * 86400) == kst(2026, 12, 1, 7, 0).timestamp()  # skips missed days
+
+
+def test_schedule_over_the_link(gw):
+    g, c, _ = gw
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+    g.link_send = capture
+    at = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=7, minute=30, second=0, microsecond=0)
+    for m in [{"type": "schedule", "id": "r1", "action": "create", "at": at.isoformat(), "kind": "wake",
+               "repeat": None, "note": ""},
+              {"type": "schedule", "id": "r2", "action": "list"},
+              {"type": "schedule", "id": "r3", "action": "cancel"},
+              {"type": "schedule", "id": "r4", "action": "cancel"},
+              {"type": "schedule", "id": "r5", "action": "create", "at": time.time() - 10}]:
+        asyncio.run(g.serve_schedule(m))
+    by = {m["id"]: m for m in sent}
+    assert by["r1"]["say"] == "내일 오전 7시 30분에 깨워 드릴게요." and by["r1"]["ok"]
+    assert by["r2"]["say"] == "예약된 전화는 내일 오전 7시 30분 기상이에요."
+    assert by["r3"]["say"] == "내일 오전 7시 30분 예약을 취소했어요."
+    assert by["r4"]["say"] == "취소할 예약이 없어요."
+    assert not by["r5"]["ok"] and by["r5"]["say"] == "그 시간으로는 예약할 수 없어요."
+    assert all(m["type"] == "schedule_result" for m in sent)
+
+
+def fire_setup(g, monkeypatch, **item):
+    placed, alerts = [], []
+
+    async def fake_place(reason, opening=None):
+        placed.append((reason, opening))
+        return {"call_id": f"call{len(placed)}"}
+
+    async def fake_alert(title, body):
+        alerts.append(body)
+        return {"sent": 1}
+    monkeypatch.setattr(g, "place_call", fake_place)
+    monkeypatch.setattr(g, "send_alert_push", fake_alert)
+    at = kst(2026, 11, 22, 7, 0).timestamp()
+    g.fake.db["schedule"]["s1"] = {"id": "s1", "at": at, "repeat": None, "kind": "wake", "note": "", "created_by": "",
+                                   "status": "pending", "attempts": 0, "call_id": None, "last_attempt": None, **item}
+    return at, placed, alerts
+
+
+def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
+    g, _, _ = gw
+    g.in_quiet_hours = lambda s, now=None: True  # a wake call the user asked for ignores quiet hours
+    at, placed, alerts = fire_setup(g, monkeypatch)
+    item = g.fake.db["schedule"]["s1"]
+    asyncio.run(g.fire_scheduled(at - 60))
+    assert placed == []  # not yet
+    for dt, n in [(0, 1), (60, 1), (120, 2), (180, 2), (240, 3), (290, 3)]:
+        asyncio.run(g.fire_scheduled(at + dt))
+        assert len(placed) == n and item["attempts"] == n, (dt, n)
+    assert placed[0] == ("wake", "일어나실 시간이에요.") and item["call_id"] == "call3" and item["status"] == "fired"
+    asyncio.run(g.fire_scheduled(at + 300))  # 60 s after the third attempt
+    assert item["status"] == "missed" and len(placed) == 3
+    assert alerts == ["오늘 오전 7시 기상 전화를 받지 않으셨어요."]
+
+
+def test_answered_call_stops_retries_and_repeat_reschedules(gw, monkeypatch):
+    g, _, _ = gw
+    at, placed, _ = fire_setup(g, monkeypatch, repeat="daily", kind="reminder", note="약 드실 시간이에요.")
+    item = g.fake.db["schedule"]["s1"]
+    asyncio.run(g.fire_scheduled(at))
+    assert placed == [("reminder", "말씀하신 시간이에요. 약 드실 시간이에요.")]
+    asyncio.run(g.handle_link(LinkWS([{"type": "call_answered", "call_id": "call1"}])))
+    assert item["status"] == "pending" and item["attempts"] == 0 and item["at"] > at  # tomorrow, same time
+    assert datetime.fromtimestamp(item["at"], g.KST).strftime("%H:%M") == "07:00"
+    asyncio.run(g.fire_scheduled(at + 600))
+    assert len(placed) == 1  # answered: no retry
+
+
+def test_cancelled_call_never_fires(gw, monkeypatch):
+    g, c, _ = gw
+    at, placed, _ = fire_setup(g, monkeypatch)
+    c.delete("/v1/schedule/s1")
+    asyncio.run(g.fire_scheduled(at + 10))
+    assert placed == []
+
+
+def test_only_the_preferred_gateway_fires(gw, monkeypatch):
+    g, _, _ = gw
+    at, placed, _ = fire_setup(g, monkeypatch)
+    monkeypatch.setattr(g, "SCHED_PRIORITY", 1)
+    monkeypatch.setattr(g, "INSTANCE", "deneb-a")
+    asyncio.run(g.scheduler_tick(datetime.fromtimestamp(at - 120, g.KST), {}))  # deneb holds the lease
+    monkeypatch.setattr(g, "SCHED_PRIORITY", 10)
+    monkeypatch.setattr(g, "INSTANCE", "macbook-b")
+    asyncio.run(g.scheduler_tick(datetime.fromtimestamp(at + 5, g.KST), {}))
+    assert placed == []  # the Mac does not fire while deneb is alive
+    g.fake.db["leases"]["scheduler"]["expires"] = 0  # deneb went away
+    asyncio.run(g.scheduler_tick(datetime.fromtimestamp(at + 65, g.KST), {}))
+    assert len(placed) == 1
+
+
+def test_gateway_without_claude(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_NO_CLAUDE="1")
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        ev = events(c.post("/v1/ask", json={"text": "안녕"}))
+        assert ev == [{"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}]
+    ran = []
+
+    async def fake_place(reason, opening=None):
+        ran.append(reason)
+        return {"call_id": "x"}
+    monkeypatch.setattr(g, "place_call", fake_place)
+    g.in_quiet_hours = lambda s, now=None: False
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 21, 8, 0, tzinfo=g.KST), {}))
+    assert ran == []  # no briefing without Claude
+
+
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
     g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}
@@ -540,7 +690,8 @@ def test_tokens_per_mode(tmp_path, monkeypatch):
 def test_limited_has_no_call_history(limited):
     g, c, _ = limited
     for method, path in [("get", "/v1/history"), ("get", "/v1/history/L1"), ("delete", "/v1/history/L1"),
-                         ("delete", "/v1/history?older_than_days=30")]:
+                         ("delete", "/v1/history?older_than_days=30"), ("get", "/v1/schedule"),
+                         ("delete", "/v1/schedule/s1")]:
         assert getattr(c, method)(path).status_code == 403, path
     asyncio.run(g.handle_link(LinkWS(CALL_LOG)))
     assert g.fake.db["history"] == {} and g.history_outbox.items == []  # never stored, never queued

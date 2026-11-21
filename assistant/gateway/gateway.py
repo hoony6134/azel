@@ -39,6 +39,10 @@ MODE = os.environ.get("BISEO_MODE", "full")
 DEVICE = os.environ.get("BISEO_DEVICE", "macbook")  # ASCII slug, unique per gateway
 PRIORITY = int(os.environ.get("BISEO_PRIORITY", "10"))  # lower = preferred by the voice server
 INSTANCE = f"{DEVICE}-{uuid.uuid4().hex[:6]}"  # lease holder: a restarted process is a new holder
+# A gateway without a Claude login or API key (e.g. an always-on deneb that only fires scheduled calls).
+CLAUDE_OK = os.environ.get("BISEO_NO_CLAUDE", "") not in ("1", "true", "yes")
+# Scheduled calls fire on one gateway: the scheduler lease goes to the lowest value among live gateways.
+SCHED_PRIORITY = int(os.environ.get("BISEO_SCHEDULER_PRIORITY", os.environ.get("BISEO_PRIORITY", "10")))
 STATE_URL = os.environ.get("BISEO_STATE_URL", "http://100.64.0.10:8894")
 VOICE_URL = os.environ.get("BISEO_VOICE_URL", "http://100.64.0.11:8891")
 TTS_URL = os.environ.get("BISEO_TTS_URL", "http://100.64.0.11:8890")
@@ -253,9 +257,9 @@ async def push_tokens():
     return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
 
 
-async def take_lease(name, ttl_s):
+async def take_lease(name, ttl_s, priority=100):
     return (await state.call("POST", f"/v1/state/leases/{quote(name, safe='')}",
-                             {"holder": INSTANCE, "ttl_s": ttl_s}))["held"]
+                             {"holder": INSTANCE, "ttl_s": ttl_s, "priority": priority}))["held"]
 
 
 def auth(request: Request):
@@ -499,6 +503,9 @@ async def ask_api(text, model, session):
 
 
 async def ask_stream(text, session, model=None, path=None, task=None):
+    if not CLAUDE_OK:
+        yield {"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}
+        return
     # The voice server prefixes recent turns ("최근 통화 내용: ..."), so judge only the last paragraph.
     if MODE == "limited" and (task == "schedule" or PERSONAL.search(text.rsplit("\n\n", 1)[-1])):
         yield {"type": "error", "code": "personal", "message": PERSONAL_REFUSAL}
@@ -540,8 +547,17 @@ def apns_config():
 
 
 async def send_voip_push(payload):
+    return await apns_send(payload, "voip")
+
+
+async def send_alert_push(title, body):
+    """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token."""
+    return await apns_send({"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}, "alert")
+
+
+async def apns_send(payload, kind):
     cfg = apns_config()
-    tokens = await push_tokens()
+    tokens = [t for t in await push_tokens() if t.get("kind", "voip") == kind]
     if not cfg or not tokens:
         return {"sent": 0, "reason": "APNs key or device token not configured"}
     if time.time() - _apns_jwt["ts"] > 50 * 60:  # APNs wants a fresh JWT at most hourly
@@ -554,8 +570,9 @@ async def send_voip_push(payload):
         for t in tokens:
             host = "api.sandbox.push.apple.com" if t["env"] == "sandbox" else "api.push.apple.com"
             r = await c.post(f"https://{host}/3/device/{t['token']}", json=payload, headers={
-                "authorization": f"bearer {_apns_jwt['token']}", "apns-topic": f"{t['bundle_id']}.voip",
-                "apns-push-type": "voip", "apns-priority": "10", "apns-expiration": "0"})
+                "authorization": f"bearer {_apns_jwt['token']}",
+                "apns-topic": t["bundle_id"] + (".voip" if kind == "voip" else ""),
+                "apns-push-type": kind, "apns-priority": "10", "apns-expiration": "0"})
             sent += r.status_code == 200
     return {"sent": sent}
 
@@ -612,9 +629,16 @@ async def scheduler_tick(now, fired):
                 await state.call("DELETE", "/v1/state/history", older_than_days=s["history_days"])
         except StateDown:
             pass  # tomorrow, then
+    try:  # scheduled calls: only the scheduler lease holder fires (renewed every tick, lowest priority wins)
+        if await take_lease("scheduler", 150, SCHED_PRIORITY):
+            await fire_scheduled(now.timestamp())
+    except StateDown:
+        pass
     jobs = {"morning_briefing": lambda: place_call("morning_briefing")}
     if s["proactive"]["triggers"].get("deadline"):
         jobs["deadline_check"] = deadline_call
+    if not CLAUDE_OK:
+        jobs = {}  # briefings and deadline checks need Claude
     for key, job in jobs.items():
         if hm == s["proactive"].get(key) and fired.get(key) != today:
             fired[key] = today
@@ -629,6 +653,181 @@ async def scheduler_tick(now, fired):
 
 
 RETENTION_AT = "04:00"  # call history older than history_days is deleted daily (quiet hours do not matter)
+
+
+# ---------- scheduled calls ("내일 10시에 깨워 줘"); no Claude involved ----------
+REPEAT_RE = re.compile(r"daily|weekdays|weekly:(mon|tue|wed|thu|fri|sat|sun)")
+DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+MAX_DAYS, MAX_ATTEMPTS, RETRY_EVERY_S, ANSWER_WAIT_S = 30, 3, 120, 60
+
+
+def check_schedule(body, now=None):
+    """Validate a new scheduled call from the app or the voice server (a trust boundary)."""
+    now = now or time.time()
+    at = body.get("at")
+    try:
+        if isinstance(at, str):
+            dt = datetime.fromisoformat(at)
+            if dt.tzinfo is None:
+                raise ValueError("no time zone")
+            at = dt.timestamp()
+        at = float(at)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "at: ISO 8601 with a time zone (or epoch seconds)")
+    if not now + 30 <= at <= now + MAX_DAYS * 86400 + 60:
+        raise HTTPException(400, f"at must be ahead and within {MAX_DAYS} days")
+    repeat = body.get("repeat") or None
+    if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
+        raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<mon..sun>")
+    kind = body.get("kind") or "wake"
+    note = body.get("note") or ""
+    if kind not in ("wake", "reminder") or not isinstance(note, str) or len(note) > 200:
+        raise HTTPException(400, "kind: wake|reminder; note: up to 200 characters")
+    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": DEVICE}
+
+
+def next_at(at, repeat, now=None):
+    """The next occurrence of a repeating call after `now`."""
+    now, dt = now or time.time(), datetime.fromtimestamp(at, KST)
+    step = timedelta(days=7 if repeat.startswith("weekly") else 1)
+    while True:
+        dt += step
+        if dt.timestamp() > now and (repeat != "weekdays" or dt.weekday() < 5):
+            return dt.timestamp()
+
+
+def spoken_when(at, repeat=None, now=None):
+    """'내일 오전 10시', '매일 오전 7시', '평일 오전 6시 40분', '매주 월요일 오전 9시'."""
+    dt, today = datetime.fromtimestamp(at, KST), datetime.fromtimestamp(now or time.time(), KST).date()
+    clock = f"{'오전' if dt.hour < 12 else '오후'} {dt.hour % 12 or 12}시" + (f" {dt.minute}분" if dt.minute else "")
+    if repeat == "daily":
+        day = "매일"
+    elif repeat == "weekdays":
+        day = "평일"
+    elif repeat:
+        day = f"매주 {'월화수목금토일'[DOW.index(repeat.split(':')[1])]}요일"
+    else:
+        diff = (dt.date() - today).days
+        day = {0: "오늘", 1: "내일", 2: "모레"}.get(diff, f"{dt.month}월 {dt.day}일")
+    return f"{day} {clock}"
+
+
+def confirm_text(item, now=None):
+    verb = "깨워 드릴게요" if item["kind"] == "wake" else "전화드릴게요"
+    return f"{spoken_when(item['at'], item['repeat'], now)}에 {verb}."
+
+
+async def schedule_create(body, now=None):
+    item = await state.call("POST", "/v1/state/schedule", check_schedule(body, now))
+    return {**item, "say": confirm_text(item, now)}
+
+
+async def schedule_list():
+    return await state.call("GET", "/v1/state/schedule") or []
+
+
+def list_text(items, now=None):
+    if not items:
+        return "예약된 전화가 없어요."
+    parts = [spoken_when(i["at"], i["repeat"], now) + (" 기상" if i["kind"] == "wake" else " 알림") for i in items[:3]]
+    more = f" 외 {len(items) - 3}개" if len(items) > 3 else ""
+    return f"예약된 전화는 {', '.join(parts)}{more}이에요."
+
+
+async def schedule_cancel(sid=None, at=None, now=None):
+    """Cancel by id, else the item at `at` (within a minute), else the soonest one."""
+    items = await schedule_list()
+    pick = next((i for i in items if i["id"] == sid), None) if sid else \
+        next((i for i in items if abs(i["at"] - float(at)) < 60), None) if at else (items[0] if items else None)
+    if not pick:
+        return None
+    item = await state.call("DELETE", f"/v1/state/schedule/{quote(pick['id'], safe='')}")
+    return {**item, "say": f"{spoken_when(item['at'], item['repeat'], now)} 예약을 취소했어요."} if item else None
+
+
+async def serve_schedule(m):
+    """A schedule request from the voice server over the link; the reply carries the sentence to speak."""
+    reply = {"id": m["id"], "type": "schedule_result", "ok": True}
+    try:
+        action = m.get("action")
+        if MODE != "full":
+            raise HTTPException(403, "limited")
+        if action == "create":
+            item = await schedule_create(m)
+            reply.update(item=item, say=item["say"])
+        elif action == "list":
+            items = await schedule_list()
+            reply.update(items=items, say=list_text(items))
+        elif action == "cancel":
+            item = await schedule_cancel(at=m.get("at"))
+            reply.update(item=item, say=item["say"] if item else "취소할 예약이 없어요.")
+        else:
+            raise HTTPException(400, "action")
+    except HTTPException as e:
+        reply.update(ok=False, say="그 시간으로는 예약할 수 없어요." if e.status_code == 400 else "지금은 예약을 받을 수 없어요.")
+    except StateDown:
+        reply.update(ok=False, say="지금은 예약을 받을 수 없어요.")
+    await link_send(reply)
+
+
+def opening_for(item):
+    if item["kind"] == "wake":  # shortcut: no day summary yet (it would need cached calendar data without Claude)
+        return "일어나실 시간이에요." + (f" {item['note']}" if item["note"] else "")
+    return f"말씀하신 시간이에요. {item['note']}" if item["note"] else "말씀하신 시간이 돼서 전화드렸어요."
+
+
+async def update_item(item, **fields):
+    """Compare-and-set on the item's current status; None when another gateway got there first."""
+    try:
+        return await state.call("POST", f"/v1/state/schedule/{quote(item['id'], safe='')}",
+                                {**fields, "expect_status": item["status"]})
+    except HTTPException as e:
+        if e.status_code == 409:
+            return None
+        raise
+
+
+async def fire_scheduled(now):
+    """Due items ring; unanswered ones retry every RETRY_EVERY_S up to MAX_ATTEMPTS, then count as missed.
+    User-requested calls ignore quiet hours (the user asked for that time)."""
+    for item in await schedule_list():
+        since = now - (item["last_attempt"] or 0)
+        if item["status"] == "pending" and item["at"] <= now:
+            await attempt(item, now)
+        elif item["status"] == "fired" and item["attempts"] < MAX_ATTEMPTS and since >= RETRY_EVERY_S:
+            await attempt(item, now)
+        elif item["status"] == "fired" and item["attempts"] >= MAX_ATTEMPTS and since >= ANSWER_WAIT_S:
+            await missed(item, now)
+
+
+async def attempt(item, now):
+    claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now)
+    if claimed:
+        call = await place_call(item["kind"], opening_for(item))
+        await state.call("POST", f"/v1/state/schedule/{quote(item['id'], safe='')}", {"call_id": call["call_id"]})
+
+
+async def missed(item, now):
+    if item["repeat"]:  # the next one still happens
+        done = await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"], now))
+    else:
+        done = await update_item(item, status="missed")
+    if done:
+        what = "기상 전화" if item["kind"] == "wake" else "예약 전화"
+        await send_alert_push((await load_settings())["assistant_name"],
+                              f"{spoken_when(item['at'], item['repeat'], now)} {what}를 받지 않으셨어요.")
+
+
+async def call_answered(call_id):
+    """The voice server saw /v1/call with this call_id: a fired scheduled call was answered."""
+    if MODE != "full" or not isinstance(call_id, str):
+        return
+    for item in await schedule_list():
+        if item["status"] == "fired" and item["call_id"] == call_id:
+            if item["repeat"]:
+                await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"]))
+            else:
+                await update_item(item, status="answered")
 
 
 async def scheduler():
@@ -678,6 +877,13 @@ async def handle_link(ws):
             t.cancel()
         elif m.get("type") == "call_log":
             await record_call_log(m)  # in order, so a call's turns follow its start
+        elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
+            tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
+        elif m.get("type") == "call_answered":
+            try:
+                await call_answered(m.get("call_id"))
+            except (StateDown, HTTPException) as e:
+                print("call_answered not recorded:", type(e).__name__, flush=True)
         for k in [k for k, t in tasks.items() if t.done()]:
             tasks.pop(k)
     for t in tasks.values():
@@ -692,7 +898,8 @@ async def voice_link():
             async with websockets.connect(VOICE_LINK, additional_headers={"Authorization": f"Bearer {LINK_TOKEN}"},
                                           max_size=None, ping_interval=20, open_timeout=10) as ws:
                 link["ws"], backoff = ws, 1
-                await link_send({"type": "hello", "device": DEVICE, "mode": MODE, "priority": PRIORITY})
+                await link_send({"type": "hello", "device": DEVICE, "mode": MODE, "priority": PRIORITY,
+                                 "claude": CLAUDE_OK})
                 await link_send({"type": "settings", "value": await load_settings()})
                 print("voice link up", flush=True)
                 await handle_link(ws)
@@ -820,7 +1027,32 @@ async def devices():
 
 def full_only():
     if MODE != "full":
-        raise HTTPException(403, "call history is not available on a limited gateway")
+        raise HTTPException(403, "not available on a limited gateway")
+
+
+@app.get("/v1/schedule")
+async def schedule_get(status: str = "pending,fired"):
+    full_only()
+    allowed = {"pending", "fired", "answered", "missed", "cancelled"}
+    if not set(status.split(",")) <= allowed:
+        raise HTTPException(400, f"status: comma list of {sorted(allowed)}")
+    items = await state.call("GET", "/v1/state/schedule", status=status) or []
+    return [{**i, "at_iso": datetime.fromtimestamp(i["at"], KST).isoformat()} for i in items]
+
+
+@app.post("/v1/schedule")
+async def schedule_post(body: dict):
+    full_only()
+    return await schedule_create(body)
+
+
+@app.delete("/v1/schedule/{sid}")
+async def schedule_delete(sid: str):
+    full_only()
+    item = await schedule_cancel(sid=sid)
+    if item is None:
+        raise HTTPException(404, "no such scheduled call")
+    return item
 
 
 @app.get("/v1/history")
@@ -862,6 +1094,9 @@ async def push_register(body: dict):
         raise HTTPException(400, "voip_token and bundle_id required")
     await state.call("PUT", f"/v1/state/push_tokens/{quote(body['voip_token'], safe='')}",
                      {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox")})
+    if body.get("alert_token"):  # ordinary notifications (missed scheduled calls)
+        await state.call("PUT", f"/v1/state/push_tokens/{quote(body['alert_token'], safe='')}",
+                         {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox"), "kind": "alert"})
     await push_tokens()  # refresh the restart-proof copy
     return {"ok": True}
 

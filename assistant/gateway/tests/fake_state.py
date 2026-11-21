@@ -13,7 +13,7 @@ def make():
     app = FastAPI()
     app.state.down = False
     db = {"settings": {}, "usage": [], "devices": {}, "push": {}, "calls": {}, "approvals": {}, "sessions": {},
-          "leases": {}, "history": {}}
+          "leases": {}, "history": {}, "schedule": {}}
     app.db = db
 
     @app.middleware("http")
@@ -114,11 +114,41 @@ def make():
 
     @app.post("/v1/state/leases/{name}")
     def lease(name: str, body: dict):
-        cur = db["leases"].get(name)
-        if cur and cur["expires"] > time.time() and cur["holder"] != body["holder"]:
+        cur, prio = db["leases"].get(name), body.get("priority", 100)
+        if cur and cur["expires"] > time.time() and cur["holder"] != body["holder"] and prio >= cur["priority"]:
             return {"held": False, **cur}
-        db["leases"][name] = {"holder": body["holder"], "expires": time.time() + body["ttl_s"]}
+        db["leases"][name] = {"holder": body["holder"], "expires": time.time() + body["ttl_s"], "priority": prio}
         return {"held": True, **db["leases"][name]}
+
+    @app.post("/v1/state/schedule")
+    def s_add(body: dict):
+        sid = uuid.uuid4().hex[:12]
+        db["schedule"][sid] = {"id": sid, **body, "status": "pending", "attempts": 0, "call_id": None,
+                               "last_attempt": None}
+        return db["schedule"][sid]
+
+    @app.get("/v1/state/schedule")
+    def s_list(status: str = "pending,fired"):
+        return sorted((i for i in db["schedule"].values() if i["status"] in status.split(",")), key=lambda i: i["at"])
+
+    @app.post("/v1/state/schedule/{sid}")
+    def s_update(sid: str, body: dict):
+        item = db["schedule"].get(sid)
+        if not item:
+            raise HTTPException(404)
+        expect = body.pop("expect_status", None)
+        if expect and item["status"] != expect:
+            raise HTTPException(409)
+        item.update({k: v for k, v in body.items() if v is not None})
+        return item
+
+    @app.delete("/v1/state/schedule/{sid}")
+    def s_cancel(sid: str):
+        item = db["schedule"].get(sid)
+        if not item or item["status"] not in ("pending", "fired"):
+            raise HTTPException(404)
+        item["status"] = "cancelled"
+        return item
 
     @app.post("/v1/state/history/{hid}/start")
     def h_start(hid: str, body: dict):

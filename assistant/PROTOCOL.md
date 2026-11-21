@@ -68,8 +68,9 @@ peer is not in 100.64.0.0/10 or the request carries `X-Forwarded-For`, `Forwarde
 (the public proxy is itself a tailnet peer, so the header check is what stops it). **Every gateway keeps its own link**; the voice server holds all of them at once.
 JSON text frames:
 
-- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority"}` first on every
-  connect (`priority`: lower is preferred; a link that never says hello counts as full, priority 50;
+- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority","claude"?}` first on every
+  connect (`claude: false` = a gateway without Claude, e.g. an always-on deneb: it never gets asks but
+  takes schedule requests, call logs and answered reports; `priority`: lower is preferred; a link that never says hello counts as full, priority 50;
   a new hello from the same `device` replaces that device's older link of the same mode; a hello that
   would replace a link of the other mode is ignored),
   `{"type":"settings","value":{…}}` (on connect and every change; from any full-mode link, the last
@@ -84,11 +85,24 @@ JSON text frames:
   "interrupted","at"}` (`at` in epoch seconds; activity = the turn's tool_start/thinking steps)
   (never for an empty transcript; fillers left out), end `{"ended_at","duration_s"}`. One `log_id` per
   `/v1/call` connection; a turn cut short by hang-up is sent before the end.
+- voice → gateway: `{"type":"schedule","id","action":"create"|"list"|"cancel","at"?,"repeat"?,"kind"?,"note"?}`
+  (to a full-mode link, Claude or not) → gateway → voice `{"id","type":"schedule_result","ok","say",
+  "item"?|"items"?}`; the voice server speaks `say` (e.g. "내일 오전 10시에 깨워 드릴게요.").
+  `{"type":"call_answered","call_id"}` when `/v1/call` connects with a `call_id` (stops a scheduled call's
+  retries).
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
 
-Routing, per ask: the full-mode link with the lowest `priority` among healthy links (3+ consecutive
+Scheduled-call utterances are handled before any routing, without Qwen's answer or Claude: a keyword
+gate (깨워, 알람, 모닝콜; "전화해 줘" / "예약해 줘" plus a time and no third-person target; 예약 목록 / 취소)
+and a deterministic Korean time parser (내일 10시, 내일 아침 7시 반, 30분 뒤, 모레 오후 3시, 매일 7시,
+평일 6시 40분, 매주 수요일 9시, 다음 주 월요일 9시; a bare "10시" is today if still ahead, else tomorrow).
+Phrasings the rules miss go to the local Qwen for strict JSON (given the current KST time), then
+validation (ahead, within 30 days, known repeat). With no time the voice server asks back ("몇 시에 깨워
+드릴까요?") and the next utterance with a time completes it.
+
+Routing, per other ask: the full-mode link (with Claude) with the lowest `priority` among healthy links (3+ consecutive
 failed asks — timeouts or errors without a `code` — make a link unhealthy until it answers again; it
 is then tried last). With no full link, limited links take the ask only when the utterance is not
 personal (calendar, mail, memory, contacts, GISTRA courses/assignments, Planit, briefings; task
@@ -103,7 +117,7 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
   `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|DELETE /v1/history`, `GET|DELETE
-  /v1/history/{id}` (bearer header).
+  /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -117,7 +131,9 @@ Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm1
 
 Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BISEO_DEVICE` (ASCII
 slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
-`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`. Token files (0600, else the
+`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`, `BISEO_NO_CLAUDE=1` (this
+gateway has no Claude: asks answer `code: "no_claude"`, no briefings or deadline checks),
+`BISEO_SCHEDULER_PRIORITY` (default `BISEO_PRIORITY`; lowest live value fires scheduled calls). Token files (0600, else the
 gateway refuses to start): `token`, `link_token` (falls back to `token` until link tokens are rolled
 out), and in limited mode `state_token_limited` (required).
 
@@ -167,10 +183,22 @@ device that created them.
   "devices":[{"name","ok","ms"}]}`
 - `POST /v1/devices/register` `{"name","url","harness":["claude_code",…]}` — daemons call
   this on start and every 60 s. `GET /v1/devices` lists them with `last_seen`.
-- `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production"}` —
-  the app sends its PushKit token.
+- `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production","alert_token"?}` —
+  the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
+- Scheduled calls (full gateways only; limited → 403): `GET /v1/schedule?status=pending,fired` (comma list
+  of pending|fired|answered|missed|cancelled) → items `{"id","at","at_iso","repeat","kind","note","status",
+  "attempts","call_id","last_attempt","created_by"}`, soonest first; `POST /v1/schedule`
+  `{"at": ISO 8601 with offset | epoch,"repeat": null|"daily"|"weekdays"|"weekly:mon".."weekly:sun",
+  "kind":"wake"|"reminder","note"?}` → the item plus `"say"` (400 unless ahead and within 30 days);
+  `DELETE /v1/schedule/{id}` → the cancelled item plus `"say"`. Firing: the full gateway holding lease
+  `scheduler` (TTL 150 s, renewed every minute, priority = `BISEO_SCHEDULER_PRIORITY`, a lower value takes
+  it over) places the call at `at` (quiet hours ignored: the user asked for that time; opening "일어나실
+  시간이에요." or the reminder note), retries every 2 min while unanswered up to 3 attempts, then marks it
+  `missed` and sends an alert push. Answered (voice `call_answered`) → `answered`; repeating items go back
+  to `pending` at their next occurrence (also after a miss). Status changes are compare-and-set, so two
+  gateways never fire the same attempt.
 - Call history (full gateways only; limited → 403), stored in ruchba (section 5):
   `GET /v1/history?limit=20&before=<epoch>&q=` → `[{"id","session","title" (first user utterance),
   "last_reply" (last assistant reply, first 120 chars),"started_at","duration_s","direction","reason",
@@ -255,7 +283,12 @@ records, search, contacts and context, answers 403) when either:
   row whose writer is `full` (403). `GET /v1/state/devices` *limited* →
   `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
   token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
-- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env"}`; `GET /v1/state/push_tokens`.
+- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`.
+- Scheduled calls (full callers only): `POST /v1/state/schedule` `{"at": epoch,"repeat","kind","note",
+  "created_by"}` → the row; `GET /v1/state/schedule?status=pending,fired`; `POST /v1/state/schedule/{id}`
+  `{"status"?,"attempts"?,"call_id"?,"at"?,"last_attempt"?,"expect_status"?}` (compare-and-set on
+  `expect_status`: 409 if the row moved on); `DELETE /v1/state/schedule/{id}` → cancelled (404 unless
+  pending or fired). Table `scheduled_calls` in the state schema.
 - `POST /v1/state/calls` `{"id","reason","opening"}`; `POST /v1/state/calls/{id}/answer` → the row,
   marked answered (404 if missing).
 - `POST /v1/state/approvals` *limited* `{"id"?,"device","tool","command","cwd"}` → `{"approval_id"}` (`id`,
@@ -263,8 +296,9 @@ records, search, contacts and context, answers 403) when either:
   `GET /v1/state/approvals?status=pending`; `GET /v1/state/approvals/{id}` *limited*;
   `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending.
 - `GET|PUT /v1/state/sessions/{voice_session}` `{"claude_session","device"}` (404 if unknown).
-- `POST /v1/state/leases/{name}` `{"holder","ttl_s"}` (0 < ttl ≤ 7 days) → `{"held","holder","expires"}`.
-  Atomic: taken if free or expired, renewed if `holder` already holds it, else `held:false` with the
+- `POST /v1/state/leases/{name}` `{"holder","ttl_s","priority"?}` (0 < ttl ≤ 7 days, priority default 100)
+  → `{"held","holder","priority","expires"}`. Atomic: taken if free or expired, renewed if `holder`
+  already holds it, taken over if `priority` is lower than the holder's, else `held:false` with the
   current holder. `DELETE /v1/state/leases/{name}?holder=` → `{"released":bool}`.
 - Call history (full callers only; personal): `POST /v1/state/history/{id}/start` (body as the voice
   server's start event), `POST /v1/state/history/{id}/turns` (a turn; `user` must be non-empty),

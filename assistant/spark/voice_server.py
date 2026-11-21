@@ -123,6 +123,7 @@ class Link:
         self.device, self.priority = "?", 50  # until hello (older gateways never send one)
         self.mode = "limited" if limited else "full"
         self.fails = 0  # consecutive failed asks; 3 or more = unhealthy, tried last
+        self.claude = True  # False: a gateway without Claude (scheduled calls, history, settings only)
 
     async def send(self, obj):
         async with self.lock:
@@ -155,15 +156,29 @@ class GatewayLinks:
     async def log(self, event):
         """A call_log event for the call history. Only to a full-mode link (history is personal); dropped when
         none is up. This shared machine never keeps history itself."""
-        try:
-            lk = self.pick(personal=True)
-            await lk.send({"type": "call_log", **event})
-        except Exception as e:
-            print("call_log dropped:", event.get("event"), type(e).__name__, flush=True)
+        await self.notify({"type": "call_log", **event})
 
-    def pick(self, personal: bool) -> Link:
+    async def notify(self, msg):
+        """A one-way message for a full-mode link (any, Claude or not); dropped when none is up."""
+        try:
+            await self.pick(personal=True, need_claude=False).send(msg)
+        except Exception as e:
+            print(msg.get("type"), "dropped:", msg.get("event", ""), type(e).__name__, flush=True)
+
+    async def request(self, msg, timeout=10):
+        """Ask a full-mode link and wait for its one reply (e.g. a schedule request)."""
+        lk, rid, q = self.pick(personal=True, need_claude=False), uuid.uuid4().hex, asyncio.Queue()
+        self.queues[rid] = (q, lk)
+        try:
+            await lk.send({**msg, "id": rid})
+            return await asyncio.wait_for(q.get(), timeout)
+        finally:
+            self.queues.pop(rid, None)
+
+    def pick(self, personal: bool, need_claude: bool = True) -> Link:
         """The link for one ask; RuntimeError carries a speakable reason when none may take it."""
-        ranked = sorted(self.links, key=lambda lk: (lk.fails >= 3, lk.priority))
+        ranked = sorted((lk for lk in self.links if lk.claude or not need_claude),
+                        key=lambda lk: (lk.fails >= 3, lk.priority))
         full = [lk for lk in ranked if lk.mode == "full"]
         if full:
             return full[0]
@@ -186,6 +201,7 @@ class GatewayLinks:
             if any(o.mode != mode for o in same):
                 return  # never let a link of the other mode evict (or pose as) that device's link
             lk.device, lk.mode = device, mode
+            lk.claude = msg.get("claude") is not False
             try:
                 lk.priority = int(msg.get("priority", 50))
             except (TypeError, ValueError):
@@ -457,6 +473,142 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
                 pass
 
 
+# ---------- scheduled calls: "내일 10시에 깨워 줘" (local; the gateway stores and fires them) ----------
+KO_NUM = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10,
+          "열한": 11, "열두": 12, "삼십": 30, "십": 10, "이십": 20, "사십": 40, "오십": 50}
+_N = r"(\d{1,2}|열한|열두|열|한|두|세|네|다섯|여섯|일곱|여덟|아홉|삼십|이십|사십|오십|십)"
+DAYS = "월화수목금토일"
+REL_RE = re.compile(_N + r"\s*(분|시간)\s*(뒤|후|있다가|지나서)")
+CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _N + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
+WEEKDAY_RE = re.compile(r"(다음\s*주|담주|이번\s*주)?\s*([월화수목금토일])요일")
+REPEATS = {"daily", "weekdays"} | {f"weekly:{d}" for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")}
+DOW_EN = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+SCHED_LIST = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거).{0,8}(목록|뭐|있|확인|알려|된 거|돼 있)")
+SCHED_CANCEL = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거|전화).{0,8}취소|취소.{0,6}(예약|알람)|^\s*취소(해\s*줘|해요|요)?[.!]?\s*$")
+SCHED_WAKE = re.compile(r"깨워|모닝 ?콜|알람.{0,10}(맞춰|설정|해\s*줘|부탁)")
+SCHED_CALL = re.compile(r"(전화|콜)\s*(해|걸어|주)|(예약|알람).{0,10}(해\s*줘|잡아|걸어|맞춰)")
+OTHER_TARGET = re.compile(r"(\S+)(한테|에게|께)")
+pending_schedule: dict[str, tuple[float, dict]] = {}  # session -> (asked at, partial request) after "몇 시에…?"
+
+
+def ko_int(tok):
+    return int(tok) if tok.isdigit() else KO_NUM[tok]
+
+
+def schedule_intent(text, session=""):
+    """'create' / 'list' / 'cancel' when the utterance is about scheduled calls, else None (normal routing)."""
+    if SCHED_LIST.search(text):
+        return "list"
+    if SCHED_CANCEL.search(text):
+        return "cancel"
+    if SCHED_WAKE.search(text):
+        return "create"
+    target = OTHER_TARGET.search(text)
+    if SCHED_CALL.search(text) and (not target or target.group(1) in ("나", "저")) and parse_when(text)[0]:
+        return "create"  # "내일 3시에 전화해 줘"; not "엄마한테 전화해 줘"
+    asked = pending_schedule.get(session)
+    if asked and time.time() - asked[0] < 90 and parse_when(text)[0]:
+        return "create"  # the answer to "몇 시에 깨워 드릴까요?"
+    return None
+
+
+def parse_when(text, now=None):
+    """(datetime in KST or None, repeat or None) from a Korean time phrase."""
+    now = now or datetime.now(KST)
+    if m := REL_RE.search(text):
+        n = ko_int(m.group(1))
+        return (now + (timedelta(minutes=n) if m.group(2) == "분" else timedelta(hours=n))).replace(
+            second=0, microsecond=0), None
+    repeat = "daily" if "매일" in text else "weekdays" if re.search(r"평일|주중", text) else None
+    if m := re.search(r"매주\s*([월화수목금토일])요일", text):
+        repeat = f"weekly:{DOW_EN[DAYS.index(m.group(1))]}"
+    clock = CLOCK_RE.search(text)
+    if not clock:
+        return None, repeat
+    part, hour = clock.group(1), ko_int(clock.group(2))
+    minute = 30 if clock.group(3) == "반" else ko_int(clock.group(4)) if clock.group(4) else 0
+    if hour > 24 or minute > 59:
+        return None, repeat
+    if part in ("오후", "저녁", "밤", "낮") and hour < 12 and not (part == "낮" and hour >= 11):
+        hour += 12
+    elif part in ("오전", "아침", "새벽") and hour == 12:
+        hour = 0
+    hour %= 24
+    day = None
+    for word, add in (("글피", 3), ("모레", 2), ("내일", 1), ("오늘", 0)):
+        if word in text:
+            day = now.date() + timedelta(days=add)
+            break
+    if (m := WEEKDAY_RE.search(text)) and not repeat:
+        want = DAYS.index(m.group(2))
+        if m.group(1) and "다음" in m.group(1) or m.group(1) == "담주":
+            day = now.date() + timedelta(days=7 - now.weekday() + want)
+        else:
+            day = now.date() + timedelta(days=(want - now.weekday()) % 7)
+    at = datetime.combine(day or now.date(), datetime.min.time(), KST).replace(hour=hour, minute=minute)
+    if day is None or repeat:  # "10시": today if still ahead, else tomorrow; repeats start at the next match
+        while at <= now or (repeat == "weekdays" and at.weekday() >= 5) or \
+                (repeat and repeat.startswith("weekly") and DOW_EN[at.weekday()] != repeat.split(":")[1]):
+            at += timedelta(days=1)
+    return at, repeat
+
+
+def valid_schedule(at, repeat, now=None):
+    now = now or datetime.now(KST)
+    return at is not None and now + timedelta(seconds=30) < at <= now + timedelta(days=30) and \
+        (repeat is None or repeat in REPEATS)
+
+
+async def qwen_schedule(text, now):
+    """Fallback for phrasings the rules miss: ask the local Qwen for strict JSON, then validate it."""
+    prompt = ("사용자의 말에서 예약 전화를 뽑아 JSON 하나만 출력해. 다른 말은 쓰지 마. 형식: "
+              '{"action":"create|list|cancel","at":"YYYY-MM-DDTHH:MM:00+09:00","repeat":null|"daily"|"weekdays"|'
+              '"weekly:mon".."weekly:sun","kind":"wake|reminder","note":"…"}. 시간을 모르면 "at":null. '
+              f"지금은 {now.isoformat(timespec='minutes')} (KST)야.")
+    out = ""
+    try:
+        async for delta in llm_stream([{"role": "system", "content": prompt}, {"role": "user", "content": text}]):
+            out += delta
+            if len(out) > 400:
+                break
+        data = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        at = datetime.fromisoformat(data["at"]).astimezone(KST) if data.get("at") else None
+        return at, data.get("repeat"), data.get("kind") if data.get("kind") in ("wake", "reminder") else None
+    except Exception:  # unparseable or invalid: the caller asks back instead of guessing
+        return None, None, None
+
+
+async def schedule_reply(text, action, session, now=None):
+    """What to say for a schedule utterance, after a full gateway stored, listed or cancelled it."""
+    now = now or datetime.now(KST)
+    if action == "list":
+        msg = {"type": "schedule", "action": "list"}
+    elif action == "cancel":
+        at, _ = parse_when(text, now)
+        msg = {"type": "schedule", "action": "cancel", **({"at": at.timestamp()} if at else {})}
+    else:
+        prior = pending_schedule.pop(session, (0, {}))[1]
+        kind = "wake" if SCHED_WAKE.search(text) else prior.get("kind", "reminder")
+        at, repeat = parse_when(text, now)
+        repeat = repeat or prior.get("repeat")
+        if at is None:
+            at, q_repeat, q_kind = await qwen_schedule(text, now)
+            repeat, kind = repeat or q_repeat, q_kind or kind
+        if at is None:
+            pending_schedule[session] = (time.time(), {"kind": kind, "repeat": repeat})
+            return "몇 시에 깨워 드릴까요?" if kind == "wake" else "몇 시에 전화드릴까요?"
+        if not valid_schedule(at, repeat, now):
+            return "지금부터 30일 안쪽의 시간으로만 예약할 수 있어요."
+        note = "" if kind == "wake" else text[:100]
+        msg = {"type": "schedule", "action": "create", "at": at.isoformat(), "repeat": repeat, "kind": kind,
+               "note": note}
+    try:
+        reply = await links.request(msg)
+    except (RuntimeError, asyncio.TimeoutError):
+        return "지금은 예약을 받을 수 없어요."
+    return str(reply.get("say") or "지금은 예약을 받을 수 없어요.")
+
+
 _tts_cache: dict[str, tuple[bytes, int]] = {}
 
 
@@ -493,9 +645,11 @@ async def respond(text, session, t0, timings, on_event=None):
     hist = history[session]
     settings = await gateway_settings()
     name = assistant_name(settings)
-    to_claude, model = pre_route(strip_vocative(text, name), settings)
+    bare = strip_vocative(text, name)
+    sched = schedule_intent(bare, session)
+    to_claude, model = (False, None) if sched else pre_route(bare, settings)
     sentences: asyncio.Queue = asyncio.Queue()
-    route = {"value": "claude" if to_claude else "qwen"}
+    route = {"value": "schedule" if sched else "claude" if to_claude else "qwen"}
 
     async def via_claude():
         route["value"] = "claude"
@@ -532,6 +686,10 @@ async def respond(text, session, t0, timings, on_event=None):
 
     async def produce():
         try:
+            if sched:  # handled here and by a full gateway; neither Qwen's answer nor Claude
+                for s in split_ready(await schedule_reply(bare, sched, session), final=True)[0]:
+                    await sentences.put(s)
+                return
             if to_claude:
                 return await via_claude()
             messages = [{"role": "system", "content": system_prompt(name) + now_kst()}, *hist,
@@ -785,6 +943,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
+        if call_id:  # the callee picked up: stops a scheduled call's retries
+            await links.notify({"type": "call_answered", "call_id": call_id})
         await links.log({"event": "start", "log_id": log_id, "session": session, "call_id": call_id,
                          "direction": "outgoing" if call_id else "incoming", "reason": (op or {}).get("reason", ""),
                          "client": client[:20], "opening": (op or {}).get("text", ""), "started_at": started})
@@ -982,6 +1142,7 @@ if __name__ == "__main__":
             globals().update(claude_stream=fake_claude, tts=fake_tts, FILLER_AFTER_S=0.05, NUDGE_AFTER_S=0.25)
             return [s async for s, *_ in respond("내일 일정 알려줘", f"f{first_delay}{gap}", time.perf_counter(), {})]
         real = claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S
+        real_llm = llm_stream
         said = "네, 확인했어요.", "내일은 일정이 없어요."
         assert asyncio.run(filler_check(0.0)) == [*said]  # quick answer: no filler
         assert asyncio.run(filler_check(0.1)) == [FILLER, *said]  # slow: one filler
@@ -1075,6 +1236,8 @@ if __name__ == "__main__":
             globals().update(tts=slow_tts, SileroVoiceActivityDetector=lambda: (lambda frame: 0.0))
             tc = TestClient(app, client=("100.64.0.8", 1))
             links.openings["cx"] = prepare_opening("첫 문장이에요. 두 번째 문장이에요.")
+            gw_link = links.add(FakeWS())
+            links.receive(gw_link, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
             with tc.websocket_connect("/v1/call?call_id=cx", headers={"Authorization": "Bearer app-tok"}) as w:
                 t0 = time.monotonic()
                 time.sleep(tap_after)
@@ -1086,6 +1249,9 @@ if __name__ == "__main__":
                         break
                 after = json.loads(w.receive()["text"])
                 w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.05)
+            assert {"type": "call_answered", "call_id": "cx"} in gw_link.ws.sent  # stops a scheduled call's retries
+            links.remove(gw_link)
             return at, after
         h = {k: hashlib.sha256(k.encode()).hexdigest() for k in ("app-tok", "link-tok", "lim-tok")}
         HASHES = load_hashes(f"# generated on the Mac\nclient {h['app-tok']}\nlink {h['link-tok']}\n"
@@ -1180,6 +1346,87 @@ if __name__ == "__main__":
         assert turn["user"] == "안녕" and turn["assistant"] == ["네,", "안녕하세요."] and turn["route"] == "qwen"
         assert turn["interrupted"] is False and "total_ms" in turn["timings"]
         assert len({m["log_id"] for m in logs}) == 1 and end["duration_s"] >= 0
+        # scheduled calls: Korean time phrases (now = Saturday 2026-11-21 08:00 KST)
+        sat8 = datetime(2026, 11, 21, 8, 0, tzinfo=KST)
+        for said, now, want, rep in [
+            ("내일 10시에 깨워 줘", sat8, (11, 22, 10, 0), None),
+            ("내일 아침 7시 반에 깨워 줘", sat8, (11, 22, 7, 30), None),
+            ("30분 뒤에 전화해 줘", sat8, (11, 21, 8, 30), None),
+            ("한 시간 후에 깨워 줘", sat8, (11, 21, 9, 0), None),
+            ("모레 오후 3시에 전화해 줘", sat8, (11, 23, 15, 0), None),
+            ("매일 7시에 깨워 줘", sat8, (11, 22, 7, 0), "daily"),
+            ("평일 6시 40분에 깨워 줘", sat8, (11, 23, 6, 40), "weekdays"),  # Saturday: next is Monday
+            ("매주 수요일 9시에 깨워 줘", sat8, (11, 25, 9, 0), "weekly:wed"),
+            ("다음 주 월요일 9시에 전화해 줘", sat8, (11, 23, 9, 0), None),
+            ("10시에 깨워 줘", sat8, (11, 21, 10, 0), None),  # still ahead today
+            ("10시에 깨워 줘", sat8.replace(hour=11), (11, 22, 10, 0), None),  # passed: tomorrow
+            ("저녁 7시에 전화해 줘", sat8, (11, 21, 19, 0), None),
+            ("밤 11시에 깨워 줘", sat8, (11, 21, 23, 0), None),
+            ("일곱 시에 깨워 줘", sat8, (11, 22, 7, 0), None),
+        ]:
+            at, repeat = parse_when(said, now)
+            assert (at.month, at.day, at.hour, at.minute) == want and repeat == rep, (said, at, repeat)
+        assert parse_when("깨워 줘", sat8) == (None, None) and parse_when("세 시간째 기다려", sat8)[0] is None
+        for said, want in [("내일 10시에 깨워 줘", "create"), ("깨워 줘", "create"), ("알람 7시로 맞춰 줘", "create"),
+                           ("내일 3시에 전화해 줘", "create"), ("나한테 30분 뒤에 전화해 줘", "create"),
+                           ("엄마한테 전화해 줘", None), ("엄마한테 내일 3시에 전화해 줘", None),
+                           ("예약 취소해 줘", "cancel"), ("취소", "cancel"), ("내일 10시 알람 취소해 줘", "cancel"),
+                           ("예약된 거 뭐 있어?", "list"), ("알람 목록 알려줘", "list"), ("내일 일정 알려줘", None),
+                           ("10시에 회의 있어", None), ("클로드가 뭐야?", None)]:
+            assert schedule_intent(said) == want, (said, schedule_intent(said))
+        assert valid_schedule(sat8 + timedelta(days=29), None, sat8) and not valid_schedule(sat8 - timedelta(minutes=1), None, sat8)
+        assert not valid_schedule(sat8 + timedelta(days=31), None, sat8) and not valid_schedule(sat8 + timedelta(hours=1), "hourly", sat8)
+
+        class GatewayWS(FakeWS):  # a full gateway that answers schedule requests
+            async def send_text(self, raw):
+                await super().send_text(raw)
+                m = json.loads(raw)
+                if m.get("type") == "schedule":
+                    say = {"create": "내일 오전 10시에 깨워 드릴게요.", "list": "예약된 전화가 없어요.",
+                           "cancel": "취소할 예약이 없어요."}[m["action"]]
+                    links.receive(self.lk, {"id": m["id"], "type": "schedule_result", "ok": True, "say": say})
+
+        async def schedule_check():
+            gw_ws = GatewayWS()
+            lk = links.add(gw_ws)
+            gw_ws.lk = lk
+            links.receive(lk, {"type": "hello", "device": "deneb", "mode": "full", "priority": 1, "claude": False})
+            out = [await schedule_reply("내일 10시에 깨워 줘", "create", "s", sat8)]
+            req = gw_ws.sent[-1]
+            assert req["action"] == "create" and req["at"] == "2026-11-22T10:00:00+09:00" and req["kind"] == "wake"
+            out.append(await schedule_reply("취소", "cancel", "s", sat8))
+            assert "at" not in gw_ws.sent[-1]  # bare cancel: the gateway cancels the soonest one
+            out.append(await schedule_reply("예약된 거 뭐 있어?", "list", "s", sat8))
+
+            async def no_json(messages):
+                yield "음, 잘 모르겠어요."
+            globals()["llm_stream"] = no_json
+            out.append(await schedule_reply("이따가 깨워 줘", "create", "s2", sat8))  # no time: ask back
+            assert schedule_intent("7시", "s2") == "create"  # the answer completes it
+            out.append(await schedule_reply("7시", "create", "s2", sat8))
+            assert gw_ws.sent[-1]["kind"] == "wake" and gw_ws.sent[-1]["at"] == "2026-11-22T07:00:00+09:00"
+
+            async def json_answer(messages):
+                assert "2026-11-21T08:00+09:00" in messages[0]["content"]  # Qwen gets the current KST time
+                yield '{"action":"create","at":"2026-11-21T13:00:00+09:00","repeat":null,"kind":"wake","note":""}'
+            globals()["llm_stream"] = json_answer
+            out.append(await schedule_reply("점심 먹고 나서 깨워 줘", "create", "s3", sat8))  # rules miss it: Qwen
+            assert gw_ws.sent[-1]["at"] == "2026-11-21T13:00:00+09:00"
+            out.append(await schedule_reply("어제 7시에 깨워 줘", "create", "s4", sat8 + timedelta(days=1, hours=1)))
+            assert not links.pick(False, need_claude=False) is None
+            try:
+                links.pick(False)  # a gateway without Claude never gets asks
+                raise AssertionError("asked a gateway without Claude")
+            except RuntimeError:
+                pass
+            links.remove(lk)
+            out.append(await schedule_reply("내일 10시에 깨워 줘", "create", "s5", sat8))  # no full gateway
+            return out
+        replies = asyncio.run(schedule_check())
+        globals()["llm_stream"] = real_llm
+        assert replies == ["내일 오전 10시에 깨워 드릴게요.", "취소할 예약이 없어요.", "예약된 전화가 없어요.",
+                           "몇 시에 깨워 드릴까요?", "내일 오전 10시에 깨워 드릴게요.", "내일 오전 10시에 깨워 드릴게요.",
+                           "내일 오전 10시에 깨워 드릴게요.", "지금은 예약을 받을 수 없어요."], replies
         at, after = tap_check(0.0)  # tapped during the first sentence: deferred until it has played
         assert 0.25 <= at < 1.0 and after == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.4)  # after the first sentence: immediate
