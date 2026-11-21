@@ -4,8 +4,8 @@ Writes 16 kHz mono 16-bit WAVs into the directory layout openWakeWord's
 train.py expects: <out>/<model>/{positive,negative}_{train,test}/.
 Re-running resumes: each split only tops up to its target count.
 
-usage: python gen_clips.py --out /work/model --model kim_biseo \
-           --wake 김비서 --n-train 4000 --n-test 500
+usage: python gen_clips.py --out /work/model --model park_biseo \
+           --wake 박비서 --n-train 4000 --n-test 500
 """
 import argparse
 import random
@@ -30,9 +30,11 @@ VOICE_QUALITY = ["clear", "husky", "nasal", "breathy", "deep", "bright", "raspy"
 # itself must never appear in these.
 ADVERSARIAL = [
     "김비", "비서", "이 비서관님", "김밥", "기비서", "김기사", "김미소", "김비선", "김부서", "김치",
-    "이비서", "박비서", "최비서", "정비서", "비서실", "김서", "김씨", "김 대리", "김비석", "김비스",
+    "이비서", "최비서", "정비서", "비서실", "김서", "김씨", "김 대리", "김비석", "김비스",
     "김밥 주세요", "비서님", "김 부장님", "깁스", "김비어", "비상", "김 서방", "김빗자루", "김 실장",
     "김 선생님", "비싸요", "기억해", "김이 서려", "김포", "깁시다", "김수현", "김민서", "김지수",
+    # near-misses of the current wake word 박비서 (김비서 is the old name)
+    "김비서", "김비서님", "박비", "박씨", "박사", "박수", "박서방", "바비", "박사님", "박 서방",
 ]
 EVERYDAY = [
     "안녕하세요", "오늘 날씨 어때", "저기요", "잠깐만", "네 알겠습니다", "뭐 해", "밥 먹었어?", "회의 시작합니다",
@@ -40,6 +42,11 @@ EVERYDAY = [
     "내일 봐", "어디 가?", "괜찮아", "진짜?", "택배 왔어요", "불 좀 켜 줄래", "이따가 전화할게", "배고프다",
     "아 그렇구나", "문 좀 닫아 줘", "오늘 일정 뭐야", "숙제 다 했어?", "잘 자", "다녀오겠습니다", "엄마 나 왔어",
 ]
+
+
+def leaked(wake):
+    """Negative phrases that contain the wake word (must stay empty)."""
+    return [t for t in ADVERSARIAL + EVERYDAY if wake.replace(" ", "") in t.replace(" ", "")]
 
 
 def describe(rng):
@@ -94,8 +101,7 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    leaked = [t for t in ADVERSARIAL + EVERYDAY if args.wake.replace(" ", "") in t.replace(" ", "")]
-    assert not leaked, f"negative phrases contain the wake word: {leaked}"
+    assert not leaked(args.wake), f"negative phrases contain the wake word: {leaked(args.wake)}"
 
     import torch
     from qwen_tts import Qwen3TTSModel

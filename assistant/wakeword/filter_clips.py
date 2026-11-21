@@ -1,10 +1,10 @@
 """Drop generated clips whose speech doesn't match their label, using Whisper.
 
 Positives must be heard as the wake word (allowing one wrong syllable, e.g.
-김비사); negatives must NOT contain it. Rejected files move to <split>_rejected/
+박비사); negatives must NOT contain it. Rejected files move to <split>_rejected/
 so nothing is lost.
 
-usage: python filter_clips.py /work/clips/kim_biseo 김비서
+usage: python filter_clips.py /work/clips/park_biseo 박비서
 """
 import sys
 from pathlib import Path
@@ -50,6 +50,6 @@ def main(root, wake):
 
 
 if __name__ == "__main__":
-    assert close_to("김비서", "김비서야") and close_to("김비서", "김 비사!") and not close_to("김비서", "김밥 주세요")
-    assert not close_to("김비서", "이비서") and not close_to("김비서", "김비사", tolerance=0)
+    assert close_to("박비서", "박비서야") and close_to("박비서", "박 비사!") and not close_to("박비서", "김밥 주세요")
+    assert not close_to("박비서", "이비서") and not close_to("박비서", "박비사", tolerance=0)
     main(sys.argv[1], sys.argv[2])
