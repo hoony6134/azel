@@ -43,23 +43,17 @@ struct BiseoMacApp: App {
     }
 }
 
-/// The jar silhouette as a 16 pt template image for the menu bar; filled during a call, dot for approvals.
+/// The menu-bar orb (assistant/design/icon templates): outline when idle, filled during a call,
+/// plus a dot when approvals are pending. Always a template image so it follows the menu bar.
 enum JarIcon {
     static func make(filled: Bool, dot: Bool) -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 16), flipped: true) { rect in
-            let path = JarPath.make(center: CGPoint(x: 8, y: 8), R: 6.2, t: 0, level: 0, from: .idle, to: .idle, mix: 1, reduceMotion: true)
-            let ns = NSBezierPath()
-            path.forEach { el in
-                switch el {
-                case .move(let p): ns.move(to: p)
-                case .line(let p): ns.line(to: p)
-                case .closeSubpath: ns.close()
-                default: break
-                }
-            }
+        let base = NSImage(named: filled ? "MenuBarTemplateFilled" : "MenuBarTemplate") ?? NSImage()
+        guard dot else { base.isTemplate = true; return base }
+        let size = NSSize(width: base.size.width + 4, height: base.size.height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(origin: .zero, size: base.size))
             NSColor.black.set()
-            if filled { ns.fill() } else { ns.lineWidth = 1.4; ns.stroke() }
-            if dot { NSBezierPath(ovalIn: NSRect(x: 13, y: 0, width: 5, height: 5)).fill() }
+            NSBezierPath(ovalIn: NSRect(x: size.width - 6, y: size.height - 6, width: 6, height: 6)).fill()
             return true
         }
         image.isTemplate = true
