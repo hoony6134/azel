@@ -483,6 +483,19 @@ class OpeningGuard:
         return "check" if seconds < GREETING_MAX_S else "interrupt"
 
 _SENT_END = re.compile(r"(?<=[.!?。…~])\s+|\n+")
+# Qwen sometimes slips Chinese characters (or kana, Cyrillic, Thai) into a Korean reply; the Korean voices read
+# them as garble. They are dropped before TTS, captions and history.
+FOREIGN = re.compile(r"[\u2e80-\u2fdf\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0400-\u04ff\u0e00-\u0e7f]+")
+foreign_dropped = [0]  # sentences cleaned since start (route_eval reports it)
+
+
+def korean_only(s: str) -> str:
+    t = FOREIGN.sub("", s)
+    if t == s:
+        return s
+    foreign_dropped[0] += 1
+    t = re.sub(r"\s{2,}", " ", re.sub(r"[(（]\s*[)）]", "", t)).strip()
+    return t if re.search(r"[가-힣A-Za-z0-9]", t) else ""
 
 
 def split_ready(buf: str, final: bool, first: bool = False):
@@ -502,7 +515,7 @@ def split_ready(buf: str, final: bool, first: bool = False):
     elif len(rest) > 80 and "," in rest:  # flush an over-long clause at its last comma
         cut = rest.rfind(",") + 1
         done, rest = done + [rest[:cut]], rest[cut:]
-    return [s.strip() for s in done if s.strip()], rest
+    return [k for k in (korean_only(s.strip()) for s in done) if k], rest
 
 
 def pick(table, text):
@@ -1508,6 +1521,8 @@ if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
+        assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
+        assert split_ready("好的. 내일 봬요.", True)[0] == ["내일 봬요."] and korean_only("API 서버") == "API 서버"
         assert split_ready("네! 알겠어요? 그럼", False) == (["네!", "알겠어요?"], "그럼")
         assert split_ready("마지막 문장", True) == (["마지막 문장"], "")
         assert split_ready("네, 알겠습니다. 오늘", False, first=True) == (["네,"], "알겠습니다. 오늘")
