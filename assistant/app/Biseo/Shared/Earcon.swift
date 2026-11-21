@@ -26,6 +26,11 @@ enum Earcon {
                     .triangle, nil, 2000, -22, 0.300)
         case .wake:
             return ([Note(freq: 1174.66, start: 0, attack: 0.003, hold: 0, decay: 0.220)], .sine, (2.76, -20), nil, -20, 0.250)
+        // Provisional (designer to confirm): a soft single-note "들었어요" and a barely-there pulse.
+        case .ack:
+            return ([Note(freq: 783.99, start: 0, attack: 0.004, hold: 0, decay: 0.060)], .sine, (2, -20), nil, -30, 0.080)
+        case .pulse:
+            return ([Note(freq: 587.33, start: 0, attack: 0.040, hold: 0, decay: 0.200)], .sine, nil, nil, -38, 0.260)
         }
     }
 
@@ -94,6 +99,7 @@ struct EarconGate {
         guard enabled else { return .drop }
         if cue == .wake { return .play }
         let userTalking = listening && now - userLoudAt < Self.micHold
+        if cue == .pulse { return userTalking ? .drop : .play } // never queued, never over the user
         if cue == .tick {
             guard !userTalking, now - lastTick >= Self.tickInterval else { return .drop }
             lastTick = now
