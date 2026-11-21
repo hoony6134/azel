@@ -58,13 +58,14 @@ struct CallScreen: View {
                 Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     .contentTransition(.opacity).animation(Theme.state, value: jarState)
                 GeometryReader { geo in
-                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt).frame(width: geo.size.width, height: geo.size.height)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: geo.size.width, height: geo.size.height)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
                         .accessibilityAction(named: "말 끊기") { call.interrupt() }
                 }
                 .frame(maxHeight: typeSize >= .accessibility1 ? 140 : .infinity)
+                if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
                 captions
                 dock
                 hangUp

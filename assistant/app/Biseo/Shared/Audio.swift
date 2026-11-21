@@ -53,9 +53,11 @@ extension PCM {
 final class Levels: @unchecked Sendable {
     static let silent = Levels()
     private let lock = NSLock()
-    private var _mic: Float = 0, _out: Float = 0
+    private var _mic: Float = 0, _out: Float = 0, _loudAt: Double = -.infinity
     var mic: Float { lock.lock(); defer { lock.unlock() }; return _mic }
     var out: Float { lock.lock(); defer { lock.unlock() }; return _out }
+    /// Last time (monotonic seconds) the mic level was above 0.25: the user is talking.
+    var micLoudAt: Double { lock.lock(); defer { lock.unlock() }; return _loudAt }
 
     /// RMS → 0…1: −50 dBFS → 0, −6 dBFS → 1.
     static func level(rms: Float) -> Float { max(0, min(1, (20 * log10(max(rms, 1e-5)) + 50) / 44)) }
@@ -73,9 +75,12 @@ final class Levels: @unchecked Sendable {
         return (sum / Float(buffer.frameLength)).squareRoot()
     }
 
-    func update(mic buffer: AVAudioPCMBuffer) { update(\._mic, buffer) }
+    func update(mic buffer: AVAudioPCMBuffer) {
+        update(\._mic, buffer)
+        if mic > 0.25 { lock.lock(); _loudAt = ProcessInfo.processInfo.systemUptime; lock.unlock() }
+    }
     func update(out buffer: AVAudioPCMBuffer) { update(\._out, buffer) }
-    func reset() { lock.lock(); _mic = 0; _out = 0; lock.unlock() }
+    func reset() { lock.lock(); _mic = 0; _out = 0; _loudAt = -.infinity; lock.unlock() }
 
     private func update(_ key: ReferenceWritableKeyPath<Levels, Float>, _ buffer: AVAudioPCMBuffer) {
         let target = Self.level(rms: Self.rms(buffer))
@@ -88,6 +93,11 @@ final class Levels: @unchecked Sendable {
 final class AudioIO {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    /// Earcons (DESIGN §14.2): a second player under the speech, ducked while speech plays.
+    private let cuePlayer = AVAudioPlayerNode()
+    private lazy var cueBuffers: [Cue: AVAudioPCMBuffer] = Dictionary(uniqueKeysWithValues: Cue.allCases.map { ($0, Earcon.buffer($0)) })
+    private let speechLock = NSLock()
+    private var speechEnd = 0.0      // monotonic time the queued speech runs out
     let levels = Levels()
     var onMic: ((Data) -> Void)?
     #if os(macOS)
@@ -98,6 +108,21 @@ final class AudioIO {
     init() {
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: PCM.speakerFormat)
+        engine.attach(cuePlayer)
+        engine.connect(cuePlayer, to: engine.mainMixerNode, format: PCM.speakerFormat)
+    }
+
+    /// working/done/error/wake replace whatever cue is playing; ticks queue.
+    func playCue(_ cue: Cue) {
+        guard engine.isRunning, let buf = cueBuffers[cue] else { return }
+        cuePlayer.volume = speechPlaying ? 0.4 : 1
+        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick ? [] : .interrupts)
+        if !cuePlayer.isPlaying { cuePlayer.play() }
+    }
+
+    private var speechPlaying: Bool {
+        speechLock.lock(); defer { speechLock.unlock() }
+        return ProcessInfo.processInfo.systemUptime < speechEnd
     }
 
     /// iOS: call after CallKit activated the audio session.
@@ -118,7 +143,13 @@ final class AudioIO {
         }
         let mixer = engine.mainMixerNode
         mixer.installTap(onBus: 0, bufferSize: 1024, format: mixer.outputFormat(forBus: 0)) { [weak self] buffer, _ in
-            self?.levels.update(out: buffer)
+            guard let self else { return }
+            levels.update(out: buffer)
+            // Ducking: −8 dB in ~30 ms while speech plays, back in ~150 ms.
+            let target: Float = speechPlaying ? 0.4 : 1
+            let dt = Float(buffer.frameLength) / Float(buffer.format.sampleRate)
+            let tau: Float = target < cuePlayer.volume ? 0.03 : 0.15
+            cuePlayer.volume += (target - cuePlayer.volume) * min(1, dt / tau * 3)
         }
         try engine.start()
         player.play()
@@ -127,11 +158,15 @@ final class AudioIO {
     func play(_ pcm16: Data) {
         guard engine.isRunning, let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
         player.scheduleBuffer(buf)
+        let now = ProcessInfo.processInfo.systemUptime
+        speechLock.lock(); speechEnd = max(speechEnd, now) + Double(buf.frameLength) / buf.format.sampleRate; speechLock.unlock()
     }
 
     /// `interrupt`: stop() drops every scheduled buffer; play() makes the node ready for the next reply.
     func flush() {
         player.stop()
+        cuePlayer.stop() // interrupt silences cues too
+        speechLock.lock(); speechEnd = 0; speechLock.unlock()
         if engine.isRunning { player.play() }
     }
 
@@ -141,6 +176,7 @@ final class AudioIO {
 
     func stop() {
         player.stop()
+        cuePlayer.stop()
         engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()

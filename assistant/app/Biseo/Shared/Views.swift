@@ -268,7 +268,10 @@ struct SettingsScreen<Extra: View>: View {
             }
             if let nameError { Text(nameError).font(.footnote).foregroundStyle(Theme.danger) }
             Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
-            Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
+            HStack {
+                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
+                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
+            }
                 .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
         }
     }

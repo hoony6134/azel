@@ -106,6 +106,21 @@ enum JarPath {
         return path
     }
 
+    /// Extra swirl turns from a tool_start surge (0.25 → 0.6 rev/s, easing back over 0.4 s) and
+    /// extra glow from a tool_end pulse.
+    static func workBoost(now: Date, surge: Date?, pulse: Date?) -> (turns: Double, glow: Double) {
+        var turns = 0.0, glow = 0.0
+        if let surge {
+            let e = now.timeIntervalSince(surge)
+            if e >= 0 { turns = 0.35 * (e < 0.4 ? e - e * e / 0.8 : 0.2) } // integral of a linear ease-out
+        }
+        if let pulse {
+            let e = now.timeIntervalSince(pulse)
+            if e >= 0 && e < 0.3 { glow = 0.25 * sin(.pi * e / 0.3) }
+        }
+        return (turns, glow)
+    }
+
     static func smoothstep(_ x: Double) -> Double { let c = max(0, min(1, x)); return c * c * (3 - 2 * c) }
 }
 
@@ -117,6 +132,10 @@ struct MoonJar: View {
     var paused = false
     /// Set on `interrupt`: one quick ring ripple (DESIGN §5).
     var ripple: Date? = nil
+    /// tool_start: the thinking swirl speeds up and eases back over 400 ms (DESIGN §13.3).
+    var surge: Date? = nil
+    /// tool_end: one glow pulse, +0.25 opacity over 300 ms.
+    var pulse: Date? = nil
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var phase
@@ -134,8 +153,9 @@ struct MoonJar: View {
                 let center = CGPoint(x: size.width / 2, y: size.height * (state == .speaking ? 0.44 : 0.5))
                 let path = JarPath.make(center: center, R: R, t: reduceMotion ? 0 : t, level: level,
                                         from: previous, to: state, mix: mix, reduceMotion: reduceMotion)
-                draw(state, path: path, opacity: mix, ctx: ctx, center: center, R: R, t: t, level: level)
-                if mix < 1 { draw(previous, path: path, opacity: 1 - mix, ctx: ctx, center: center, R: R, t: t, level: level) }
+                let boost = reduceMotion ? (0.0, 0.0) : JarPath.workBoost(now: now, surge: surge, pulse: pulse)
+                draw(state, path: path, opacity: mix, ctx: ctx, center: center, R: R, t: t, level: level, boost: boost)
+                if mix < 1 { draw(previous, path: path, opacity: 1 - mix, ctx: ctx, center: center, R: R, t: t, level: level, boost: boost) }
                 if let ripple, case let e = now.timeIntervalSince(ripple), e >= 0, e < 0.4 {
                     let k = 1.05 + e * (reduceMotion ? 0 : 0.8)
                     let ring = path.applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: k, y: k)
@@ -151,7 +171,9 @@ struct MoonJar: View {
         .accessibilityAddTraits(.updatesFrequently)
     }
 
-    private func draw(_ s: JarState, path: Path, opacity: Double, ctx: GraphicsContext, center: CGPoint, R: Double, t: Double, level: Double) {
+    /// boost: (extra swirl turns, extra glow opacity) from tool activity.
+    private func draw(_ s: JarState, path: Path, opacity: Double, ctx: GraphicsContext, center: CGPoint, R: Double, t: Double, level: Double,
+                      boost: (Double, Double) = (0, 0)) {
         var ctx = ctx
         ctx.opacity = opacity
         let box = path.boundingRect
@@ -164,6 +186,7 @@ struct MoonJar: View {
             case .speaking: strength = 0.4 + 0.5 * level
             default: break
             }
+            strength += boost.1
             ctx.drawLayer { g in
                 g.addFilter(.blur(radius: s == .speaking ? R * (0.3 + 0.5 * level) : 28))
                 g.fill(path, with: .color(glow.opacity(strength)))
@@ -196,7 +219,7 @@ struct MoonJar: View {
         // 5. thinking swirl
         if s == .thinking {
             ctx.clip(to: path)
-            let angle = reduceMotion ? 0 : t * .pi / 2
+            let angle = reduceMotion ? 0 : t * .pi / 2 + boost.0 * 2 * .pi
             ctx.fill(path, with: .conicGradient(Gradient(colors: [Theme.glazeIndigo.opacity(0.7), Theme.porcelain.opacity(0.1),
                                                                    Theme.glazeIndigo.opacity(0.4), Theme.glazeIndigo.opacity(0.7)]),
                                                 center: CGPoint(x: box.midX, y: box.midY), angle: .radians(angle)))

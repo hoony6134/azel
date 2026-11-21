@@ -18,6 +18,10 @@ final class MacCall: ObservableObject {
     @Published private(set) var recording = false
     @Published private(set) var connectedAt: Date?
     @Published var error: String?
+    /// What the assistant is doing this turn (DESIGN §13) and the jar's surge/pulse moments.
+    @Published private(set) var activity = ActivityLog()
+    @Published private(set) var surgeAt: Date?
+    @Published private(set) var pulseAt: Date?
     /// Last interrupt (server or tap), drives the jar's ripple.
     @Published private(set) var interruptedAt: Date?
     /// Device UIDs for the call engine; nil = system default. Saved across launches.
@@ -62,6 +66,7 @@ final class MacCall: ObservableObject {
         talking = true
         if inCall {
             client.sending = true
+            client.cue(.wake, listening: false)
             showPanel()
         } else {
             start(panel: true)
@@ -106,6 +111,7 @@ final class MacCall: ObservableObject {
         guard !inCall else { return }
         activeSession = session ?? Session.current("mac")
         log = CallLog()
+        activity = ActivityLog()
         state = ""
         error = nil
         if usePanel { showPanel() }
@@ -168,16 +174,26 @@ final class MacCall: ObservableObject {
     private func connect() {
         inCall = true
         applyDevices()
-        do { try client.start(session: activeSession); connectedAt = Date() } catch {
+        do {
+            try client.start(session: activeSession)
+            connectedAt = Date()
+            if pttCall || talking { client.cue(.wake, listening: false) }
+        } catch {
             end(error: error.localizedDescription, keepPanel: true)
         }
     }
 
     private func handle(_ event: CallEvent) {
+        if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         scheduleIdle()
         if event.type == "turn_done" { scheduleFade() }
         switch event.type {
         case "state": state = event.value ?? ""
+        case "activity" where event.phase == "tool_start":
+            surgeAt = Date()
+            ActivityAnnouncer.toolStarted(event.label ?? "", thinking: state == "thinking")
+        case "activity" where event.phase == "tool_end":
+            pulseAt = Date()
         case "error": error = event.message
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
@@ -248,7 +264,7 @@ struct CallPanelView: View {
 
     var body: some View {
         HStack(spacing: Theme.m) {
-            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt).frame(width: 68, height: 68)
+            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: 68, height: 68)
                 .onTapGesture { call.interrupt() }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
             VStack(alignment: .leading, spacing: 2) {
@@ -259,7 +275,16 @@ struct CallPanelView: View {
                 } else if reply == nil && user == nil {
                     Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                 }
-                if let user { Text(user).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
+                if let current = call.activity.current {
+                    // §13.4: the activity line replaces the transcript while a step runs.
+                    HStack(spacing: Theme.xs) {
+                        Image(systemName: current.glyph).font(.system(size: 13)).foregroundStyle(Theme.indigo)
+                        Text(current.label).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text)
+                        if !call.activity.done.isEmpty { Text("· ✓\(call.activity.done.count)").font(.footnote).foregroundStyle(Theme.text3) }
+                    }
+                    .lineLimit(1)
+                    .accessibilityElement(children: .combine)
+                } else if let user { Text(user).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
                 if let reply {
                     Text(reply.text + (reply.interrupted ? " …" : "")).font(.title3.weight(.medium))
                         .foregroundStyle(reply.interrupted ? Theme.text3 : Theme.text).lineLimit(2)

@@ -100,6 +100,20 @@ final class CallClient {
         }
     }
 
+    private var gate = EarconGate()
+
+    /// Plays a work sound if the gate allows; cues that would land on the user's voice wait up to
+    /// 300 ms, then drop. Main thread.
+    func cue(_ cue: Cue, listening: Bool, waited: Double = 0) {
+        let now = ProcessInfo.processInfo.systemUptime
+        switch gate.decide(cue, now: now, listening: listening, userLoudAt: audio.levels.micLoudAt, waited: waited, enabled: Earcon.enabled) {
+        case .play: audio.playCue(cue)
+        case .drop: break
+        case .wait:
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.cue(cue, listening: listening, waited: waited + 0.05) }
+        }
+    }
+
     /// Push-to-talk key-up: ~700 ms of zero PCM so the server VAD closes the turn (DESIGN §12.5).
     func sendSilence(milliseconds: Int = 700) {
         socket?.send(.data(Self.silence(milliseconds: milliseconds))) { _ in }

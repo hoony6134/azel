@@ -17,6 +17,10 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var recording = false
     @Published private(set) var connectedAt: Date?
     @Published var error: String?
+    /// What the assistant is doing this turn (DESIGN §13) and the jar's surge/pulse moments.
+    @Published private(set) var activity = ActivityLog()
+    @Published private(set) var surgeAt: Date?
+    @Published private(set) var pulseAt: Date?
     /// Last interrupt (server or tap), drives the jar's ripple.
     @Published private(set) var interruptedAt: Date?
     /// Incoming calls show the push's `caller`; outgoing ones the cached assistant name.
@@ -120,6 +124,7 @@ final class CallManager: NSObject, ObservableObject {
         inCall = true
         state = ""
         log = CallLog()
+        activity = ActivityLog()
         muted = false
         held = false
         recording = false
@@ -152,8 +157,15 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     private func handle(_ event: CallEvent) {
+        if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         switch event.type {
         case "state": state = event.value ?? ""
+        case "activity" where event.phase == "tool_start":
+            surgeAt = Date()
+            let label = event.label ?? "", thinking = state == "thinking"
+            MainActor.assumeIsolated { ActivityAnnouncer.toolStarted(label, thinking: thinking) } // handle() runs on main
+        case "activity" where event.phase == "tool_end":
+            pulseAt = Date()
         case "error": error = event.message
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)

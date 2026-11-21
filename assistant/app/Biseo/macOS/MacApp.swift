@@ -251,14 +251,17 @@ struct MacHome: View {
                     } else {
                         Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }
-                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
                         .accessibilityAction(named: "말 끊기") { call.interrupt() }
                         .frame(width: call.inCall ? 320 : 200, height: call.inCall ? 320 : 200)
                         .animation(Theme.enter, value: call.inCall)
-                    if call.inCall { captions; dock } else { idle }
+                    if call.inCall {
+                        if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                        captions; dock
+                    } else { idle }
                     if let e = call.error { Text(e).font(.footnote).foregroundStyle(Theme.danger) }
                 }
                 .padding(Theme.xl)
