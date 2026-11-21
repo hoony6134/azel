@@ -872,6 +872,15 @@ def test_briefing_context(gw):
     assert sent[-1]["facts"][:2] == ["승인 대기 1건", "다음 예약 전화: 내일 오전 7시 기상"]
 
 
+def test_outbox_survives_concurrent_puts(gw):
+    g, _, _ = gw
+
+    async def two_at_once():  # two asks finishing together used to raise "pop from empty list"
+        await asyncio.gather(*[g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.01}) for _ in range(5)])
+    asyncio.run(two_at_once())
+    assert len(g.fake.db["usage"]) == 5 and g.pending_usage == []
+
+
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
     g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}

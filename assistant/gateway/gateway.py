@@ -196,9 +196,21 @@ class Outbox:
     def __init__(self, name, rejected, route):
         self.file, self.rejected, self.route = HOME / name, HOME / rejected, route
         self.items: list[dict] = json.loads(self.file.read_text()) if self.file.exists() else []
+        self._lock, self._loop = None, None
+
+    def lock(self):
+        """One sender at a time (two asks finishing together drained the same list: 'pop from empty list')."""
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._lock, self._loop = asyncio.Lock(), loop
+        return self._lock
 
     async def put(self, body):
         self.items.append(body)
+        async with self.lock():
+            await self._flush()
+
+    async def _flush(self):
         try:
             while self.items:
                 try:

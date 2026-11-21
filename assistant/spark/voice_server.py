@@ -485,6 +485,14 @@ def pre_route(text, settings, local=False):
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
 
 
+def hold_tag_prefix(buf):
+    """(speakable text, held tail): a tail that could still grow into the routing tag is never spoken early."""
+    at = buf.rfind("[")
+    if at != -1 and ROUTE_TAG.startswith(buf[at:].rstrip()) and len(buf) - at < len(ROUTE_TAG) + 2:
+        return buf[:at], buf[at:]
+    return buf, ""
+
+
 def tag_state(head):
     """Qwen's reply so far (left-stripped): 'tag' = route to Claude, 'tool' = a tool call (collect it whole),
     'maybe' = too short to tell, 'no' = speak it."""
@@ -928,9 +936,11 @@ async def respond(text, session, t0, timings, on_event=None):
                         state = tag_state(buf.lstrip())
                     if state in ("maybe", "tool"):
                         continue  # might be a tag; a tool call is collected whole
-                    if state == "tag":
+                    if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
                         return await via_claude()
-                    done, buf = split_ready(buf, final=False, first="first_sentence_ms" not in timings)
+                    speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
+                    done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
+                    buf = rest + held
                     for s in done:
                         timings.setdefault("first_sentence_ms", ms(t0))
                         await sentences.put(s)
@@ -941,9 +951,9 @@ async def respond(text, session, t0, timings, on_event=None):
                     messages += [{"role": "assistant", "content": buf.strip()},
                                  {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
                     continue
-                if state == "tool":
-                    return await via_claude()  # tools looping, or no brain: let Claude take it
-                for s in split_ready(buf, final=True)[0]:
+                if state == "tool" or ROUTE_TAG in buf:
+                    return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
+                for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
                     await sentences.put(s)
                 break
         finally:
@@ -1482,6 +1492,23 @@ if __name__ == "__main__":
             assert strip_vocative(said, name) == want, (said, name)
         assert pre_route(strip_vocative("스파크야 안녕", "스파크"), {})[0] is False  # a name that is also a keyword
         assert [tag_state(h) for h in ("", "[CLA", "[CLAUDE]", "네")] == ["maybe", "maybe", "tag", "no"]
+        assert hold_tag_prefix("수요일이요. [CL") == ("수요일이요. ", "[CL") and hold_tag_prefix("네 [1]번") == ("네 [1]번", "")
+
+        async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
+            async def tagging_llm(messages, max_tokens=600):
+                for d in ["수요", "일이요. [CL", "AUDE]"]:
+                    yield d
+
+            async def answer_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                yield "정확히 확인해 보니 목요일이에요."
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            globals().update(llm_stream=tagging_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
+            return [s async for s, *_ in respond("회의가 무슨 요일이었더라", "late", time.perf_counter(), {})]
+        said_late = asyncio.run(late_tag_check())
+        globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
+        assert not any("CLA" in s or "[" in s for s in said_late) and said_late[-1] == "정확히 확인해 보니 목요일이에요.", said_late
         async def prefetch_check():  # the opening is synthesized when the call message arrives, not on connect
             spoken = []
 
