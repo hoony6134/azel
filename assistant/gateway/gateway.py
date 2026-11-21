@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import agent_loop
 import connectors
+import google_tools
 import tools_bridge
 import nim
 import wake_enroll
@@ -865,7 +866,8 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
 
     async def run(name, args):
         return (await bridge.call(name, args, current_persona.get(), caller="api", where=where))["content"]
-    system = name_prompt(settings) + FULL_API_STYLE + device_prompt(settings, devices)
+    system = name_prompt(settings) + (FULL_API_STYLE if google_status() != "connected" else FULL_API_STYLE.replace(
+        "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해.", GOOGLE_STYLE)) + device_prompt(settings, devices)
     yield activity("thinking")
     async for kind, v in claude_api.ask(API_KEY, model, system, text, defs, run):
         if kind == "text":
@@ -1790,6 +1792,7 @@ async def status():
                                   probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
+            "google": google_status(),  # connected | expired (the app shows "Google 다시 연결") | none
             "devices": [{"id": d["id"], "name": d["name"], "limited": bool(d.get("limited")), **p,
                          "fresh": time.time() - d["last_seen"] < DEVICE_FRESH_S} for d, p in zip(devs, probes[3:])]}
 
@@ -2529,6 +2532,8 @@ async def task_create(body, source="api"):
     spec = check_task(body)
     settings = await load_settings()
     spec["backend"] = spec["backend"] or settings.get("task_backend", "claude_code")
+    if spec["backend"] != "claude_code" and MAIL_CAL.search(spec["goal"]) and google_status() != "connected" and CLAUDE_OK:
+        spec["backend"] = "claude_code"  # calendar and mail are only on the claude.ai connectors then
     if spec["backend"] == "claude_code" and not CLAUDE_OK:
         raise HTTPException(503, "Claude is not available on this gateway")
     if spec["persona"] and not persona_by_id(settings, spec["persona"]):
@@ -2842,6 +2847,8 @@ if __name__ == "__main__":
 
 # ---------- one tool executor for every path (tools_bridge.py) and API-backed tasks (agent_loop.py) ----------
 TASK_BACKENDS = ("claude_code", *agent_loop.BACKENDS)
+GOOGLE_STYLE = ("메일과 캘린더는 calendar_events, gmail_search, gmail_read 도구로 확인하고, 도구 결과에 없는 일정이나 메일은 "
+                "말하지 마.")
 TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로 요약해. "
                   "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
                   "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기에는 읽기와 진단만 해.")
@@ -2850,7 +2857,15 @@ bridge = tools_bridge.Bridge(
     place_call=lambda reason, opening, pid: place_call(reason, opening=opening, persona_id=pid),
     schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
     state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
-    in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME))
+    in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME),
+    google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
+
+
+def google_status():
+    return google_tools.status(HOME) if MODE == "full" else "none"
+
+
+MAIL_CAL = re.compile(r"메일|편지함|답장|캘린더|일정(?!한)|약속|회의|스케줄", re.I)
 
 
 @app.get("/v1/tools")

@@ -74,3 +74,19 @@ def test_task_backend_setting(tgw, monkeypatch):  # noqa: F811
     r = c.post("/v1/tasks", json={"goal": "x", "notify": "none"})
     t = wait_for(c, r.json()["id"], ("done", "failed"))
     assert t["backend"] == "claude_api" and t["status"] == "failed" and "키" in t["error"]  # no API key in tests
+
+
+def test_google_tools_only_with_a_live_grant(tgw, tmp_path):  # noqa: F811
+    g, c, notes = tgw
+    assert g.google_status() == "none" and "gmail_search" not in [t["name"] for t in c.get("/v1/tools").json()]
+    for name, data in (("google_client.json", {"installed": {"client_id": "x", "client_secret": "y",
+                                                             "token_uri": "https://t", "auth_uri": "https://a"}}),
+                       ("google_oauth.json", {"refresh_token": "r", "expired": False})):
+        (g.HOME / name).write_text(json.dumps(data))
+        (g.HOME / name).chmod(0o600)
+    assert g.google_status() == "connected"
+    assert {"calendar_events", "gmail_search", "gmail_read"} <= {t["name"] for t in c.get("/v1/tools").json()}
+    (g.HOME / "google_oauth.json").write_text(json.dumps({"refresh_token": "r", "expired": True}))
+    assert g.google_status() == "expired" and "gmail_read" not in [t["name"] for t in c.get("/v1/tools").json()]
+    r = c.post("/v1/tasks", json={"goal": "이번 주 캘린더 일정 정리해 줘", "backend": "qwen", "notify": "none"})
+    assert r.json()["backend"] == "claude_code"  # no live grant: calendar work stays on the claude.ai connectors

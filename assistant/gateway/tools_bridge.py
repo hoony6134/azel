@@ -61,7 +61,8 @@ class Bridge:
         if caller == "qwen":
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
-        return [*dev_defs, CALL_USER, CREATE_TASK, *cyg_defs], where
+        g_defs, _ = self.d.get("google", lambda: ([], None))()
+        return [*dev_defs, CALL_USER, CREATE_TASK, *cyg_defs, *g_defs], where
 
     # ---------- one call ----------
     async def call(self, name, args, persona_id=None, caller="api", on_progress=None, where=None):
@@ -72,9 +73,10 @@ class Bridge:
                 return ok(await self.call_user(args, persona_id))
             if name == "create_task":
                 return ok(await self.create_task(args, persona_id, caller))
-            cyg_defs, cyg_run = self.d["cygnus"]()
-            if cyg_run and name in {t["name"] for t in cyg_defs}:
-                return ok(await cyg_run(name, args))
+            for source in ("cygnus", "google"):  # read-only sources with their own allowlist and checks
+                defs, run = self.d.get(source, lambda: ([], None))()
+                if run and name in {t["name"] for t in defs}:
+                    return ok(await run(name, args))
             if where is None:
                 _, where = await self.tools(caller)
             if name not in where:
