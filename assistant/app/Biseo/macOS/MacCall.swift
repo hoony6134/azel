@@ -34,7 +34,7 @@ final class MacCall: ObservableObject {
 
     private init() {
         client.onEvent = { [weak self] in self?.handle($0) }
-        client.onClose = { [weak self] in self?.end(error: nil, keepPanel: true) }
+        client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
     }
 
     /// "누르고 말하기" (default) or "눌러서 켜고 끄기".

@@ -16,8 +16,17 @@ final class CallClient {
 
     /// Server text events, on the main queue.
     var onEvent: ((CallEvent) -> Void)?
-    /// The socket closed or failed (not after `stop()`), on the main queue.
-    var onClose: (() -> Void)?
+    /// The socket closed or failed (not after `stop()`), on the main queue, with a message for the
+    /// user when the call never got going.
+    var onClose: ((String?) -> Void)?
+    private var receivedAny = false
+
+    /// 401/403 on the WebSocket handshake: wrong token, or a server that doesn't take the header yet.
+    static func closeMessage(status: Int?, receivedAny: Bool) -> String? {
+        if status == 401 || status == 403 { return "토큰이 맞지 않거나 서버가 아직 업데이트되지 않았어요" }
+        if !receivedAny { return "음성 서버에 연결하지 못했어요" + (status.map { " (HTTP \($0))" } ?? "") }
+        return nil
+    }
     /// Read on the audio thread; set from the main thread.
     var muted = false
     /// Hold: no mic goes up, playback pauses, the recording pauses. The socket stays open.
@@ -62,6 +71,7 @@ final class CallClient {
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
                                                                          session: session, callID: callID))
         socket = task
+        receivedAny = false
         task.resume()
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
@@ -77,6 +87,7 @@ final class CallClient {
         task.receive { [weak self] result in
             guard let self else { return }
             // Audio and interrupts are handled right here, in arrival order; UI hops to main.
+            if case .success = result { receivedAny = true }
             switch result {
             case .success(.data(let pcm)):
                 audio.play(pcm)
@@ -91,7 +102,8 @@ final class CallClient {
                 recorder?.note(event)
                 DispatchQueue.main.async { self.onEvent?(event) }
             case .failure:
-                DispatchQueue.main.async { if task === self.socket { self.onClose?() } }
+                let message = Self.closeMessage(status: (task.response as? HTTPURLResponse)?.statusCode, receivedAny: receivedAny)
+                DispatchQueue.main.async { if task === self.socket { self.onClose?(message) } }
                 return
             @unknown default:
                 break

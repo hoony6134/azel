@@ -57,25 +57,29 @@ struct SetupFlow: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.l) {
                 Text("연결").font(.title.weight(.semibold)).foregroundStyle(Theme.text).padding(.top, Theme.xl)
-                Card("서버 주소") {
-                    field("음성 서버", $voice)
-                    field("게이트웨이", $gateway)
+                Card("토큰") {
+                    HStack {
+                        SecureField(Config.token == nil ? "토큰" : "저장됨 (바꿀 때만 입력)", text: $token)
+                            .textFieldStyle(.roundedBorder)
+                            .onChange(of: token) { let clean = Config.cleanToken(token); if clean != token { token = clean } }
+                        Button("붙여넣기") { if let s = SetupFlow.pasteboardString() { token = Config.cleanToken(s) } }
+                            .buttonStyle(.bordered).tint(Theme.celadon)
+                    }
+                    Text("키체인에만 저장돼요").font(.footnote).foregroundStyle(Theme.text3)
+                }
+                Card("서버") {
+                    Text(voice == Config.publicVoiceURL && gateway == Config.publicGatewayURL ? "azel.scian.xyz (기본)" : "\(voice)\n\(gateway)")
+                        .font(.footnote.monospaced()).foregroundStyle(Theme.text2)
                     DisclosureGroup("고급") {
                         VStack(alignment: .leading, spacing: Theme.s) {
-                            #if os(macOS)
-                            Button("Tailnet 주소 사용") { voice = Config.tailnetVoiceURL; gateway = Config.tailnetGatewayURL }
-                            #endif
+                            field("음성 서버", $voice)
+                            field("게이트웨이", $gateway)
                             Button("공개 주소 사용") { voice = Config.publicVoiceURL; gateway = Config.publicGatewayURL }
                         }
                         .padding(.top, Theme.s)
                     }
                     .tint(Theme.celadon)
                     Text(Config.addressNote).font(.footnote).foregroundStyle(Theme.text3)
-                }
-                Card("토큰") {
-                    SecureField(Config.token == nil ? "토큰" : "저장됨 (바꿀 때만 입력)", text: $token)
-                        .textFieldStyle(.roundedBorder)
-                    Text("키체인에만 저장돼요").font(.footnote).foregroundStyle(Theme.text3)
                 }
                 if !checks.isEmpty {
                     Card("연결 확인") {
@@ -131,7 +135,7 @@ struct SetupFlow: View {
         defer { checking = false }
         Config.voiceURL = voice.trimmingCharacters(in: .whitespaces)
         Config.gatewayURL = gateway.trimmingCharacters(in: .whitespaces)
-        if !token.isEmpty { Config.token = token.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if !token.isEmpty { Config.token = Config.cleanToken(token) }
         token = ""
         #if os(iOS)
         CallManager.shared.registerPush()
@@ -162,6 +166,14 @@ struct SetupFlow: View {
         }
         .buttonStyle(.plain)
         .padding(.bottom, Theme.l)
+    }
+
+    static func pasteboardString() -> String? {
+        #if os(iOS)
+        UIPasteboard.general.string
+        #else
+        NSPasteboard.general.string(forType: .string)
+        #endif
     }
 
     static var micAuthorized: Bool {

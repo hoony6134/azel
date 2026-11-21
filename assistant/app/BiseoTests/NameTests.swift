@@ -32,3 +32,26 @@ final class AssistantNameTests: XCTestCase {
         XCTAssertTrue(d.allSatisfy { $0 == 0 })
     }
 }
+
+final class SetupTests: XCTestCase {
+    func testPastedTokensLoseWhitespace() {
+        XCTAssertEqual(Config.cleanToken("  abc\n def\t\n"), "abcdef")
+        XCTAssertEqual(Config.cleanToken("abc"), "abc")
+    }
+
+    func testSavedPlainAddressesFallBackOnIOSOnly() {
+        XCTAssertNil(Config.usable("ws://100.64.0.11:8891", iOS: true))
+        XCTAssertNil(Config.usable("http://100.64.0.8:8892", iOS: true))
+        XCTAssertEqual(Config.usable("wss://azel.scian.xyz", iOS: true), "wss://azel.scian.xyz")
+        XCTAssertEqual(Config.usable("ws://100.64.0.11:8891", iOS: false), "ws://100.64.0.11:8891")
+        XCTAssertNil(Config.usable("  ", iOS: false))
+        XCTAssertNil(Config.usable(nil, iOS: false))
+    }
+
+    func testCallSocketRejectionsAreExplained() {
+        XCTAssertEqual(CallClient.closeMessage(status: 401, receivedAny: false), "토큰이 맞지 않거나 서버가 아직 업데이트되지 않았어요")
+        XCTAssertEqual(CallClient.closeMessage(status: 403, receivedAny: false), "토큰이 맞지 않거나 서버가 아직 업데이트되지 않았어요")
+        XCTAssertEqual(CallClient.closeMessage(status: 502, receivedAny: false), "음성 서버에 연결하지 못했어요 (HTTP 502)")
+        XCTAssertNil(CallClient.closeMessage(status: nil, receivedAny: true), "a normal remote hang-up stays quiet")
+    }
+}

@@ -46,11 +46,10 @@ targets:
         # macOS (ignored on iOS): menu-bar only, no Dock icon
         LSUIElement: true
         LSApplicationCategoryType: public.app-category.productivity
-        # Defaults are https/wss on azel.scian.xyz, so ATS stays on. The advanced tailnet addresses are
-        # plain http/ws to 100.64.x.x IPs: NSExceptionDomains takes no numeric IPs, but
-        # NSAllowsLocalNetworking lets bare-IP hosts through (checked 2026-11-21: http://100.64.0.8:8892
-        # answered 401, not an ATS error) on macOS only; iOS still refuses it (-1022), so the tailnet
-        # option is macOS-only. Not limited to 100.64/10; real hostnames still need TLS.
+        # Defaults are https/wss on azel.scian.xyz, so ATS stays on. Plain tailnet http/ws can't be
+        # allowed per IP range (NSExceptionDomains takes no numeric IPs). NSAllowsLocalNetworking only
+        # lets macOS reach this Mac's own address (checked 2026-11-21: 100.64.0.8 → 401, vd-spark
+        # 100.64.0.11 → -1022; iOS refuses both), so the app offers only the TLS addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
   BiseoTests:

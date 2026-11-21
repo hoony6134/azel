@@ -29,6 +29,11 @@ struct HomeView: View {
                 .aspectRatio(1, contentMode: .fit)
                 .padding(.horizontal, 60)
                 callButton
+                if let e = call.error, !call.inCall {
+                    Label(e, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(Theme.danger)
+                        .multilineTextAlignment(.leading)
+                        .accessibilityElement(children: .combine)
+                }
                 quickActions
                 ScheduleCard(schedule: schedule)
                 recents
