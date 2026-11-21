@@ -143,9 +143,6 @@ def migrate_personas(s):
                       "voice": DEFAULT_TTS_VOICE, "voice_style": "", "personality": s.get("personality") or "",
                       "color": "#7C5CFF", "default_model": None, "share_memory": False, "created_at": 0,
                       "primary": True})
-    for p in ps:  # voices no longer offered (Chinese/Japanese-native) become sohee
-        if str(p.get("voice") or "").lower() not in KOREAN_VOICES:
-            p["voice"] = "sohee"
     s["personas"] = ps
     prim = primary_persona(s)
     s["assistant_name"], s["personality"] = prim.get("name") or DEFAULTS["assistant_name"], prim.get("personality") or ""
@@ -1688,12 +1685,15 @@ async def nim_key(body: dict):
     return Response(status_code=204)
 
 
-# The voices offered for personas: natural in Korean. Measured 2026-11-21 (3 Korean sentences through Whisper):
-# sohee, ryan, aiden all CER 0.05 (only digit formatting differs). eric, dylan and serena also scored < 0.1 but are
-# Chinese-native speakers, and the user asked for Korean (plus some English) only; vivian, uncle_fu, ono_anna too.
-KOREAN_VOICES = {"sohee": ("소희", "따뜻한 한국어 여성", "ko"), "ryan": ("라이언", "힘 있는 남성 (영어 억양이 조금 있어요)", "en"),
-                 "aiden": ("에이든", "밝고 친근한 남성 (영어 억양이 조금 있어요)", "en")}
-VOICE_INFO = KOREAN_VOICES
+# Labels for the TTS server's speakers (Qwen3-TTS CustomVoice): the voice's character only, never a language or
+# nationality. `lang` stays in /v1/voices for older apps (not shown). Unknown speakers show their id.
+VOICE_INFO = {
+    "sohee": ("소희", "따뜻하고 감정이 풍부한 여성", "ko"), "vivian": ("비비안", "밝고 또렷한, 살짝 톡 쏘는 젊은 여성", "zh"),
+    "serena": ("세레나", "부드럽고 다정한 젊은 여성", "zh"), "uncle_fu": ("푸 아저씨", "낮고 묵직한, 연륜 있는 남성", "zh"),
+    "dylan": ("딜런", "맑고 자연스러운 젊은 남성", "zh"), "eric": ("에릭", "활기차고 살짝 허스키한 남성", "zh"),
+    "ryan": ("라이언", "리듬감 있고 힘찬 남성", "en"), "aiden": ("에이든", "밝고 시원한 청년", "en"),
+    "ono_anna": ("오노 안나", "경쾌하고 발랄한 여성", "ja"),
+}
 _tts_voices: dict = {"at": 0.0, "voices": []}
 _sample_at: list = [0.0]  # voice samples: one per 2 s on this gateway
 
@@ -1702,8 +1702,8 @@ _sample_at: list = [0.0]  # voice samples: one per 2 s on this gateway
 async def voices():
     """The TTS speakers for the persona editor, with Korean labels."""
     full_only()
-    return [{"id": v, "label": KOREAN_VOICES[v][0], "desc": KOREAN_VOICES[v][1], "lang": KOREAN_VOICES[v][2]}
-            for v in await tts_voices() if v in KOREAN_VOICES]
+    return [{"id": v, "label": VOICE_INFO.get(v, (v, "", ""))[0], "desc": VOICE_INFO.get(v, (v, "", ""))[1],
+             "lang": VOICE_INFO.get(v, (v, "", ""))[2]} for v in await tts_voices()]
 
 
 async def tts_sample(text, voice, style):
@@ -1721,8 +1721,8 @@ async def voice_sample(body: dict):
     text, voice, style = body.get("text"), body.get("voice"), body.get("voice_style") or ""
     if not (isinstance(text, str) and 0 < len(text.strip()) <= 60):
         raise HTTPException(400, "text: 1-60 characters")
-    if not isinstance(voice, str) or voice.lower() not in KOREAN_VOICES or voice.lower() not in await tts_voices():
-        raise HTTPException(400, f"voice: one of {sorted(KOREAN_VOICES)}")
+    if not isinstance(voice, str) or voice.lower() not in await tts_voices():
+        raise HTTPException(400, "voice: not a TTS speaker")
     if not isinstance(style, str) or len(style) > 200:
         raise HTTPException(400, "voice_style: text up to 200 characters")
     if time.time() - _sample_at[0] < 2:
@@ -1765,9 +1765,8 @@ async def check_persona(body, s, pid=None):
         body["name"] = " ".join(body["name"].split())
         if any(p["name"] == body["name"] and p["id"] != pid for p in live_personas(s)):
             raise HTTPException(400, "name: another persona already has it")
-    if "voice" in body and (not isinstance(body["voice"], str) or body["voice"].lower() not in KOREAN_VOICES
-                            or body["voice"].lower() not in await tts_voices()):
-        raise HTTPException(400, f"voice: one of {sorted(KOREAN_VOICES)} (GET /v1/voices)")
+    if "voice" in body and (not isinstance(body["voice"], str) or body["voice"].lower() not in await tts_voices()):
+        raise HTTPException(400, "voice: not a TTS speaker (GET /v1/voices)")
     if not isinstance(body.get("voice_style", ""), str) or len(body.get("voice_style", "")) > 200:
         raise HTTPException(400, "voice_style: text up to 200 characters")
     if body.get("personality") is None and "personality" in body:

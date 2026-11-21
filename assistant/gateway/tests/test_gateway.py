@@ -318,7 +318,11 @@ def test_persona_delete_voices_and_samples(gw, monkeypatch):
     g.fake.state.down = False
     assert not c.get("/v1/personas/nova").json()["deleted_at"]
     v = c.get("/v1/voices").json()
-    assert {"id": "sohee", "label": "소희", "desc": "따뜻한 한국어 여성", "lang": "ko"} in v and len(v) == 3 and "vivian" not in {x["id"] for x in v}
+    assert {"id": "sohee", "label": "소희", "desc": "따뜻하고 감정이 풍부한 여성", "lang": "ko"} in v and len(v) == 4
+    assert {"id": "vivian", "label": "비비안", "desc": "밝고 또렷한, 살짝 톡 쏘는 젊은 여성", "lang": "zh"} in v
+    assert not any(w in x["desc"] for x in v for w in ("한국어", "중국어", "영어", "일본어", "억양"))  # character, not origin
+    r = c.post("/v1/personas", json={"id": "vivi", "name": "비비", "voice": "vivian"})
+    assert r.status_code == 201 and c.get("/v1/personas/vivi").json()["voice"] == "vivian"  # every speaker, no migration
     calls = []
 
     async def fake_sample(text, voice, style):

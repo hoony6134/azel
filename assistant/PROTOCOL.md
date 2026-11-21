@@ -358,16 +358,15 @@ device that created them.
   (`name`, `voice` required; max 8 live personas), `GET|PUT /v1/personas/{id}` (PUT: any field but id,
   primary, created_at), `DELETE /v1/personas/{id}` (marks `deleted_at`: its calls, history and schedule
   keep `persona_id` and the name stays resolvable; the primary cannot be deleted → 400),
-  `POST /v1/personas/{id}/primary`. Voices must be one of the Korean-capable set `sohee`, `ryan`, `aiden`
-  and offered by the TTS server's `/v1/audio/voices` (fallback `BISEO_TTS_VOICES`; neither reachable → 503);
-  anything else → 400. A stored persona on another voice (the dropped Chinese/Japanese-native speakers
-  vivian, serena, uncle_fu, dylan, eric, ono_anna) is read back with `voice: "sohee"`. `DELETE /v1/personas/{id}?delete_history=true|false`
+  `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices` (all nine
+  Qwen3-TTS speakers; fallback `BISEO_TTS_VOICES`; neither reachable → 503); anything else → 400. `DELETE /v1/personas/{id}?delete_history=true|false`
   (default false): the persona's own notes and call summaries (memory records with `meta.persona_id`) and
   its calls' follow-up contexts are always deleted; its call history is deleted with `delete_history=true`,
   otherwise it stays with `"persona_deleted": true` on each item (the app shows "삭제된 비서"). If ruchba
   cannot do that (503), the persona is not deleted either. `GET /v1/voices` →
-  `[{"id","label","desc","lang"}]`, only the Korean-capable speakers the TTS server offers, with Korean labels (e.g. `{"id":"sohee","label":"소희",
-  "desc":"따뜻한 한국어 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
+  `[{"id","label","desc","lang"}]`, every speaker the TTS server offers, with Korean labels and a description of
+  the voice's character (never a language or nationality); `lang` is kept for compatibility and is not shown (e.g. `{"id":"sohee","label":"소희",
+  "desc":"따뜻하고 감정이 풍부한 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
   (text 1–60 chars) → `audio/wav` for the editor's "들어보기"; at most one per 2 s per gateway (429);
   502 if the TTS server cannot be reached. `assistant_name` stays a read/write alias of the primary persona's
   name.
