@@ -1431,6 +1431,8 @@ async def handle_link(ws):
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
+        elif m.get("type") == "task" and isinstance(m.get("id"), str):
+            tasks[m["id"]] = asyncio.create_task(serve_task(m))
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "call_answered":
@@ -1476,6 +1478,7 @@ async def lifespan(app):
         tasks.append(asyncio.create_task(scheduler()))
         if static_devices:
             tasks.append(asyncio.create_task(static_prober()))
+        tasks.append(asyncio.create_task(fail_orphan_tasks_safe()))
         if CLAUDE_OK:
             tasks.append(asyncio.create_task(discovery.refresh()))
         if OLD_DB.exists() and not MIGRATED.exists():
@@ -1483,7 +1486,17 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    for run in list(task_runs.values()):  # a stopping gateway kills its task processes
+        run.cancel()
+    await asyncio.gather(*task_runs.values(), return_exceptions=True)
     await warm_pool.close_all()
+
+
+async def fail_orphan_tasks_safe():
+    try:
+        await fail_orphan_tasks()
+    except StateDown:
+        pass
 
 
 async def reap_warm():
@@ -2073,6 +2086,319 @@ async def get_approval(aid: str):
 @app.post("/v1/approvals/{aid}")
 async def decide(aid: str, body: dict):
     return await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": bool(body.get("approve"))})
+
+
+# ---------- tasks: background Claude Code runs on the devices ("…해 줘, 끝나면 알려 줘") ----------
+# Full gateways only. A task is not a voice turn: its own `claude -p` process (never the warm voice pool), at most
+# TASK_SLOTS at once, hard limits on time and estimated cost, steps logged without arguments or results, approvals
+# waited for, and a call or push at the end. Stored in ruchba's kv (`task-<id>` + the `tasks-index` list).
+TASK_SLOTS = 2
+TASK_DEFAULT_MIN, TASK_DEFAULT_USD = 30, 2.0
+TASK_MAX_ROUNDS = 4  # one approval wait per round
+TASK_STATUSES = ("queued", "running", "waiting_approval", "done", "failed", "cancelled")
+TASK_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로"
+              " 요약해. 도구가 pending_approval을 돌려주면 그 명령을 다시 시도하지 말고 'APPROVAL_PENDING <approval_id>'"
+              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
+task_slots = asyncio.Semaphore(TASK_SLOTS)
+task_runs: dict[str, asyncio.Task] = {}  # tasks this gateway is running
+
+
+def task_key(tid):
+    return f"/v1/state/kv/task-{tid}"
+
+
+async def task_save(t):
+    t["updated"] = time.time()
+    await state.call("PUT", task_key(t["id"]), t)
+
+
+async def task_index_add(t):
+    # shortcut: read-modify-write of one list; two gateways creating tasks in the same instant can drop one entry
+    # from the index (the task itself is kept). Move to a state table if tasks get busy.
+    ids = [i for i in (await state.call("GET", "/v1/state/kv/tasks-index") or []) if i != t["id"]]
+    await state.call("PUT", "/v1/state/kv/tasks-index", [t["id"], *ids][:200])
+
+
+def task_step(t, kind, **fields):
+    t["steps"].append({"at": time.time(), "kind": kind, **fields})
+    del t["steps"][:-200]
+
+
+def check_task(body):
+    goal = body.get("goal")
+    if not isinstance(goal, str) or not 1 <= len(goal.strip()) <= 2000:
+        raise HTTPException(400, "goal: 1-2000 characters")
+    notify = body.get("notify", "push")
+    if notify not in ("call", "push", "none"):
+        raise HTTPException(400, "notify: call, push or none")
+    budget = body.get("budget_usd", TASK_DEFAULT_USD)
+    minutes = body.get("max_minutes", TASK_DEFAULT_MIN)
+    for name, v, top in (("budget_usd", budget, 50), ("max_minutes", minutes, 240)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= top:
+            raise HTTPException(400, f"{name}: a number above 0, at most {top}")
+    device = body.get("device")
+    if device is not None and not (isinstance(device, str) and re.fullmatch(r"[a-z0-9_-]{1,32}", device)):
+        raise HTTPException(400, "device: a device id")
+    persona = body.get("persona")
+    if persona is not None and not (isinstance(persona, str) and PERSONA_ID.fullmatch(persona)):
+        raise HTTPException(400, "persona: a persona id")
+    return {"goal": goal.strip(), "notify": notify, "budget_usd": float(budget), "max_minutes": float(minutes),
+            "device": device, "persona": persona}
+
+
+async def task_create(body, source="api"):
+    full_only()
+    if not CLAUDE_OK:
+        raise HTTPException(503, "Claude is not available on this gateway")
+    spec = check_task(body)
+    settings = await load_settings()
+    if spec["persona"] and not persona_by_id(settings, spec["persona"]):
+        raise HTTPException(400, "persona: no such persona")
+    t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
+         "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
+         "cost_usd": 0.0, "cancel_requested": False}
+    await task_save(t)
+    await task_index_add(t)
+    task_runs[t["id"]] = asyncio.create_task(run_task(t))
+    return t
+
+
+def task_prompt(t, devices):
+    where = f"작업 기기: {t['device']}." if t["device"] else "작업 기기는 기본 순서대로 골라."
+    limited = [d["id"] for d in devices if d.get("limited")]
+    note = f" 한도 기기(읽기·진단만): {', '.join(limited)}." if limited else ""
+    return f"{where}{note}\n\n목표: {t['goal']}"
+
+
+async def task_round(t, prompt, resume, deadline):
+    """One `claude -p` run of a task: (session id, pending approval id or None). Kills on time or cost."""
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    settings = await load_settings()
+    devices = await fresh_devices()
+    model = settings["task_defaults"].get("task", {}).get("model")
+    model = model if model in MODELS else "sonnet"
+    style = name_prompt(settings) + TASK_STYLE + device_prompt(settings, devices)
+    servers, allowed, run_settings, run_env = run_args(settings, devices)
+    cfg = None
+    if servers:
+        fd, cfg = tempfile.mkstemp(suffix=".json")  # holds tokens: 0600, deleted after the run
+        with os.fdopen(fd, "w") as f:
+            json.dump({"mcpServers": servers}, f)
+    cmd = base_cmd(MODELS[model], style, allowed, cfg, resume, run_settings)
+    text = prompt if resume else task_prompt(t, devices)
+    proc = await asyncio.create_subprocess_exec(cmd[0], "-p", text, *cmd[1:], cwd=WORKDIR,
+                                                env=os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"} | run_env,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                                                limit=2**24)
+    pin, pout = PRICES[model]
+    spent_before, session, pending, said = t["cost_usd"], resume, None, ""
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TaskLimit("time", f"{t['max_minutes']:g}분 시간 한도를 넘어 멈췄어요.")
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), min(left, 5))
+            except asyncio.TimeoutError:
+                if (await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"):
+                    raise asyncio.CancelledError
+                continue
+            if not raw:
+                break
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if e.get("type") == "assistant":
+                msg = e.get("message") or {}
+                for b in msg.get("content") or []:
+                    if b.get("type") == "tool_use":
+                        task_step(t, "tool", tool=b.get("name", ""), label=tool_label(b.get("name", "")))
+                    elif b.get("type") == "text" and b.get("text", "").strip():
+                        said = b["text"].strip()
+                u = msg.get("usage") or {}
+                t["cost_usd"] += (u.get("input_tokens", 0) * pin + u.get("output_tokens", 0) * pout) / 1e6
+                await task_save(t)
+                if t["cost_usd"] >= t["budget_usd"]:
+                    raise TaskLimit("budget", f"예산 {t['budget_usd']:g}달러를 넘어 멈췄어요.")
+            elif e.get("type") == "user":
+                for b in (e.get("message") or {}).get("content") or []:
+                    if b.get("type") == "tool_result" and (m := PENDING_RE.search(json.dumps(b.get("content"), ensure_ascii=False).replace('\\"', '"'))):
+                        pending = m.group(1)
+            elif e.get("type") == "result":
+                session = e.get("session_id") or session
+                if e.get("total_cost_usd"):  # the CLI's own figure replaces the estimate for this round
+                    t["cost_usd"] = spent_before + float(e["total_cost_usd"])
+                said = str(e.get("result") or said)
+                if e.get("is_error") and not pending:
+                    raise TaskLimit("error", claude_failure(said)["message"])
+        await proc.wait()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if cfg:
+            os.unlink(cfg)
+    t["result"] = re.sub(r"APPROVAL_PENDING\s+\S+", "", said).strip()[:2000] or None
+    return session, pending
+
+
+class TaskLimit(Exception):
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind, self.message = kind, message
+
+
+async def wait_approval(t, aid):
+    """Poll the approval until decided (the task's clock stands still meanwhile): True if approved."""
+    t["status"] = "waiting_approval"
+    task_step(t, "approval", approval_id=aid)
+    await task_save(t)
+    while True:
+        a = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}") or {}
+        if a.get("status") in ("approved", "rejected"):
+            t["status"] = "running"
+            task_step(t, "approval_" + a["status"], approval_id=aid)
+            await task_save(t)
+            return a["status"] == "approved"
+        if (await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"):
+            raise asyncio.CancelledError
+        await asyncio.sleep(TASK_APPROVAL_POLL_S)
+
+
+TASK_APPROVAL_POLL_S = 3
+
+
+async def run_task(t):
+    try:
+        async with task_slots:
+            if t["cancel_requested"]:
+                raise asyncio.CancelledError
+            t.update(status="running", started=time.time())
+            await task_save(t)
+            deadline = time.monotonic() + t["max_minutes"] * 60
+            session, prompt = None, None
+            for _ in range(TASK_MAX_ROUNDS):
+                session, pending = await task_round(t, prompt, session, deadline)
+                if not pending:
+                    break
+                waited = time.monotonic()
+                ok = await wait_approval(t, pending)
+                deadline += time.monotonic() - waited
+                prompt = (f"승인됐어 (approval_id={pending}). 같은 명령을 approval_id와 함께 다시 실행하고 이어서 해." if ok else
+                          "사용자가 그 명령을 거절했어. 그 명령 없이 할 수 있는 만큼 하고 결과를 요약해.")
+            t.update(status="done", finished=time.time())
+    except asyncio.CancelledError:
+        t.update(status="cancelled", finished=time.time(), error="취소됐어요.")
+    except TaskLimit as e:
+        t.update(status="failed", finished=time.time(), error=e.message)
+        task_step(t, "killed", reason=e.kind)
+    except Exception as e:  # keep the gateway alive; the task records why
+        print("task failed:", t["id"], type(e).__name__, e, flush=True)
+        t.update(status="failed", finished=time.time(), error="작업이 실패했어요.")
+    finally:
+        task_runs.pop(t["id"], None)
+        try:
+            await task_save(t)
+            await record_usage({"model": "task", "path": "task", "task": "task", "input_tokens": 0,
+                                "output_tokens": 0, "cost_usd": round(t["cost_usd"], 6)})
+        except StateDown:
+            print("task not saved:", t["id"], flush=True)
+        if t["status"] != "cancelled":
+            await task_notify(t)
+
+
+def task_summary(t):
+    if t["status"] == "done":
+        return f"맡기신 작업 끝났어요. {t['result'] or '결과는 앱에서 확인해 주세요.'}"[:600]
+    return f"맡기신 작업이 끝나지 못했어요. {t['error'] or ''}"[:600]
+
+
+async def task_notify(t):
+    try:
+        if t["notify"] == "call":
+            await place_call("task", opening=task_summary(t), persona_id=t["persona"])
+        elif t["notify"] == "push":
+            await send_alert_push("작업 완료" if t["status"] == "done" else "작업 실패", task_summary(t)[:180])
+    except Exception as e:
+        print("task notify failed:", t["id"], type(e).__name__, flush=True)
+
+
+async def fail_orphan_tasks():
+    """At start: this gateway's tasks that were running when it stopped can never finish."""
+    for tid in await state.call("GET", "/v1/state/kv/tasks-index") or []:
+        t = await state.call("GET", task_key(tid))
+        if t and t.get("owner") == DEVICE and t["status"] in ("queued", "running", "waiting_approval"):
+            t.update(status="failed", finished=time.time(), error="게이트웨이가 다시 시작돼서 멈췄어요.")
+            await task_save(t)
+
+
+def task_view(t, steps=True):
+    keep = ("id", "goal", "status", "device", "persona", "notify", "budget_usd", "max_minutes", "created", "started",
+            "finished", "result", "error", "cost_usd", "owner")
+    return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
+
+
+@app.post("/v1/tasks", status_code=201)
+async def tasks_post(body: dict):
+    return task_view(await task_create(body))
+
+
+@app.get("/v1/tasks")
+async def tasks_list(limit: int = 20):
+    full_only()
+    out = []
+    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:max(1, min(limit, 100))]:
+        if t := await state.call("GET", task_key(tid)):
+            out.append(task_view(t, steps=False))
+    return out
+
+
+@app.get("/v1/tasks/{tid}")
+async def tasks_get(tid: str):
+    full_only()
+    t = await state.call("GET", task_key(quote(tid, safe=""))) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
+    if not t:
+        raise HTTPException(404, "no such task")
+    return task_view(t)
+
+
+@app.post("/v1/tasks/{tid}/cancel")
+async def tasks_cancel(tid: str):
+    full_only()
+    t = await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
+    if not t:
+        raise HTTPException(404, "no such task")
+    if t["status"] in ("done", "failed", "cancelled"):
+        raise HTTPException(409, f"task already {t['status']}")
+    if run := task_runs.get(tid):  # ours: stop it now (the claude process is killed on the way out)
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+    else:  # another gateway's: it sees the flag within seconds
+        t["cancel_requested"] = True
+        await task_save(t)
+    return task_view(await state.call("GET", task_key(tid)) or t, steps=False)
+
+
+DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크"}
+
+
+async def serve_task(m):
+    """A task request from the voice server ("…해 줘, 끝나면 알려 줘"): start it, answer what to say."""
+    reply = {"id": m["id"], "type": "task_result", "ok": True}
+    try:
+        current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
+        t = await task_create({k: m[k] for k in ("goal", "device", "persona", "notify") if m.get(k) is not None},
+                              source="voice")
+        settings = await load_settings()
+        dev = t["device"] or settings["default_device"]
+        then = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림 드릴게요.", "none": "앱에서 진행 상황을 볼 수 있어요."}
+        reply.update(task_id=t["id"], say=f"{DEVICE_WORD.get(dev, dev)}에서 시작할게요. {then[t['notify']]}")
+    except (HTTPException, StateDown) as e:
+        print("voice task refused:", getattr(e, "detail", e), flush=True)
+        reply.update(ok=False, say="지금은 작업을 맡을 수 없어요.")
+    await link_send(reply)
 
 
 OLD_DB = HOME / "gateway.db"  # the per-host SQLite of the single-gateway era
