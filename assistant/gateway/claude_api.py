@@ -81,18 +81,14 @@ async def _result(block, run_tool):
 
 
 def cygnus_bridge(home):
-    """(tool definitions, run_tool) for the read-only Cygnus tools, or ([], None) without a PAT or the brain module.
-    The bridge itself (allowlist, validation, trimming) is assistant/brain/cygnus.py's tools() / call().
+    """(tool definitions, run_tool) for the read-only Cygnus tools, or ([], None) without a PAT.
+    The bridge itself (allowlist, validation, trimming) is cygnus.py's tools() / call(), in this directory.
 
-    shortcut: imports cygnus.py from the sibling brain directory, so a host needs it next to the gateway's; move it
-    into a shared package if more services need it."""
+    shortcut: gateway/cygnus.py is a copy of brain/cygnus.py plus the people tool and the memory-scoped writes;
+    make it one shared module when the brain branch lands."""
     import os
-    import sys
-    from pathlib import Path
-    brain_dir = Path(__file__).resolve().parent.parent / "brain"
-    if not (home / "cygnus_pat").exists() or not (brain_dir / "cygnus.py").exists():
+    if not (home / "cygnus_pat").exists():
         return [], None
     os.environ.setdefault("BISEO_HOME", str(home))
-    sys.path.insert(0, str(brain_dir))
-    import cygnus
+    import cygnus  # the gateway's own copy (batch 5); the brain keeps its own
     return (cygnus.tools(), cygnus.call) if cygnus.available() else ([], None)

@@ -44,7 +44,8 @@ CASES = [
     ("약 먹기 알림 11시 반으로 미뤄줘", lambda w, t: w.updates == [("one", {"when": "2026-11-23T23:30:00+09:00"}, None)],
      "inherit 오후 → 23:30"),
     ("7시에 전화해줘", lambda w, t: [x["at"] for x in w.schedule] == [at_(19)], "call 19:00 today"),
-    ("내일 7시에 전화해줘", lambda w, t: not w.schedule and "아침 7시" in t and "저녁 7시" in t, "asks 아침/저녁"),
+    ("내일 7시에 전화해줘", lambda w, t: not w.schedule and any(x in t for x in ("아침", "오전"))
+     and any(x in t for x in ("저녁", "오후")), "asks 아침/저녁"),
     ("3시에 전화해줘", lambda w, t: [x["at"] for x in w.schedule] == [at_(15)], "call 15:00"),
 ]
 

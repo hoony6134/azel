@@ -461,7 +461,10 @@ def gateway_tools_text(defs):
     lines = "\n".join(f"- {t['name']}: {str(t.get('description', ''))[:120]}" for t in defs[:40])
     return ("\n\n[기기·전화·작업 도구, 같은 형식으로 불러]\n" + lines + "\n사용자에게 전화를 걸거나 예약하려면 call_user, 여러 단계 "
             "일은 create_task로 맡겨(끝나고 전화를 원하면 notify call). 기기에서 무언가 실행하는 도구는 사용자가 앱에서 "
-            "허용해야 실행돼. 전화를 걸 수 없다고 말하지 마.")
+            "허용해야 실행돼. 전화를 걸 수 없다고 말하지 마."
+            + ("\n사용자, 주변 사람, 지난 일, 취향, 계획을 물으면 '모르겠어요' 하기 전에 memory_recall이나 people_lookup을 먼저 "
+               "불러. 결과에 없는 사실은 지어내지 마. '기억해', '잊지 마'라고 하면 remember로 저장하고 결과 문장을 그대로 말해."
+               if any(t["name"] == "memory_recall" for t in defs) else ""))
 
 
 async def gateway_tool(name, args, on_say=None):
@@ -1279,7 +1282,11 @@ async def respond(text, session, t0, timings, on_event=None):
     sched = schedule_intent(bare, session)
     job = None if sched else task_intent(bare)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
-    to_claude, model = (False, None) if sched or job else pre_route(bare, settings, local=bool(ctx), tools=links.brain_tools() if ctx else ())
+    gw_names = tuple(t["name"] for t in gw_tools["defs"])
+    # The gateway's memory and people tools answer personal questions too: Qwen looks first, Claude only after
+    local = bool(ctx) or "memory_recall" in gw_names
+    to_claude, model = (False, None) if sched or job else pre_route(
+        bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
     sentences: asyncio.Queue = asyncio.Queue()
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
     route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
@@ -2237,6 +2244,8 @@ if __name__ == "__main__":
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
+        for ask in ("내가 좋아하는 커피 뭐였지?", "내 주변 사람 누구 있어?", "내가 좋아하는 커피 기억해 줘", "지도교수님 누구야?"):
+            assert not pre_route(ask, {}, local=True, tools=("memory_recall", "people_lookup"))[0], ask  # Qwen looks first
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
         assert task_intent("맥북 다운로드 폴더 정리해 줘") == "call" and task_intent("논문 찾아서 요약하고 끝나면 알려 줘") == "call"
         assert task_intent("빌드 돌리고 다 되면 알림으로 알려 줘") == "push" and task_intent("맥북 켜져 있어?") is None

@@ -220,6 +220,22 @@ def add_record(r: Record):
              " returning id, created", (r.kind, r.session, r.device, r.text, Jsonb(r.meta), embed(r.text)))[0]
 
 
+@app.get("/v1/records", dependencies=[v1])
+def list_records(kind: str = "note", memory: bool = False, limit: int = Query(50, ge=1, le=500)):
+    """Newest first. memory=true: only the assistant's remembered facts (meta.memory), the app's memory list."""
+    return db("select id, kind, session, device, text, meta, created from records"
+              " where kind = %s and (not %s or meta ? 'memory') order by created desc limit %s", (kind, memory, limit))
+
+
+@app.delete("/v1/records/{rid}", dependencies=[v1])
+def delete_record(rid: int):
+    """Forget one remembered fact. Only meta.memory notes: transcripts and call summaries are never deleted here."""
+    rows = db("delete from records where id = %s and meta ? 'memory' returning id, text, meta", (rid,))
+    if not rows:
+        raise HTTPException(404, "no such memory")
+    return rows[0]
+
+
 class Search(BaseModel):
     query: str = Field(min_length=1)
     kinds: list[str] | None = None

@@ -38,8 +38,8 @@ CALL_USER = {
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["reason"], "properties": {
         "when": {"type": ["string", "null"], "description": "정확한 ISO 시각을 이미 알 때만(앱 등). 지금이면 null"},
         "when_text": {"type": "string", "maxLength": 60, "description": (
-            "사용자가 말한 시각 표현 그대로(예: '6시', '내일 오후 1시', '30분 뒤', '금요일 3시 반'). 시각은 게이트웨이가 정하니 "
-            "직접 계산하지 마. 애매하면 도구가 물어볼 말을 돌려줘")},
+            "사용자가 말한 시각 표현을 한 글자도 바꾸지 말고 그대로(예: '6시', '11시 반', '내일 오후 1시', '30분 뒤'). 오전·오후를 "
+            "덧붙이거나 계산하지 마: 게이트웨이가 정하고, 애매하면 물어볼 말을 돌려줘")},
         "reason": {"type": "string", "maxLength": 200},
         "kind": {"type": "string", "enum": ["reminder", "wake"], "description": "wake = 깨우는 전화"},
         "repeat": {"type": ["string", "null"], "description": "옛 방식: daily, weekdays, weekly:0..6(0=월). repeat_cron을 쓸 것"},
@@ -79,8 +79,8 @@ SCHEDULE_UPDATE = {
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
         **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]},
         "when_text": {"type": "string", "maxLength": 60, "description": (
-            "사용자가 말한 시각 표현 그대로(예: '6시', '내일 오후 1시', '30분 뒤', '금요일 3시 반'). 시각은 게이트웨이가 정하니 "
-            "직접 계산하지 마. 애매하면 도구가 물어볼 말을 돌려줘")},
+            "사용자가 말한 시각 표현을 한 글자도 바꾸지 말고 그대로(예: '6시', '11시 반', '내일 오후 1시', '30분 뒤'). 오전·오후를 "
+            "덧붙이거나 계산하지 마: 게이트웨이가 정하고, 애매하면 물어볼 말을 돌려줘")},
         "when": {"type": "string", "description": (
             "정확한 ISO 시각을 이미 알 때만(앱 등). 반복 전체면 이 시각의 시·분이 새 규칙의 시각. cron은 repeat_cron에")},
         "purpose": {"type": "string", "maxLength": 60},
@@ -134,6 +134,7 @@ class Bridge:
         if caller == "qwen":
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
+        cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
         g_defs, _ = self.d.get("google", lambda: ([], None))()
         return [*dev_defs, *OWN_TOOLS, *cyg_defs, *g_defs], where
 
@@ -222,6 +223,8 @@ class Bridge:
             return say, view
         if name == "approval_status":
             return await self.approval_status(args)
+        if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
+            return await getattr(self, name)(args, persona_id)
         for source in ("cygnus", "google"):  # read-only sources with their own allowlist and checks
             defs, run = self.d.get(source, lambda: ([], None))()
             if run and name in {t["name"] for t in defs}:
@@ -412,6 +415,115 @@ class Bridge:
         new, say = await self.d["schedule_update"](item["id"], changes, occurrence)
         return say, new
 
+    # ---------- memory: Azel's own (ruchba records) and Cygnus (read PAT; writes with the memory-scoped PAT) ----------
+    def mine(self, rec, persona_id):
+        """A record this persona may see: shared ones, and its own."""
+        p = (rec.get("meta") or {}).get("persona")
+        return p in (None, "", "shared") or p == persona_id
+
+    async def cygnus_ok(self, persona_id):
+        """The user's own Cygnus memory: the primary persona and personas that share memory (PROTOCOL.md)."""
+        return await self.d.get("persona_shares", lambda pid: none_true())(persona_id)
+
+    async def cygnus_read(self, name, args):
+        _, run = self.d["cygnus"]()
+        if not run:
+            return ""
+        out = await run(name, args)
+        return "" if out.startswith(("지금은 Cygnus", "이 기기에는", "모르는 도구", "Cygnus가 거절")) or out == "(결과 없음)" \
+            else out
+
+    async def memory_recall(self, args, persona_id):
+        q = str(args["query"]).strip()
+        if not q:
+            raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
+        recs = [r for r in await self.d["memory_search"](q, 8) if self.mine(r, persona_id) and r.get("score", 1) >= 0.25]
+        cyg = await self.cygnus_read("memory_recall", {"query": q}) if await self.cygnus_ok(persona_id) else ""
+        lines = [f"[아젤 기억 {str(r.get('created', ''))[:10]}] {r['text'][:240]}" for r in recs[:4]]
+        if cyg:
+            lines.append(f"[Cygnus 기억] {cyg[:900]}")
+        if not lines:
+            return "기억에서 찾지 못했어요.", {"azel": [], "cygnus": ""}, "기억에서 찾지 못했어요. 지어내지 말고 모른다고 해."
+        spoken = (recs[0]["text"][:120] + " (아젤 기억)") if recs else "Cygnus 기억에서 찾았어요."
+        return spoken, {"azel": recs[:4], "cygnus": cyg}, "\n".join(lines) + "\n(출처를 밝혀 답하고, 없는 사실은 지어내지 마.)"
+
+    async def people_lookup(self, args, persona_id):
+        q = " ".join(str(args.get(k) or "") for k in ("name", "relation", "query")).strip()
+        if not q:
+            raise Fail("invalid", "누구를 찾을지(name, relation, query) 알려 주세요.")
+        people = await self.cygnus_read("gistra_people", {"query": args["name"]} if args.get("name") else {})
+        known = await self.cygnus_read("memory_recall", {"query": f"{q} 사람 person", "kind": "person"}) \
+            if await self.cygnus_ok(persona_id) else ""
+        recs = [r for r in await self.d["memory_search"](q, 6) if self.mine(r, persona_id) and r.get("score", 1) >= 0.25]
+        lines = ([f"[Cygnus 사람 목록] {people[:900]}"] if people else []) + \
+            ([f"[Cygnus 기억] {known[:600]}"] if known else []) + [f"[아젤 기억] {r['text'][:200]}" for r in recs[:3]]
+        if not lines:
+            return "그 사람에 대한 정보를 찾지 못했어요.", {}, "찾지 못했어요. 지어내지 말고 모른다고 해."
+        return "찾았어요.", {"people": people, "cygnus": known, "azel": recs[:3]}, \
+            "\n".join(lines) + "\n(출처를 밝혀 답하고, 결과에 없는 사람이나 사실은 지어내지 마.)"
+
+    async def remember(self, args, persona_id):
+        import cygnus  # the secret rule is the same one the Cygnus write path enforces
+        fact = re.sub(r"\s+", " ", str(args["fact"])).strip(" .")
+        about = str(args.get("about") or "").strip()[:40]
+        if not fact:
+            raise Fail("invalid", "무엇을 기억할지 알려 주세요.")
+        if cygnus.SECRET.search(f"{fact} {about}"):
+            raise Fail("invalid", "비밀번호나 카드번호 같은 비밀은 기억하지 않을게요. 그런 건 안전한 곳에 따로 두세요.")
+        shared = args.get("persona_scope", "shared") == "shared"
+        cyg_id, note = None, ""
+        if shared and self.d.get("cygnus_can_write", lambda: False)() and await self.cygnus_ok(persona_id):
+            # only an explicit "기억해" goes to Cygnus
+            kind = "person" if about else "preference" if re.search(r"좋아|싫어|선호|즐겨|별로", fact) else "fact"
+            try:
+                out = await self.d["cygnus_write"]("memory_save", {"text": f"{fact}" + (f" ({about})" if about else ""),
+                                                                   "kind": kind})
+                m = re.search(r"\b(m[_-]?[0-9a-z]{4,}|[0-9a-f]{8,}|\d{2,})\b", out)
+                cyg_id = m.group(1) if m else None
+            except Exception:  # noqa: BLE001  Azel still remembers; say Cygnus didn't take it
+                note = " (Cygnus에는 지금 못 남겼어요.)"
+        rec = await self.d["memory_add"](fact, {"memory": True, "source": "explicit", "about": about or None,
+                                                "persona": None if shared else persona_id, "cygnus_id": cyg_id})
+        return f"기억해 둘게요: {fact}.{note}", {"id": str(rec.get("id")), "cygnus_id": cyg_id}
+
+    async def memory_list(self, args, persona_id):
+        rows = [r for r in await self.d["memory_list"](int(args.get("limit") or 50)) if self.mine(r, persona_id)]
+        items = [{"id": str(r["id"]), "text": r["text"], "source": (r.get("meta") or {}).get("source", "explicit"),
+                  "about": (r.get("meta") or {}).get("about"), "persona": (r.get("meta") or {}).get("persona"),
+                  "in_cygnus": bool((r.get("meta") or {}).get("cygnus_id")), "created": str(r.get("created", ""))}
+                 for r in rows]
+        return (f"기억하는 게 {len(items)}개 있어요." if items else "아직 기억하는 게 없어요."), items, \
+            "\n".join(f"- id {i['id']}: {i['text'][:80]}" for i in items[:20]) or "아직 기억하는 게 없어요."
+
+    async def forget(self, args, persona_id):
+        rows = [r for r in await self.d["memory_list"](200) if self.mine(r, persona_id)]
+        if args.get("id"):
+            hits = [r for r in rows if str(r["id"]) == str(args["id"])]
+        elif args.get("query"):
+            words = [w for w in str(args["query"]).split() if len(w) > 1] or [str(args["query"])]
+            hits = [r for r in rows if all(w in r["text"] for w in words)]
+        else:
+            raise Fail("invalid", "무엇을 잊을지 알려 주세요.")
+        if not hits:
+            raise Fail("not_found", "그런 기억이 없어요.")
+        if len(hits) > 1:
+            raise Need("choose", "어느 기억을 지울까요?",
+                       "어느 기억인지 골라 주세요: " + "; ".join(f"{r['text'][:40]}(id {r['id']})" for r in hits[:5]),
+                       [{"id": str(r["id"]), "spoken": r["text"][:60]} for r in hits[:5]])
+        r = hits[0]
+        if args.get("confirmed") is not True:
+            q = f"'{r['text'][:80]}' 이 기억을 지울까요?"
+            raise Need("confirm", q, f"아직 지우지 않았어요. 사용자에게 \"{q}\"라고 묻고, 맞다고 하면 id={r['id']}, "
+                                     "confirmed=true로 다시 불러 주세요.", resend={"id": str(r["id"]), "confirmed": True})
+        await self.d["memory_delete"](r["id"])
+        cid = (r.get("meta") or {}).get("cygnus_id")
+        if cid and self.d.get("cygnus_can_write", lambda: False)():
+            try:
+                await self.d["cygnus_write"]("memory_edit", {"id": cid, "op": "archive"})
+            except Exception:  # noqa: BLE001
+                return f"잊었어요: {r['text'][:80]}. (Cygnus 쪽은 지금 지우지 못했어요.)", {"id": str(r["id"])}
+        return f"잊었어요: {r['text'][:80]}.", {"id": str(r["id"])}
+
     async def log_call(self, reason, at, pid):
         """Every user-requested call: who, when (None = now), why. The same list counts the daily cap."""
         today = datetime.now(KST).strftime("%Y-%m-%d")
@@ -563,6 +675,10 @@ def cancelled(done):
     return done[1], done[0]
 
 
+async def none_true():
+    return True
+
+
 def iso(text):
     try:
         t = datetime.fromisoformat(str(text))
@@ -589,19 +705,52 @@ def err(text):
 
 
 # ---------- the same tools as an MCP server, for `claude -p` (POST /v1/mcp, stateless JSON-RPC) ----------
+MEMORY_RECALL = {
+    "name": "memory_recall",
+    "description": ("사용자에 대한 기억 검색: 취향, 주변 사람, 지난 일, 계획, 결정. 아젤의 기억(지난 통화 포함)과 Cygnus 장기 기억을 "
+                    "함께 찾아 출처와 함께 돌려준다. 사용자·사람·과거·취향·계획을 물으면 '모르겠어요' 하기 전에 먼저 불러. "
+                    "결과에 없는 사실은 지어내지 마."),
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
+        "query": {"type": "string", "maxLength": 120, "description": "찾을 말 두세 개(예: '커피 취향', '지도교수')"}}}}
+PEOPLE_LOOKUP = {
+    "name": "people_lookup",
+    "description": ("주변 사람 찾기(읽기 전용): 교수·조교의 과목, 연락처, 사무실, 면담 시간과 기억에 있는 사람들. "
+                    "name(이름), relation(지도교수, 친구 같은 관계), query 중 하나 이상. '주변 사람', '누구야'는 이걸로."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "name": {"type": "string", "maxLength": 40}, "relation": {"type": "string", "maxLength": 40},
+        "query": {"type": "string", "maxLength": 80}}}}
+REMEMBER = {
+    "name": "remember",
+    "description": ("사용자가 '기억해', '잊지 마'라고 하거나 오래 갈 취향·사실·계획을 말하면 저장한다. 한 문장의 사실로. "
+                    "비밀번호, 카드번호, 계좌, 토큰 같은 비밀은 저장하지 않는다. 결과의 문장을 그대로 읽어 줘."),
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["fact"], "properties": {
+        "fact": {"type": "string", "maxLength": 300, "description": "예: '좋아하는 커피는 아이스 바닐라 라떼'"},
+        "about": {"type": "string", "maxLength": 40, "description": "사람에 관한 거면 그 사람"},
+        "persona_scope": {"type": "string", "enum": ["shared", "persona"],
+                          "description": "shared(모든 비서가 공유, 기본) 또는 persona(이 비서만)"}}}}
+FORGET = {
+    "name": "forget",
+    "description": "기억 하나를 지운다. 먼저 찾은 기억을 사용자에게 읽어 주고 확인받은 뒤 confirmed=true로 다시 불러.",
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "query": {"type": "string", "maxLength": 120}, "id": {"type": "string", "pattern": "^[0-9]{1,18}$"},
+        "confirmed": {"type": "boolean"}}}}
+MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것 목록(최근 순, 직접 기억한 것과 통화에서 자동으로 남긴 것).",
+               "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+                   "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
 # schedule_create: call_user that must have a time (the app's "new schedule" form); same handler, same checks.
 SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             APPROVAL_STATUS)
+             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST)
+CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
 MCP_TOOLS = ALL_OWN  # claude -p already has the daemons, Cygnus and the claude.ai connectors as its own MCP servers
 # The external token (the user's own Claude Code, later claude.ai): ring, schedule and hand off work, nothing personal.
 SCOPES = {"full": {t["name"] for t in MCP_TOOLS},
           "external": {"call_user", "schedule_create", "schedule_list", "schedule_cancel", "schedule_update",
-                       "create_task", "task_status", "task_cancel"}}
+                       "create_task", "task_status", "task_cancel"}}  # no personal reads or memory by default
 APP_ACTIONS = {t["name"] for t in ALL_OWN}  # the app: its own actions; device and personal reads stay with models
 # ACTIONS.md §1 metadata. rest: the dedicated route (method, path, how the action's args map), or the reason there
 # is none. examples: (valid, invalid) inputs for the conformance test.
@@ -626,6 +775,18 @@ ACTIONS = {
                     "rest": ("POST", "/v1/tasks/{id}/cancel"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
     "approval_status": {"read_only": True, "scopes": ("internal", "qwen", "app"),
                         "rest": ("GET", "/v1/approvals/{id}"), "examples": ({}, {"id": "zz"})},
+    "memory_recall": {"read_only": True, "scopes": ("internal", "qwen", "app"),
+                      "rest": ("POST", "/v1/memories/recall"), "examples": ({"query": "커피"}, {"query": ""})},
+    "people_lookup": {"read_only": True, "scopes": ("internal", "qwen", "app"),
+                      "rest": ("POST", "/v1/memories/people"), "examples": ({"name": "김교수"}, {})},
+    "remember": {"read_only": False, "scopes": ("internal", "qwen", "app"),
+                 "rest": ("POST", "/v1/memories"),
+                 "examples": ({"fact": "좋아하는 커피는 아이스 라떼"}, {"fact": "내 카드번호는 1234 5678 9012 3456"})},
+    "forget": {"read_only": False, "scopes": ("internal", "qwen", "app"),
+               "rest": ("DELETE", "/v1/memories/{id}"),
+               "examples": ({"id": "{mem}", "confirmed": True}, {"id": "999999999", "confirmed": True})},
+    "memory_list": {"read_only": True, "scopes": ("internal", "qwen", "app"),
+                    "rest": ("GET", "/v1/memories"), "examples": ({}, {"limit": 0})},
 }
 NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); tailnet POST /v1/tools/call reaches them
     "device": "기기 작업은 앱에서 create_task로 맡겨요(명령 실행은 승인과 함께 모델 경로에서만).",

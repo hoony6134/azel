@@ -51,3 +51,14 @@ def test_contacts_crud(client):
     assert client.delete(f"/v1/contacts/{c['id']}").json() == {"deleted": c["id"]}
     assert client.get(f"/v1/contacts/{c['id']}").status_code == 404
     assert client.put("/v1/contacts/999999", json={"name": "x"}).status_code == 404
+
+
+def test_memory_list_and_delete_touch_only_remembered_facts(client):
+    fact = client.post("/v1/records", json={"kind": "note", "text": "좋아하는 커피는 아이스 라떼",
+                                            "meta": {"memory": True, "source": "explicit"}}).json()
+    summary = client.post("/v1/records", json={"kind": "note", "text": "통화 요약", "meta": {}}).json()
+    listed = client.get("/v1/records?kind=note&memory=true").json()
+    assert [r["id"] for r in listed][:1] == [fact["id"]] and summary["id"] not in [r["id"] for r in listed]
+    assert client.delete(f"/v1/records/{summary['id']}").status_code == 404  # not a memory: kept
+    assert client.delete(f"/v1/records/{fact['id']}").json()["id"] == fact["id"]
+    assert client.delete(f"/v1/records/{fact['id']}").status_code == 404

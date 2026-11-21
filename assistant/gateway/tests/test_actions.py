@@ -57,13 +57,15 @@ def make_target(g, c, kind):
             when = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
             r = c.post("/v1/schedule", json={"reason": "약 먹기", "when": when.isoformat()}, headers=V2)
         return r.json()["data"]["id"]
+    if kind == "{mem}":
+        return c.post("/v1/memories", json={"fact": "테스트로 기억할 사실"}, headers=V2).json()["data"]["id"]
     t = c.post("/v1/tasks", json={"goal": "정리", "notify": "none", "backend": "claude_code"}, headers=V2).json()["data"]
     wait_for(c, t["id"], ("done", "failed"))
     return t["id"]
 
 
 def fill(g, c, args):
-    return {k: (make_target(g, c, v) if v in ("{id}", "{task}") else v) for k, v in args.items()}
+    return {k: (make_target(g, c, v) if v in ("{id}", "{task}", "{mem}") else v) for k, v in args.items()}
 
 
 def rest_call(c, meta, args):
