@@ -97,7 +97,8 @@ answering a call the assistant placed; the server then speaks that call's openin
   `VAD_THRESHOLD`, `NOISE_MARGIN_DB`, `MIN_VOICED_MS`, `BARGE_MIN_VOICED_MS` and their `NOISY_` variants.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
-  answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
+  answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}` (every interrupt, voice or tap, ends
+  with exactly that pair; a cancelled reply's own `listening` is dropped). During a placed call's
   opening the first sentence still finishes first.
 
 ## 1b. Gateway link — `WS /v1/gateway-link` on the voice server
@@ -297,7 +298,8 @@ device that created them.
 - NVIDIA NIM provider (full gateways only; `gateway/nim.py`). The hosted, OpenAI-compatible API, never a local
   container. Setting `"providers":{"nim":{"enabled":false,"base_url":"https://integrate.api.nvidia.com/v1",
   "model":"nvidia/nemotron-3-ultra-550b-a55b","prices":{}}}`; GET adds the read-only `"has_key"`. A partial
-  `providers.nim` merges into the current one; `base_url` must be https without credentials; `model` is free text;
+  `providers.nim` merges into the current one; `base_url` must be https on `integrate.api.nvidia.com` or another
+  `*.api.nvidia.com` host (port 443, no credentials); changing it deletes the stored key (enter it again); `model` is free text;
   `prices` `{model: [usd_in, usd_out] per MTok}` (absent → cost 0). `default_model`, `task_defaults.*.model`, a
   persona's `default_model` and `/v1/ask`'s `model` accept `"nim"`; the voice server sends `model:"nim"` for
   "엔비디아로 …". The NIM path streams like Claude (text deltas, `activity` thinking/tool_start/tool_end, `done`) with
@@ -317,7 +319,9 @@ device that created them.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
   `budget_paths` (a list of `api|nim|claude_code`, default `["api","nim"]`) are the usage paths that count toward
   `monthly_budget_usd` and its warning; `claude_code` runs on the subscription and costs no money, so by default it
-  does not count. `cost_usd` is the counted (paid) total; `by_*` still cover every row. Also
+  does not count. The budget gate applies after the route is resolved and only when the resolved path is in
+  `budget_paths`: a spent paid budget never stops a subscription (`claude_code`) ask. Tasks run on `claude -p` and
+  are recorded as path `claude_code` with `task:"task"` and the task's model. `cost_usd` is the counted (paid) total; `by_*` still cover every row. Also
   `"paid":{"cost_usd","by_path"}` and `"subscription":{"claude_code":{"turns","input_tokens","output_tokens",
   "equivalent_usd","quota"}}`, where `quota` is null until a `claude -p` run has reported the subscription windows
   (`rate_limit_event`), else `{"window":"5h"|"weekly" (the fullest),"utilization_pct","resets_at" (epoch s),
@@ -346,9 +350,10 @@ device that created them.
   - `notify` (default `"push"`) fires when the task finishes, fails, or needs an approval: `"call"` rings as the
     task's persona with the result as the opening (reason `task`; `task_approval` with "맡기신 작업에 승인이 필요해요…");
     `"push"` sends an alert push (not VoIP) to the `alert_token`s from `/v1/push/register`, titled "작업 완료" /
-    "작업 실패" / "승인 필요", with `"type":"task","task_id":"<id>"` at the payload's top level next to `aps` (the app
-    opens `azel://task/<id>`); `"none"` sends nothing. A cancelled task sends nothing. Cost goes into usage as path
-    `task`. Stored in ruchba's kv (`task-<id>`, index `tasks-index`, newest 200); a gateway restarting marks its own
+    "작업 실패" / "승인 필요", body "작업이 끝났어요: <goal, 40 chars>" / "작업이 실패했어요: …" / "승인이 필요해요: …"
+    (never model output), with `"type":"task","task_id":"<id>"` at the payload's top level next to `aps` (the app
+    opens `azel://task/<id>`); `"none"` sends nothing. A cancelled task sends nothing. A task resumes only on approvals
+    its own run created (never on an id that merely appears in tool output). Usage: path `claude_code`, `task:"task"`. Stored in ruchba's kv (`task-<id>`, index `tasks-index`, newest 200); a gateway restarting marks its own
     unfinished tasks `failed`.
   - Voice: "…해 줘, 끝나면 알려 줘" (push when it says 알림/푸시) or a job on a named device ("맥북 다운로드 폴더 정리해
     줘") becomes a task over the gateway link (`{"type":"task","goal","notify","persona","device"?}` →
@@ -364,7 +369,8 @@ device that created them.
   denied (`permissions.deny`) in `claude -p` runs. Its daemon config must also allow only read/diagnostic tools.
 - `POST /v1/push/register` `{"voip_token"?,"bundle_id","env":"sandbox"|"production","alert_token"?}` —
   the app sends its PushKit token and/or its ordinary APNs token (missed-call notices, task pushes). macOS sends
-  only `alert_token`. `bundle_id` and at least one token are required (400 otherwise).
+  only `alert_token`. `bundle_id` must be `xyz.scian.biseo` and at least one token is required (400 otherwise). At
+  most 10 tokens per kind are kept; registering an 11th evicts the oldest.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
@@ -461,21 +467,30 @@ device that created them.
   so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
 - Approvals: risky or (on `approve_unlisted` devices) unlisted daemon commands waiting for the user's tap.
   - `POST /v1/approvals` `{"device","tool","command","cwd"}` (daemons) → `{"approval_id","status":"pending",
-    "expires_at"}` and an alert push (`"type":"approval","approval_id"`, body `"<device>: <command, 80 chars>"`, never
-    output). If an `always` rule matches (same device and exact command) → `{"approval_id","status":"approved",
-    "rule_id"}` at once, no push (still audited when it runs).
+    "expires_at"}` and an alert push (`"type":"approval","approval_id"`, body "<device>에서 명령 실행 승인이 필요해요";
+    the command is shown only in the app). If an `always` rule matches (same device, exact command and cwd) →
+    `{"approval_id","status":"approved","rule_id"}` at once, no push (still audited when it runs), except when the
+    request comes from a task: a task's commands always need a tap.
   - `GET /v1/approvals` → pending ones only: `[{"id","device","tool","command","cwd","status","created","decided",
     "expires_at","decision","requester","rule_id"}]`. `requester`: the ask or task this gateway was running when the
     approval came in (`{"session","persona"}` or `{"task_id","persona"}`), else null. `GET /v1/approvals/{id}` → the
-    same object; `status` `pending|approved|rejected|expired` (a pending one expires 5 minutes after it was made).
+    same object; `status` `pending|approved|used|rejected|expired` (a pending one expires 5 minutes after it was
+    made; an approved one that has not run within 10 minutes of the tap expires too; `used` once it ran).
   - `POST /v1/approvals/{id}` `{"decision":"once"|"always"|"deny"}` (older apps: `{"approve":bool}` = once / deny)
-    → `{"id","status","decision","rule_id"?}`; 409 when it is no longer pending (decided or expired). `always` also
-    stores a rule `{"id","device","command","created"}`.
+    → `{"id","status","decision","rule_id"?,"forced_once"?}`; 409 when it is no longer pending (decided or expired).
+    `always` also stores a rule `{"id","device","command","cwd","created"}`, except for commands that run other code
+    (wrappers such as env/xargs/find/nohup/timeout, shells, interpreters, `open`, package managers, git …): those are
+    approved once and the answer carries `"forced_once":true`. Full gateways only (403 on limited).
   - `GET /v1/approvals/rules` → the rules; `DELETE /v1/approvals/rules/{id}` revokes one (404 if unknown).
+  - `POST /v1/approvals/{id}/use` `{"device","command","cwd"}` (daemons, right before an approved run) spends the
+    approval in ruchba atomically and once: approved, for that device, exact command and cwd, within 10 minutes of
+    the tap → `{"id","status":"used"}`, else 409.
   - `POST /v1/approvals/{id}/ran` `{"exit_code","status"}` (daemons, after an approved run) appends to the audit log;
     `GET /v1/approvals/audit?limit=50` → `[{"approval_id","device","command","cwd","exit_code","status","at",
     "decision":"once"|"always"|"rule"}]` (newest 500 kept; never output).
   - Kept in ruchba's approvals table plus kv (`approval-<id>`, `approval-rules`, `approval-audit`): no schema change.
+    A limited gateway has no kv access: it only creates and reads the approval rows (no rules, push, audit or
+    decisions), as before.
   - In a call, Claude says "앱에서 허용해 주세요", then calls `run_command` again with the `approval_id`, which waits for
     the decision (below); rejected or expired → it tells the user it was not allowed. Tasks wait as described under
     Tasks.
@@ -489,16 +504,25 @@ Approval flow: an approval-required `run_command` (or, with `approve_unlisted = 
 `allowed_commands`) posts `{"device","tool":"run_command","command","cwd"}` to `POST /v1/approvals` and returns
 `pending_approval` (an `always` rule answers `approved` and it runs at once). Claude calls `run_command` again with
 `approval_id`; the daemon waits up to `approval_wait_s` (120) for the decision (`pending_approval` again after that),
-then checks `GET /v1/approvals/{id}` → `{"status":"approved","command","cwd"}`, requires an exact command/cwd match,
-accepts each id once, runs it, and reports `POST /v1/approvals/{id}/ran` `{"exit_code","status"}` (no output).
+then checks `GET /v1/approvals/{id}` → `{"status":"approved","device","command","cwd"}`, requires its own device id
+and an exact command/cwd match, spends it with `POST /v1/approvals/{id}/use` (central, atomic, once, within 10 min of
+the tap; also kept in the local used-ids file), runs it, and reports `POST /v1/approvals/{id}/ran`
+`{"exit_code","status"}` (no output).
 Approved runs may use any existing directory under `$HOME` as cwd; allowlisted runs without approval stay inside
 `allowed_roots` with `check_args`.
 `approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,
 vd-core and sadr (unlisted commands are refused there, approval id or not).
-Never runnable, refused before any approval exists (and for approved runs): `sudo`/`su`/`doas` anywhere in the argv;
-anything under `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains` (as argument or cwd) and the
-`security` tool; `rm -r` on `/` or the home directory (or above it); `diskutil erase*`, `mkfs*`/`newfs*`,
-`dd of=/dev/…`; `sh|bash|zsh|… -c` and `osascript -e`. Still no shell: argv only.
+Never runnable, refused before any approval exists (and for approved runs). Names compare case-insensitively and
+every argv position counts, so wrappers (env incl. `-S`/`--split-string`, xargs, `find -exec`, nice, nohup, time,
+timeout, caffeinate, command) hide nothing:
+- `sudo`/`su`/`doas`/`pkexec`; `security`; any `osascript`;
+- inline code: `sh|bash|zsh|… -c`, `python* -c`, `perl -e/-E`, `ruby -e`, `node -e/-p/--eval`, `php -r`, `lua -e`;
+- `open -a|-b` of Terminal or iTerm, `open` of `.command|.tool|.sh|.scpt|.applescript|.workflow` files;
+- `rm -r` or `find … -delete` on `/` or the home directory (or above it); `diskutil erase*|zeroDisk|secureErase|
+  reformat|partitionDisk|apfs delete*|apfs erase*`; `mkfs*`/`newfs*`; `dd of=/dev/…`;
+- any path (argument, `--opt=value`, attached `-C/path`, cwd; symlinks resolved first) that is, is inside, or is an
+  ancestor of `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains` (so `~`, `~/.config`, `/Users`, `/`).
+Still no shell: argv only.
 
 Tools: `list_dir(path)`, `read_file(path, max_bytes?)`, `search(query, path?)`,
 `run_command(command, cwd?, approval_id?)`, `delegate(task, cwd, harness?, model?)` →
@@ -553,7 +577,8 @@ records, search, contacts and context, answers 403) when either:
   row whose writer is `full` (403). `GET /v1/state/devices` *limited* →
   `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
   token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
-- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`.
+- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`
+  (newest first, with `ts`); `DELETE /v1/state/push_tokens/{token}` → `{"deleted"}`.
 - Autonomous calls (full callers only): `POST /v1/state/proactive_log` (one decision, fields as in
   section 3) → `{"id"}`; `GET /v1/state/proactive_log?since=<epoch>&called=true|false&limit=100` → newest
   first. `GET|PUT /v1/state/kv/{key}` (key `[a-z0-9_]{1,40}`, not `settings`): small shared JSON values,
@@ -568,7 +593,9 @@ records, search, contacts and context, answers 403) when either:
 - `POST /v1/state/approvals` *limited* `{"id"?,"device","tool","command","cwd"}` → `{"approval_id"}` (`id`,
   12 hex chars, only from full callers, for migrated approvals; an existing id is left unchanged);
   `GET /v1/state/approvals?status=pending`; `GET /v1/state/approvals/{id}` *limited*;
-  `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending.
+  `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending;
+  `POST /v1/state/approvals/{id}/use` *limited* `{"device","command","cwd","window_s"?:600}` → `{"id","status":"used"}`
+  (atomic: approved, matching, decided within `window_s`; 409 otherwise).
 - `GET|PUT /v1/state/sessions/{voice_session}` `{"claude_session","device"}` (404 if unknown).
 - `POST /v1/state/leases/{name}` `{"holder","ttl_s","priority"?}` (0 < ttl ≤ 7 days, priority default 100)
   → `{"held","holder","priority","expires"}`. Atomic: taken if free or expired, renewed if `holder`
