@@ -549,7 +549,8 @@ def needs_answer(text):
 def hold_tag_prefix(buf):
     """(speakable text, held tail): a tail that could still grow into the routing tag is never spoken early."""
     at = buf.rfind("[")
-    if at != -1 and ROUTE_TAG.startswith(buf[at:].rstrip()) and len(buf) - at < len(ROUTE_TAG) + 2:
+    tail = buf[at:].rstrip()
+    if at != -1 and (ROUTE_TAG.startswith(tail) or TOOL_TAG.startswith(tail)) and len(buf) - at < len(ROUTE_TAG) + 2:
         return buf[:at], buf[at:]
     return buf, ""
 
@@ -1017,6 +1018,13 @@ async def respond(text, session, t0, timings, on_event=None):
                         continue  # might be a tag; a tool call is collected whole
                     if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
                         return await via_claude()
+                    if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
+                        before, _, after = buf.partition(TOOL_TAG)
+                        for s in split_ready(before, final=True)[0]:
+                            said_round.append(s)
+                            await say(s)
+                        buf, state = TOOL_TAG + after, "tool"
+                        continue
                     speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
                     done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
                     buf = rest + held
@@ -2281,6 +2289,18 @@ if __name__ == "__main__":
             assert "광주에 삶" in sysmsg and "서버 이전 끝남" in sysmsg and TOOL_TAG in sysmsg
             assert "랩미팅 발표는 다음 주로" in prompts[1][-1]["content"] and timings["recall_ms"] < 400
             assert not [m for m in gw.ws.sent if m.get("type") == "ask"]  # answered locally, no Claude
+            late = []
+
+            async def late_tool_llm(messages, max_tokens=600):  # words first, then a tool call
+                late.append(messages)
+                for d in (["찾아볼게요. [TO", 'OL] {"name": "search_memory", "args": {"query": "랩미팅"}}']
+                          if len(late) == 1 else ["다음 주로 미루셨어요."]):
+                    yield d
+            globals()["llm_stream"] = late_tool_llm
+            said = asyncio.run(run("랩미팅 어떻게 됐지?", "s"))
+            assert all("TOOL" not in x and "{" not in x for x, _ in said) and said[-1] == ("다음 주로 미루셨어요.", "qwen"), said
+            assert "랩미팅 발표는 다음 주로" in late[1][-1]["content"]
+            globals()["llm_stream"] = fake_llm
             prompts.clear()
             t = time.perf_counter()
             asyncio.run(run("느린 기억 찾기", "s"))  # the brain never answers recall: give up after RECALL_WAIT_S
