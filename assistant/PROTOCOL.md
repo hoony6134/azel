@@ -172,7 +172,7 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
   `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
   `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
-  `GET|POST|DELETE /v1/wake/enroll` (bearer header).
+  `GET|POST|DELETE /v1/wake/enroll`, `GET /v1/providers/nim/models`, `PUT /v1/providers/nim/key` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -219,7 +219,7 @@ device that created them.
   `claude -p` path (labels mapped from the tool name only: gistra_* 학사 일정, planit_* 할 일, Google
   Calendar 캘린더, Gmail 메일, memory_* 기억, infra_* 서버 상태, Notion 노션, daemon run_command /
   list_dir·read_file·search / browse / delegate, anything else "도구 준비 중"), one `thinking` on the API path.
-  `model`: `haiku|sonnet|opus|auto`; `path`: `api|claude_code|auto`
+  `model`: `haiku|sonnet|opus|auto|nim`; `path`: `api|claude_code|auto`
   (auto = API when a key is configured, else `claude -p`). Omitted → settings defaults.
 - `GET /v1/settings` / `PUT /v1/settings` — whole JSON document:
   ```json
@@ -282,6 +282,21 @@ device that created them.
     or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
     `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
     Claude processes. Each full gateway that should use the server needs its own copy.
+- NVIDIA NIM provider (full gateways only; `gateway/nim.py`). The hosted, OpenAI-compatible API, never a local
+  container. Setting `"providers":{"nim":{"enabled":false,"base_url":"https://integrate.api.nvidia.com/v1",
+  "model":"nvidia/nemotron-3-ultra-550b-a55b","prices":{}}}`; GET adds the read-only `"has_key"`. A partial
+  `providers.nim` merges into the current one; `base_url` must be https without credentials; `model` is free text;
+  `prices` `{model: [usd_in, usd_out] per MTok}` (absent → cost 0). `default_model`, `task_defaults.*.model`, a
+  persona's `default_model` and `/v1/ask`'s `model` accept `"nim"`; the voice server sends `model:"nim"` for
+  "엔비디아로 …". The NIM path streams like Claude (text deltas, `activity` thinking/tool_start/tool_end, `done`) with
+  the devices' MCP tools as function tools; a model that answers 400 to a request with tools is asked again without
+  them (remembered per model). Speakable errors: `nim_key` (no key, or the key refused), `nim_off`, `nim_error`.
+  Usage rows: `path:"nim"`, `model` = the NIM model id. A limited gateway treats `nim` as its usual Claude path.
+  - `GET /v1/providers/nim/models` → `{"models":[ids]}` from NIM's `/models` (cached 10 min; 409 without a key,
+    502 when NIM refuses or is unreachable). A suggestion list only.
+  - `PUT /v1/providers/nim/key` `{"value":"nvapi-…"}` → **204**; `""` deletes it. Write-only: stored in
+    `~/.config/biseo/providers/nim_key` (0600, directory 0700, temp file + rename), sent only to `base_url`, never
+    returned or logged.
 - Wake-word enrollment (full gateways only; not mounted on limited ones; `gateway/wake_enroll.py`, owned by the
   wakeword session): `POST /v1/wake/enroll` multipart `clips[]` (16 kHz mono 16-bit WAV, 0.4–2.5 s) →
   `{"accepted","rejected":[{"index","reason"}],"training"}`; `GET /v1/wake/enroll` → `{"clips","trained_at",
@@ -300,7 +315,7 @@ device that created them.
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
   `{"id" (slug a-z0-9_-),"name" (1–12 Hangul/Latin/space, unique),"voice" (a TTS speaker),"voice_style"
   (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb", orb tint),
-  "default_model" (null|haiku|sonnet|opus),"share_memory" (bool, default false),"created_at","primary",
+  "default_model" (null|haiku|sonnet|opus|nim),"share_memory" (bool, default false),"created_at","primary",
   "deleted_at"}`. Stored in the shared settings as `personas`; settings without it migrate to one persona
   `azel` (primary) holding `assistant_name` and `personality`, which stay readable (and writable) as the
   primary's for older clients. `GET /v1/personas` (`?include=deleted`), `POST /v1/personas` → 201

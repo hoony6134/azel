@@ -31,6 +31,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import connectors
+import nim
 import wake_enroll
 from claude_warm import Pool, base_cmd
 
@@ -87,7 +88,9 @@ DEFAULTS = {
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
     "noise_mode": "normal",  # normal | noisy: the voice server's voice-activity thresholds and barge-in
     "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
+    "providers": {"nim": nim.DEFAULT},  # other model providers (nim.py); keys never live in settings
 }
+CHOOSABLE = ("auto", "qwen", "nim", *MODELS)  # default_model, task_defaults.*.model
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
 
 
@@ -372,7 +375,14 @@ async def load_settings():
     s["personality_default"] = PERSONALITY_DEFAULT  # shown, never stored (the app's placeholder, the voice server's text)
     s["default_device"] = OLD_DEVICE_NAMES.get(s["default_device"], s["default_device"])
     s["device_fallback"] = [OLD_DEVICE_NAMES.get(d, d) for d in s["device_fallback"]]
+    s["providers"] = {**DEFAULTS["providers"], **(s.get("providers") or {})}
+    s["providers"]["nim"] = {**nim.DEFAULT, **s["providers"]["nim"]}
     return s
+
+
+def settings_view(s):
+    """Settings as the app sees them: plus `providers.nim.has_key` (only whether the key exists)."""
+    return {**s, "providers": {**s["providers"], "nim": nim.view(s["providers"]["nim"], HOME)}}
 
 
 def write_settings_copy(doc):
@@ -450,6 +460,10 @@ def resolve(settings, model, path, task, text=""):
     none, short lookups get Haiku and everything else Sonnet."""
     td = settings["task_defaults"].get(task or "", {})
     model = model or td.get("model") or settings["default_model"]
+    if model == "nim":
+        if MODE == "limited":
+            raise HTTPException(400, "nim: not on a limited gateway")
+        return "nim", "nim"
     if model in ("auto", "qwen"):  # the voice server only calls us when Claude is wanted
         said = text.rsplit("\n\n", 1)[-1]  # the voice server prefixes recent turns
         model = "haiku" if len(said) <= 40 and LOOKUP.search(said) and not MULTI_STEP.search(said) else "sonnet"
@@ -703,6 +717,27 @@ async def ask_api(text, model, session):
     yield final
 
 
+async def ask_nim(text, model, session):
+    """The hosted NVIDIA NIM path: streams like Claude, with the devices' tools when the model takes tools."""
+    settings = await load_settings()
+    cfg = settings["providers"]["nim"]
+    if not cfg["enabled"]:
+        yield {"type": "error", "code": "nim_off", "message": "엔비디아 모델이 꺼져 있어요. 앱의 설정에서 켜 주세요."}
+        return
+    devices = await fresh_devices()
+    tools, where = await device_tools(devices)
+    system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
+    try:
+        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, tools, lambda b: run_tool(b, where),
+                                     lambda phase, tool="": activity(phase, f"mcp__{tool}" if tool else "")):
+            yield item
+    except nim.NimError as e:
+        yield {"type": "error", "code": e.code, "message": e.message}
+    except httpx.HTTPError as e:
+        print("nim failed:", type(e).__name__, flush=True)  # never the key: it is only in a header
+        yield {"type": "error", "code": "nim_error", "message": "지금은 엔비디아 모델에 연결할 수 없어요."}
+
+
 async def ask_stream(text, session, model=None, path=None, task=None):
     if not CLAUDE_OK:
         yield {"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}
@@ -716,17 +751,21 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if await month_cost() >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}
         return
+    if MODE == "limited" and model == "nim":
+        model = None  # a limited gateway has no NIM: its usual Claude path
     model, path = resolve(settings, model, path, task, text)
-    gen = ask_claude_code if path == "claude_code" else ask_api
+    gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
     said = False
     async for item in gen(text, model, session):
         if isinstance(item, str):
             said = said or bool(item.strip())
             yield {"type": "text", "delta": item}
-        elif item.get("type") == "activity":
+        elif item.get("type") in ("activity", "error"):
             yield item
+            if item["type"] == "error":
+                return
         else:
-            await record_usage({"model": model, "path": path, "task": task or "",
+            await record_usage({"model": item.get("model") or model, "path": path, "task": task or "",
                                 "input_tokens": item.get("input_tokens", 0),
                                 "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
             if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
@@ -1431,7 +1470,7 @@ async def ask(body: dict):
 
 @app.get("/v1/settings")
 async def get_settings():
-    return await load_settings()
+    return settings_view(await load_settings())
 
 
 @app.put("/v1/settings")
@@ -1470,6 +1509,23 @@ async def put_settings(body: dict):
             body["connectors"] = connectors.check(body["connectors"])
         except ValueError as e:
             raise HTTPException(400, str(e))
+    if "default_model" in body and body["default_model"] not in CHOOSABLE:
+        raise HTTPException(400, f"default_model: one of {list(CHOOSABLE)}")
+    if "task_defaults" in body:
+        td = body["task_defaults"]
+        if not isinstance(td, dict) or not all(isinstance(v, dict) and v.get("model", "auto") in CHOOSABLE
+                                               for v in td.values()):
+            raise HTTPException(400, f"task_defaults: {{task: {{model: one of {list(CHOOSABLE)}, path?}}}}")
+    if "providers" in body:
+        full_only()
+        prov = body["providers"]
+        if not isinstance(prov, dict) or set(prov) - {"nim"}:
+            raise HTTPException(400, "providers: {nim: {...}}")
+        try:
+            cur = (await load_settings())["providers"]
+            body["providers"] = {**cur, **({"nim": nim.check(prov["nim"], cur["nim"])} if "nim" in prov else {})}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -1478,7 +1534,7 @@ async def put_settings(body: dict):
     prim["name"], prim["personality"] = s["assistant_name"], s["personality"]
     await save_settings({k: v for k, v in s.items() if k != "personality_default"})
     await link_send({"type": "settings", "value": s})
-    return s
+    return settings_view(s)
 
 
 @app.get("/v1/usage")
@@ -1538,6 +1594,34 @@ async def devices():
 def full_only():
     if MODE != "full":
         raise HTTPException(403, "not available on a limited gateway")
+
+
+@app.get("/v1/providers/nim/models")
+async def nim_models():
+    """Suggested model ids from NIM's /models (cached 10 min); the model setting stays free text."""
+    full_only()
+    key = nim.read_key(HOME)
+    if not key:
+        raise HTTPException(409, "no NIM key: PUT /v1/providers/nim/key first")
+    cfg = (await load_settings())["providers"]["nim"]
+    try:
+        return {"models": await nim.list_models(cfg, key)}
+    except nim.NimError as e:
+        raise HTTPException(502, e.message)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"NIM unreachable ({type(e).__name__})")
+
+
+@app.put("/v1/providers/nim/key", status_code=204)
+async def nim_key(body: dict):
+    """Write-only: the key goes to HOME/providers/nim_key (0600) and is never returned; "" deletes it."""
+    full_only()
+    try:
+        nim.write_key(HOME, nim.check_key(body.get("value")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    nim._models.update(at=0.0)  # a new key may see other models
+    return Response(status_code=204)
 
 
 # The voices offered for personas: natural in Korean. Measured 2026-11-21 (3 Korean sentences through Whisper):
@@ -1628,8 +1712,8 @@ async def check_persona(body, s, pid=None):
         raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
     if "color" in body and not (isinstance(body["color"], str) and COLOR_RE.fullmatch(body["color"])):
         raise HTTPException(400, "color: #rrggbb")
-    if body.get("default_model") not in (None, *MODELS):
-        raise HTTPException(400, f"default_model: null or one of {sorted(MODELS)}")
+    if body.get("default_model") not in (None, "nim", *MODELS):
+        raise HTTPException(400, f"default_model: null, nim or one of {sorted(MODELS)}")
     if not isinstance(body.get("share_memory", False), bool):
         raise HTTPException(400, "share_memory: true or false")
 
