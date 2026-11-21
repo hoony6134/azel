@@ -5,13 +5,22 @@ import XCTest
 final class FakeServer: URLProtocol {
     nonisolated(unsafe) static var routes: [String: (Int, String)] = [:]
     nonisolated(unsafe) static var delay: TimeInterval = 0
+    /// Every request seen: method, path and body.
+    nonisolated(unsafe) static var seen: [(method: String, path: String, body: Data)] = []
 
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "fake.test" }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         let url = request.url!
-        let (code, body) = Self.routes[url.path] ?? (404, #"{"detail":"Not Found"}"#)
+        var sent = request.httpBody ?? Data()
+        if sent.isEmpty, let stream = request.httpBodyStream {
+            stream.open(); defer { stream.close() }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable { let n = stream.read(&buf, maxLength: buf.count); if n <= 0 { break }; sent.append(buf, count: n) }
+        }
+        Self.seen.append((request.httpMethod ?? "GET", url.path, sent))
+        let (code, body) = Self.routes["\(request.httpMethod ?? "GET") \(url.path)"] ?? Self.routes[url.path] ?? (404, #"{"detail":"Not Found"}"#)
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.delay) { [self] in
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: code, httpVersion: nil, headerFields: nil)!,
                                 cacheStoragePolicy: .notAllowed)

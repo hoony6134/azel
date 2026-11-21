@@ -223,6 +223,7 @@ struct SettingsScreen<Extra: View>: View {
     @State private var pendingDays: Int?
     @State private var showProactiveLog = false
     @State private var showPersonas = false
+    @State private var showConnectors = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
@@ -238,6 +239,26 @@ struct SettingsScreen<Extra: View>: View {
                 }
                 if let s = Binding($settings) { assistantCard(s) }
                 Card("호출어") { WakeEnrollRow() }
+                Card("커넥터") {
+                    Button { showConnectors = true } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Claude가 쓸 커넥터").foregroundStyle(Theme.text)
+                                Text("적을수록 답이 빨라요").font(.footnote).foregroundStyle(Theme.text3)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(isPresented: $showConnectors) {
+                        NavigationStack { ConnectorsView() }
+                            #if os(macOS)
+                            .frame(width: 560, height: 640)
+                            #endif
+                    }
+                }
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
