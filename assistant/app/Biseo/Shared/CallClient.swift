@@ -123,6 +123,7 @@ final class CallClient {
             guard let self else { return }
             let playing = audio.speechPlaying
             if playing != wasPlaying { wasPlaying = playing; onPlayback?(playing) }
+            reportPlayed()
             if let cue = thinking.tick(now: ProcessInfo.processInfo.systemUptime) { self.cue(cue, listening: false) }
         }
         // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
@@ -187,6 +188,7 @@ final class CallClient {
             guard admit else { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock(); return }
             audio.play(pcm)
             karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
+            playedLock.lock(); played.audio(samples: pcm.count / 2); playedLock.unlock()
             DispatchQueue.main.async { self.thinking.audioArrived() }
             statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
             recorder?.assistant(pcm)
@@ -199,13 +201,12 @@ final class CallClient {
             let newReply = event.type == "reply_start" && admission.replyStart(event.reply_id)
             admission.apply(type: event.type, value: event.value)
             admissionLock.unlock()
-            // A new reply while the previous one is still playing (the server's playback estimate
-            // ended early): drop the rest of the old one. Its text events already arrived, so the
-            // karaoke keeps them and only restarts its clock.
-            if newReply && audio.speechPlaying {
-                audio.flush()
-                karaokeLock.lock(); karaoke.restartClock(); karaokeLock.unlock()
-            }
+            // A new reply queues after the previous one's tail (PM, 2026-11-22: a reply_start alone
+            // never cuts audio; only `interrupt` does).
+            playedLock.lock()
+            if newReply, let id = event.reply_id { played.start(id) }
+            if event.type == "turn_done" { played.close() }
+            playedLock.unlock()
             switch event.type {
             case "interrupt":
                 cutPlayback()
@@ -234,9 +235,20 @@ final class CallClient {
     private func cutPlayback() {
         freezeKaraoke()
         audio.flush()
+        playedLock.lock(); played.flush(); playedLock.unlock()   // a cut reply is never reported as played
         playback.apply("interrupt")
         if !playback.playing { audio.pause() }
         admissionLock.lock(); admission.interrupt(); admissionLock.unlock()
+    }
+
+    /// `{"type":"played","reply_id":N}` once reply N's last buffer has actually played, so the server
+    /// stops guessing when playback ended (the cut-off investigation, 2026-11-22).
+    private var played = PlayedTracker()
+    private let playedLock = NSLock()
+
+    private func reportPlayed() {
+        playedLock.lock(); let due = played.due(played: audio.playedSamples); playedLock.unlock()
+        for id in due { socket?.send(.string(#"{"type":"played","reply_id":\#(id)}"#)) { _ in } }
     }
 
     /// Which incoming audio belongs to the reply being played (user bug, 2026-11-22: after an
@@ -352,6 +364,7 @@ final class CallClient {
         thinking = ThinkingCues()
         karaokeLock.lock(); karaoke = KaraokeTimeline(); karaokeLock.unlock()
         admissionLock.lock(); admission = AudioAdmission(); admissionLock.unlock()
+        playedLock.lock(); played = PlayedTracker(); playedLock.unlock()
         if wasPlaying { wasPlaying = false; onPlayback?(false) }
         if socket != nil {
             statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()
@@ -449,5 +462,44 @@ struct RouteRestartGate {
         if let last, now - last < Self.quiet { return false }
         last = now
         return true
+    }
+}
+
+/// Where each reply ends on the playback clock (samples scheduled since the last flush, the same
+/// clock as `AudioIO.playedSamples`), to tell the server when one has really finished playing.
+struct PlayedTracker: Equatable {
+    private struct Reply: Equatable { var id: Int; var begin: Int; var end: Int; var closed = false }
+    private var replies: [Reply] = []
+    private var scheduled = 0
+
+    /// `reply_start`: closes the reply before it (no more audio comes for it).
+    mutating func start(_ id: Int) {
+        close()
+        replies.append(Reply(id: id, begin: scheduled, end: scheduled))
+    }
+
+    mutating func audio(samples: Int) {
+        scheduled += samples
+        if let i = replies.indices.last, !replies[i].closed { replies[i].end = scheduled }
+    }
+
+    /// `turn_done`: the open reply is complete.
+    mutating func close() { if let i = replies.indices.last { replies[i].closed = true } }
+
+    /// Interrupt or hangup: the clock restarts and nothing cut is reported.
+    mutating func flush() { replies = []; scheduled = 0 }
+
+    /// Replies that are complete, had audio, and whose last sample has played, oldest first. A reply
+    /// still streaming is never due, even if playback caught up with it for a moment.
+    mutating func due(played: Int) -> [Int] {
+        var out: [Int] = []
+        while let r = replies.first, r.closed {
+            if r.end > r.begin {
+                guard played >= r.end else { break }
+                out.append(r.id)
+            }
+            replies.removeFirst()
+        }
+        return out
     }
 }
