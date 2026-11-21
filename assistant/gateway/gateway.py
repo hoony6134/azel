@@ -558,7 +558,8 @@ async def ask_claude_code(text, model, session):
             elif e.get("type") == "result":
                 u = e.get("usage", {})
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
-                             output_tokens=u.get("output_tokens", 0), error=e.get("is_error", False))
+                             output_tokens=u.get("output_tokens", 0), error=e.get("is_error", False),
+                             result=str(e.get("result") or "")[:300])
                 if e.get("session_id"):
                     try:
                         await state.call("PUT", f"/v1/state/sessions/{quote(session, safe='')}",
@@ -710,8 +711,10 @@ async def ask_stream(text, session, model=None, path=None, task=None):
         return
     model, path = resolve(settings, model, path, task, text)
     gen = ask_claude_code if path == "claude_code" else ask_api
+    said = False
     async for item in gen(text, model, session):
         if isinstance(item, str):
+            said = said or bool(item.strip())
             yield {"type": "text", "delta": item}
         elif item.get("type") == "activity":
             yield item
@@ -719,8 +722,29 @@ async def ask_stream(text, session, model=None, path=None, task=None):
             await record_usage({"model": model, "path": path, "task": task or "",
                                 "input_tokens": item.get("input_tokens", 0),
                                 "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
+            if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
+                yield claude_failure(item.get("result", ""))
+                return
             spent = await month_cost()
-            yield {"type": "done", **item, "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+            yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
+                   "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+
+
+LIMIT_WORDS = re.compile(r"limit|429|rate|quota|resets?|한도|사용량", re.I)
+
+
+def claude_failure(result):
+    """A Claude run that ended in an error with nothing said: a speakable error event (code `limit` for the usage
+    limit, else `claude_error`). The result text names the reason; only its gist reaches the caller."""
+    if LIMIT_WORDS.search(result):
+        when = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", result, re.I)
+        hint = ""
+        if when:
+            h = int(when.group(1)) % 12 + (12 if when.group(3).lower() == "pm" else 0)
+            hint = f" {'오전' if h < 12 else '오후'} {h % 12 or 12}시{' ' + when.group(2) + '분' if when.group(2) and when.group(2) != '00' else ''}쯤 풀려요."
+        return {"type": "error", "code": "limit",
+                "message": "지금은 Claude 사용 한도에 걸려서 답할 수 없어요." + (hint or " 조금 뒤에 다시 물어봐 주세요.")}
+    return {"type": "error", "code": "claude_error", "message": "지금은 Claude가 답하지 못했어요. 조금 뒤에 다시 물어봐 주세요."}
 
 
 async def ask_text(text, session, **kw):

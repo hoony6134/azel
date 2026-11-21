@@ -203,7 +203,9 @@ these files are 0600 and survive a restart. Only full gateways seed empty shared
 device that created them.
 
 - `POST /v1/ask` `{"text","session","model"?,"path"?,"task"?}` → NDJSON stream of
-  `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}`, with
+  `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}` (or, when a Claude run ends in an
+  error with nothing said, `{"type":"error","code":"limit"|"claude_error","message":"<speakable>"}`: `limit` for the
+  subscription's usage limit, with the reset time when Claude names it), with
   `{"type":"activity","phase","tool","label","kind","route":"claude"}` interleaved (kinds as in section 1): `tool_start`/`tool_end` per tool call on the
   `claude -p` path (labels mapped from the tool name only: gistra_* 학사 일정, planit_* 할 일, Google
   Calendar 캘린더, Gmail 메일, memory_* 기억, infra_* 서버 상태, Notion 노션, daemon run_command /

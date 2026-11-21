@@ -358,6 +358,15 @@ def test_connectors_app_shape(gw, monkeypatch):
         assert c.put("/v1/connectors", json=bad).status_code == 400, bad
 
 
+def test_claude_error_is_spoken_not_silent(gw):
+    g, c, _ = gw
+    ev = events(c.post("/v1/ask", json={"text": "한도 걸린 질문"}))
+    assert ev == [{"type": "error", "code": "limit", "message": "지금은 Claude 사용 한도에 걸려서 답할 수 없어요. 오후 10시쯤 풀려요."}]
+    assert g.claude_failure("something broke")["code"] == "claude_error"
+    assert g.claude_failure("rate limited (429)")["message"].endswith("다시 물어봐 주세요.")
+    assert events(c.post("/v1/ask", json={"text": "평범한 질문"}))[-1]["type"] == "done"  # unchanged otherwise
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400
