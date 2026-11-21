@@ -197,6 +197,10 @@ Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm1
 
 ## 3. Gateway API (`http://<host>:8892`, every device)
 
+Everything the assistant *does* (calls, schedules, tasks, approvals' status, device and read tools) is an action defined
+once in the gateway's registry, with the same contract on every surface: see [ACTIONS.md](ACTIONS.md). The schedule,
+task and call routes below are thin adapters onto those actions.
+
 Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BISEO_DEVICE` (ASCII
 slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
 `BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`, `BISEO_NO_CLAUDE=1` (this
