@@ -116,7 +116,7 @@ final class CallClient {
             Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
             throw StartError.audio
         }
-        receive(task)
+        receive(task, call: beginCall())
         pulseTimer?.invalidate()
         wasPlaying = false
         pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -136,13 +136,13 @@ final class CallClient {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: check)
     }
 
-    private func receive(_ task: URLSessionWebSocketTask) {
+    private func receive(_ task: URLSessionWebSocketTask, call: Int) {
         task.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let message):
                 if !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
-                process(message)
+                deliver(message, call: call)
             case .failure:
                 let status = (task.response as? HTTPURLResponse)?.statusCode
                 let message = Self.closeMessage(status: status, receivedAny: receivedAny)
@@ -150,9 +150,32 @@ final class CallClient {
                 DispatchQueue.main.async { if task === self.socket { self.onClose?(message) } }
                 return
             }
-            receive(task)
+            receive(task, call: call)
         }
     }
+
+    /// Which call the socket callbacks belong to: bumped at start and at stop, so a frame of the
+    /// call that just ended (still in flight after hangup) never plays, in this call or the next.
+    private var callNumber = 0
+
+    private func beginCall() -> Int {
+        admissionLock.lock(); defer { admissionLock.unlock() }
+        callNumber += 1
+        return callNumber
+    }
+
+    /// `process` for a message of call `call`; dropped (audio counted) when that call is over.
+    func deliver(_ message: URLSessionWebSocketTask.Message, call: Int) {
+        admissionLock.lock(); let current = callNumber == call; admissionLock.unlock()
+        guard current else {
+            if case .data(let pcm) = message { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock() }
+            return
+        }
+        process(message)
+    }
+
+    /// For tests: the number the next socket's callbacks would carry if a call were up.
+    var currentCall: Int { admissionLock.lock(); defer { admissionLock.unlock() }; return callNumber }
 
     /// One socket message, in arrival order. Audio and interrupts are handled right here; the UI
     /// hops to main. Internal (not private) so tests can feed a scripted server.
@@ -322,6 +345,7 @@ final class CallClient {
 
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
+        _ = beginCall()            // the old socket's late frames are dropped from here on
         silenceCheck?.cancel()
         pulseTimer?.invalidate()
         pulseTimer = nil

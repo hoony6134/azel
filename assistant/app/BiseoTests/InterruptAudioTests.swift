@@ -100,3 +100,35 @@ final class RouteChangeTests: XCTestCase {
     }
     #endif
 }
+
+final class HangupAudioTests: XCTestCase {
+    private func frame(_ n: Int) -> URLSessionWebSocketTask.Message { .data(Data(count: n)) }
+
+    func testLateFramesOfAHungUpCallNeverPlay() {
+        let client = CallClient()
+        let ended = client.currentCall
+        client.deliver(frame(1000), call: ended)                    // the call still up: plays
+        client.stop()                                               // hang up
+        client.deliver(frame(2000), call: ended)                    // still in flight from the old socket
+        client.deliver(.string(#"{"type":"reply_start","reply_id":9}"#), call: ended)
+        client.deliver(frame(3000), call: ended)
+        XCTAssertEqual(client.audioCounts.accepted, 1000)
+        XCTAssertEqual(client.audioCounts.dropped, 2000 + 3000)
+        client.stop()                                               // twice is fine
+    }
+
+    #if os(macOS)
+    func testHangupDropsEverythingScheduled() throws {
+        let audio = AudioIO()
+        try audio.start()
+        audio.play(Data(count: 24_000 * 2 * 3))                     // 3 s of a reply queued
+        XCTAssertTrue(audio.speechPlaying)
+        audio.stop()
+        XCTAssertFalse(audio.speechPlaying, "nothing left to play")
+        XCTAssertEqual(audio.playedSamples, 0)
+        try audio.start()                                           // the next call
+        XCTAssertFalse(audio.speechPlaying, "the old reply doesn't come back")
+        audio.stop()
+    }
+    #endif
+}
