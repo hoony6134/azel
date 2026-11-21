@@ -50,11 +50,11 @@ def fill(c, token, out: Path, target, make_text, positive, wake, rng):
             time.sleep(15)
 
 
-def one_clip(c, token, out, rejected, make_text, positive, wake, rng):
+def one_clip(c, token, out, rejected, make_text, positive, wake, rng, voices=SPEAKERS):
     """Generate one clip; return 1 if it was kept, 0 if rejected or unusable."""
     if True:
         text = make_text(rng)
-        body = {"input": text, "voice": rng.choice(SPEAKERS), "response_format": "wav", "language": "Korean"}
+        body = {"input": text, "voice": rng.choice(voices), "response_format": "wav", "language": "Korean"}
         if style := rng.choice(STYLES):
             body["instructions"] = style
         r = c.post(TTS, json=body)
