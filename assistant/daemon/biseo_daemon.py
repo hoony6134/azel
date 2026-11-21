@@ -32,7 +32,7 @@ log = logging.getLogger("biseo-daemon")
 
 DEFAULTS = {
     "id": "macbook",
-    "name": "맥북",
+    "name": "macbook",
     "host": "100.64.0.8",
     "port": 8893,
     "token_file": "~/.config/biseo/token",

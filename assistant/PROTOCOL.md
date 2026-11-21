@@ -25,10 +25,14 @@ The voice server stores **no plaintext token**: it compares SHA-256 digests (`hm
 
 ## 1. Live call — `WS /v1/call` on the voice server
 
-Auth: `Authorization: Bearer <client token>` header (preferred); the `?token=` query is a fallback
-for old clients only (it can end up in proxy logs). Both are checked against the `client` hashes.
+Auth: `Authorization: Bearer <client token>` header. The `?token=` query is a **deprecated** fallback for
+old clients (it can end up in proxy logs); the server logs a one-line warning without the value each time
+it is used, and it will be removed once every shipped app sends the header. Both are checked against the
+`client` hashes. The voice server never logs query strings or headers: its container runs uvicorn with
+`--no-access-log --log-level warning`, and query strings in uvicorn's log lines are redacted.
 Query: `session` (stable per conversation), optional `client` (`iphone`|`mac`|`terminal`, for the call
-history), optional `call_id` (set when
+history), optional `intent=briefing` (the app's "오늘 브리핑": the server speaks a briefing first, see below),
+optional `call_id` (set when
 answering a call the assistant placed; the server then speaks that call's opening first).
 
 - Client → server **binary**: mono PCM16 little-endian, 16 kHz, any frame size
@@ -52,6 +56,15 @@ answering a call the assistant placed; the server then speaks that call's openin
     same objects between its `audio` lines.
   - `{"type":"turn_done","timings":{…}}`
   - `{"type":"error","message":"…"}`
+- Briefing (`intent=briefing`, without `call_id`): the server first asks a full gateway for the situation
+  (`briefing_context` over the link, 2 s timeout). With a situation note, the local Qwen composes a
+  30–40 s briefing from it right away (today's date, classes/meetings, deadlines, todos, server health,
+  pending approvals, the next scheduled call), spoken sentence by sentence as `reply` frames with
+  `"route":"briefing"`. With no note yet it says the filler, sends `activity` `routing`, and streams a
+  Claude briefing over the link (the morning-briefing prompt) with its activity events; at most one such
+  Claude briefing per 10 min, within which the last briefing text is spoken again. Barge-in works
+  as for any reply. The call log records `reason: "briefing"`; what was said becomes the call's
+  `opening`.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
@@ -68,8 +81,10 @@ peer is not in 100.64.0.0/10 or the request carries `X-Forwarded-For`, `Forwarde
 (the public proxy is itself a tailnet peer, so the header check is what stops it). **Every gateway keeps its own link**; the voice server holds all of them at once.
 JSON text frames:
 
-- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority"}` first on every
-  connect (`priority`: lower is preferred; a link that never says hello counts as full, priority 50;
+- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority","claude"?,"role"?}` first on every
+  connect (`role: "brain"`: the resident brain's link, section 6; never picked for asks, logs or schedules;
+  `claude: false` = a gateway without Claude, e.g. an always-on deneb: it never gets asks but
+  takes schedule requests, call logs and answered reports; `priority`: lower is preferred; a link that never says hello counts as full, priority 50;
   a new hello from the same `device` replaces that device's older link of the same mode; a hello that
   would replace a link of the other mode is ignored),
   `{"type":"settings","value":{…}}` (on connect and every change; from any full-mode link, the last
@@ -79,16 +94,38 @@ JSON text frames:
   `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"call_log","event":"start"|"turn"|"end","log_id",…}` — call history, sent
   only to a full-mode link (dropped when none is up; the voice server stores no history):
-  start `{"session","call_id","direction":"outgoing"|"incoming","reason","client","opening","started_at"}`,
+  start `{"session","call_id","direction":"incoming"|"outgoing","reason","client","opening","started_at"}`,
+  where `direction` is from the USER's point of view, the same as a phone's call log:
+  `"direction":"incoming"`: the assistant called the user (VoIP push / `call_id` present).
+  `"direction":"outgoing"`: the user called the assistant (app call button, Siri, Mac push-to-talk).
+  (Voice servers before this was pinned sent the opposite; `memory_service.py --fix-call-directions` corrects
+  stored rows by `call_id` presence, idempotently.)
   turn `{"user","assistant":["sentence",…],"route","activity":[{"label","kind","at"},…],"timings",
   "interrupted","at"}` (`at` in epoch seconds; activity = the turn's tool_start/thinking steps)
   (never for an empty transcript; fillers left out), end `{"ended_at","duration_s"}`. One `log_id` per
   `/v1/call` connection; a turn cut short by hang-up is sent before the end.
+- voice → gateway: `{"type":"schedule","id","action":"create"|"list"|"cancel","at"?,"repeat"?,"kind"?,"note"?}`
+  (to a full-mode link, Claude or not; `at` ISO 8601 with offset for create, epoch for cancel) → gateway →
+  voice `{"id","type":"schedule_result","ok","say","item"?|"items"?}` (items in the `/v1/schedule` shape,
+  `created_by: "voice"`); the voice server speaks `say` (e.g. "내일 오전 10시에 깨워 드릴게요.").
+  `{"type":"call_answered","call_id"}` when `/v1/call` connects with a `call_id` (stops a scheduled call's
+  retries). `{"type":"briefing_context","id"}` → gateway → voice `{"id","type":"briefing_context",
+  "situation": "<azel-situation, or azel-checkpoint if that is stale; \"\" if neither is fresh>",
+  "facts":["승인 대기 N건","다음 예약 전화: …","최근 24시간 서버 경보: …"]}`.
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
 
-Routing, per ask: the full-mode link with the lowest `priority` among healthy links (3+ consecutive
+Scheduled-call utterances are handled before any routing, without Qwen's answer or Claude: a keyword
+gate (깨워, 알람, 모닝콜; "전화해 줘" / "예약해 줘" plus a time and no third-person target; 예약 목록 / 취소)
+and a deterministic Korean time parser (내일 10시, 내일 아침 7시 반, 30분 뒤, 모레 오후 3시, 매일 7시,
+평일 6시 40분, 매주 수요일 9시, 다음 주 월요일 9시; a bare "10시" is today if still ahead, else tomorrow).
+Phrasings the rules miss go to the local Qwen for strict JSON (given the current KST time), then
+validation (ahead, within 30 days, known repeat, `weekly:N` on that weekday; a time without an offset
+means KST). A weekday mismatch asks back ("무슨 요일 몇 시에 할까요?"). With no time the voice server asks back ("몇 시에 깨워
+드릴까요?") and the next utterance with a time completes it.
+
+Routing, per other ask: the full-mode link (with Claude) with the lowest `priority` among healthy links (3+ consecutive
 failed asks — timeouts or errors without a `code` — make a link unhealthy until it answers again; it
 is then tried last). With no full link, limited links take the ask only when the utterance is not
 personal (calendar, mail, memory, contacts, GISTRA courses/assignments, Planit, briefings; task
@@ -103,7 +140,7 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
   `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|DELETE /v1/history`, `GET|DELETE
-  /v1/history/{id}` (bearer header).
+  /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`, `GET /v1/proactive/log` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -117,7 +154,11 @@ Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm1
 
 Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BISEO_DEVICE` (ASCII
 slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
-`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`. Token files (0600, else the
+`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`, `BISEO_NO_CLAUDE=1` (this
+gateway has no Claude: asks answer `code: "no_claude"`, no briefings or deadline checks),
+`BISEO_SCHEDULER_PRIORITY` (default `BISEO_PRIORITY`; lowest live value fires scheduled calls),
+`BISEO_LLM_URL` / `BISEO_LLM_MODEL` (the local Qwen for autonomous-call decisions; default vd-spark
+`http://100.64.0.11:8888/v1/chat/completions`, `Qwen3.8-Flash-Next`). Token files (0600, else the
 gateway refuses to start): `token`, `link_token` (falls back to `token` until link tokens are rolled
 out), and in limited mode `state_token_limited` (required).
 
@@ -152,10 +193,27 @@ device that created them.
    "task_defaults":{"chat":{"model":"qwen"},"schedule":{"model":"sonnet"},
                     "code":{"model":"opus","path":"claude_code"},"mac":{"model":"sonnet"}},
    "monthly_budget_usd":500,"budget_warn_pct":80,
-   "proactive":{"morning_briefing":"08:00","quiet_hours":["23:30","07:30"],
-                "triggers":{"deadline":true,"server_down":true}},
-   "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤"}
+   "proactive":{"enabled":true,
+                "morning_briefing":{"enabled":true,"time":"08:00"},
+                "deadline_check":{"enabled":true,"time":"20:00"},
+                "server_alerts":true,
+                "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
+                              "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
+   "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
+   "history_days":365,"reply_length":"normal"}
   ```
+  `reply_length` `brief`|`normal`|`detailed` (else 400) sets how long answers run, with the same wording for
+  Qwen's system prompt and Claude's voice style: brief = one or two sentences; normal = brief for chit-chat,
+  about four or five sentences for explanations, summaries, schedules and status reports; detailed = up to
+  six to eight. The first clause stays short either way (latency). Qwen's `max_tokens` follows it (250 /
+  600 / 1000).
+  `proactive.enabled` is the master switch ("먼저 전화하기"): off, no proactive call fires (briefing,
+  deadline check, server alerts, autonomous calls). User-created scheduled calls always fire. There are no
+  quiet hours any more (scheduled calls replace them). A stored settings document in the old shape
+  (`"morning_briefing":"08:00"`, `quiet_hours`, `triggers.deadline/server_down`) is migrated on read.
+  `PUT` with `proactive` merges one level deep into the current values (e.g. `{"proactive":{"autonomous":
+  {"enabled":true}}}`), then validates: times `HH:MM`, `window` start < end, `max_per_day` 0–10,
+  `min_gap_minutes` 0–1440, at most 6 `checkpoints`; otherwise 400.
   `assistant_name` (default "아젤"; 1–12 Hangul/Latin letters or spaces, else 400) is the assistant's spoken
   name: the gateways use it for the VoIP push `caller` and Claude's prompts, and the voice server for
   Qwen's system prompt (built per turn from the settings pushed over the link), so a rename applies on
@@ -167,24 +225,67 @@ device that created them.
   "devices":[{"name","ok","ms"}]}`
 - `POST /v1/devices/register` `{"name","url","harness":["claude_code",…]}` — daemons call
   this on start and every 60 s. `GET /v1/devices` lists them with `last_seen`.
-- `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production"}` —
-  the app sends its PushKit token.
+- `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production","alert_token"?}` —
+  the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
+- Scheduled calls (full gateways only; limited → 403). Item (the same shape on the voice path):
+  `{"id","at","repeat","kind","note","status","attempts","created_by"}` with `at` an ISO 8601 string with
+  offset in KST (e.g. `"2026-11-22T10:00:00+09:00"`, accepted and returned), `repeat` null | `"daily"` |
+  `"weekdays"` | `"weekly:<dow>"` (0 = Monday … 6 = Sunday; must match the weekday of `at`, else 400),
+  `kind` `wake`|`reminder`, `status`
+  `pending`|`fired`|`answered`|`missed`|`cancelled`, `created_by` `voice`|`app`.
+  `GET /v1/schedule` → pending and fired items, soonest first; `?include=all` adds past ones (answered,
+  missed, cancelled). `POST /v1/schedule` `{"at","repeat"?,"kind"?,"note"?}` → **201** with the created item;
+  400 if `at` is not an ISO string with offset, is past, or is more than 30 days out (or repeat/kind/note
+  invalid). `DELETE /v1/schedule/{id}` → cancels and returns the item (404 unless pending or fired). Firing: the full gateway holding lease
+  `scheduler` (TTL 150 s, renewed every minute, priority = `BISEO_SCHEDULER_PRIORITY`, a lower value takes
+  it over) places the call at `at` (always, even with `proactive.enabled` off: the user asked for it; opening "일어나실
+  시간이에요." or the reminder note), retries every 2 min while unanswered up to 3 attempts, then marks it
+  `missed` and sends an alert push. An item more than 10 min past `at` when the scheduler sees it (the
+  holder was down) is never rung: it becomes `missed` (repeats move to their next occurrence) with an
+  alert push ("…를 제때 걸지 못했어요"). Answered (voice `call_answered`) → `answered`; repeating items go back
+  to `pending` at their next occurrence (also after a miss). Status changes are compare-and-set, so two
+  gateways never fire the same attempt.
+- Autonomous calls ("서버가 생각해서 알아서 부르기"; `proactive.enabled` and `proactive.autonomous.enabled`,
+  the latter off by default):
+  - Checkpoints: at each `autonomous.checkpoints` time (default 08:30, 13:00, 18:00) one full gateway
+    with Claude (lease `job:checkpoint:<date>:<HH:MM>`) runs one `claude -p` that reads GISTRA, Planit,
+    Calendar and Gmail and writes a compact note (what is due within 48 h, what needs the user, urgency 1–5
+    per line) to the memory service's task context `azel-checkpoint`. About 3 runs a day. The brain
+    (`assistant/brain`) merges it with other state into `azel-situation`; the decision reads
+    `azel-situation`, or `azel-checkpoint` when that is missing or older than 6 h.
+  - Decision: at :00 and :30 the scheduler lease holder gathers signals without Claude (critical alerts
+    of the last 24 h, delegated device jobs finished or failed in the last 2 h via each trusted daemon's
+    `list_jobs`, approvals pending > 30 min, scheduled calls missed in the last 24 h, task contexts with
+    open questions, the situation note) and asks the local Qwen for `{"call","urgency","reason","opening"}`.
+  - Fail closed: if the decision log cannot be read (ruchba down, 404, error) nothing rings, and a call is
+    rung only after its log row (with the pre-generated `call_id`) is written.
+  - Guardrails, all required to ring: `call` is `true`, `urgency` an integer ≥ 4, now inside `window`,
+    fewer than `max_per_day` autonomous calls today, the last one at least `min_gap_minutes` ago, and no
+    autonomous call about the same reason (hash of the normalized reason) in the last 24 h. The call opens
+    with Qwen's `opening` (≤ 200 chars).
+  - Every decision is logged, called or not: `GET /v1/proactive/log?limit=50&since=<epoch>` → newest first,
+    `[{"id","at","call","urgency","reason","opening","reason_hash","called","blocked_by"
+    (no_call|urgency|window|max_per_day|min_gap|duplicate|null),"signals","call_id"}]` (full only).
 - Call history (full gateways only; limited → 403), stored in ruchba (section 5):
   `GET /v1/history?limit=20&before=<epoch>&q=` → `[{"id","session","title" (first user utterance),
   "last_reply" (last assistant reply, first 120 chars),"started_at","duration_s","direction","reason",
   "client","turns","routes":{"qwen":n,"claude":m},"kinds":["calendar",…]}]`, newest first. With `q`:
   full transcripts are searched with the memory records' hybrid vector + text ranking (calls still in
-  progress by substring), best first, each item adding `"match"`: a short snippet of the matching line;
+  progress by substring). Calls whose words match come first; meaning-only matches (vector, no word match)
+  are listed only when no call matches the words, and need cosine ≥ 0.9. Each item adds `"match"`: a short
+  snippet of the matching line;
   `GET /v1/history/{id}` → the call with `"turns":[{"at","user","assistant","route",
   "activity":[{"label","kind","at"}],"timings","interrupted"}]`, every `at` in seconds from the call's
   start, computed by the memory service; `DELETE /v1/history/{id}`; `DELETE /v1/history?older_than_days=N`. Setting
   `history_days` (default 365, 0 = forever): a full gateway deletes older calls daily at 04:00 (lease
   `job:retention:<date>`). Gateways write the voice server's `call_log` events through a restart-proof
   outbox (`pending_history.json`).
-- `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call. One call per alert set per
-  10 min across gateways (lease `alert:<names>`); if ruchba is down, the gateway calls anyway.
+- `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call (if `proactive.enabled` and
+  `server_alerts`), about the alert names not called about in the last 2 h (lease `alert:<name>`, so a
+  flapping alert rings once), and at most 3 server-down calls per rolling 24 h (kv `alert_calls`). If
+  ruchba is down the gateway applies the same limits from its own memory and calls.
 - Scheduled jobs (morning briefing, deadline check) run on every full gateway's clock; the one that
   takes lease `job:<name>:<date>` (24 h) fires it. Lease holder = `<device>-<random per process>`,
   so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
@@ -193,7 +294,7 @@ device that created them.
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
-Registration body: `{"id":"macbook","name":"MacBook","url","harness":[…]}` — `id` is an ASCII
+Registration body: `{"id":"macbook","name":"macbook","url","harness":[…]}` — `id` and `name` are the same English device name (macbook, albireo, gienah, deneb, spark); `id` is an ASCII
 slug used as the MCP server name on the Claude side.
 
 Approval flow: an approval-required `run_command` posts
@@ -255,7 +356,16 @@ records, search, contacts and context, answers 403) when either:
   row whose writer is `full` (403). `GET /v1/state/devices` *limited* →
   `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
   token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
-- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env"}`; `GET /v1/state/push_tokens`.
+- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`.
+- Autonomous calls (full callers only): `POST /v1/state/proactive_log` (one decision, fields as in
+  section 3) → `{"id"}`; `GET /v1/state/proactive_log?since=<epoch>&called=true|false&limit=100` → newest
+  first. `GET|PUT /v1/state/kv/{key}` (key `[a-z0-9_]{1,40}`, not `settings`): small shared JSON values,
+  e.g. `alerts_recent` (critical alerts of the last 24 h, kept by the gateways for the decision).
+- Scheduled calls (full callers only; internal, epoch seconds; gateways convert to the `/v1/schedule`
+  shape): `POST /v1/state/schedule` `{"at": epoch,"repeat","kind","note","created_by":"voice"|"app"}` → the row; `GET /v1/state/schedule?status=pending,fired`; `POST /v1/state/schedule/{id}`
+  `{"status"?,"attempts"?,"call_id"?,"at"?,"last_attempt"?,"expect_status"?}` (compare-and-set on
+  `expect_status`: 409 if the row moved on); `DELETE /v1/state/schedule/{id}` → cancelled (404 unless
+  pending or fired). Table `scheduled_calls` in the state schema.
 - `POST /v1/state/calls` `{"id","reason","opening"}`; `POST /v1/state/calls/{id}/answer` → the row,
   marked answered (404 if missing).
 - `POST /v1/state/approvals` *limited* `{"id"?,"device","tool","command","cwd"}` → `{"approval_id"}` (`id`,
@@ -263,8 +373,9 @@ records, search, contacts and context, answers 403) when either:
   `GET /v1/state/approvals?status=pending`; `GET /v1/state/approvals/{id}` *limited*;
   `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending.
 - `GET|PUT /v1/state/sessions/{voice_session}` `{"claude_session","device"}` (404 if unknown).
-- `POST /v1/state/leases/{name}` `{"holder","ttl_s"}` (0 < ttl ≤ 7 days) → `{"held","holder","expires"}`.
-  Atomic: taken if free or expired, renewed if `holder` already holds it, else `held:false` with the
+- `POST /v1/state/leases/{name}` `{"holder","ttl_s","priority"?}` (0 < ttl ≤ 7 days, priority default 100)
+  → `{"held","holder","priority","expires"}`. Atomic: taken if free or expired, renewed if `holder`
+  already holds it, taken over if `priority` is lower than the holder's, else `held:false` with the
   current holder. `DELETE /v1/state/leases/{name}?holder=` → `{"released":bool}`.
 - Call history (full callers only; personal): `POST /v1/state/history/{id}/start` (body as the voice
   server's start event), `POST /v1/state/history/{id}/turns` (a turn; `user` must be non-empty),
@@ -275,3 +386,47 @@ records, search, contacts and context, answers 403) when either:
   `DELETE /v1/state/history?older_than_days=N` (also delete those calls' transcript records). Tables
   `call_history` and `call_turns` (on delete cascade) in the state schema; the existing `calls` table
   stays the placed-call openings.
+
+## 6. Brain — the resident assistant (`brain/`, deneb; the Mac for development)
+
+One process on an always-on full (jh-only) host. It listens on nothing: it dials the voice server's gateway
+link and talks to the memory service and the local Qwen (`http://100.64.0.11:8888/v1/chat/completions`). Tokens:
+`token` (memory service, gateways' `/v1/ask`) and `link_token`, both 0600. One brain writes at a time (lease
+`brain`, 120 s); a second brain only serves its link. Background Qwen requests are paced to one per
+`BRAIN_BG_GAP_S` (default 4) seconds.
+
+Link (section 1b), its own connection: hello `{"type":"hello","device":"brain-<host>","mode":"full","claude":false,
+"role":"brain","priority":99}`. `role:"brain"` counts only on a full (`link`-token) link. A brain link never gets
+asks, call_logs or schedule requests.
+- brain → voice `{"type":"context","session"?,"value"}`: the Korean context block (≤ 2400 chars: profile,
+  situation, recent calls), pushed on connect and whenever it changes (situation refresh every 5 min). With
+  `session`: that call only (a placed call adds its reason). The voice server uses a block younger than 15 min, only
+  in Qwen's SYSTEM, and as "알고 있는 것" ahead of a Claude ask on a full link. Never to a limited link.
+- voice → brain `{"type":"call_event","event":"start"|"end","session","reason"?}`; the brain answers a start with
+  that session's context.
+- voice → brain `{"type":"tool","id","name","args"}` → `{"id","type":"tool_result","result":"…"}` (Korean, for Qwen).
+  Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
+  `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
+  schedule list). Timeout 4 s.
+- voice → brain `{"type":"recall","id","text"}` → `{"id","type":"recall_result","hits":["…"]}` (≤ 2 memory hits);
+  the voice server waits at most 400 ms, then answers without them.
+
+Qwen with a brain context: personal questions are no longer pre-routed to Claude (live data, devices by name,
+code and file work, and named models still are). Qwen answers from the context, or prints one line
+`[TOOL] {"name":…,"args":{…}}` (the voice server runs it and asks Qwen again; at most two tools per turn), or
+`[CLAUDE]` as before. Without a brain (no link, or no context younger than 15 min) routing and the prompt are as
+before.
+
+Memory written by the brain (no schema change; record kind `note`, contexts):
+- after every ended call with ≥ 12 characters of user speech: a `note` record `"[통화 요약 <when>] <summary> 결정: …
+  후속: …"` with `meta {"type":"call_summary","call","title","at","decisions","facts","followups"}`; follow-ups as
+  context `call-<first 12 of the history id>` (`open_questions` = follow-ups, which the gateways' autonomous
+  signals read); facts merged into `azel-profile` by Qwen.
+- `azel-profile`: stable facts and preferences, seeded once from Cygnus memory through a full gateway's
+  `/v1/ask` (Claude), then refined from calls.
+- `azel-day`: Claude's day digest (today and tomorrow, deadlines within 7 days, today's todos, mail needing a
+  reply) through `/v1/ask` at `BRAIN_DIGEST_AT` (default 07:30, 12:30, 17:30) unless one is younger than 2.5 h.
+- `azel-situation`: composed without a model from `azel-day`, `azel-checkpoint` (the gateways' autonomous-call
+  checkpoint note), scheduled calls, pending approvals, full-writer devices, open call follow-ups (3 days),
+  `azel-todos`, and recent call summaries (3 days). First line `## 상황 (…)`; a note there without it is a gateway's
+  checkpoint and is moved to `azel-checkpoint`.
