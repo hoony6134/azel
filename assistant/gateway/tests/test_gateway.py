@@ -168,7 +168,7 @@ def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypa
     c.put("/v1/settings", json={"proactive": {"enabled": False}})
     placed = []
 
-    async def fake_place(reason, opening=None):
+    async def fake_place(reason, opening=None, call_id=None):
         placed.append(reason)
         return {"call_id": f"c{len(placed)}"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -247,7 +247,7 @@ def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None):
+    async def fake_place(reason, opening=None, call_id=None):
         placed.append((reason, opening))
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -516,11 +516,13 @@ def test_schedule_api_validates_and_confirms(gw):
     for bad in [{"at": iso(now - 60)}, {"at": iso(now + 31 * 86400)}, {"at": "2026-12-01T10:00:00"},  # no offset
                 {"at": now + 3600}, {"at": iso(now + 3600), "repeat": "hourly"},
                 {"at": iso(now + 3600), "repeat": "weekly:mon"}, {"at": iso(now + 3600), "repeat": "weekly:7"},
-                {"at": iso(now + 3600), "kind": "nap"}, {"at": iso(now + 3600), "note": "x" * 201}, {"at": "내일"}]:
+                {"at": iso(now + 3600), "kind": "nap"}, {"at": iso(now + 3600), "note": "x" * 201}, {"at": "내일"},
+                {"at": kst(2026, 11, 25, 9, 0).isoformat(), "repeat": "weekly:0"}]:  # weekly:0 on a Wednesday
         assert c.post("/v1/schedule", json=bad).status_code == 400, bad
-    weekly = c.post("/v1/schedule", json={"at": iso(now + 7200), "repeat": "weekly:0", "kind": "reminder",
+    dow = datetime.fromtimestamp(now + 7200, g.KST).weekday()
+    weekly = c.post("/v1/schedule", json={"at": iso(now + 7200), "repeat": f"weekly:{dow}", "kind": "reminder",
                                           "note": "회의"}).json()
-    assert weekly["repeat"] == "weekly:0" and weekly["created_by"] == "app"
+    assert weekly["repeat"] == f"weekly:{dow}" and weekly["created_by"] == "app"
     assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"], item["id"]]  # soonest first
     gone = c.delete(f"/v1/schedule/{item['id']}").json()
     assert gone == {**item, "status": "cancelled"}
@@ -578,9 +580,10 @@ def test_schedule_over_the_link(gw):
 def fire_setup(g, monkeypatch, **item):
     placed, alerts = [], []
 
-    async def fake_place(reason, opening=None):
+    async def fake_place(reason, opening=None, call_id=None):
         placed.append((reason, opening))
-        return {"call_id": f"call{len(placed)}"}
+        assert g.fake.db["schedule"]["s1"]["call_id"] == call_id  # claimed with the attempt, before ringing
+        return {"call_id": call_id}
 
     async def fake_alert(title, body):
         alerts.append(body)
@@ -602,7 +605,7 @@ def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
     for dt, n in [(0, 1), (60, 1), (120, 2), (180, 2), (240, 3), (290, 3)]:
         asyncio.run(g.fire_scheduled(at + dt))
         assert len(placed) == n and item["attempts"] == n, (dt, n)
-    assert placed[0] == ("wake", "일어나실 시간이에요.") and item["call_id"] == "call3" and item["status"] == "fired"
+    assert placed[0] == ("wake", "일어나실 시간이에요.") and item["status"] == "fired" and len(item["call_id"]) == 32
     asyncio.run(g.fire_scheduled(at + 300))  # 60 s after the third attempt
     assert item["status"] == "missed" and len(placed) == 3
     assert alerts == ["오늘 오전 7시 기상 전화를 받지 않으셨어요."]
@@ -614,11 +617,26 @@ def test_answered_call_stops_retries_and_repeat_reschedules(gw, monkeypatch):
     item = g.fake.db["schedule"]["s1"]
     asyncio.run(g.fire_scheduled(at))
     assert placed == [("reminder", "말씀하신 시간이에요. 약 드실 시간이에요.")]
-    asyncio.run(g.handle_link(LinkWS([{"type": "call_answered", "call_id": "call1"}])))
+    asyncio.run(g.handle_link(LinkWS([{"type": "call_answered", "call_id": item["call_id"]}])))
     assert item["status"] == "pending" and item["attempts"] == 0 and item["at"] > at  # tomorrow, same time
     assert datetime.fromtimestamp(item["at"], g.KST).strftime("%H:%M") == "07:00"
     asyncio.run(g.fire_scheduled(at + 600))
     assert len(placed) == 1  # answered: no retry
+
+
+def test_late_scheduled_call_is_missed_not_rung(gw, monkeypatch):
+    g, _, _ = gw
+    at, placed, alerts = fire_setup(g, monkeypatch)
+    asyncio.run(g.fire_scheduled(at + 6 * 3600))  # 07:00 alarm, gateway back at 13:00
+    assert placed == [] and g.fake.db["schedule"]["s1"]["status"] == "missed"
+    assert alerts == ["오늘 오전 7시 기상 전화를 제때 걸지 못했어요."]
+    at, placed, alerts = fire_setup(g, monkeypatch, repeat="daily")
+    asyncio.run(g.fire_scheduled(at + 11 * 60))  # just past the 10-minute grace
+    item = g.fake.db["schedule"]["s1"]
+    assert placed == [] and item["status"] == "pending" and item["at"] == at + 86400  # repeats move on
+    at, placed, alerts = fire_setup(g, monkeypatch, status="fired", attempts=1, last_attempt=at, call_id="c0")
+    asyncio.run(g.fire_scheduled(at + 3600))  # a retry the gateway slept through: no late ring either
+    assert placed == [] and g.fake.db["schedule"]["s1"]["status"] == "missed"
 
 
 def test_cancelled_call_never_fires(gw, monkeypatch):
@@ -651,7 +669,7 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
         assert ev == [{"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}]
     ran = []
 
-    async def fake_place(reason, opening=None):
+    async def fake_place(reason, opening=None, call_id=None):
         ran.append(reason)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -685,7 +703,7 @@ def test_guardrails(gw):
 def auto_setup(g, monkeypatch, verdict):
     placed, asked = [], []
 
-    async def fake_place(reason, opening=None):
+    async def fake_place(reason, opening=None, call_id=None):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
@@ -705,7 +723,8 @@ def test_autonomous_tick_calls_logs_and_dedupes(gw, monkeypatch):
     now = datetime.now(g.KST).replace(hour=10, minute=0)
     g.fake.now = lambda: now.timestamp()
     entry = asyncio.run(g.autonomous_tick(now, A))
-    assert placed == [("autonomous", "ruchba 디스크가 꽉 찼어요. 볼까요?")] and entry["called"] and entry["call_id"] == "call1"
+    assert placed == [("autonomous", "ruchba 디스크가 꽉 찼어요. 볼까요?")] and entry["called"] and len(entry["call_id"]) == 32
+    assert g.fake.db["plog"][-1]["call_id"] == entry["call_id"]  # the row names the call that rang
     assert "NodeDown" in asked[0]  # the signal reached the decision
     later = now + timedelta(hours=3)  # past the gap, same reason
     g.fake.now = lambda: later.timestamp()
@@ -738,6 +757,31 @@ def test_autonomous_tick_only_when_enabled(gw, monkeypatch):
     c.put("/v1/settings", json={"proactive": {"enabled": False}})  # master switch off
     asyncio.run(g.scheduler_tick(noon.replace(minute=30), {}))
     assert len(asked) == 1
+
+
+def test_autonomous_fails_closed(gw, monkeypatch):
+    g, _, _ = gw
+    placed, _ = auto_setup(g, monkeypatch, {"call": True, "urgency": 5, "reason": "급함", "opening": "급해요."})
+    ten = datetime.now(g.KST).replace(hour=10, minute=0)
+    real_call = g.state.call
+
+    async def no_log(method, path, body=None, **params):  # the log route answers 404
+        if path == "/v1/state/proactive_log" and method == "GET":
+            return None
+        return await real_call(method, path, body, **params)
+    g.state.call = no_log
+    with pytest.raises(g.StateDown):
+        asyncio.run(g.autonomous_tick(ten, A))
+    assert placed == []
+
+    async def write_fails(method, path, body=None, **params):  # cannot record the call: do not ring
+        if path == "/v1/state/proactive_log" and method == "POST":
+            raise g.StateDown("down")
+        return await real_call(method, path, body, **params)
+    g.state.call = write_fails
+    with pytest.raises(g.StateDown):
+        asyncio.run(g.autonomous_tick(ten, A))
+    assert placed == []
 
 
 def test_bad_qwen_output_never_calls(gw, monkeypatch):
@@ -843,7 +887,7 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
     g, _, _ = gw
     ran = []
 
-    async def fake_place(reason, opening=None):
+    async def fake_place(reason, opening=None, call_id=None):
         ran.append(g.INSTANCE)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -859,6 +903,30 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
     g.fake.state.down = True  # no lease service: skip rather than risk several calls
     asyncio.run(g.scheduler_tick(datetime(2026, 11, 22, 8, 0, tzinfo=g.KST), {}))
     assert ran == ["macbook-aaa"]
+
+
+def test_alert_limits(gw, monkeypatch):
+    g, c, _ = gw
+    placed = []
+
+    async def fake_place(reason, opening=None, call_id=None):
+        placed.append(opening)
+        return {"call_id": "x"}
+    monkeypatch.setattr(g, "place_call", fake_place)
+    fire = lambda *names: c.post("/v1/alerts", json={"alerts": [  # noqa: E731
+        {"status": "firing", "labels": {"severity": "critical", "alertname": n}} for n in names]}).json()
+    assert fire("NodeDown")["called"]
+    for _ in range(5):  # flapping: re-fires every few minutes
+        assert not fire("NodeDown")["called"]
+    assert fire("NodeDown", "DiskFull")["called"] and "DiskFull" in placed[-1] and "NodeDown" not in placed[-1]
+    assert fire("TLSExpiry")["called"]  # third call today
+    assert not fire("BackupFailed")["called"]  # cap: 3 per rolling 24 h
+    assert len(placed) == 3
+    g.fake.db["kv"]["alert_calls"] = [time.time() - 90000] * 3  # a day later
+    g.fake.db["leases"].clear()
+    assert fire("BackupFailed")["called"]
+    g.fake.state.down = True  # ruchba down: the same limits from this gateway's memory
+    assert fire("RuchbaDown")["called"] and not fire("RuchbaDown")["called"]
 
 
 def test_alert_calls_once_across_gateways(gw, monkeypatch):

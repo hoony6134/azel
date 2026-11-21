@@ -318,9 +318,10 @@ async def push_tokens():
     return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
 
 
-async def take_lease(name, ttl_s, priority=100):
+async def take_lease(name, ttl_s, priority=100, holder=None):
+    """`holder` defaults to this process (it renews its own lease); pass a fresh one for 'only if nobody has it'."""
     return (await state.call("POST", f"/v1/state/leases/{quote(name, safe='')}",
-                             {"holder": INSTANCE, "ttl_s": ttl_s, "priority": priority}))["held"]
+                             {"holder": holder or INSTANCE, "ttl_s": ttl_s, "priority": priority}))["held"]
 
 
 def auth(request: Request):
@@ -638,7 +639,8 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
-async def place_call(reason, opening=None):
+async def place_call(reason, opening=None, call_id=None):
+    """Ring the phone. `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
         raise HTTPException(403, "limited gateways do not place calls")
     if opening is None and reason == "morning_briefing":
@@ -646,7 +648,7 @@ async def place_call(reason, opening=None):
             "아침 브리핑 전화를 걸었어. 오늘 수업과 마감(GISTRA), 오늘 할 일(Planit), 캘린더 일정, "
             "밤사이 서버 상태(Cygnus 인프라)를 확인해서 '좋은 아침이에요'로 시작하는 30초 안쪽 브리핑으로 말해.",
             session=f"briefing-{uuid.uuid4().hex[:8]}", model="sonnet", task="schedule")
-    call_id = uuid.uuid4().hex
+    call_id = call_id or uuid.uuid4().hex
     try:
         await state.call("POST", "/v1/state/calls", {"id": call_id, "reason": reason, "opening": opening or ""})
     except StateDown:
@@ -901,13 +903,17 @@ async def autonomous_tick(now_dt, a):
     now = now_dt.timestamp()
     signals = await gather_signals(now)
     decision = await qwen_decide(signals, now)
-    recent = await state.call("GET", "/v1/state/proactive_log", since=now - 86400, called="true") or []
+    recent = await state.call("GET", "/v1/state/proactive_log", since=now - 86400, called="true")
+    if not isinstance(recent, list):  # unreadable history = unknown cap and gap: fail closed, no call
+        raise StateDown("proactive_log unreadable")
     blocked = guard(decision, now, recent, a)
-    entry = {**decision, "reason_hash": reason_hash(decision["reason"]), "called": False, "blocked_by": blocked,
-             "signals": {k: v[:10] for k, v in signals.items()}}
-    if blocked is None:
-        call = await place_call("autonomous", decision["opening"] or decision["reason"])
-        entry.update(called=True, call_id=call["call_id"])
+    entry = {**decision, "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
+             "blocked_by": blocked, "signals": {k: v[:10] for k, v in signals.items()}}
+    if blocked is None:  # write the row first: if it cannot be recorded, the cap cannot count it, so no call
+        entry["call_id"] = uuid.uuid4().hex
+        await state.call("POST", "/v1/state/proactive_log", entry)
+        await place_call("autonomous", decision["opening"] or decision["reason"], call_id=entry["call_id"])
+        return entry
     await state.call("POST", "/v1/state/proactive_log", entry)
     return entry
 
@@ -925,6 +931,7 @@ async def remember_alert(names, now):
 # ---------- scheduled calls ("내일 10시에 깨워 줘"); no Claude involved ----------
 REPEAT_RE = re.compile(r"daily|weekdays|weekly:[0-6]")  # weekly:<dow>, 0 = Monday
 MAX_DAYS, MAX_ATTEMPTS, RETRY_EVERY_S, ANSWER_WAIT_S = 30, 3, 120, 60
+LATE_S = 600  # a scheduled call more than 10 min late (gateway down) becomes missed instead of ringing
 
 
 def check_schedule(body, created_by, now=None):
@@ -942,6 +949,8 @@ def check_schedule(body, created_by, now=None):
     repeat = body.get("repeat") or None
     if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
         raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<0-6> (0 = Monday)")
+    if repeat and repeat.startswith("weekly:") and datetime.fromtimestamp(at, KST).weekday() != int(repeat[7:]):
+        raise HTTPException(400, "repeat weekly:<dow> must match the weekday of at (0 = Monday)")
     kind = body.get("kind") or "wake"
     note = body.get("note") or ""
     if kind not in ("wake", "reminder") or not isinstance(note, str) or len(note) > 200:
@@ -1063,7 +1072,9 @@ async def fire_scheduled(now):
     User-requested calls fire even with proactive.enabled off (the user asked for that time)."""
     for item in await schedule_list():
         since = now - (item["last_attempt"] or 0)
-        if item["status"] == "pending" and item["at"] <= now:
+        if item["status"] in ("pending", "fired") and now - item["at"] > LATE_S:
+            await missed(item, now, late=True)  # gateway was down: no 07:00 alarm at 13:00
+        elif item["status"] == "pending" and item["at"] <= now:
             await attempt(item, now)
         elif item["status"] == "fired" and item["attempts"] < MAX_ATTEMPTS and since >= RETRY_EVERY_S:
             await attempt(item, now)
@@ -1072,21 +1083,22 @@ async def fire_scheduled(now):
 
 
 async def attempt(item, now):
-    claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now)
+    call_id = uuid.uuid4().hex  # in the claim itself, so call_answered always finds this attempt
+    claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now, call_id=call_id)
     if claimed:
-        call = await place_call(item["kind"], opening_for(item))
-        await state.call("POST", f"/v1/state/schedule/{quote(item['id'], safe='')}", {"call_id": call["call_id"]})
+        await place_call(item["kind"], opening_for(item), call_id=call_id)
 
 
-async def missed(item, now):
+async def missed(item, now, late=False):
     if item["repeat"]:  # the next one still happens
         done = await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"], now))
     else:
         done = await update_item(item, status="missed")
     if done:
         what = "기상 전화" if item["kind"] == "wake" else "예약 전화"
+        how = "를 제때 걸지 못했어요" if late else "를 받지 않으셨어요"
         await send_alert_push((await load_settings())["assistant_name"],
-                              f"{spoken_when(item['at'], item['repeat'], now)} {what}를 받지 않으셨어요.")
+                              f"{spoken_when(item['at'], item['repeat'], now)} {what}{how}.")
 
 
 async def call_answered(call_id):
@@ -1410,16 +1422,44 @@ async def alerts(body: dict):
               and a.get("labels", {}).get("severity") == "critical"]
     if not firing:
         return {"called": False}
-    names = ", ".join(sorted({a["labels"].get("alertname", "알 수 없는 경보") for a in firing}))
-    await remember_alert(names, time.time())
+    all_names = sorted({a["labels"].get("alertname", "알 수 없는 경보") for a in firing})
+    now = time.time()
+    await remember_alert(", ".join(all_names), now)
     if not s["proactive"]["enabled"] or not s["proactive"]["server_alerts"]:
         return {"called": False}
-    try:  # Alertmanager may post the same alert to several gateways: one call per alert set per 10 min
-        if not await take_lease(f"alert:{names}", 600):
-            return {"called": False, "reason": "another gateway is calling"}
-    except StateDown:
-        pass  # ruchba itself may be what is down: call anyway
+    new = await alerts_to_ring(all_names, now)
+    if not new:
+        return {"called": False, "reason": "rang about these recently, or the daily cap is reached"}
+    names = ", ".join(new)
     return {"called": True, **await place_call("server_down", f"서버 경보가 왔어요. {names}. 로그를 볼까요, 재시작할까요?")}
+
+
+ALERT_NAME_S, ALERT_MAX_PER_DAY = 7200, 3  # one call per alert name per 2 h; at most 3 server-down calls per 24 h
+local_alerts: dict = {"names": {}, "calls": []}  # the same limits on this gateway alone while ruchba is down
+
+
+async def alerts_to_ring(names, now):
+    """The alert names worth a call now, under the limits shared by every gateway (leases and a kv list), or
+    this gateway's own memory when ruchba is down (ruchba itself may be what failed). A flapping alert
+    re-fires every few minutes; its 2 h lease keeps it to one call."""
+    try:
+        calls = [t for t in (await state.call("GET", "/v1/state/kv/alert_calls") or []) if now - t < 86400]
+        if len(calls) >= ALERT_MAX_PER_DAY:
+            return []
+        new = [n for n in names if await take_lease(f"alert:{n}", ALERT_NAME_S, holder=uuid.uuid4().hex)]
+        if new:
+            await state.call("PUT", "/v1/state/kv/alert_calls", calls + [now])
+        return new
+    except StateDown:
+        local_alerts["calls"] = [t for t in local_alerts["calls"] if now - t < 86400]
+        if len(local_alerts["calls"]) >= ALERT_MAX_PER_DAY:
+            return []
+        new = [n for n in names if now - local_alerts["names"].get(n, 0) >= ALERT_NAME_S]
+        for n in new:
+            local_alerts["names"][n] = now
+        if new:
+            local_alerts["calls"].append(now)
+        return new
 
 
 @app.post("/v1/approvals")

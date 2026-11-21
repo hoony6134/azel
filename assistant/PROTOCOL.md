@@ -61,7 +61,8 @@ answering a call the assistant placed; the server then speaks that call's openin
   30–40 s briefing from it right away (today's date, classes/meetings, deadlines, todos, server health,
   pending approvals, the next scheduled call), spoken sentence by sentence as `reply` frames with
   `"route":"briefing"`. With no note yet it says the filler, sends `activity` `routing`, and streams a
-  Claude briefing over the link (the morning-briefing prompt) with its activity events. Barge-in works
+  Claude briefing over the link (the morning-briefing prompt) with its activity events; at most one such
+  Claude briefing per 10 min, within which the last briefing text is spoken again. Barge-in works
   as for any reply. The call log records `reason: "briefing"`; what was said becomes the call's
   `opening`.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
@@ -120,7 +121,8 @@ gate (깨워, 알람, 모닝콜; "전화해 줘" / "예약해 줘" plus a time a
 and a deterministic Korean time parser (내일 10시, 내일 아침 7시 반, 30분 뒤, 모레 오후 3시, 매일 7시,
 평일 6시 40분, 매주 수요일 9시, 다음 주 월요일 9시; a bare "10시" is today if still ahead, else tomorrow).
 Phrasings the rules miss go to the local Qwen for strict JSON (given the current KST time), then
-validation (ahead, within 30 days, known repeat). With no time the voice server asks back ("몇 시에 깨워
+validation (ahead, within 30 days, known repeat, `weekly:N` on that weekday; a time without an offset
+means KST). A weekday mismatch asks back ("무슨 요일 몇 시에 할까요?"). With no time the voice server asks back ("몇 시에 깨워
 드릴까요?") and the next utterance with a time completes it.
 
 Routing, per other ask: the full-mode link (with Claude) with the lowest `priority` among healthy links (3+ consecutive
@@ -230,7 +232,8 @@ device that created them.
 - Scheduled calls (full gateways only; limited → 403). Item (the same shape on the voice path):
   `{"id","at","repeat","kind","note","status","attempts","created_by"}` with `at` an ISO 8601 string with
   offset in KST (e.g. `"2026-11-22T10:00:00+09:00"`, accepted and returned), `repeat` null | `"daily"` |
-  `"weekdays"` | `"weekly:<dow>"` (0 = Monday … 6 = Sunday), `kind` `wake`|`reminder`, `status`
+  `"weekdays"` | `"weekly:<dow>"` (0 = Monday … 6 = Sunday; must match the weekday of `at`, else 400),
+  `kind` `wake`|`reminder`, `status`
   `pending`|`fired`|`answered`|`missed`|`cancelled`, `created_by` `voice`|`app`.
   `GET /v1/schedule` → pending and fired items, soonest first; `?include=all` adds past ones (answered,
   missed, cancelled). `POST /v1/schedule` `{"at","repeat"?,"kind"?,"note"?}` → **201** with the created item;
@@ -239,7 +242,9 @@ device that created them.
   `scheduler` (TTL 150 s, renewed every minute, priority = `BISEO_SCHEDULER_PRIORITY`, a lower value takes
   it over) places the call at `at` (always, even with `proactive.enabled` off: the user asked for it; opening "일어나실
   시간이에요." or the reminder note), retries every 2 min while unanswered up to 3 attempts, then marks it
-  `missed` and sends an alert push. Answered (voice `call_answered`) → `answered`; repeating items go back
+  `missed` and sends an alert push. An item more than 10 min past `at` when the scheduler sees it (the
+  holder was down) is never rung: it becomes `missed` (repeats move to their next occurrence) with an
+  alert push ("…를 제때 걸지 못했어요"). Answered (voice `call_answered`) → `answered`; repeating items go back
   to `pending` at their next occurrence (also after a miss). Status changes are compare-and-set, so two
   gateways never fire the same attempt.
 - Autonomous calls ("서버가 생각해서 알아서 부르기"; `proactive.enabled` and `proactive.autonomous.enabled`,
@@ -254,6 +259,8 @@ device that created them.
     of the last 24 h, delegated device jobs finished or failed in the last 2 h via each trusted daemon's
     `list_jobs`, approvals pending > 30 min, scheduled calls missed in the last 24 h, task contexts with
     open questions, the situation note) and asks the local Qwen for `{"call","urgency","reason","opening"}`.
+  - Fail closed: if the decision log cannot be read (ruchba down, 404, error) nothing rings, and a call is
+    rung only after its log row (with the pre-generated `call_id`) is written.
   - Guardrails, all required to ring: `call` is `true`, `urgency` an integer ≥ 4, now inside `window`,
     fewer than `max_per_day` autonomous calls today, the last one at least `min_gap_minutes` ago, and no
     autonomous call about the same reason (hash of the normalized reason) in the last 24 h. The call opens
@@ -275,8 +282,10 @@ device that created them.
   `history_days` (default 365, 0 = forever): a full gateway deletes older calls daily at 04:00 (lease
   `job:retention:<date>`). Gateways write the voice server's `call_log` events through a restart-proof
   outbox (`pending_history.json`).
-- `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call. One call per alert set per
-  10 min across gateways (lease `alert:<names>`); if ruchba is down, the gateway calls anyway.
+- `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call (if `proactive.enabled` and
+  `server_alerts`), about the alert names not called about in the last 2 h (lease `alert:<name>`, so a
+  flapping alert rings once), and at most 3 server-down calls per rolling 24 h (kv `alert_calls`). If
+  ruchba is down the gateway applies the same limits from its own memory and calls.
 - Scheduled jobs (morning briefing, deadline check) run on every full gateway's clock; the one that
   takes lease `job:<name>:<date>` (24 h) fires it. Lease holder = `<device>-<random per process>`,
   so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
