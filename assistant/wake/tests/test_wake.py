@@ -172,3 +172,11 @@ def test_example_config_parses():
     from pathlib import Path
     cfg = bw.load_config(Path(__file__).parent.parent / "wake.example.toml")
     assert cfg["model"] == "hey_jarvis"
+
+
+def test_verifier_mtime_tracks_file_and_toggle(tmp_path):
+    v = tmp_path / "v.pkl"
+    assert bw.verifier_mtime({"verifier": str(v)}) == 0  # absent
+    v.write_bytes(b"x")
+    assert bw.verifier_mtime({"verifier": str(v)}) > 0
+    assert bw.verifier_mtime({"verifier": ""}) == 0  # toggled off

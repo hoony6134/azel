@@ -32,6 +32,8 @@ CONFIG_PATH = Path.home() / ".config/biseo/wake.toml"
 DEFAULTS = {
     "model": "hey_jarvis",  # built-in openWakeWord name, or a path to an .onnx (kim_biseo.onnx)
     "threshold": 0.5,
+    "verifier": "~/.config/biseo/azel_verifier.pkl",  # personal voice verifier; "" turns it off
+    "verifier_gate": 0.3,  # base score that makes the verifier run; wake needs both gate and threshold
     "server": "http://100.64.0.11:8891",
     "tts_url": "http://100.64.0.11:8890/v1/audio/speech",
     "ack_text": "네?",
@@ -95,7 +97,11 @@ class Listener:
     # --- main loop ------------------------------------------------------------------------
     def run(self, frames):
         frames = iter(frames)
-        for frame in self.live(frames):
+        seen = verifier_mtime(self.cfg)
+        for n, frame in enumerate(self.live(frames)):
+            if n % 30 == 0 and verifier_mtime(self.cfg) != seen:  # ~every 5 s
+                seen = verifier_mtime(self.cfg)
+                self.oww = load_oww(self.cfg)
             self.ring = (self.ring + [frame])[-int(2 / FRAME_S):]
             score = max(self.oww.predict(frame).values())
             if score >= self.cfg["threshold"]:
@@ -211,7 +217,19 @@ def load_oww(cfg):
         m = str(Path(m).expanduser())
     # fetches the shared feature models, plus the built-in model when m names one; no-op once present
     openwakeword.utils.download_models([Path(m).stem])
+    v = Path(cfg["verifier"]).expanduser() if cfg["verifier"] else None
+    if v and v.exists():
+        return Model(wakeword_models=[m], inference_framework="onnx", custom_verifier_threshold=cfg["verifier_gate"],
+                     custom_verifier_models={Path(m).stem: str(v)})
     return Model(wakeword_models=[m], inference_framework="onnx")
+
+
+def verifier_mtime(cfg):
+    """mtime of the verifier file (0 when absent or off): a change means enrollment finished or was deleted."""
+    try:
+        return Path(cfg["verifier"]).expanduser().stat().st_mtime if cfg["verifier"] else 0
+    except OSError:
+        return 0
 
 
 class Mic:
