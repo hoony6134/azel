@@ -1,7 +1,10 @@
 """Always-on wake-word listener for 아젤 (Mac).
 
-wake word (openWakeWord) -> "네?" -> record with Silero VAD -> POST /v1/turn ->
-play the streamed reply -> 6 s follow-up window without the wake word -> back to wake.
+wake word (openWakeWord) -> "네?" -> hand the call to the Azel app (azel://wake).
+The mic is open only while the Azel app process runs: quit the app and the stream is released (no mic indicator),
+start it again and listening resumes. While the app is in a call (its in-call file exists) the mic is ignored,
+so its own voice can't wake it. handoff = "headless" keeps the old always-on flow on the Mac itself:
+record with Silero VAD -> POST /v1/turn -> play the streamed reply -> 6 s follow-up window -> back to wake.
 
 usage:
   uv run python biseo_wake.py                    # listen on the default mic
@@ -12,13 +15,16 @@ import base64
 import io
 import itertools
 import json
+import os
 import queue
+import re
 import subprocess
 import sys
 import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import numpy as np
@@ -46,6 +52,13 @@ DEFAULTS = {
     "save_audio": False,
     "log_path": "~/.local/state/biseo/wake.jsonl",
     "token_path": "~/.config/biseo/token",
+    "handoff": "app",  # "app": listen only while the app runs, open azel://wake; "headless": always on, /v1/turn flow
+    "app_path": "/Applications/Azel.app",  # its process is told by this bundle path
+    "in_call_path": "~/Library/Application Support/Azel/in-call",  # the app's lock file while it is in a call
+    "gateway": "http://100.64.0.8:8892",  # for the primary persona id
+    "handoff_ignore_s": 3,  # deaf this long after the handoff, until the app creates the in-call file
+    "in_call_stale_s": 7200,  # an in-call file older than this is a leftover
+    "app_check_s": 2,  # how often the app-running check runs
 }
 
 
@@ -57,6 +70,8 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         if unknown:
             raise ValueError(f"{path}: unknown keys {sorted(unknown)}")
         cfg |= user
+    if cfg["handoff"] not in ("app", "headless"):
+        raise ValueError(f'{path}: handoff must be "app" or "headless"')
     return cfg
 
 
@@ -70,9 +85,11 @@ class Listener:
     """The state machine. Audio in/out, the detector and the clock are injected so tests can fake them."""
 
     def __init__(self, cfg, oww, vad, http: httpx.Client, play, ack=None, flush=lambda: None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, wall=time.time, open_url=None):
         self.cfg, self.oww, self.vad, self.http = cfg, oww, vad, http
         self._play, self.ack, self.flush, self.clock = play, ack, flush, clock
+        self.wall, self.open_url = wall, open_url or open_app_url
+        self.deaf_until, self.was_in_call = 0.0, False
         self.muted_until = 0.0
         self.ring: list[np.ndarray] = []  # last ~2 s, saved with a detection when save_audio is on
         self.log_path = Path(cfg["log_path"]).expanduser()
@@ -88,10 +105,22 @@ class Listener:
         self.muted_until = self.clock() + self.cfg["mute_after_ms"] / 1000
         self.oww.reset()
 
+    def in_call(self):
+        """The app is in a call: its lock file exists and is not a leftover (older than in_call_stale_s)."""
+        try:
+            age = self.wall() - Path(self.cfg["in_call_path"]).expanduser().stat().st_mtime
+        except OSError:
+            return False
+        return age < self.cfg["in_call_stale_s"]
+
     def live(self, frames):
-        """Frames that arrive outside the mute window."""
+        """Frames that arrive outside the mute window, the post-handoff deaf window and any app call."""
         for f in frames:
-            if self.clock() >= self.muted_until:
+            busy = self.in_call()
+            if self.was_in_call and not busy:
+                self.oww.reset()  # forget what the call put into the detector's buffer
+            self.was_in_call = busy
+            if not busy and self.clock() >= max(self.muted_until, self.deaf_until):
                 yield f
 
     # --- main loop ------------------------------------------------------------------------
@@ -128,6 +157,17 @@ class Listener:
             self.play(*self.ack)
         else:
             self.beep()
+        if use_app(self.cfg):
+            persona = primary_persona(self.cfg, self.http)
+            entry["handoff"], entry["persona"] = "app", persona
+            if self.open_url(f"azel://wake?persona={quote(persona)}"):
+                self.deaf_until = self.clock() + self.cfg["handoff_ignore_s"]
+            else:  # no headless fallback in app mode: the app answers, or nobody does
+                entry["error"] = "open azel://wake failed"
+                print(entry["error"], flush=True)
+            self.log(entry)
+            self.oww.reset()
+            return
         try:
             while (wav := self.record(frames)) is not None:  # first request, then follow-ups
                 transcript = self.turn(wav, session)
@@ -203,6 +243,72 @@ class Listener:
     def beep(self):
         subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], check=False)
         self.mute()
+
+
+def use_app(cfg) -> bool:
+    """App mode hands every wake to the Azel app; only handoff = "headless" answers on the Mac itself."""
+    return cfg["handoff"] == "app"
+
+
+def app_running(cfg) -> bool:
+    """Is the Azel app's process up? Matched on its bundle path so a lookalike name can't count."""
+    pattern = "^" + re.escape(str(Path(cfg["app_path"]).expanduser())) + "/Contents/MacOS/"
+    return subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode == 0
+
+
+def gated(frames, cfg, running=app_running, clock=time.monotonic):
+    """Frames while the app runs, re-checked every app_check_s; ends when it quits so the caller can free the mic."""
+    last = clock()
+    for f in frames:
+        if clock() - last >= cfg["app_check_s"]:
+            last = clock()
+            if not running(cfg):
+                return
+        yield f
+
+
+def supervise(cfg, listener, open_mic, running=app_running, sleep=time.sleep, stop=lambda: False):
+    """Open the mic only while the app runs, release it when the app quits, resume when it starts again.
+    Each state change is printed and logged once."""
+    state = None
+    while not stop():
+        up = running(cfg)
+        if up != state:
+            state = up
+            msg = "app running: listening" if up else "app not running: mic closed"
+            print(msg, flush=True)
+            listener.log({"time": datetime.now().astimezone().isoformat(timespec="seconds"), "event": msg})
+        if not up:
+            sleep(cfg["app_check_s"])
+            continue
+        mic = open_mic()
+        frames = iter(mic)
+        listener.flush = mic.flush
+        try:
+            listener.run(gated(frames, cfg, running, listener.clock))
+        finally:
+            frames.close()  # stops and closes the input stream
+            listener.flush = lambda: None
+            listener.oww.reset()
+            listener.ring = []
+
+
+def primary_persona(cfg, http: httpx.Client) -> str:
+    """The primary persona's id from the gateway, or "azel" when it cannot be had."""
+    try:
+        r = http.get(f"{cfg['gateway']}/v1/personas", timeout=2)
+        r.raise_for_status()
+        data = r.json()
+        for p in (data["personas"] if isinstance(data, dict) else data):
+            if p.get("primary") and not p.get("deleted_at"):
+                return p["id"]
+    except Exception:  # the gateway being down must not stop the wake
+        pass
+    return "azel"
+
+
+def open_app_url(url: str) -> bool:
+    return subprocess.run(["open", "-g", url], capture_output=True).returncode == 0
 
 
 def fetch_ack(cfg, http: httpx.Client):
@@ -307,11 +413,14 @@ def main():
     from pysilero_vad import SileroVoiceActivityDetector
     token = Path(cfg["token_path"]).expanduser().read_text().strip()
     http = httpx.Client(headers={"Authorization": f"Bearer {token}"})
-    mic = Mic()
-    listener = Listener(cfg, oww, SileroVoiceActivityDetector(), http, play_blocking,
-                        ack=fetch_ack(cfg, http), flush=mic.flush)
-    print(f"listening for {cfg['model']} (threshold {cfg['threshold']})", flush=True)
-    listener.run(mic)
+    listener = Listener(cfg, oww, SileroVoiceActivityDetector(), http, play_blocking, ack=fetch_ack(cfg, http))
+    print(f"wake model {cfg['model']} (threshold {cfg['threshold']}), handoff {cfg['handoff']}", flush=True)
+    if use_app(cfg):
+        supervise(cfg, listener, Mic)
+    else:
+        mic = Mic()
+        listener.flush = mic.flush
+        listener.run(mic)
 
 
 if __name__ == "__main__":

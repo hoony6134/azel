@@ -26,3 +26,12 @@ vad_threshold = 0.5
 save_audio = false
 log_path = "~/.local/state/biseo/wake.jsonl"
 token_path = "~/.config/biseo/token"
+
+# After "네?", hand the call to the Azel app (azel://wake?persona=<primary>). The mic is open only while the app's
+# process runs (app_path); quit the app and the stream is released. "headless" keeps the old always-on
+# record -> /v1/turn -> reply flow on the Mac itself.
+handoff = "app"
+app_path = "/Applications/Azel.app"
+# While the app is in a call it keeps this file; the listener ignores the mic then (older than 2 h = stale).
+in_call_path = "~/Library/Application Support/Azel/in-call"
+gateway = "http://100.64.0.8:8892"  # where the primary persona id comes from (falls back to "azel")

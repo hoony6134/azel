@@ -45,7 +45,7 @@ def frames(clock, spec):
             yield np.full(FRAME, value, dtype=np.int16)
 
 
-def make(tmp_path, handler=None, **cfg):
+def make(tmp_path, handler=None, wall=None, open_url=None, **cfg):
     clock, played, flushed, requests = Clock(), [], [], []
 
     def default_handler(req):
@@ -63,9 +63,11 @@ def make(tmp_path, handler=None, **cfg):
 
     http = httpx.Client(transport=httpx.MockTransport(handler or default_handler),
                         headers={"Authorization": "Bearer t"})
-    c = bw.DEFAULTS | {"log_path": str(tmp_path / "wake.jsonl")} | cfg
+    c = bw.DEFAULTS | {"log_path": str(tmp_path / "wake.jsonl"), "handoff": "headless",
+                       "in_call_path": str(tmp_path / "in-call")} | cfg
+    extra = {k: v for k, v in {"wall": wall, "open_url": open_url}.items() if v}
     lis = Listener(c, FakeOww(), FakeVad(), http, play, ack=(np.zeros(8000, np.int16), 16000),
-                   flush=lambda: flushed.append(1), clock=clock)
+                   flush=lambda: flushed.append(1), clock=clock, **extra)
     return lis, clock, played, flushed, requests
 
 
@@ -213,3 +215,148 @@ def test_bad_reload_keeps_old_model_and_startup_falls_back(tmp_path, monkeypatch
     (tmp_path / "azel.base.onnx").unlink(), (tmp_path / "azel.prev.onnx").unlink()
     with pytest.raises(RuntimeError):
         bw.load_oww_or_fallback(cfg)
+
+
+# ---------- hand the call to the app, and stay deaf while it is in a call ----------
+def personas_handler(requests, body):
+    def h(req):
+        requests.append(req)
+        return httpx.Response(200, json=body) if req.url.path == "/v1/personas" else httpx.Response(500)
+    return h
+
+
+def test_handoff_decision(tmp_path):
+    app = tmp_path / "Azel.app"
+    app.mkdir()
+    cfg = bw.DEFAULTS | {"app_path": str(app)}
+    assert bw.use_app(cfg | {"handoff": "app"})
+    assert not bw.use_app(cfg | {"handoff": "headless"})  # only an explicit headless answers on the Mac
+    assert bw.DEFAULTS["handoff"] == "app"
+    bad = tmp_path / "wake.toml"
+    bad.write_text('handoff = "carrier-pigeon"\n')
+    with pytest.raises(ValueError):
+        bw.load_config(bad)
+
+
+def test_wake_opens_the_app_with_the_primary_persona_and_stays_headless_free(tmp_path):
+    app = tmp_path / "Azel.app"
+    app.mkdir()
+    reqs, opened = [], []
+    h = personas_handler(reqs, [{"id": "other", "primary": False},
+                                {"id": "sohee_x", "primary": True, "deleted_at": None}])
+    lis, clock, played, _, _ = make(tmp_path, handler=h, handoff="app",
+                                    open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), *utterance(), (SIL, 40)]))
+    assert opened == ["azel://wake?persona=sohee_x"]
+    assert played == [16000]  # the ack only; no /v1/turn, no reply audio
+    assert [r.url.path for r in reqs] == ["/v1/personas"]
+    assert log_lines(tmp_path)[0]["handoff"] == "app"
+
+
+def test_persona_falls_back_to_azel_and_a_failed_open_never_goes_headless(tmp_path):
+    lis, clock, _, _, requests = make(tmp_path, handoff="app", open_url=lambda u: False)
+    # the default handler answers every URL with the voice-turn stream, so /v1/personas has no "primary" -> azel
+    assert bw.primary_persona(lis.cfg, lis.http) == "azel"
+    requests.clear()
+    lis.run(frames(clock, [(WAKE, 1), *utterance(), (SIL, 40)]))
+    assert not any(r.url.path == "/v1/turn" for r in requests)  # no headless fallback in app mode
+    assert log_lines(tmp_path)[0]["error"] == "open azel://wake failed"
+
+
+def test_deaf_for_a_few_seconds_after_handoff(tmp_path):
+    app = tmp_path / "Azel.app"
+    app.mkdir()
+    opened = []
+    lis, clock, _, _, _ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (WAKE, 5)]))  # ~0.8 s later: still inside the 3 s
+    assert len(opened) == 1
+    lis.run(frames(clock, [(SIL, 30), (WAKE, 1)]))  # 4.8 s of quiet, then a real wake
+    assert len(opened) == 2
+
+
+def test_mic_ignored_while_the_app_is_in_a_call_but_not_when_stale(tmp_path):
+    import os
+    now = 1_000_000.0
+    lock = tmp_path / "in-call"
+    lock.write_text("")
+    os.utime(lock, (now - 60, now - 60))
+    lis, clock, played, _, _ = make(tmp_path, wall=lambda: now)
+    assert lis.in_call()
+    lis.run(frames(clock, [(WAKE, 3), (SIL, 3)]))
+    assert played == [] and not (tmp_path / "wake.jsonl").exists()  # the assistant's own voice can't wake it
+    os.utime(lock, (now - 3 * 3600, now - 3 * 3600))  # a leftover from a crashed call
+    assert not lis.in_call()
+    lis.run(frames(clock, [(WAKE, 1), (SIL, 40)]))
+    assert played == [16000]
+    lock.unlink()
+    assert not lis.in_call()
+
+
+# ---------- listen only while the app runs ----------
+class FakeMic:
+    def __init__(self, gen):
+        self.gen, self.closed, self.flushes = gen, False, 0
+
+    def __iter__(self):
+        try:
+            yield from self.gen
+        finally:
+            self.closed = True  # what leaving Mic.__iter__'s `with stream` does: the input stream is released
+
+    def flush(self):
+        self.flushes += 1
+
+
+def test_gated_stops_when_the_app_quits_and_does_not_pull_more_frames(tmp_path):
+    lis, clock, *_ = make(tmp_path)
+    up, pulled = [True], []
+
+    def src():
+        for f in frames(clock, [(SIL, 100)]):
+            pulled.append(1)
+            yield f
+    out = []
+    for f in bw.gated(src(), lis.cfg, lambda c: up[0], clock):
+        out.append(f)
+        if len(out) == 20:
+            up[0] = False  # the app quits; noticed at the next 2 s check
+    assert 20 <= len(out) <= 34 and len(pulled) <= len(out) + 1
+
+
+def test_supervise_opens_the_mic_only_while_the_app_runs_and_resumes(tmp_path, capsys):
+    lis, clock, played, _, _ = make(tmp_path, handoff="app", open_url=lambda u: True)
+    states = iter([False, False, True, False, False, True, True])  # not running, running, quit, running again
+    opened, mics, slept = [], [], []
+
+    def open_mic():
+        opened.append(1)
+        m = FakeMic(frames(clock, [(SIL, 3), (WAKE, 1), (SIL, 40)]))
+        mics.append(m)
+        return m
+    seq = []
+
+    def running(cfg):
+        seq.append(next(states, False))
+        return seq[-1]
+    done = []
+
+    def stop():
+        done.append(1)
+        return len(done) > 9
+    bw.supervise(lis.cfg, lis, open_mic, running, sleep=slept.append, stop=stop)
+    assert opened and all(m.closed for m in mics)  # every stream was released
+    assert len(opened) == 2  # one per run of the app, none while it was down
+    assert slept and set(slept) == {lis.cfg["app_check_s"]}
+    out = capsys.readouterr().out.splitlines()
+    assert out.count("app not running: mic closed") >= 1 and out.count("app running: listening") >= 1
+    # state changes are logged once each, not on every check
+    events = [l["event"] for l in log_lines(tmp_path) if "event" in l]
+    assert all(a != b for a, b in zip(events, events[1:]))
+    assert any(l.get("handoff") == "app" for l in log_lines(tmp_path))  # a wake while running still hands off
+
+
+def test_app_running_matches_the_bundle_path(monkeypatch):
+    seen = []
+    monkeypatch.setattr(bw.subprocess, "run", lambda argv, **kw: seen.append(argv) or type("R", (), {"returncode": 0})())
+    assert bw.app_running({"app_path": "/Applications/Azel.app"})
+    assert seen[0][:2] == ["pgrep", "-f"] and seen[0][2] == "^/Applications/Azel\\.app/Contents/MacOS/"
