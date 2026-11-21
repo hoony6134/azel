@@ -20,9 +20,26 @@ final class CallClient {
     var onClose: (() -> Void)?
     /// Read on the audio thread; set from the main thread.
     var muted = false
+    /// Hold: no mic goes up, playback pauses, the recording pauses. The socket stays open.
+    var held = false {
+        didSet { if held != oldValue { held ? audio.pause() : audio.resume() } }
+    }
+    var isConnected: Bool { socket != nil }
+    var isRecording: Bool { recorder != nil }
 
-    private let audio = AudioIO()
+    let audio = AudioIO()
     private var socket: URLSessionWebSocketTask?
+    private let lock = NSLock()
+    private var _recorder: CallRecorder?
+    private var recorder: CallRecorder? {
+        get { lock.lock(); defer { lock.unlock() }; return _recorder }
+        set { lock.lock(); _recorder = newValue; lock.unlock() }
+    }
+
+    enum MicAction: Equatable { case send, silence, drop }
+    /// What happens to one mic chunk: held drops it (and pauses the recording timeline); muted keeps
+    /// the recording's clock running with silence but sends nothing.
+    static func micAction(muted: Bool, held: Bool) -> MicAction { held ? .drop : muted ? .silence : .send }
 
     init() {}
 
@@ -45,7 +62,10 @@ final class CallClient {
         socket = task
         task.resume()
         audio.onMic = { [weak self, weak task] data in
-            if self?.muted == false { task?.send(.data(data)) { _ in } }
+            guard let self else { return }
+            let action = Self.micAction(muted: muted, held: held)
+            if action == .send { task?.send(.data(data)) { _ in } }
+            if action != .drop { recorder?.mic(data, silent: action == .silence) }
         }
         do { try audio.start() } catch { throw StartError.audio }
         receive(task)
@@ -58,9 +78,15 @@ final class CallClient {
             switch result {
             case .success(.data(let pcm)):
                 audio.play(pcm)
+                recorder?.assistant(pcm)
             case .success(.string(let text)):
                 guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { break }
-                if event.type == "interrupt" { audio.flush() }
+                if event.type == "interrupt" {
+                    audio.flush()
+                    if held { audio.pause() }
+                    recorder?.interrupt()
+                }
+                recorder?.note(event)
                 DispatchQueue.main.async { self.onEvent?(event) }
             case .failure:
                 DispatchQueue.main.async { if task === self.socket { self.onClose?() } }
@@ -72,8 +98,28 @@ final class CallClient {
         }
     }
 
+    /// Starts writing both sides to Documents/Recordings. Only on the user's tap.
+    func startRecording(session: String) throws {
+        guard recorder == nil else { return }
+        recorder = try CallRecorder(url: Recordings.directory.appendingPathComponent(Recordings.fileName(session: session, start: Date())))
+    }
+
+    func stopRecording() {
+        let r = recorder
+        recorder = nil
+        r?.finish()
+    }
+
+    /// iOS: CallKit gave the audio session back (after a hold or interruption); macOS: device change.
+    func restartAudio() throws {
+        audio.stop()
+        do { try audio.start() } catch { throw StartError.audio }
+        if held { audio.pause() }
+    }
+
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
+        stopRecording()
         if let task = socket {
             task.send(.string(#"{"type":"hangup"}"#)) { _ in task.cancel(with: .normalClosure, reason: nil) }
         }
@@ -81,6 +127,7 @@ final class CallClient {
         audio.onMic = nil
         audio.stop()
         muted = false
+        held = false
     }
 
     /// iOS `didDeactivate`: the system took the audio session away.

@@ -7,6 +7,7 @@ struct BiseoMacApp: App {
     @ObservedObject private var call = MacCall.shared
 
     init() {
+        Recordings.cleanup()
         HotKey.action = { MacCall.shared.toggle() }
         HotKey.register()
     }
@@ -90,7 +91,7 @@ struct MenuContent: View {
         wakeSection
         Divider()
         Button("새로고침") { Task { await model.refresh() } }.keyboardShortcut("r")
-        Button("설정…") { show() }.keyboardShortcut(",")
+        Button("설정 · 녹음…") { show() }.keyboardShortcut(",")
         Button("종료") { NSApp.terminate(nil) }.keyboardShortcut("q")
     }
 
@@ -175,6 +176,7 @@ struct MainWindow: View {
                     SettingsView().tabItem { Label("설정", systemImage: "gearshape") }
                     UsageView().tabItem { Label("사용량", systemImage: "chart.bar") }
                     StatusView().tabItem { Label("상태", systemImage: "server.rack") }
+                    NavigationStack { RecordingsView() }.tabItem { Label("녹음", systemImage: "waveform") }
                     ApprovalsView(pending: Binding(get: { model.approvals.count }, set: { _ in Task { await model.refresh() } }))
                         .tabItem { Label("승인", systemImage: "checkmark.shield") }
                     Form {

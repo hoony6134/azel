@@ -39,11 +39,24 @@ enum PCM {
     }
 }
 
+extension PCM {
+    /// PCM16 little-endian bytes → Float samples in -1…1 (trailing odd byte dropped).
+    static func samples(fromPCM16 data: Data) -> [Float] {
+        data.withUnsafeBytes { raw in
+            (0..<(data.count / 2)).map { Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: $0 * 2, as: Int16.self))) / 32768 }
+        }
+    }
+}
+
 /// Mic tap → PCM16 16 kHz chunks, and an ordered PCM16 24 kHz player.
 final class AudioIO {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     var onMic: ((Data) -> Void)?
+    #if os(macOS)
+    /// Core Audio device ids for the next start(); nil = system default.
+    var inputDevice: AudioDeviceID?, outputDevice: AudioDeviceID?
+    #endif
 
     init() {
         engine.attach(player)
@@ -53,6 +66,11 @@ final class AudioIO {
     /// iOS: call after CallKit activated the audio session.
     func start() throws {
         let input = engine.inputNode
+        #if os(macOS)
+        // Set before voice processing so the echo canceller pairs the chosen devices.
+        if let id = inputDevice { try? input.auAudioUnit.setDeviceID(id) }
+        if let id = outputDevice { try? engine.outputNode.auAudioUnit.setDeviceID(id) }
+        #endif
         try? input.setVoiceProcessingEnabled(true) // echo cancellation on top of .voiceChat
         let format = input.outputFormat(forBus: 0)
         guard let converter = AVAudioConverter(from: format, to: PCM.micFormat) else { throw AVError(.unknown) }
@@ -74,6 +92,10 @@ final class AudioIO {
         player.stop()
         if engine.isRunning { player.play() }
     }
+
+    /// Hold: playback pauses where it is (queued replies wait); resume() continues them.
+    func pause() { player.pause() }
+    func resume() { if engine.isRunning { player.play() } }
 
     func stop() {
         player.stop()

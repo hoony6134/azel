@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 
 // MARK: - Call
@@ -5,6 +6,7 @@ import SwiftUI
 struct CallView: View {
     @ObservedObject private var call = CallManager.shared
     @State private var session = Session.current()
+    @State private var showRecordings = false
 
     private var stateText: String {
         ["listening": "듣는 중", "thinking": "생각 중", "speaking": "말하는 중"][call.state] ?? "연결 중"
@@ -13,7 +15,8 @@ struct CallView: View {
     var body: some View {
         VStack(spacing: 16) {
             if call.inCall {
-                Text(stateText).font(.title2.bold())
+                Text(call.held ? "대기 중" : stateText).font(.title2.bold())
+                if call.recording { RecordingBadge(since: call.connectedAt) }
                 ScrollViewReader { proxy in
                     List(call.lines) { line in
                         HStack(alignment: .firstTextBaseline) {
@@ -30,6 +33,12 @@ struct CallView: View {
                     }
                     .listStyle(.plain)
                     .onChange(of: call.lines.count) { if let last = call.lines.last { proxy.scrollTo(last.id) } }
+                }
+                HStack(spacing: 12) {
+                    control(call.speaker ? "스피커 끄기" : "스피커", "speaker.wave.2.fill", on: call.speaker) { call.toggleSpeaker() }
+                    RoutePicker().frame(width: 44, height: 44).accessibilityLabel("오디오 출력 선택")
+                    control(call.held ? "대기 해제" : "대기", "pause.fill", on: call.held) { call.toggleHold() }
+                    control(call.recording ? "녹음 중지" : "녹음", "record.circle", on: call.recording, tint: .red) { call.toggleRecording() }
                 }
                 HStack {
                     Button { call.toggleMute() } label: {
@@ -51,11 +60,33 @@ struct CallView: View {
                 .buttonStyle(.borderedProminent).tint(.green)
                 Button { session = Session.rotate() } label: { Label("새 대화", systemImage: "square.and.pencil") }
                 Text(session).font(.caption).foregroundStyle(.secondary)
+                Button { showRecordings = true } label: { Label("녹음 목록", systemImage: "waveform") }
                 Spacer()
             }
             if let error = call.error { Text(error).font(.footnote).foregroundStyle(.red) }
         }
         .padding()
         .onAppear { session = Session.current() }
+        .sheet(isPresented: $showRecordings) { NavigationStack { RecordingsView() } }
     }
+
+    private func control(_ title: String, _ icon: String, on: Bool, tint: Color = .accentColor, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.title3).frame(width: 44, height: 44)
+                .foregroundStyle(on ? .white : .primary)
+                .background(on ? tint : Color.secondary.opacity(0.15), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+    }
+}
+
+/// AirPods / Bluetooth / receiver / speaker picker.
+struct RoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let v = AVRoutePickerView()
+        v.prioritizesVideoDevices = false
+        return v
+    }
+    func updateUIView(_ view: AVRoutePickerView, context: Context) {}
 }

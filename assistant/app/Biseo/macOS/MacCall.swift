@@ -14,7 +14,13 @@ final class MacCall: ObservableObject {
     @Published private(set) var state = ""          // listening | thinking | speaking
     @Published private(set) var lines: [Line] = []
     @Published private(set) var muted = false
+    @Published private(set) var held = false
+    @Published private(set) var recording = false
+    @Published private(set) var connectedAt: Date?
     @Published var error: String?
+    /// Device UIDs for the call engine; nil = system default. Saved across launches.
+    @Published var inputUID = UserDefaults.standard.string(forKey: "inputDevice") { didSet { deviceChanged() } }
+    @Published var outputUID = UserDefaults.standard.string(forKey: "outputDevice") { didSet { deviceChanged() } }
 
     private let client = CallClient()
     private var panel: NSPanel?
@@ -49,11 +55,40 @@ final class MacCall: ObservableObject {
         client.muted = muted
     }
 
+    func toggleHold() {
+        guard inCall else { return }
+        held.toggle()
+        client.held = held
+    }
+
+    /// Records both sides to Documents/Recordings (inside the app container); only on the user's click.
+    func toggleRecording() {
+        guard inCall else { return }
+        if client.isRecording { client.stopRecording() } else {
+            do { try client.startRecording(session: Session.current("mac")) } catch { self.error = "녹음 시작 실패" }
+        }
+        recording = client.isRecording
+    }
+
+    private func applyDevices() {
+        client.audio.inputDevice = AudioDevices.id(forUID: inputUID, input: true)
+        client.audio.outputDevice = AudioDevices.id(forUID: outputUID, input: false)
+    }
+
+    private func deviceChanged() {
+        UserDefaults.standard.set(inputUID, forKey: "inputDevice")
+        UserDefaults.standard.set(outputUID, forKey: "outputDevice")
+        applyDevices()
+        guard inCall else { return }
+        do { try client.restartAudio() } catch { end(error: error.localizedDescription, keepPanel: true) }
+    }
+
     private static let micDenied = "마이크 권한이 없습니다. 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 박비서를 켜 주세요."
 
     private func connect() {
         inCall = true
-        do { try client.start(session: Session.current("mac")) } catch {
+        applyDevices()
+        do { try client.start(session: Session.current("mac")); connectedAt = Date() } catch {
             end(error: error.localizedDescription, keepPanel: true)
         }
     }
@@ -74,6 +109,9 @@ final class MacCall: ObservableObject {
         if let message { error = message }
         inCall = false
         muted = false
+        held = false
+        recording = false
+        connectedAt = nil
         state = ""
         if !keepPanel { panel?.orderOut(nil) }
     }
@@ -119,15 +157,23 @@ struct CallPanelView: View {
         return ["listening": "듣는 중", "thinking": "생각 중", "speaking": "말하는 중"][call.state] ?? "연결 중"
     }
 
+    private func icon(_ title: String, _ name: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: name).foregroundStyle(on ? Color.red : Color.primary) }
+            .buttonStyle(.borderless).help(title).accessibilityLabel(title)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: call.inCall ? "waveform" : "phone.down").symbolEffect(.variableColor, isActive: call.state == "speaking")
-                Text(stateText).font(.headline)
+                Text(call.held ? "대기 중" : stateText).font(.headline)
+                if call.recording { RecordingBadge(since: call.connectedAt) }
                 Spacer()
                 if call.inCall {
-                    Button { call.toggleMute() } label: { Image(systemName: call.muted ? "mic.slash.fill" : "mic.fill") }
-                        .help(call.muted ? "음소거 해제" : "음소거").accessibilityLabel(call.muted ? "음소거 해제" : "음소거")
+                    icon(call.muted ? "음소거 해제" : "음소거", call.muted ? "mic.slash.fill" : "mic.fill", on: call.muted) { call.toggleMute() }
+                    icon(call.held ? "대기 해제" : "대기", "pause.fill", on: call.held) { call.toggleHold() }
+                    icon(call.recording ? "녹음 중지" : "녹음", "record.circle", on: call.recording) { call.toggleRecording() }
+                    DeviceMenu(call: call)
                 }
                 Button(call.inCall ? "끊기" : "닫기") { call.hangUp() }.keyboardShortcut(.cancelAction)
             }
@@ -157,5 +203,25 @@ struct CallPanelView: View {
         }
         .padding(.horizontal, 14).padding(.bottom, 12).padding(.top, 28)
         .frame(width: 380, height: 300)
+    }
+}
+
+/// Input / output device for this call (macOS has no AVRoutePickerView for voice calls).
+struct DeviceMenu: View {
+    @ObservedObject var call: MacCall
+
+    var body: some View {
+        Menu {
+            Picker("입력", selection: $call.inputUID) {
+                Text("시스템 기본값").tag(String?.none)
+                ForEach(AudioDevices.list(input: true), id: \.uid) { Text($0.name).tag(Optional($0.uid)) }
+            }
+            Picker("출력", selection: $call.outputUID) {
+                Text("시스템 기본값").tag(String?.none)
+                ForEach(AudioDevices.list(input: false), id: \.uid) { Text($0.name).tag(Optional($0.uid)) }
+            }
+        } label: { Image(systemName: "hifispeaker.and.homepod") }
+        .menuStyle(.borderlessButton).fixedSize()
+        .help("오디오 장치").accessibilityLabel("오디오 장치")
     }
 }

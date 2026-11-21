@@ -12,6 +12,10 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var state = ""          // listening | thinking | speaking
     @Published private(set) var lines: [Line] = []
     @Published private(set) var muted = false
+    @Published private(set) var held = false
+    @Published private(set) var speaker = false
+    @Published private(set) var recording = false
+    @Published private(set) var connectedAt: Date?
     @Published var error: String?
 
     private let provider: CXProvider
@@ -36,6 +40,10 @@ final class CallManager: NSObject, ObservableObject {
         client.onClose = { [weak self] in self?.fail(nil) }
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
+        // The system call UI's speaker button and AirPods coming and going change the route too.
+        NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.speaker = AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
+        }
     }
 
     // MARK: UI actions
@@ -60,6 +68,27 @@ final class CallManager: NSObject, ObservableObject {
         controller.request(CXTransaction(action: CXSetMutedCallAction(call: uuid, muted: !muted))) { _ in }
     }
 
+    /// Goes through CallKit so the system call UI shows the hold state too.
+    func toggleHold() {
+        guard let uuid = callUUID else { return }
+        controller.request(CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: !held))) { _ in }
+    }
+
+    func toggleSpeaker() {
+        do { try AVAudioSession.sharedInstance().overrideOutputAudioPort(speaker ? .none : .speaker) } catch {
+            self.error = "스피커 전환 실패"
+        }
+    }
+
+    /// Records both sides to Documents/Recordings; only ever started by the user's tap.
+    func toggleRecording() {
+        guard inCall else { return }
+        if client.isRecording { client.stopRecording() } else {
+            do { try client.startRecording(session: callID ?? Session.current(sessionPrefix)) } catch { self.error = "녹음 시작 실패" }
+        }
+        recording = client.isRecording
+    }
+
     /// Sends the PushKit token to the gateway once both it and the server token exist.
     func registerPush() {
         guard let token = voipToken, Config.token != nil else { return }
@@ -77,18 +106,33 @@ final class CallManager: NSObject, ObservableObject {
         state = ""
         lines = []
         muted = false
+        held = false
+        recording = false
+        connectedAt = nil
         error = nil
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .voiceChat)
     }
 
-    /// Runs from `didActivate`: the audio session is ours now.
+    /// Runs from `didActivate`: the audio session is ours now. After a hold the socket is still up,
+    /// so only the audio engine comes back.
     private func connect() {
         guard let uuid = callUUID else { return fail("서버 설정이 없습니다") }
+        if client.isConnected {
+            do { try client.restartAudio() } catch { fail(error.localizedDescription) }
+            return
+        }
         do { try client.start(session: callID ?? Session.current(sessionPrefix), callID: callID) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
+        connectedAt = Date()
+        let update = CXCallUpdate()
+        update.supportsHolding = true
+        update.supportsGrouping = false
+        update.supportsUngrouping = false
+        update.supportsDTMF = false
+        provider.reportCall(with: uuid, updated: update)
     }
 
     private func handle(_ event: CallEvent) {
@@ -114,6 +158,9 @@ final class CallManager: NSObject, ObservableObject {
         callID = nil
         sessionPrefix = "iphone"
         muted = false
+        held = false
+        recording = false
+        connectedAt = nil
         inCall = false
         state = ""
     }
@@ -146,6 +193,11 @@ extension CallManager: CXProviderDelegate {
         action.fulfill()
     }
 
+    func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
+        if action.callUUID == callUUID { held = action.isOnHold; client.held = held }
+        action.fulfill()
+    }
+
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) { connect() }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) { client.stopAudio() }
@@ -170,6 +222,10 @@ extension CallManager: PKPushRegistryDelegate {
         update.remoteHandle = CXHandle(type: .generic, value: caller)
         update.localizedCallerName = caller
         update.hasVideo = false
+        update.supportsHolding = true
+        update.supportsGrouping = false
+        update.supportsUngrouping = false
+        update.supportsDTMF = false
         provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] err in
             if err != nil { DispatchQueue.main.async { self?.incoming[uuid] = nil } }
             completion()

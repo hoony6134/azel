@@ -6,7 +6,10 @@ struct BiseoApp: App {
     @State private var pendingApprovals = 0
     @Environment(\.scenePhase) private var scenePhase
 
-    init() { _ = CallManager.shared } // PushKit must be registered on every launch, including background VoIP launches
+    init() {
+        _ = CallManager.shared // PushKit must be registered on every launch, including background VoIP launches
+        Recordings.cleanup()
+    }
 
     var body: some Scene {
         WindowGroup {
