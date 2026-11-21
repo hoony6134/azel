@@ -19,6 +19,8 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
+import cron as C
+
 KST = timezone(timedelta(hours=9))
 APPROVAL_WAIT_S = 300
 APPROVAL_POLL_S = 2
@@ -35,18 +37,48 @@ CALL_USER = {
         "when": {"type": ["string", "null"], "description": "예: 2026-11-22T10:00:00+09:00, 지금이면 null"},
         "reason": {"type": "string", "maxLength": 200},
         "kind": {"type": "string", "enum": ["reminder", "wake"], "description": "wake = 깨우는 전화"},
-        "repeat": {"type": ["string", "null"], "description": "daily, weekdays, weekly:0..6(0=월), 한 번이면 null"},
+        "repeat": {"type": ["string", "null"], "description": "옛 방식: daily, weekdays, weekly:0..6(0=월). repeat_cron을 쓸 것"},
+        "repeat_cron": {"type": ["string", "null"], "description": (
+            "반복이면 5칸 cron(KST, 분 시 일 월 요일, 요일 0=일요일). 예: 매일 7시 '0 7 * * *', 화목 2시 '0 14 * * 2,4', "
+            "평일 10시~6시 2시간마다 '0 10-18/2 * * 1-5', 매월 1일 '0 9 1 * *'. 전화 사이 30분 이상, 하루 20번까지")},
+        "start_date": {"type": ["string", "null"], "description": "반복 시작일 YYYY-MM-DD"},
+        "end_date": {"type": ["string", "null"], "description": "반복 마지막 날 YYYY-MM-DD"},
+        "notify": {"type": "string", "enum": ["call", "push"], "description": "'알림으로'면 push, 기본 call"},
+        "confirmed": {"type": "boolean", "description": "단순한 매일·매주 규칙이 아니면, 사용자에게 읽어 주고 확인받은 뒤 true"},
         "persona_id": {"type": "string", "maxLength": 32}}},
 }
+PICK = {  # how schedule_cancel and schedule_update choose their item
+    "id": {"type": "string", "maxLength": 40}, "at": {"type": "string", "description": "ISO 8601 KST (반복이면 그 회차의 시각)"},
+    "description": {"type": "string", "maxLength": 100, "description": "메모나 '내일 7시' 같은 말"}}
 SCHEDULE_LIST = {"name": "schedule_list", "description": "예약된 전화 목록(id 포함).",
                  "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
 SCHEDULE_CANCEL = {
     "name": "schedule_cancel",
     "description": "예약된 전화 하나를 취소한다. id, 시각(at), 또는 설명(description: 메모나 '내일 7시' 같은 말)으로 고른다. "
-                   "여러 개가 맞으면 아무것도 취소하지 않고 어느 것인지 돌려준다. 아무것도 안 주면 가장 가까운 예약.",
+                   "여러 개가 맞으면 아무것도 취소하지 않고 어느 것인지 돌려준다. 아무것도 안 주면 가장 가까운 예약. "
+                   "반복 예약은 scope: occurrence(at의 그 회차, 없으면 다음 회차 하나만) 또는 rule(반복 전체, 기본).",
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
-        "id": {"type": "string", "maxLength": 40}, "at": {"type": "string", "description": "ISO 8601 KST"},
-        "description": {"type": "string", "maxLength": 100}}}}
+        **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]}}}}
+SCHEDULE_UPDATE = {
+    "name": "schedule_update",
+    "description": ("예약된 전화 하나를 바꾼다(시각, 목적, 알림 방식, 반복 규칙, 기간). 고르는 법은 schedule_cancel과 같고, 여러 개가 "
+                    "맞으면 아무것도 바꾸지 않고 어느 것인지 돌려준다. 반복 예약이면 scope가 필요해: 사용자가 '오늘', '내일'처럼 "
+                    "특정한 날을 말했으면 occurrence(그 회차만, at에 그 회차의 원래 시각), 아니면 rule(반복 전체). 애매하면 먼저 "
+                    "물어봐. '~만 빼줘', '이번만 건너뛰어'처럼 한 회차를 빼는 건 이 도구가 아니라 schedule_cancel(scope=occurrence, "
+                    "at=그 회차 시각)이야. 한 회차를 빼려고 반복 규칙(repeat_cron)을 고치지 마."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]},
+        "when": {"type": "string", "description": (
+            "새 시각, ISO 8601 KST(예: 2026-11-23T18:00:00+09:00). 오전·새벽 없이 1~6시라고만 하면 오후. 반복 전체면 이 시각의 "
+            "시·분이 새 규칙의 시각. cron은 여기 말고 repeat_cron에")},
+        "purpose": {"type": "string", "maxLength": 60},
+        "notify": {"type": "string", "enum": ["call", "push"], "description": (
+            "사용자가 받는 방식을 바꾸라고 할 때만('전화 말고 알림으로' → push). '10시 알림'의 '알림'은 예약을 가리키는 말일 뿐, "
+            "그때는 notify를 넣지 마")},
+        "repeat_cron": {"type": "string", "description": "새 반복 규칙(5칸 cron)"},
+        "start_date": {"type": ["string", "null"]}, "end_date": {"type": ["string", "null"]},
+        "confirmed": {"type": "boolean", "description": ("단순한 매일·매주가 아닌 새 규칙을, 도구가 돌려준 읽어 주기 문장으로 "
+                                                         "사용자에게 물어 '네'라는 답을 들은 뒤에만 true. 스스로 true로 하지 마")}}}}
 TASK_STATUS = {"name": "task_status", "description": "백그라운드 작업 상태. id가 없으면 최근 3개.",
                "input_schema": {"type": "object", "additionalProperties": False, "properties": {
                    "id": {"type": "string", "pattern": "^[0-9a-f]{12}$"}}}}
@@ -96,6 +128,8 @@ class Bridge:
                 return ok(await self.d["schedule_list_text"]())
             if name == "schedule_cancel":
                 return ok(await self.schedule_cancel(args))
+            if name == "schedule_update":
+                return ok(await self.schedule_update(args))
             if name == "task_status":
                 return ok(await self.task_status(args))
             if name == "approval_status":
@@ -109,7 +143,11 @@ class Bridge:
             if name not in where:
                 return err(f"없는 도구예요: {str(name)[:40]}")
             return await self.device(name, args, where, caller, on_progress)
+        except (Refused, C.CronError) as e:  # a reason to say as is
+            return err(str(e))
         except Exception as e:  # a failed tool is an answer for the model, never a crash
+            if getattr(e, "status_code", None) == 400 and isinstance(getattr(e, "detail", None), str):
+                return err(e.detail)  # the gateway's own refusal (limits, dates), already in Korean
             return err(f"도구가 실패했어요: {type(e).__name__}")
 
     async def device(self, name, args, where, caller, on_progress):
@@ -155,9 +193,12 @@ class Bridge:
         pid = args.get("persona_id") if isinstance(args.get("persona_id"), str) else persona_id
         when = args.get("when")
         kind = args.get("kind") if args.get("kind") in ("reminder", "wake") else "reminder"
+        if args.get("repeat_cron"):
+            return await self.call_user_rule(args, reason, kind, pid)
         if when:
             item, say = await self.d["schedule_create"]({"at": when, "kind": kind, "note": "" if kind == "wake" else reason,
                                                          "repeat": args.get("repeat") or None,
+                                                         **({"notify": args["notify"]} if args.get("notify") else {}),
                                                          **({"persona_id": pid} if pid else {})}, "voice")
             await self.log_call(reason, item.get("at"), pid)
             return say
@@ -171,6 +212,84 @@ class Bridge:
         await self.log_call(reason, None, pid)
         return "지금 전화를 걸게요."
 
+    @staticmethod
+    def rule_check(args, expr):
+        """(cron, start, end) parsed, or Refused with the read-back when an unconfirmed rule needs the user's yes."""
+        expr = " ".join(str(expr).split())
+        C.parse(expr)
+        start, end = C.as_date(args.get("start_date")), C.as_date(args.get("end_date"))
+        if (not C.trivial(expr) or start or end) and args.get("confirmed") is not True:
+            verb = "알림 드릴게요" if args.get("notify") == "push" else "전화드릴게요"
+            rule = C.rule_text(expr, start, end)
+            raise Refused(f"아직 저장하지 않았어요. 사용자에게 '{rule}{'' if rule.endswith('마다') else '에'} {verb}. "
+                          "맞죠?'라고 읽어 주고, 맞다고 하면 confirmed=true로 다시 불러 주세요.")
+        return expr, start, end
+
+    async def call_user_rule(self, args, reason, kind, pid):
+        expr, start, end = self.rule_check(args, args["repeat_cron"])
+        body = {"cron": expr, "start_date": start and start.isoformat(), "end_date": end and end.isoformat(),
+                "kind": kind, "notify": args.get("notify") or "call", "note": "" if kind == "wake" else reason,
+                "request": reason, **({"at": args["when"]} if args.get("when") else {}),
+                **({"persona_id": pid} if pid else {})}
+        item, say = await self.d["schedule_create"](body, "voice")
+        await self.log_call(reason, item.get("at"), pid)
+        return say
+
+    async def pick(self, args, soonest):
+        """(item or None, message or None) the way cancel and update choose: id, a time (an item's next time or one of
+        its rule's fires), a description, else the soonest (cancel) or the only one (update)."""
+        items = await self.d["schedule_items"]()
+        if args.get("id"):
+            hits = [i for i in items if i["id"] == args["id"]]
+        elif args.get("at"):
+            t = datetime.fromisoformat(args["at"])
+            hits = [i for i in items if datetime.fromisoformat(i["at"]) == t] or \
+                [i for i in items if (e := rule_of(i)) and C.next_fire(e, t - timedelta(minutes=1)) == t]
+        elif desc := str(args.get("description") or "").strip():
+            words = [w for w in re.split(r"\s+", desc) if len(w) > 1] or [desc]  # "약" is a whole description
+            hits = [i for i in items if all(w in " ".join((i.get("note", ""), i.get("purpose") or "", i["spoken"],
+                                                          i.get("rule_text") or "")) for w in words)]
+        else:
+            hits = items[:1] if soonest else items
+        if len(hits) == 1:
+            return hits[0], None
+        if not hits:
+            return None, "그런 예약이 없어요." if args else "예약이 없어요."
+        return None, "어느 것인지 골라 주세요: " + "; ".join(f"{i['spoken']}(id {i['id']})" for i in hits[:5])
+
+    async def schedule_update(self, args):
+        item, msg = await self.pick(args, soonest=False)
+        if msg:
+            return msg
+        changes = {k: args[k] for k in ("when", "purpose", "notify", "repeat_cron") if args.get(k)}
+        changes.update({k: args[k] for k in ("start_date", "end_date") if k in args})
+        if not changes:
+            return "무엇을 바꿀지 말씀해 주세요."
+        if changes.get("when"):
+            try:
+                datetime.fromisoformat(changes["when"])
+            except ValueError:
+                raise Refused("when은 2026-11-23T18:00:00+09:00 같은 ISO 시각이에요. 반복 규칙은 repeat_cron에 주세요.")
+        scope = args.get("scope")
+        if rule_of(item) and scope not in ("occurrence", "rule"):
+            return ("아직 바꾸지 않았어요. 반복 예약이라 scope가 필요해요. 사용자가 '오늘', '내일', '24일'처럼 특정한 날을 "
+                    "말했으면 scope=occurrence(at=그 회차 시각), 말하지 않았으면 scope=rule로 바로 다시 불러요. 둘 다 "
+                    "말이 안 될 때만 '이번 한 번만 바꿀까요, 매번 바꿀까요?'라고 물어요.")
+        if scope == "occurrence" and {"repeat_cron", "start_date", "end_date"} & set(changes):
+            return "한 번만 바꿀 때는 시각, 목적, 알림 방식만 바꿀 수 있어요."
+        if changes.get("repeat_cron"):
+            expr, start, end = self.rule_check({**args, "notify": args.get("notify") or item.get("notify")},
+                                               changes["repeat_cron"])
+            changes["repeat_cron"] = expr
+        occurrence = None
+        if rule_of(item) and scope == "occurrence":
+            if not args.get("at"):  # "오늘 2시 건": guessing the next fire (10시) would move the wrong one
+                return (f"아직 바꾸지 않았어요. 바꿀 회차의 원래 시각을 at으로 주세요(예: 다음 회차 {item['at']}). "
+                        "id나 설명과 함께 줘도 돼요.")
+            occurrence = args["at"]
+        _, say = await self.d["schedule_update"](item["id"], changes, occurrence)
+        return say
+
     async def log_call(self, reason, at, pid):
         """Every user-requested call: who, when (None = now), why. The same list counts the daily cap."""
         today = datetime.now(KST).strftime("%Y-%m-%d")
@@ -179,20 +298,26 @@ class Bridge:
         await self.d["state"]("PUT", f"/v1/state/kv/user-calls-{today}", rows[-100:])
 
     async def schedule_cancel(self, args):
-        """By id or time through the gateway's schedule_cancel; by description only when exactly one item matches."""
+        """By id or time through the gateway's schedule_cancel; by description only when exactly one item matches.
+        scope="occurrence" on a recurring item skips one fire (the one at `at`, else the next) and keeps the rule."""
+        if args.get("scope") == "occurrence":
+            item, msg = await self.pick(args, soonest=True)
+            if msg:
+                return msg
+            if not rule_of(item):
+                args = {**args, "id": item["id"]}  # a one-off item: cancelling its only occurrence is cancelling it
+            else:
+                done = await self.d["schedule_cancel"](item["id"], None, occurrence=args.get("at") or item["at"])
+                return done[1] if done else "그런 예약이 없어요."
         if args.get("id") or args.get("at"):
             at = datetime.fromisoformat(args["at"]).timestamp() if args.get("at") else None
             done = await self.d["schedule_cancel"](args.get("id"), at)
             return done[1] if done else "그런 예약이 없어요."
-        items = await self.d["schedule_items"]()
-        desc = str(args.get("description") or "").strip()
-        if desc:
-            words = [w for w in re.split(r"\s+", desc) if len(w) > 1]
-            hits = [i for i in items if all(w in (i["note"] + " " + i["spoken"]) for w in words)]
-            if len(hits) != 1:
-                return ("그런 예약이 없어요." if not hits else
-                        "어느 것인지 골라 주세요: " + "; ".join(f"{i['spoken']}(id {i['id']})" for i in hits[:5]))
-            done = await self.d["schedule_cancel"](hits[0]["id"], None)
+        if str(args.get("description") or "").strip():
+            item, msg = await self.pick(args, soonest=True)
+            if msg:
+                return msg
+            done = await self.d["schedule_cancel"](item["id"], None)
             return done[1] if done else "그런 예약이 없어요."
         done = await self.d["schedule_cancel"](None, None)  # the soonest, as the voice path always did
         return done[1] if done else "취소할 예약이 없어요."
@@ -224,6 +349,17 @@ class Bridge:
         return f"작업으로 맡겼어요. {how}".strip() + f" (작업 {t['id']})"
 
 
+class Refused(Exception):
+    """A tool that did nothing on purpose; the message says why (and what the model should ask)."""
+
+
+def rule_of(item):
+    """An item's cron: its own, or its legacy repeat at its time of day; None for a one-off."""
+    if item.get("cron"):
+        return item["cron"]
+    return C.legacy(item.get("repeat"), datetime.fromisoformat(item["at"])) if item.get("repeat") else None
+
+
 def ok(text):
     return {"content": str(text), "is_error": False, "waited_s": 0}
 
@@ -233,12 +369,17 @@ def err(text):
 
 
 # ---------- the same tools as an MCP server, for `claude -p` (POST /v1/mcp, stateless JSON-RPC) ----------
-OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, CREATE_TASK, TASK_STATUS, APPROVAL_STATUS)
+OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, APPROVAL_STATUS)
 MCP_TOOLS = OWN_TOOLS  # claude -p already has the daemons, Cygnus and the claude.ai connectors as its own MCP servers
+# The external token (the user's own Claude Code, later claude.ai): ring, schedule and hand off work, nothing personal.
+SCOPES = {"full": {t["name"] for t in MCP_TOOLS},
+          "external": {"call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status"}}
 
 
-async def mcp_handle(bridge, msg, persona_id=None):
-    """One JSON-RPC message; None for notifications."""
+async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
+    """One JSON-RPC message; None for notifications. A tool outside the caller's scope is invisible in tools/list
+    and refused in tools/call exactly like a tool that doesn't exist."""
+    allowed = SCOPES[scope]
     mid, method = msg.get("id"), msg.get("method")
     if mid is None:
         return None
@@ -247,12 +388,13 @@ async def mcp_handle(bridge, msg, persona_id=None):
                   "capabilities": {"tools": {}}, "serverInfo": {"name": "azel", "version": "1"}}
     elif method == "tools/list":
         result = {"tools": [{"name": t["name"], "description": t["description"], "inputSchema": t["input_schema"]}
-                            for t in MCP_TOOLS]}
+                            for t in MCP_TOOLS if t["name"] in allowed]}
     elif method == "tools/call":
         p = msg.get("params") or {}
-        if p.get("name") not in {t["name"] for t in MCP_TOOLS}:
+        if p.get("name") not in allowed:
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
-        r = await bridge.call(p["name"], p.get("arguments") or {}, persona_id, caller="claude_code")
+        r = await bridge.call(p["name"], p.get("arguments") or {}, persona_id,
+                              caller="claude_code" if scope == "full" else "external")
         result = {"content": [{"type": "text", "text": r["content"]}], "isError": r["is_error"]}
     elif method == "ping":
         result = {}

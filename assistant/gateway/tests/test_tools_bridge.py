@@ -43,7 +43,7 @@ class World:
 
     async def schedule_create(self, body, created_by):
         self.schedule.append(body)
-        return {"at": body["at"]}, "내일 오전 10시에 전화드릴게요."
+        return {"at": body.get("at")}, "내일 오전 10시에 전화드릴게요."
 
     async def task_create(self, body, source):
         self.tasks.append(body)
@@ -271,8 +271,9 @@ def test_schedule_task_and_approval_tools():
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
         run(b.call("call_user", {"when": when, "reason": note}))
-    assert [t["name"] for t in run(b.tools("api"))[0]][3:9] == ["call_user", "schedule_list", "schedule_cancel",
-                                                                 "create_task", "task_status", "approval_status"]
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:10] == ["call_user", "schedule_list", "schedule_cancel",
+                                                                  "schedule_update", "create_task", "task_status",
+                                                                  "approval_status"]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
     assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"})) \
@@ -286,3 +287,129 @@ def test_schedule_task_and_approval_tools():
     w.approvals["a9"] = {"id": "a9", "status": "pending", "device": "macbook", "command": "open x"}
     w.kv["/v1/state/approvals"] = None
     assert "그런 승인 요청이 없어요." == run(b.call("approval_status", {"id": "zz"}))["content"]
+
+
+class Rules(World):
+    """A schedule with a one-off and a recurring item, and the gateway's update and occurrence-cancel."""
+
+    def __init__(self):
+        super().__init__()
+        self.items = [
+            {"id": "one", "at": "2026-11-23T22:00:00+09:00", "spoken": "오늘 오후 10시", "note": "약 먹기", "purpose": "약 먹기"},
+            {"id": "rule", "at": "2026-11-23T10:00:00+09:00", "spoken": "평일 오전 10시", "cron": "0 10-18/2 * * 1-5",
+             "rule_text": "평일 오전 10시부터 오후 6시까지 2시간마다", "note": "", "purpose": "스트레칭"},
+            {"id": "old", "at": "2026-11-24T07:00:00+09:00", "spoken": "매일 오전 7시", "repeat": "daily",
+             "note": "", "purpose": ""},
+        ]
+        self.updates, self.cancels = [], []
+
+    async def schedule_items(self):
+        return self.items
+
+    async def schedule_update(self, sid, changes, occurrence):
+        self.updates.append((sid, changes, occurrence))
+        return {}, "바꿨어요."
+
+    async def schedule_cancel(self, sid, at, occurrence=None):
+        self.cancels.append((sid, at, occurrence))
+        return {}, "취소했어요."
+
+    def bridge(self):
+        b = super().bridge()
+        b.d.update(schedule_items=self.schedule_items, schedule_update=self.schedule_update,
+                   schedule_cancel=self.schedule_cancel)
+        return b
+
+
+def test_call_user_rules_need_a_yes_unless_simple():
+    w = World()
+    b = w.bridge()
+    assert not run(b.call("call_user", {"reason": "운동", "repeat_cron": "0 21 * * *"}))["is_error"]
+    assert w.schedule[-1]["cron"] == "0 21 * * *" and w.schedule[-1]["notify"] == "call"
+    r = run(b.call("call_user", {"reason": "스트레칭", "repeat_cron": "0 10-18/2 * * 1-5", "notify": "push"}))
+    assert r["is_error"] and "평일 오전 10시부터 오후 6시까지 2시간마다 알림 드릴게요. 맞죠?" in r["content"] and len(w.schedule) == 1
+    run(b.call("call_user", {"reason": "스트레칭", "repeat_cron": "0 10-18/2 * * 1-5", "notify": "push", "confirmed": True}))
+    assert w.schedule[-1]["notify"] == "push" and w.schedule[-1]["request"] == "스트레칭"
+    r = run(b.call("call_user", {"reason": "x", "repeat_cron": "0 7 * * *", "end_date": "2026-12-31"}))
+    assert r["is_error"] and "12월 31일까지" in r["content"]  # a date range is read back too
+    assert run(b.call("call_user", {"reason": "x", "repeat_cron": "every day"}))["content"] == "반복 규칙을 이해하지 못했어요."
+
+    class Refusal(Exception):
+        status_code, detail = 400, "하루 전화가 20번을 넘게 돼요."
+
+    async def refuse(body, by):
+        raise Refusal()
+    b.d["schedule_create"] = refuse
+    r = run(b.call("call_user", {"reason": "x", "repeat_cron": "0 7 * * *"}))
+    assert r == {"content": "하루 전화가 20번을 넘게 돼요.", "is_error": True, "waited_s": 0}
+
+
+def test_schedule_update_picks_one_and_asks_otherwise():
+    w = Rules()
+    b = w.bridge()
+    assert run(b.call("schedule_update", {"description": "약", "when": "2026-11-23T18:00:00+09:00"}))["content"] == "바꿨어요."
+    assert w.updates[-1] == ("one", {"when": "2026-11-23T18:00:00+09:00"}, None)
+    assert run(b.call("schedule_update", {"when": "2026-11-23T18:00:00+09:00"}))["content"].startswith("어느 것인지")
+    assert run(b.call("schedule_update", {"id": "one"}))["content"] == "무엇을 바꿀지 말씀해 주세요."
+    assert run(b.call("schedule_update", {"description": "없는것", "purpose": "x"}))["content"] == "그런 예약이 없어요."
+    r = run(b.call("schedule_update", {"id": "one", "when": "0 8 * * *"}))
+    assert r["is_error"] and "repeat_cron" in r["content"]  # a cron in `when` is refused, not passed on
+    assert len(w.updates) == 1  # nothing else changed
+
+
+def test_schedule_update_on_rules_needs_a_scope():
+    w = Rules()
+    b = w.bridge()
+    for sid in ("rule", "old"):  # a cron rule, and a legacy daily repeat
+        assert "scope" in run(b.call("schedule_update", {"id": sid, "purpose": "물 마시기"}))["content"]
+    assert w.updates == []
+    run(b.call("schedule_update", {"id": "rule", "scope": "rule", "purpose": "물 마시기"}))
+    assert w.updates[-1] == ("rule", {"purpose": "물 마시기"}, None)
+    # "오늘 12시 건만 1시로": that fire, picked by its time
+    run(b.call("schedule_update", {"at": "2026-11-23T12:00:00+09:00", "scope": "occurrence",
+                                   "when": "2026-11-23T13:00:00+09:00"}))
+    assert w.updates[-1] == ("rule", {"when": "2026-11-23T13:00:00+09:00"}, "2026-11-23T12:00:00+09:00")
+    to = "2026-11-23T15:00:00+09:00"
+    assert "at으로" in run(b.call("schedule_update", {"id": "rule", "scope": "occurrence", "when": to}))["content"]
+    run(b.call("schedule_update", {"id": "rule", "at": "2026-11-23T16:00:00+09:00", "scope": "occurrence", "when": to}))
+    assert w.updates[-1] == ("rule", {"when": to}, "2026-11-23T16:00:00+09:00")  # id picks, at names the fire
+    assert "한 번만" in run(b.call("schedule_update", {"id": "rule", "scope": "occurrence",
+                                                     "repeat_cron": "0 9 * * *"}))["content"]
+    r = run(b.call("schedule_update", {"id": "rule", "scope": "rule", "repeat_cron": "0 9-17/2 * * 1-5"}))
+    assert r["is_error"] and "맞죠?" in r["content"]  # a new non-trivial rule is read back first
+    run(b.call("schedule_update", {"id": "rule", "scope": "rule", "repeat_cron": "0 9  * * *", "end_date": None}))
+    assert w.updates[-1] == ("rule", {"repeat_cron": "0 9 * * *", "end_date": None}, None)
+
+
+def test_schedule_cancel_one_occurrence():
+    w = Rules()
+    b = w.bridge()
+    run(b.call("schedule_cancel", {"id": "rule", "scope": "occurrence"}))
+    assert w.cancels[-1] == ("rule", None, "2026-11-23T10:00:00+09:00")  # the next fire
+    run(b.call("schedule_cancel", {"at": "2026-11-23T14:00:00+09:00", "scope": "occurrence"}))
+    assert w.cancels[-1] == ("rule", None, "2026-11-23T14:00:00+09:00")
+    run(b.call("schedule_cancel", {"id": "one", "scope": "occurrence"}))
+    assert w.cancels[-1] == ("one", None, None)  # a one-off: cancelled outright
+    run(b.call("schedule_cancel", {"id": "rule"}))
+    assert w.cancels[-1] == ("rule", None, None)  # default: the whole rule
+
+
+def test_mcp_scopes():
+    w = World()
+    b = w.bridge()
+
+    def names(scope):
+        r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, scope=scope))
+        return [t["name"] for t in r["result"]["tools"]]
+    assert names("full") == [t["name"] for t in TB.OWN_TOOLS]
+    assert names("external") == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task",
+                                 "task_status"]
+    for tool in ("approval_status", "macbook__list_dir", "infra_health", "nope"):
+        r = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": tool, "arguments": {}}}, scope="external"))
+        assert r["error"] == {"code": -32602, "message": "unknown tool"}, tool  # out of scope = nonexistent
+    assert "result" in run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                             "params": {"name": "approval_status", "arguments": {}}}, scope="full"))
+    run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                          "params": {"name": "create_task", "arguments": {"goal": "정리"}}}, scope="external"))
+    assert w.tasks[-1]["notify"] == "push"  # the user is at a terminal, not in a call
