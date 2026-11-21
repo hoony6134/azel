@@ -1586,6 +1586,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         while protected and (wait := guard.wait(time.monotonic())) > 0:
             await asyncio.sleep(min(wait, 0.05))
         current["gen"] += 1  # first: nothing the old reply still produces reaches the phone
+        g = current["gen"]  # if a newer reply starts while we wait, our interrupt must not cut it on the phone
         me = asyncio.current_task()
         olds = [t for t in {*current["replies"], current["task"]} if t and not t.done() and t is not me]
         for t in olds:
@@ -1595,12 +1596,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             for t in olds:  # a reply that had already failed (TTS down): its error is consumed here, not lost
                 if t.done() and not t.cancelled():
                     t.exception()
+        if g != current["gen"]:
+            return  # a newer interrupt or reply took over meanwhile: it does the telling
         current["play_end"] = guard.play_end = 0.0
-        await send({"type": "interrupt"})  # barge-in: the client drops its queue
-        await send({"type": "state", "value": "listening"})  # the cancelled reply's own "listening" is dropped
+        await send({"type": "interrupt"}, gen=g)  # barge-in: the client drops its queue
+        await send({"type": "state", "value": "listening"}, gen=g)  # the cancelled reply's own "listening" is dropped
         if current["paused_at"] is not None:  # it was paused: un-pause the (now empty) queue, or it stays stuck
             current["paused_at"] = None
-            await send({"type": "resume"})
+            await send({"type": "resume"}, gen=g)
 
     async def speak_briefing():
         spoken, cut, gen = [], False, new_reply()
@@ -2746,6 +2749,63 @@ if __name__ == "__main__":
             asks = [m for m in gw_ws.sent if m.get("type") == "ask"]
             links.remove(lk)
             return asks, [m for m in gw_ws.sent if m.get("type") == "cancel"]
+        def late_interrupt_check():
+            """Two taps on a reply that takes 5 s to stop: the first tap's wait times out after the second tap has
+            claimed a newer generation, so only the newest interrupt reaches the phone (one interrupt, one listening)."""
+            async def stt(audio):
+                return "광합성 설명해 줘"
+            calls = []
+
+            async def stuck_tts(sentence):
+                calls.append(sentence)
+                if len(calls) == 2:  # the reply's second chunk ignores cancellation for 5 s
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        await asyncio.sleep(5)
+                        raise
+                return b"\1\0" * 48000, 24000  # 2 s of audio
+
+            async def two_llm(messages, max_tokens=600):
+                for t in ("첫 번째 문장을 길게 말해요. ", "두 번째 문장도 길게 이어서 말해요. "):
+                    yield t
+            from fastapi.testclient import TestClient
+            import threading
+            globals().update(transcribe=stt, tts=stuck_tts, llm_stream=two_llm,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            history.clear()
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            frames = []
+            with tc.websocket_connect("/v1/call?session=late", headers={"Authorization": "Bearer app-tok"}) as w:
+                def reader():  # never block the test on a frame that does not come
+                    try:
+                        while True:
+                            m = w.receive()
+                            if m.get("type") == "websocket.close":
+                                return
+                            frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    except Exception:
+                        return
+                rt = threading.Thread(target=reader, daemon=True)
+                rt.start()
+                w.send_bytes(speech)
+                end = time.monotonic() + 5
+                while "audio" not in frames and time.monotonic() < end:
+                    time.sleep(0.02)
+                w.send_text(json.dumps({"type": "interrupt"}))  # tap A: waits ≤ 3 s on the stuck reply
+                time.sleep(0.5)
+                w.send_text(json.dumps({"type": "interrupt"}))  # tap B: a newer generation
+                time.sleep(4.5)  # both waits have timed out
+                w.send_text(json.dumps({"type": "hangup"}))
+                rt.join(3)
+            time.sleep(0.1)
+            return frames
+        frames = late_interrupt_check()
+        globals().update(tts=real[1], llm_stream=real_llm)
+        assert frames.count({"type": "interrupt"}) == 1, frames  # tap A's late interrupt was skipped
+        cut = frames.index({"type": "interrupt"})
+        assert frames[cut + 1] == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
+
         asks, cancels = hangup_check()
         assert asks and [c["id"] for c in cancels] == [asks[0]["id"]], (asks, cancels)
         # no token ever reaches a log: the container disables access logs and INFO, and query strings are redacted
