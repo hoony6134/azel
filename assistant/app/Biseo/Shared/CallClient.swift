@@ -20,6 +20,23 @@ final class CallClient {
     /// user when the call never got going.
     var onClose: ((String?) -> Void)?
     private var receivedAny = false
+    /// Something the user should see without the call ending (e.g. the mic sends only silence).
+    var onWarning: ((String) -> Void)?
+    private let statsLock = NSLock()
+    private var sentBytes = 0, sentPeak: Int16 = 0, receivedAudioBytes = 0
+    private var silenceCheck: DispatchWorkItem?
+
+    static let silentMicMessage = "마이크 소리가 들어오지 않아요. 입력 장치와 마이크 권한을 확인해 주세요."
+
+    /// Peak sample of PCM16 bytes (all-zero chunks mean the mic path is broken, not a quiet room).
+    static func peak(_ pcm16: Data) -> Int16 {
+        pcm16.withUnsafeBytes { raw in
+            (0..<(pcm16.count / 2)).reduce(Int16(0)) { m, i in
+                let v = Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))
+                return max(m, v == .min ? .max : abs(v))
+            }
+        }
+    }
 
     /// 401/403 on the WebSocket handshake: wrong token, or a server that doesn't take the header yet.
     static func closeMessage(status: Int?, receivedAny: Bool) -> String? {
@@ -74,28 +91,49 @@ final class CallClient {
                                                                          session: session, callID: callID, intent: intent))
         socket = task
         receivedAny = false
+        statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; statsLock.unlock()
+        Log.call.info("call start session=\(session, privacy: .public) intent=\(intent ?? "-", privacy: .public) host=\(task.originalRequest?.url?.host ?? "?", privacy: .public)")
         task.resume()
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
             let action = sending ? Self.micAction(muted: muted, held: held) : .drop
-            if action == .send { task?.send(.data(data)) { _ in } }
+            if action == .send {
+                task?.send(.data(data)) { error in if let error { Log.call.error("mic send failed: \(error.localizedDescription, privacy: .public)") } }
+                let p = Self.peak(data)
+                statsLock.lock(); sentBytes += data.count; sentPeak = max(sentPeak, p); statsLock.unlock()
+            }
             if action != .drop { recorder?.mic(data, silent: action == .silence) }
         }
-        do { try audio.start() } catch { throw StartError.audio }
+        do { try audio.start() } catch {
+            Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
+            throw StartError.audio
+        }
         receive(task)
+        // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
+        let check = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            statsLock.lock(); let bytes = sentBytes, peak = sentPeak, got = receivedAudioBytes; statsLock.unlock()
+            Log.call.info("call 4s: sent \(bytes, privacy: .public) B peak \(peak, privacy: .public), received audio \(got, privacy: .public) B")
+            if bytes > 0 && peak == 0 { onWarning?(Self.silentMicMessage) }
+        }
+        silenceCheck = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: check)
     }
 
     private func receive(_ task: URLSessionWebSocketTask) {
         task.receive { [weak self] result in
             guard let self else { return }
             // Audio and interrupts are handled right here, in arrival order; UI hops to main.
-            if case .success = result { receivedAny = true }
+            if case .success = result, !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
             switch result {
             case .success(.data(let pcm)):
                 audio.play(pcm)
+                statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
                 recorder?.assistant(pcm)
             case .success(.string(let text)):
                 guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { break }
+                if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
+                if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
                 if event.type == "interrupt" {
                     audio.flush()
                     if held { audio.pause() }
@@ -104,7 +142,9 @@ final class CallClient {
                 recorder?.note(event)
                 DispatchQueue.main.async { self.onEvent?(event) }
             case .failure:
-                let message = Self.closeMessage(status: (task.response as? HTTPURLResponse)?.statusCode, receivedAny: receivedAny)
+                let status = (task.response as? HTTPURLResponse)?.statusCode
+                let message = Self.closeMessage(status: status, receivedAny: receivedAny)
+                Log.call.error("call socket closed: status=\(status ?? -1, privacy: .public) code=\(task.closeCode.rawValue, privacy: .public)")
                 DispatchQueue.main.async { if task === self.socket { self.onClose?(message) } }
                 return
             @unknown default:
@@ -166,6 +206,11 @@ final class CallClient {
 
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
+        silenceCheck?.cancel()
+        if socket != nil {
+            statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()
+            Log.call.info("call stop: sent \(bytes, privacy: .public) B, received audio \(got, privacy: .public) B")
+        }
         stopRecording()
         if let task = socket {
             task.send(.string(#"{"type":"hangup"}"#)) { _ in task.cancel(with: .normalClosure, reason: nil) }

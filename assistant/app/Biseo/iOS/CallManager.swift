@@ -47,6 +47,7 @@ final class CallManager: NSObject, ObservableObject {
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
         client.onClose = { [weak self] in self?.fail($0) }
+        client.onWarning = { [weak self] in self?.error = $0 }
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
         // The system call UI's speaker button and AirPods coming and going change the route too.

@@ -61,3 +61,33 @@ final class CallRequestTests: XCTestCase {
         XCTAssertEqual(briefing.url?.absoluteString, "wss://azel.scian.xyz/v1/call?session=briefing-2026-11-22&intent=briefing")
     }
 }
+
+final class MultichannelMicTests: XCTestCase {
+    /// Mac mics arrive as 3 or 9 channels; downmixing those in AVAudioConverter gave pure zeros.
+    func testNineChannelMicStillProducesSignal() {
+        let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 9)!
+        let nine = AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: layout)
+        let buf = AVAudioPCMBuffer(pcmFormat: nine, frameCapacity: 4800)!
+        buf.frameLength = 4800
+        for c in 0..<9 { for i in 0..<4800 { buf.floatChannelData![c][i] = c == 0 ? 0.5 * sin(2 * .pi * 440 * Float(i) / 48_000) : 0.01 } }
+        let mono = PCM.firstChannel(buf)!
+        XCTAssertEqual(mono.format.channelCount, 1)
+        XCTAssertEqual(mono.floatChannelData![0][100], buf.floatChannelData![0][100])
+        let converter = AVAudioConverter(from: mono.format, to: PCM.micFormat)!
+        var total = 0, peak: Int16 = 0
+        for _ in 0..<3 {
+            guard let data = PCM.pcm16Data(from: PCM.firstChannel(buf)!, converter: converter) else { continue } // resampler warm-up
+            total += data.count
+            peak = max(peak, CallClient.peak(data))
+        }
+        XCTAssertGreaterThan(peak, 8000, "the voice channel survives")
+        XCTAssertGreaterThan(total / 2, 3000, "most of 300 ms at 16 kHz")
+    }
+
+    func testMonoPassesThroughUnchanged() {
+        let one = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        let buf = AVAudioPCMBuffer(pcmFormat: one, frameCapacity: 10)!
+        XCTAssertTrue(PCM.firstChannel(buf) === buf)
+        XCTAssertEqual(CallClient.peak(Data([0, 0, 0x00, 0x80])), Int16.max, "-32768 counts as full scale")
+    }
+}

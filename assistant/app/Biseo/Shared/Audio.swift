@@ -40,6 +40,19 @@ enum PCM {
 }
 
 extension PCM {
+    /// Channel 0 of a multichannel mic buffer as a mono buffer. Mac mics come as 3 channels (9 with
+    /// voice processing, where channel 0 is the echo-cancelled voice), and AVAudioConverter's
+    /// downmix of those layouts produced pure silence (user bug, 2026-11-21).
+    static func firstChannel(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard buffer.format.channelCount > 1 else { return buffer }
+        guard let src = buffer.floatChannelData,
+              let format = AVAudioFormat(standardFormatWithSampleRate: buffer.format.sampleRate, channels: 1),
+              let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: buffer.frameLength) else { return nil }
+        out.frameLength = buffer.frameLength
+        out.floatChannelData![0].update(from: src[0], count: Int(buffer.frameLength))
+        return out
+    }
+
     /// PCM16 little-endian bytes → Float samples in -1…1 (trailing odd byte dropped).
     static func samples(fromPCM16 data: Data) -> [Float] {
         data.withUnsafeBytes { raw in
@@ -137,11 +150,16 @@ final class AudioIO {
         #endif
         try? input.setVoiceProcessingEnabled(true) // echo cancellation on top of .voiceChat
         let format = input.outputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: format, to: PCM.micFormat) else { throw AVError(.unknown) }
-        converter.downmix = true
+        guard format.channelCount > 0, format.sampleRate > 0,
+              let mono = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),
+              let converter = AVAudioConverter(from: format.channelCount == 1 ? format : mono, to: PCM.micFormat) else {
+            Log.call.error("mic format unusable: \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz")
+            throw AVError(.unknown)
+        }
+        Log.call.info("mic \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz, voice processing \(input.isVoiceProcessingEnabled, privacy: .public)")
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.levels.update(mic: buffer)
-            if let data = PCM.pcm16Data(from: buffer, converter: converter) { self?.onMic?(data) }
+            if let one = PCM.firstChannel(buffer), let data = PCM.pcm16Data(from: one, converter: converter) { self?.onMic?(data) }
         }
         let mixer = engine.mainMixerNode
         mixer.installTap(onBus: 0, bufferSize: 1024, format: mixer.outputFormat(forBus: 0)) { [weak self] buffer, _ in

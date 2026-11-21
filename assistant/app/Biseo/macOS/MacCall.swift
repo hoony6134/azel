@@ -36,6 +36,7 @@ final class MacCall: ObservableObject {
     private init() {
         client.onEvent = { [weak self] in self?.handle($0) }
         client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
+        client.onWarning = { [weak self] in self?.error = $0 }
     }
 
     /// "누르고 말하기" (default) or "눌러서 켜고 끄기".
@@ -123,7 +124,9 @@ final class MacCall: ObservableObject {
             AVCaptureDevice.requestAccess(for: .audio) { ok in
                 Task { @MainActor in ok ? self.connect() : (self.error = Self.micDenied) }
             }
-        default: error = Self.micDenied
+        default:
+            Log.call.error("mic permission denied")
+            error = Self.micDenied
         }
     }
 
