@@ -384,8 +384,8 @@ struct PersonaDeleteSheet: View {
     }
 }
 
-/// 들어보기: one sample at a time, 2 s cooldown after each (the server's rate limit), 429 handled,
-/// .ambient session so the silent switch is respected.
+/// 들어보기: one sample at a time, 2 s cooldown after each (the server's rate limit), 429 handled.
+/// Uses the preview `.playback` session and keeps the player alive while it plays.
 @MainActor
 final class VoiceSampler: ObservableObject {
     @Published private(set) var loading: String?
@@ -413,16 +413,17 @@ final class VoiceSampler: ObservableObject {
             cooldown()
             switch result {
             case .success(let wav):
-                #if os(iOS)
-                try? AVAudioSession.sharedInstance().setCategory(.ambient)
-                try? AVAudioSession.sharedInstance().setActive(true)
-                #endif
+                PreviewAudio.activate()
                 player = try? AVAudioPlayer(data: wav)
+                player?.prepareToPlay()
                 if player?.play() == true {
                     playing = voice
                     let length = player?.duration ?? 3
                     Task { try? await Task.sleep(nanoseconds: UInt64(length * 1e9)); if playing == voice { playing = nil } }
-                } else { message = "샘플을 재생할 수 없어요" }
+                } else {
+                    Log.call.error("voice sample could not play (\(wav.count, privacy: .public) bytes)")
+                    message = "샘플을 재생할 수 없어요"
+                }
             case .failure(let e):
                 if case GatewayError.http(429) = e { message = "잠시 후 다시 들어 보세요" }
                 else if let s = SectionStatus.from(e) { message = s == .unavailable ? "목소리 샘플은 서버 업데이트 후 들을 수 있어요" : "샘플을 만들지 못했어요" }
