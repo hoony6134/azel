@@ -1639,3 +1639,26 @@ def test_night_rule_reaches_every_prompt(gw, monkeypatch):
     monkeypatch.undo()
     night = g.datetime(2026, 11, 22, 1, 30, tzinfo=g.KST)
     assert "'내일'은 오늘(11월 22일)" in g.late_night.prompt_rule(night)
+
+
+def test_every_placed_call_opens_with_the_title(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+
+    async def no_push(payload):
+        return {"sent": 0}
+    monkeypatch.setattr(g, "link_send", capture)
+    monkeypatch.setattr(g, "send_voip_push", no_push)
+    c.put("/v1/settings", json={"user_title": "정훈님"})
+    c.post("/v1/personas", json={"id": "mia", "name": "미아", "voice": "sohee", "user_title": "오빠"})
+    asyncio.run(g.place_call("deadline", "마감이 다가오는 게 있어요. 과제가 내일까지예요."))  # a model-written opening
+    asyncio.run(g.place_call("user_request", "약 드실 시간이에요.", persona_id="mia"))
+    asyncio.run(g.place_call("task", "정훈님, 맡기신 정리 끝났어요."))  # already has it: unchanged
+    openings = [m["opening"] for m in sent if m.get("type") == "call"]
+    assert openings == ["정훈님, 마감이 다가오는 게 있어요. 과제가 내일까지예요.", "오빠, 약 드실 시간이에요.",
+                        "정훈님, 맡기신 정리 끝났어요."], openings

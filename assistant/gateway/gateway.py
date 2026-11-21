@@ -1068,6 +1068,13 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
+def with_title(opening, title):
+    """The user's title at the start of an opening, whoever wrote it (a model may leave it out): "정훈님, …"."""
+    if not opening or not title or title in opening[:len(title) + 12]:
+        return opening
+    return f"{title}, {opening}"
+
+
 async def place_call(reason, opening=None, call_id=None, persona_id=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
@@ -1079,13 +1086,14 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None):
             "밤사이 서버 상태(Cygnus 인프라)를 확인해서 '좋은 아침이에요'로 시작하는 30초 안쪽 브리핑으로 말해.",
             session=f"briefing-{uuid.uuid4().hex[:8]}", model="sonnet", task="schedule")
     call_id = call_id or uuid.uuid4().hex
+    settings = await load_settings()
+    persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
+    opening = with_title(opening, user_title(settings, persona))  # every placed call opens with the title
     try:
         await state.call("POST", "/v1/state/calls", {"id": call_id, "reason": reason, "opening": opening or ""})
     except StateDown:
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
-    settings = await load_settings()
-    persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
     await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
                      "persona": persona["id"]})
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],

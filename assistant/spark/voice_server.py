@@ -1260,6 +1260,13 @@ def day_part(hour):
     return "밤" if hour == 0 else "낮" if hour == 12 else "오전" if hour < 12 else "오후"
 
 
+def with_title(sentence, title):
+    """'정훈님, …' at the start unless the title is already there (same rule as the gateway's openings)."""
+    if not sentence or not title or title in sentence[:len(title) + 12]:
+        return sentence
+    return f"{title}, {sentence}"
+
+
 def night_rule():
     """The gateway's late-night day rule for Qwen (late_night.prompt_rule): empty after 05:00."""
     return late_night.prompt_rule(datetime.now(KST))
@@ -1827,7 +1834,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             st = await gateway_settings()
             p = current_persona(st)
-            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st), user_title(st, p)):
+            title = user_title(st, p)
+            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st), title):
+                if s not in (FILLER, FILLER_LONG) and not spoken:
+                    s = with_title(s, title)  # the briefing's first words always use the title
                 pcm, _ = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
                 await send(audio=pcm, gen=gen)
@@ -2274,6 +2284,8 @@ if __name__ == "__main__":
         assert "사용자를 '주인님'(이)라고 부른다." in system_prompt("아젤", "normal", "", "까칠함", "주인님")
         assert "'내일'은 오늘(11월 22일)" in late_night.prompt_rule(datetime(2026, 11, 22, 1, 30, tzinfo=KST))
         assert late_night.prompt_rule(datetime(2026, 11, 22, 9, 0, tzinfo=KST)) == ""  # only between 00:00 and 05:00
+        assert with_title("좋은 아침이에요.", "정훈님") == "정훈님, 좋은 아침이에요." and with_title("x", "") == "x"
+        assert with_title("정훈님 좋은 아침이에요.", "정훈님") == "정훈님 좋은 아침이에요."  # already there: unchanged
         assert "부른다" not in system_prompt("아젤", "normal", "", "까칠함", "")  # no title: no line
         cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")
         assert "성격과 말투: 귀엽고 따뜻하지만 장난기 있는 동생. 이것은" in cute and "사용자를 이 말로 묘사하거나" in cute
