@@ -924,27 +924,34 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if path in settings["budget_paths"] and await month_cost(settings) >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}
         return
-    requester_ctx.set(requester_id("ask", session))  # approvals from this ask's daemon calls come back with it
-    gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
-    said = False
-    async for item in gen(text, model, session):
-        if isinstance(item, str):
-            said = said or bool(item.strip())
-            yield {"type": "text", "delta": item}
-        elif item.get("type") in ("activity", "error"):
-            yield item
-            if item["type"] == "error":
-                return
-        else:
-            await record_usage({"model": item.get("model") or model, "path": path, "task": task or "",
-                                "input_tokens": item.get("input_tokens", 0),
-                                "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
-            if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
-                yield claude_failure(item.get("result", ""))
-                return
-            spent = await month_cost(settings)
-            yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
-                   "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+    token = requester_ctx.set(requester_id("ask", session))  # this ask's daemon calls carry it; reset below
+    try:
+        gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
+        said = False
+        async for item in gen(text, model, session):
+            if isinstance(item, str):
+                said = said or bool(item.strip())
+                yield {"type": "text", "delta": item}
+            elif item.get("type") in ("activity", "error"):
+                yield item
+                if item["type"] == "error":
+                    return
+            else:
+                await record_usage({"model": item.get("model") or model, "path": path, "task": task or "",
+                                    "input_tokens": item.get("input_tokens", 0),
+                                    "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
+                if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
+                    yield claude_failure(item.get("result", ""))
+                    return
+                spent = await month_cost(settings)
+                yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
+                       "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+    finally:
+        try:
+            requester_ctx.reset(token)  # never leaks into later work in the same task
+        except ValueError:
+            pass  # the generator was finalized from another context (garbage collected): nothing to undo
+
 
 
 LIMIT_WORDS = re.compile(r"limit|429|rate|quota|resets?|한도|사용량", re.I)
@@ -2247,9 +2254,9 @@ DECISIONS = ("once", "always", "deny")
 ALWAYS_OK = {"open", "ls", "cat", "head", "tail", "wc", "du", "df", "pwd", "rg", "grep", "find", "sw_vers", "uptime",
              "pmset", "system_profiler", "git"}
 GIT_ALWAYS = {"status", "log", "diff", "show", "branch"}
+GIT_BRANCH_WRITE = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-u", "-f", "--force",
+                    "--unset-upstream", "--edit-description", "--track", "--no-track", "--create-reflog"}
 FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
-OPEN_EXEC_EXT = (".command", ".tool", ".sh", ".scpt", ".scptd", ".applescript", ".workflow", ".terminal", ".py",
-                 ".pkg", ".mpkg", ".dmg", ".jar")
 ALWAYS_NO = "항상 허용은 조회용 명령(ls, cat, git status, 앱이나 웹 주소 열기 같은 것)에만 쓸 수 있어서 이번 한 번만 허용했어요."
 task_approvals: dict[str, set] = {}  # task id -> approval ids created while it ran (only those resume it)
 REQUESTER_RE = re.compile(r"(ask|task):[A-Za-z0-9_:.-]{1,100}")
@@ -2278,13 +2285,26 @@ def always_ok(command):
         return False
     n, rest = os.path.basename(t[0]).lower(), t[1:]
     if n == "git":
-        return bool(rest) and rest[0] in GIT_ALWAYS
+        if not rest or rest[0] not in GIT_ALWAYS or any(r in ("--ext-diff", "--textconv") or r.startswith("--output")
+                                                        for r in rest):
+            return False
+        if rest[0] == "branch":  # listing only: no positional name (creates), no delete/move/copy/upstream
+            return all(r.startswith("-") and r not in GIT_BRANCH_WRITE for r in rest[1:])
+        return True
     if n == "find":
         return not FIND_ACTIONS & {r.lower() for r in rest}
     if n == "pmset":
         return rest[:1] == ["-g"]
-    if n == "open":  # apps (-a/-b) and URLs, never a file that runs something
-        return not any(r.lower().endswith(OPEN_EXEC_EXT) for r in rest)
+    if n == "open":  # only `-a <App name>` and http(s)/mailto URLs: no files, no --args/-n/--env/-b
+        k = 0
+        while k < len(rest):
+            if rest[k] == "-a" and k + 1 < len(rest) and "/" not in rest[k + 1]:
+                k += 2
+            elif re.match(r"(https?://|mailto:)", rest[k], re.I):
+                k += 1
+            else:
+                return False
+        return bool(rest)
     return True
 
 

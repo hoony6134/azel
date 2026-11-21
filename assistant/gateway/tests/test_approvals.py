@@ -111,7 +111,12 @@ def test_task_resumes_when_its_approval_expires(tmp_path, monkeypatch):
 @pytest.mark.parametrize("cmd", ["python3 tool.py", "env FOO=1 ls", "bash run.sh", "/usr/bin/python3.12 x.py",
                                  "mkdir -p reports", "cp a b", "rm x", "git push", "git -C x status", "git commit -m x",
                                  "find . -delete", "find . -exec ls ;", "pmset -a sleep 0", "open run.command",
-                                 "open ./x.sh", "open ~/Downloads/a.pkg", "xargs ls", "'unbalanced"])
+                                 "open ./x.sh", "open ~/Downloads/a.pkg", "xargs ls", "'unbalanced",
+                                 "git diff --ext-diff", "git diff --textconv", "git log --output=/tmp/x", "git show --output x",
+                                 "git branch -D main", "git branch -d old", "git branch newname", "git branch -m a b",
+                                 "open notes.txt", "open ./run", "open -n -a Safari", "open -a Safari --args --x",
+                                 "open --env X=1 -a Safari", "open -b com.apple.Safari", "open -a /Applications/X.app",
+                                 "open", "open file:///etc/passwd"])
 def test_always_forced_to_once_unless_read_only(agw, cmd):
     g, c, _ = agw
     aid = c.post("/v1/approvals", json={**CMD, "command": cmd}).json()["approval_id"]
@@ -123,7 +128,8 @@ def test_always_forced_to_once_unless_read_only(agw, cmd):
 
 @pytest.mark.parametrize("cmd", ['open -a "Google Chrome"', "open https://example.com", "ls -la", "cat a.txt", "head -n5 x",
                                  "tail x", "wc -l x", "du -sh .", "df -h", "pwd", "git status", "git log -5", "git diff",
-                                 "git show HEAD", "git branch", "rg foo .", "grep -r x .", "find . -name x", "sw_vers",
+                                 "git show HEAD", "git branch", "git branch -a -v", "rg foo .", "grep -r x .",
+                                 "find . -name x", "sw_vers", "open mailto:a@b.c", "open -a Safari https://example.com",
                                  "uptime", "pmset -g batt", "system_profiler SPHardwareDataType"])
 def test_always_allowed_for_read_only(agw, cmd):
     g, c, _ = agw
@@ -218,3 +224,13 @@ def test_runs_tell_daemons_who_they_are(agw, monkeypatch):
         await g.mcp("http://d/mcp", "tools/list", {})
     asyncio.run(api_path())
     assert seen == ["ask:azel:call-2"]
+
+
+def test_requester_does_not_outlive_its_ask(agw):
+    g, c, _ = agw
+
+    async def two():
+        async for _ in g.ask_stream("서버 괜찮아?", "azel:call-7"):
+            pass
+        return g.requester_ctx.get()  # same task, after the ask: nothing left over
+    assert asyncio.run(two()) == ""

@@ -484,10 +484,11 @@ device that created them.
     made; an approved one that has not run within 10 minutes of the tap expires too; `used` once it ran).
   - `POST /v1/approvals/{id}` `{"decision":"once"|"always"|"deny"}` (older apps: `{"approve":bool}` = once / deny)
     → `{"id","status","decision","rule_id"?,"forced_once"?,"forced_reason"?}`; 409 when it is no longer pending.
-    `always` stores a rule `{"id","device","command","cwd","created"}` only for read-only programs: `open` (apps with
-    `-a`/`-b` and URLs, not files with executable extensions), `ls`, `cat`, `head`, `tail`, `wc`, `du`, `df`, `pwd`,
-    `git status|log|diff|show|branch`, `rg`, `grep`, `find` without `-exec`/`-delete`, `sw_vers`, `uptime`,
-    `pmset -g`, `system_profiler`. Anything else is approved once, with `"forced_once":true` and a Korean
+    `always` stores a rule `{"id","device","command","cwd","created"}` only for read-only programs: `open` with only
+    `-a <App name>` and http(s)/mailto URLs (no files, `--args`, `-n`, `--env`, `-b`), `ls`, `cat`, `head`, `tail`,
+    `wc`, `du`, `df`, `pwd`, `git status|log|diff|show` (no `--ext-diff`, `--textconv`, `--output`), `git branch` to
+    list only (no name, delete, move, copy or upstream), `rg`, `grep`, `find` without `-exec`/`-delete`, `sw_vers`,
+    `uptime`, `pmset -g`, `system_profiler`. Anything else is approved once, with `"forced_once":true` and a Korean
     `forced_reason` for the app to show. Full gateways only (403 on limited).
   - `GET /v1/approvals/rules` → the rules; `DELETE /v1/approvals/rules/{id}` revokes one (404 if unknown).
   - `POST /v1/approvals/{id}/use` `{"device","command","cwd"}` (daemons, right before an approved run) spends the
@@ -526,19 +527,25 @@ timeout, caffeinate, command) hide nothing:
 - `sudo`/`su`/`doas`/`pkexec`; `security`; `osascript`; `awk`/`gawk`/`nawk`, `expect`, `sqlite3`, `vim`/`vi`/`nvim`,
   `emacs`, `tmux`, `screen`, `bun`, `deno`, `php`, `make`, `xcrun`, `launchctl`, `crontab`, `at`, `periodic`;
 - inline code: `sh|bash|zsh|… -c`, `python* -c`, `perl -e/-E`, `ruby -e`, `node -e/-p/--eval`, `lua -e`;
-- options that run commands: `git -c|--config*|--exec-path|--upload-pack|--receive-pack` and `core.sshCommand`;
+- options that run commands: `rg --pre*|--hostname-bin` (also for allowlisted runs without approval);
+  `git -c|--config*|--exec-path|--upload-pack|--receive-pack` and `core.sshCommand` (`git -C <dir>` is fine);
+  `git config` except read-only (`--get*`, `--list`/`-l`); `tar -P`/`--absolute-paths` (also bundled, `-xPf`,
+  `xPf`) and `pax -r`; `plutil -replace|-insert|-remove`;
   `ssh|scp|sftp -o|-F|-S|-e` and ProxyCommand/LocalCommand/ProxyJump; `rsync -e|--rsh`; `zip -TT|--unzip-command`;
-  `tar -I|--use-compress-program|--to-command|--checkpoint-action`; `less`/`more` with `!`; `defaults write|import|
-  delete|rename`; variables such as `GIT_SSH_COMMAND`, `PAGER`, `EDITOR`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`;
-- `open -a|-b` of Terminal or iTerm, `open` of `.command|.tool|.sh|.scpt|.applescript|.workflow` files;
+  `tar -I|--use-compress-program|--to-command|--checkpoint-action`; `less`/`more` with `!`; `defaults … write|import|
+  delete|rename` (anywhere, `-currentHost` too); variables such as `GIT_SSH_COMMAND`, `PAGER`, `EDITOR`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`;
+- `open -a|-b` of Terminal or iTerm; `open` of `.command|.tool|.sh|.scpt|.applescript|.workflow|.terminal|
+  .fileloc|.app|.action|.inetloc` paths or of any existing file with an exec bit;
 - `rm -r` or `find … -delete` on `/` or the home directory (or above it); any `diskutil` subcommand except `list` and
   `info`; `mkfs*`/`newfs*`; `dd` with an `of=` that resolves under `/dev` (`//dev/disk2` too);
 - `ln -s` whose target, resolved from the link's own directory (and from the cwd), is or covers a protected path;
 - any path (argument, `--opt=value`, every attached short-option value such as `-Cx/..`, cwd; relative paths also
   resolved against each `-C`/`--directory`; symlinks resolved first) that is, is inside, or is an ancestor of a
   protected path: `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains`, `~/.zshrc`, `~/.zprofile`,
-  `~/.zshenv`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/Library/LaunchAgents`, `~/.gitconfig`,
-  `~/.config/git` (so `~`, `~/.config`, `~/Library`, `/Users`, `/` too).
+  `~/.zshenv`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zsh_history`,
+  `~/Library/LaunchAgents`, `~/.gitconfig`, `~/.config/git`, `~/.config/fish`, `~/.config/gh`, `~/.local/bin`,
+  `~/.aws`, `~/.netrc` (so `~`, `~/.config`, `~/.local`, `~/Library`, `/Users`, `/` too);
+- any repo's `.git` directory itself, anything in a `.git/hooks`, any `.git/config`, and a cwd inside a `.git`.
 Still no shell: argv only.
 
 Tools: `list_dir(path)`, `read_file(path, max_bytes?)`, `search(query, path?)`,
