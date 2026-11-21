@@ -36,9 +36,13 @@ def test_devices_and_push_tokens(client):
     assert client.put("/v1/state/devices/x", json={"name": "", "url": "u"}).status_code == 422
     client.put("/v1/state/push_tokens/abc", json={"bundle_id": "xyz.scian.biseo", "env": "production"})
     client.put("/v1/state/push_tokens/al1", json={"bundle_id": "xyz.scian.biseo", "kind": "alert"})
-    assert client.get("/v1/state/push_tokens").json() == [
-        {"token": "abc", "bundle_id": "xyz.scian.biseo", "env": "production", "kind": "voip"},
-        {"token": "al1", "bundle_id": "xyz.scian.biseo", "env": "sandbox", "kind": "alert"}]
+    rows = client.get("/v1/state/push_tokens").json()  # newest first, with ts (the gateway evicts the oldest)
+    assert [{k: r[k] for k in ("token", "bundle_id", "env", "kind")} for r in rows] == [
+        {"token": "al1", "bundle_id": "xyz.scian.biseo", "env": "sandbox", "kind": "alert"},
+        {"token": "abc", "bundle_id": "xyz.scian.biseo", "env": "production", "kind": "voip"}]
+    assert rows[0]["ts"] >= rows[1]["ts"]
+    assert client.delete("/v1/state/push_tokens/abc").json() == {"deleted": 1}
+    assert [r["token"] for r in client.get("/v1/state/push_tokens").json()] == ["al1"]
     assert client.put("/v1/state/push_tokens/x", json={"bundle_id": "b", "kind": "sms"}).status_code == 422
 
 
@@ -59,6 +63,18 @@ def test_approvals(client):
     assert got["status"] == "approved" and got["command"] == "git push" and got["decided"]
     assert client.get("/v1/state/approvals").json() == []
     assert client.get("/v1/state/approvals/nope").status_code == 404
+    use = {"device": "macbook", "command": "git push", "cwd": "~/dev/x"}
+    assert client.post(f"/v1/state/approvals/{aid}/use", json={**use, "device": "albireo"}).status_code == 409
+    assert client.post(f"/v1/state/approvals/{aid}/use", json={**use, "command": "git push -f"}).status_code == 409
+    assert client.post(f"/v1/state/approvals/{aid}/use", json=use).json() == {"id": aid, "status": "used"}
+    assert client.post(f"/v1/state/approvals/{aid}/use", json=use).status_code == 409  # once
+    assert client.get(f"/v1/state/approvals/{aid}").json()["status"] == "used"
+    old = client.post("/v1/state/approvals", json={**use, "tool": "run_command"}).json()["approval_id"]
+    client.post(f"/v1/state/approvals/{old}", json={"approve": True})
+    time.sleep(1.2)
+    assert client.post(f"/v1/state/approvals/{old}/use", json={**use, "window_s": 1}).status_code == 409  # stale
+    pend = client.post("/v1/state/approvals", json={**use, "tool": "run_command"}).json()["approval_id"]
+    assert client.post(f"/v1/state/approvals/{pend}/use", json=use).status_code == 409  # never approved
 
 
 def test_sessions(client):

@@ -59,12 +59,17 @@ def make():
 
     @app.put("/v1/state/push_tokens/{tok}")
     def put_push(tok: str, body: dict):
-        db["push"][tok] = {"token": tok, **body}
+        db["push"].pop(tok, None)
+        db["push"][tok] = {"token": tok, **body, "ts": time.time()}
         return {"ok": True}
 
     @app.get("/v1/state/push_tokens")
     def push():
-        return list(db["push"].values())
+        return sorted(db["push"].values(), key=lambda r: -r["ts"])
+
+    @app.delete("/v1/state/push_tokens/{tok}")
+    def push_delete(tok: str):
+        return {"deleted": int(db["push"].pop(tok, None) is not None)}
 
     @app.post("/v1/state/calls")
     def add_call(body: dict):
@@ -101,6 +106,15 @@ def make():
             raise HTTPException(409, "not pending")
         a.update(status="approved" if body["approve"] else "rejected", decided=time.time())
         return {"id": aid, "status": a["status"]}
+
+    @app.post("/v1/state/approvals/{aid}/use")
+    def use(aid: str, body: dict):
+        a = db["approvals"].get(aid)
+        if not a or a["status"] != "approved" or any(a.get(k) != body[k] for k in ("device", "command", "cwd")) \
+                or time.time() - (a.get("decided") or 0) > body.get("window_s", 600):
+            raise HTTPException(409, "not usable")
+        a["status"] = "used"
+        return {"id": aid, "status": "used"}
 
     @app.get("/v1/state/sessions/{vs}")
     def session(vs: str):

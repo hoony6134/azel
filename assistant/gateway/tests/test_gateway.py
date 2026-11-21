@@ -75,15 +75,47 @@ def test_ask_streams_and_records_usage(gw):
     c.post("/v1/ask", json={"text": "또", "session": "s1"})  # same voice session resumes
     args = json.loads((tmp / "args.json").read_text())
     assert args[args.index("--resume") + 1] == "sess-1"
-    assert c.get("/v1/usage").json()["cost_usd"] == 1.0
+    assert c.get("/v1/usage").json()["cost_usd"] == 0  # claude_code is the subscription: not counted
+    assert c.get("/v1/usage").json()["subscription"]["claude_code"]["equivalent_usd"] == 1.0
 
 
 def test_budget_blocks(gw):
     g, c, _ = gw
-    c.put("/v1/settings", json={"monthly_budget_usd": 0.4})
+    c.put("/v1/settings", json={"monthly_budget_usd": 0.4, "budget_paths": ["claude_code"]})
     c.post("/v1/ask", json={"text": "a"})
     ev = events(c.post("/v1/ask", json={"text": "b"}))
-    assert ev == [{"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}]
+    assert ev == [{"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}]
+
+
+def test_budget_ignores_the_subscription_by_default(gw):
+    g, c, _ = gw
+    assert c.get("/v1/settings").json()["budget_paths"] == ["api", "nim"]
+    c.put("/v1/settings", json={"monthly_budget_usd": 0.4})
+    for _ in range(3):  # 1.5 equivalent USD of claude_code: over the budget, yet never blocked
+        ev = events(c.post("/v1/ask", json={"text": "a"}))
+        assert ev[-1]["type"] == "done" and not ev[-1]["budget_warning"]
+    asyncio.run(g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.5}))  # paid: counts
+    assert events(c.post("/v1/ask", json={"text": "b"}))[-1]["type"] == "done"  # the subscription path still answers
+    g.API_KEY = "sk-test"
+    assert events(c.post("/v1/ask", json={"text": "b", "path": "api"}))[0]["code"] == "budget"  # a paid path is held
+
+
+def test_budget_paths_validated_and_usage_shape(gw):
+    g, c, _ = gw
+    for bad in ("api", ["gpt"], [1], None):
+        assert c.put("/v1/settings", json={"budget_paths": bad}).status_code == 400, bad
+    assert c.put("/v1/settings", json={"budget_paths": ["nim", "api", "api"]}).json()["budget_paths"] == ["api", "nim"]
+    c.post("/v1/ask", json={"text": "a"})
+    asyncio.run(g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.25, "input_tokens": 3}))
+    u = c.get("/v1/usage").json()
+    assert u["calls"] == 2 and u["by_path"] == {"claude_code": 0.5, "api": 0.25}
+    assert u["cost_usd"] == 0.25 and u["paid"] == {"cost_usd": 0.25, "by_path": {"api": 0.25}}
+    cc = u["subscription"]["claude_code"]
+    assert (cc["turns"], cc["input_tokens"], cc["output_tokens"], cc["equivalent_usd"]) == (1, 10, 5, 0.5)
+    assert cc["quota"]["window"] == "5h" and cc["quota"]["utilization_pct"] == 41.0
+    assert cc["quota"]["windows"]["weekly"]["utilization_pct"] == 30.0
+    g.claude_quota["5h"]["resets_at"] = 1  # a window past its reset is dropped
+    assert c.get("/v1/usage").json()["subscription"]["claude_code"]["quota"]["window"] == "weekly"
 
 
 def test_assistant_name(gw, monkeypatch):
@@ -213,14 +245,18 @@ def test_personality(gw):
     assert s["personality"] == "" and s["personality_default"] == g.PERSONALITY_DEFAULT
     c.post("/v1/ask", json={"text": "a"})
     prompt = lambda: (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]  # noqa: E731
-    assert f"성격: {g.PERSONALITY_DEFAULT}" in prompt()  # empty = the default, for Claude too
+    assert f"성격과 말투: {g.PERSONALITY_DEFAULT.rstrip('.')}. 이것은 너 자신의 성격이야." in prompt()  # empty = the default, for Claude too
     s = c.put("/v1/settings", json={**s, "personality": "느긋하고 다정함"}).json()  # whole document back: fine
     assert s["personality"] == "느긋하고 다정함" and "personality_default" not in g.fake.db["settings"]
     c.post("/v1/ask", json={"text": "b"})
-    assert "성격: 느긋하고 다정함" in prompt() and g.PERSONALITY_DEFAULT not in prompt()
+    assert "성격과 말투: 느긋하고 다정함. 이것은" in prompt() and g.PERSONALITY_DEFAULT not in prompt()
     for reset in ["", "   ", None]:  # "기본값으로 되돌리기"
         s = c.put("/v1/settings", json={"personality": reset}).json()
         assert s["personality"] == ("" if reset is None else reset) and g.personality(s) == g.PERSONALITY_DEFAULT
+    g.fake.db["settings"]["user_title"] = "정훈 님"  # the setting itself is added with the persona model
+    c.post("/v1/ask", json={"text": "c"})
+    assert "사용자를 '정훈 님'(이)라고 부른다." in prompt() and "새로 부르지 말고" not in prompt()
+    g.fake.db["settings"].pop("user_title")
     assert c.put("/v1/settings", json={"personality": "가" * 601}).status_code == 400
     assert c.put("/v1/settings", json={"personality": 3}).status_code == 400
 
@@ -228,7 +264,7 @@ def test_personality(gw):
 # ---------- personas ----------
 def persona_gw(g, monkeypatch):
     async def voices():
-        return ["sohee", "ryan", "vivian"]
+        return ["sohee", "ryan", "aiden", "vivian"]
     monkeypatch.setattr(g, "tts_voices", voices)
 
 
@@ -274,9 +310,9 @@ def test_personas_tint_colors_like_the_app_sends(gw, monkeypatch):
 def test_personas_crud_and_limits(gw, monkeypatch):
     g, c, _ = gw
     persona_gw(g, monkeypatch)
-    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "Vivian", "personality": "느긋함",
+    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "Aiden", "personality": "느긋함",
                                      "color": "#22aa88", "share_memory": True})
-    assert r.status_code == 201 and r.json()["voice"] == "vivian" and not r.json()["primary"]
+    assert r.status_code == 201 and r.json()["voice"] == "aiden" and not r.json()["primary"]
     for bad in [{"name": "루나", "voice": "sohee"},  # name taken
                 {"name": "새비서", "voice": "nova"},  # not a TTS speaker
                 {"name": "a" * 13, "voice": "sohee"}, {"name": "새비서"}, {"name": "새비서", "voice": "sohee", "color": "red"},
@@ -304,7 +340,7 @@ def test_personas_crud_and_limits(gw, monkeypatch):
 def test_persona_calls_schedule_and_asks(gw, monkeypatch):
     g, c, tmp = gw
     persona_gw(g, monkeypatch)
-    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋하고 다정함"})
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "aiden", "personality": "느긋하고 다정함"})
     sent, pushes = [], []
 
     async def capture(obj):
@@ -335,7 +371,7 @@ def test_persona_calls_schedule_and_asks(gw, monkeypatch):
 def test_persona_delete_voices_and_samples(gw, monkeypatch):
     g, c, _ = gw
     persona_gw(g, monkeypatch)
-    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian"})
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "aiden"})
     c.post("/v1/personas", json={"id": "mira", "name": "미라", "voice": "ryan"})
     assert c.delete("/v1/personas/luna").json()["deleted_at"] and g.fake.persona_data == ("luna", False)
     c.delete("/v1/personas/mira?delete_history=true")
@@ -346,7 +382,11 @@ def test_persona_delete_voices_and_samples(gw, monkeypatch):
     g.fake.state.down = False
     assert not c.get("/v1/personas/nova").json()["deleted_at"]
     v = c.get("/v1/voices").json()
-    assert {"id": "sohee", "label": "소희", "desc": "따뜻한 한국어 여성", "lang": "ko"} in v and len(v) == 3
+    assert {"id": "sohee", "label": "소희", "desc": "따뜻하고 감정이 풍부한 여성", "lang": "ko"} in v and len(v) == 4
+    assert {"id": "vivian", "label": "비비안", "desc": "밝고 또렷한, 살짝 톡 쏘는 젊은 여성", "lang": "zh"} in v
+    assert not any(w in x["desc"] for x in v for w in ("한국어", "중국어", "영어", "일본어", "억양"))  # character, not origin
+    r = c.post("/v1/personas", json={"id": "vivi", "name": "비비", "voice": "vivian"})
+    assert r.status_code == 201 and c.get("/v1/personas/vivi").json()["voice"] == "vivian"  # every speaker, no migration
     calls = []
 
     async def fake_sample(text, voice, style):
@@ -567,7 +607,7 @@ def test_ruchba_down_read_only(gw):
 def test_outage_survives_a_restart(tmp_path, monkeypatch):
     g = start(tmp_path, monkeypatch)
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
-        c.post("/v1/push/register", json={"voip_token": "tok1", "bundle_id": "xyz.scian.azel"})
+        c.post("/v1/push/register", json={"voip_token": "tok1", "bundle_id": "xyz.scian.biseo"})
         g.fake.state.down = True
         c.post("/v1/ask", json={"text": "a"})
     assert len(g.pending_usage) == 1 and os.stat(tmp_path / "pending_usage.json").st_mode & 0o077 == 0
@@ -620,7 +660,7 @@ def test_old_gateway_db_migrates_once_and_idempotently(tmp_path, monkeypatch):
                 break
             time.sleep(0.05)
         assert (tmp_path / "migrated_from_sqlite").exists()
-        assert c.get("/v1/usage").json()["cost_usd"] == 2.5  # this month only
+        assert c.get("/v1/usage").json()["subscription"]["claude_code"]["equivalent_usd"] == 2.5  # this month only
     assert list(g.fake.db["approvals"]) == ["aaaaaaaaaaaa"]  # pending only, same id
     assert [t["token"] for t in g.fake.db["push"].values()] == ["tokA"]
     asyncio.run(g.migrate_sqlite())  # by hand again: nothing doubles
@@ -747,7 +787,7 @@ def test_spoken_times(gw):
         (kst(2026, 11, 30, 9, 0), None, "11월 30일 오전 9시"), (kst(2026, 11, 22, 7, 0), "daily", "매일 오전 7시"),
         (kst(2026, 11, 23, 6, 40), "weekdays", "평일 오전 6시 40분"), (kst(2026, 11, 23, 9, 0), "weekly:0", "매주 월요일 오전 9시"),
         (kst(2026, 11, 29, 9, 0), "weekly:6", "매주 일요일 오전 9시"),
-        (kst(2026, 11, 22, 0, 5), None, "내일 오전 12시 5분")]:
+        (kst(2026, 11, 22, 0, 5), None, "내일 밤 12시 5분"), (kst(2026, 11, 21, 12, 30), None, "오늘 낮 12시 30분")]:
         assert g.spoken_when(at.timestamp(), repeat, now) == want, want
     fri7 = kst(2026, 11, 27, 7, 0).timestamp()  # a Friday
     assert g.next_at(fri7, "weekdays", fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
@@ -1347,7 +1387,7 @@ def test_warm_turn_timeout_kills_a_hung_process(tmp_path, monkeypatch):
 def test_prewarm_uses_the_call_persona(tmp_path, monkeypatch):
     g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
     g.fake.db["settings"] = {"personas": [{"id": "azel", "name": "아젤", "voice": "sohee", "primary": True},
-                                          {"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋함"}]}
+                                          {"id": "luna", "name": "루나", "voice": "aiden", "personality": "느긋함"}]}
 
     async def run():
         await g.prewarm("luna:s1", "luna")
@@ -1462,3 +1502,72 @@ def test_limited_has_no_connectors(limited):
     assert c.put("/v1/connectors/secret/x", json={"value": "v"}).status_code == 403
     assert c.put("/v1/settings", json={"connectors": {"claude_ai": {}}}).status_code == 403
     assert not (tmp / "mcp").exists()
+
+
+def test_api_key_alone_never_moves_a_full_gateway_off_claude_code(tmp_path, monkeypatch):
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    g = start(tmp_path, monkeypatch)
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        assert g.resolve(g.DEFAULTS, None, None, "chat", "안녕")[1] == "claude_code"  # "auto" = claude -p
+        assert g.resolve(g.DEFAULTS, None, "api", "chat", "안녕")[1] == "api"  # explicit opt-in
+        c.post("/v1/ask", json={"text": "a", "session": "s1"})
+        assert (tmp_path / "args.json").exists()  # the claude -p fake ran
+
+
+def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatch):
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    g = start(tmp_path, monkeypatch)
+    seen = {}
+
+    async def fake_ask(key, model, system, text, tools, run):
+        seen.update(key=key, model=model, system=system, tools=[t["name"] for t in tools])
+        seen["result"] = await run("macbook__list_dir", {"path": "~"})
+        yield "tool", "macbook__list_dir"
+        yield "text", "홈 폴더에 파일이 세 개 있어요.\n"
+        yield "done", {"input_tokens": 100, "cache_read_input_tokens": 1500, "cache_creation_input_tokens": 0,
+                       "output_tokens": 20, "cost_usd": 0.0001}
+
+    async def dev_tools(devices):
+        return [{"name": "macbook__list_dir", "description": "x", "input_schema": {"type": "object"}}], \
+            {"macbook__list_dir": ("http://d", "list_dir")}
+
+    async def fake_run_tool(block, where):
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "a b c", "is_error": False}
+    monkeypatch.setattr(g.claude_api, "ask", fake_ask)
+    monkeypatch.setattr(g, "device_tools", dev_tools)
+    monkeypatch.setattr(g, "run_tool", fake_run_tool)
+    monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))  # no PAT in tests
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        evs = events(c.post("/v1/ask", json={"text": "홈 폴더 봐 줘", "session": "s", "path": "api", "model": "haiku"}))
+    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir"]
+    assert "Cygnus 도구" in seen["system"] and g.PERSONAL_REFUSAL not in seen["system"] and seen["result"] == "a b c"
+    assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
+    done = evs[-1]
+    assert done["type"] == "done" and done["path"] == "api" and done["input_tokens"] == 1600
+
+
+def test_user_title_shared_and_per_persona(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    assert c.get("/v1/settings").json()["user_title"] == ""
+    assert "부른다" not in g.persona_block(asyncio.run(g.load_settings()))  # none set: no line
+    assert c.put("/v1/settings", json={"user_title": "  선생 님 "}).json()["user_title"] == "선생 님"
+    for bad in ["a" * 13, "주인님!", 3]:
+        assert c.put("/v1/settings", json={"user_title": bad}).status_code == 400, bad
+    assert c.put("/v1/settings", json={"user_title": "선생님"}).status_code == 200
+    s = asyncio.run(g.load_settings())
+    assert "사용자를 '선생님'(이)라고 부른다." in g.persona_block(s)
+    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "sohee"})
+    assert r.json()["user_title"] == ""  # "" = use the shared one
+    assert c.put("/v1/personas/luna", json={"user_title": "주인님"}).json()["user_title"] == "주인님"
+    assert c.put("/v1/personas/luna", json={"user_title": "!!"}).status_code == 400
+    s = asyncio.run(g.load_settings())
+    g.current_persona.set("luna")
+    assert "사용자를 '주인님'(이)라고 부른다." in g.persona_block(s)
+    assert c.put("/v1/personas/luna", json={"user_title": None}).json()["user_title"] == ""  # null: unset
+    r = c.post("/v1/personas", json={"id": "nul", "name": "널", "voice": "sohee", "user_title": None, "color": None})
+    assert r.status_code == 201 and r.json()["user_title"] == "" and r.json()["color"] == "celadon"  # create: defaults
+    assert "사용자를 '선생님'(이)라고 부른다." in g.persona_block(asyncio.run(g.load_settings()))
+    g.current_persona.set(None)
+    stored = g.fake.db["settings"]
+    assert stored["user_title"] == "선생님" and next(p for p in stored["personas"] if p["id"] == "luna")["user_title"] == ""

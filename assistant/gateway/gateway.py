@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import tempfile
 import time
 import uuid
@@ -31,7 +32,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import connectors
+import nim
 import wake_enroll
+import claude_api
 from claude_warm import Pool, base_cmd
 
 HOME = Path(os.environ.get("BISEO_HOME", Path.home() / ".config/biseo"))
@@ -74,6 +77,7 @@ DEFAULTS = {
     "task_defaults": {"chat": {"model": "qwen"}, "schedule": {"model": "sonnet"},
                       "code": {"model": "opus", "path": "claude_code"}, "mac": {"model": "sonnet"}},
     "monthly_budget_usd": 500, "budget_warn_pct": 80,
+    "budget_paths": ["api", "nim"],  # which usage paths count toward the budget; claude_code is the subscription
     # "먼저 전화하기": proactive calls. User-created scheduled calls are not proactive and always fire.
     "proactive": {"enabled": True, "morning_briefing": {"enabled": True, "time": "08:00"},
                   "deadline_check": {"enabled": True, "time": "20:00"}, "server_alerts": True,
@@ -81,14 +85,27 @@ DEFAULTS = {
                                  "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}},
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
+    "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
     "noise_mode": "normal",  # normal | noisy: the voice server's voice-activity thresholds and barge-in
     "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
+    "providers": {"nim": nim.DEFAULT},  # other model providers (nim.py); keys never live in settings
 }
+CHOOSABLE = ("auto", "qwen", "nim", *MODELS)  # default_model, task_defaults.*.model
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
+TITLE_RE = re.compile(r"[가-힣A-Za-z ]{0,12}")
+
+
+def check_title(v, field):
+    """user_title (shared or a persona's): 0-12 Hangul/Latin letters or spaces, whitespace collapsed; null → ""."""
+    if v is None:
+        return ""
+    if not (isinstance(v, str) and TITLE_RE.fullmatch(v)):
+        raise HTTPException(400, f"{field}: 0-12 Hangul/Latin letters or spaces")
+    return " ".join(v.split())
 
 
 # reply_length: the same wording the voice server gives Qwen, so both routes answer at the same length.
@@ -113,13 +130,34 @@ def personality(settings):
     return p.strip() if isinstance(p, str) and p.strip() else PERSONALITY_DEFAULT
 
 
+def character_line(name, text, title=""):
+    """The persona's character as the assistant's own (same wording in gateway.py and voice_server.py). Without the
+    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요"). `title`: how to
+    address the user (the user_title setting); without one, never a made-up 오빠/형/언니/누나."""
+    text = text.strip().rstrip(".。 ")
+    address = (f"사용자를 '{title}'(이)라고 부른다. 그 호칭은 자연스러운 곳에서만 쓰고 매 문장마다 부르지는 마. " if title else
+               "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. ")
+    return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
+            "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
+            + address + "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+
+
+def user_title(settings, persona):
+    """The title the user set for this persona, else the shared one ("" = none). Up to 12 letters, no quotes."""
+    for t in ((persona or {}).get("user_title"), settings.get("user_title")):
+        t = re.sub(r"[\"'\\\x00-\x1f]", "", t).strip()[:12] if isinstance(t, str) else ""
+        if t:
+            return t
+    return ""
+
+
 def persona_block(settings):
     """Who is talking: name and character of the persona this ask belongs to (the primary by default). Used for
     Claude's voice style and every prompt that speaks to the user."""
     p = active_persona(settings)
     text = p["personality"].strip() if isinstance(p.get("personality"), str) and p["personality"].strip() \
         else PERSONALITY_DEFAULT
-    return f"너의 이름은 '{p['name']}'이야. 성격: {text} "
+    return f"너의 이름은 '{p['name']}'이야. " + character_line(p["name"], text, user_title(settings, p))
 
 
 # ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
@@ -141,6 +179,8 @@ def migrate_personas(s):
                       "voice": DEFAULT_TTS_VOICE, "voice_style": "", "personality": s.get("personality") or "",
                       "color": "#7C5CFF", "default_model": None, "share_memory": False, "created_at": 0,
                       "primary": True})
+    for p in ps:
+        p.setdefault("user_title", "")
     s["personas"] = ps
     prim = primary_persona(s)
     s["assistant_name"], s["personality"] = prim.get("name") or DEFAULTS["assistant_name"], prim.get("personality") or ""
@@ -169,17 +209,32 @@ def name_prompt(settings):
     return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"])
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
-                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
+                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)"
+                      # the voice server's PLANS_ASK: "내일 내가 해야 될 일", "토요일에 뭐 있어"
+                      r"|해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게) ?(뭐|있|정리|알려)"
+                      r"|(오늘|내일|모레|글피|이번 ?주|다음 ?주|주말|[월화수목금토일]요일).{0,10}(뭐 ?(해|하|있)|정리|계획|바빠|바쁘|일과|해야)",
+                      re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
     "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 하되 '네'가 아니라 "
     "내용으로 시작해. "
     "마크다운, 목록, 표, 이모지, URL, 코드 블록을 쓰지 마. '확인하지 않은 것' 같은 꼬리말도 붙이지 마. "
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
+    "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
+    "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
+    "기기 명령이 pending_approval을 돌려주면 먼저 '앱에서 허용해 주세요'라고 짧게 말한 다음, 같은 명령을 그 "
+    "approval_id와 함께 다시 호출해서 승인을 기다려. 거절되거나(rejected) 만료되면(expired) 허용되지 않았다고 말해. "
 )
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
     "macbook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
+)
+# Full gateways on the Messages API path (claude_path "api", opt-in): Cygnus through our read-only bridge, no
+# Gmail or Calendar (those are claude.ai connectors).
+FULL_API_STYLE = VOICE_BASE + (
+    "사용자의 일정, 과제, 할 일, 기억, 서버 상태는 주어진 Cygnus 도구로 확인하고, 확인하지 못한 것은 지어내지 마. "
+    "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해. 기기 작업은 주어진 기기 도구로만 해. "
+    "위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
 API_STYLE = VOICE_BASE + (
     "너는 일정, 메일, 메모리, GISTRA, Planit 같은 개인 데이터를 볼 수 없어. 그런 요청이면 "
@@ -311,6 +366,49 @@ HISTORY_PATHS = {"start": "start", "turn": "turns", "end": "end"}
 history_outbox = Outbox("pending_history.json", "history_rejected.jsonl",
                         lambda b: f"/v1/state/history/{quote(b['log_id'], safe='')}/{HISTORY_PATHS[b['event']]}")
 local_devices: dict[str, dict] = {}  # daemons that registered here, so this device works offline
+# Team devices (vd-spark, vd-core) cannot dial a jh gateway (ACL), so their daemons never register: full gateways
+# list them in HOME/static_devices.json (or BISEO_STATIC_DEVICES) and probe them directly. Rows live only in this
+# process (the shared devices table has no `limited` column); each needs its daemon's own bearer token in
+# HOME/device_tokens/<id> (0600): the shared token never goes to a team device.
+STATIC_PATH = HOME / "static_devices.json"
+static_devices: dict[str, dict] = {}
+device_tokens: dict[str, str] = {}  # daemon url -> its bearer token, when not the shared one
+limited_urls: set[str] = set()  # daemons that may never be handed a `delegate`
+STATIC_PROBE_S = 60
+
+
+def load_static_devices(raw):
+    for e in json.loads(raw or "[]"):
+        did, url = str(e.get("id", "")), e.get("url")
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", did) or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ValueError(f"static_devices: bad entry {did!r}")
+        if e.get("mode") != "limited":
+            raise ValueError(f"static_devices: {did} must be mode limited")
+        tok = secret(f"device_tokens/{did}")
+        if not tok:
+            print(f"static device {did} skipped: no {HOME}/device_tokens/{did}", flush=True)
+            continue
+        static_devices[did] = {"id": did, "name": str(e.get("name") or did)[:40], "url": url, "harness": [],
+                               "gateway": DEVICE, "writer": "full", "limited": True, "static": True, "last_seen": 0.0}
+        device_tokens[url] = tok
+        limited_urls.add(url)
+
+
+if MODE == "full":
+    load_static_devices(os.environ.get("BISEO_STATIC_DEVICES") or (STATIC_PATH.read_text() if STATIC_PATH.exists() else ""))
+
+
+def with_static(rows):
+    """Shared device rows plus this gateway's static ones (a static row wins over a row with the same id)."""
+    return [d for d in rows if d["id"] not in static_devices] + list(static_devices.values())
+
+
+async def static_prober():
+    while True:
+        for d in list(static_devices.values()):
+            if (await probe(d["url"], token=True))["ok"]:
+                d["last_seen"] = time.time()
+        await asyncio.sleep(STATIC_PROBE_S)
 
 
 HM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
@@ -370,7 +468,14 @@ async def load_settings():
     s["personality_default"] = PERSONALITY_DEFAULT  # shown, never stored (the app's placeholder, the voice server's text)
     s["default_device"] = OLD_DEVICE_NAMES.get(s["default_device"], s["default_device"])
     s["device_fallback"] = [OLD_DEVICE_NAMES.get(d, d) for d in s["device_fallback"]]
+    s["providers"] = {**DEFAULTS["providers"], **(s.get("providers") or {})}
+    s["providers"]["nim"] = {**nim.DEFAULT, **s["providers"]["nim"]}
     return s
+
+
+def settings_view(s):
+    """Settings as the app sees them: plus `providers.nim.has_key` (only whether the key exists)."""
+    return {**s, "providers": {**s["providers"], "nim": nim.view(s["providers"]["nim"], HOME)}}
 
 
 def write_settings_copy(doc):
@@ -390,8 +495,29 @@ async def month_rows():
     return await state.get("/v1/state/usage", [], since=since) + [u for u in pending_usage if u["ts"] >= since]
 
 
-async def month_cost():
-    return sum(r["cost_usd"] for r in await month_rows())
+async def month_cost(settings=None):
+    """This month's spend on the paths that count toward the budget (`budget_paths`)."""
+    paths = (settings or await load_settings())["budget_paths"]
+    return sum(r["cost_usd"] for r in await month_rows() if r["path"] in paths)
+
+
+claude_quota: dict[str, dict] = {}  # latest subscription windows from `claude -p` rate_limit_event, by "5h" / "weekly"
+QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "weekly"}
+
+
+def note_quota(event):
+    for key, w in (event.get("rate_limit_info", {}).get("unifiedWindows") or {}).items():
+        if key in QUOTA_WINDOWS and isinstance(w.get("utilization"), (int, float)) and w.get("resetsAt"):
+            claude_quota[QUOTA_WINDOWS[key]] = {"utilization_pct": round(w["utilization"] * 100, 1), "resets_at": w["resetsAt"]}
+
+
+def quota_view():
+    """The fullest live window (a window past its reset is stale and dropped), plus all of them; None before any run."""
+    live = {k: v for k, v in claude_quota.items() if v["resets_at"] > time.time()}
+    if not live:
+        return None
+    k = max(live, key=lambda k: live[k]["utilization_pct"])
+    return {"window": k, **live[k], "windows": live}
 
 
 async def record_usage(row):
@@ -435,7 +561,7 @@ async def fresh_devices():
     rows = await state.get("/v1/state/devices")
     if rows is None:  # ruchba down and nothing cached yet
         rows = list(local_devices.values())
-    return [d for d in rows if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
+    return [d for d in with_static(rows) if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
 
 
 # A short status or lookup question: Haiku answers it about 1 s sooner. Anything with several steps stays Sonnet.
@@ -448,12 +574,16 @@ def resolve(settings, model, path, task, text=""):
     none, short lookups get Haiku and everything else Sonnet."""
     td = settings["task_defaults"].get(task or "", {})
     model = model or td.get("model") or settings["default_model"]
+    if model == "nim":
+        if MODE == "limited":
+            raise HTTPException(400, "nim: not on a limited gateway")
+        return "nim", "nim"
     if model in ("auto", "qwen"):  # the voice server only calls us when Claude is wanted
         said = text.rsplit("\n\n", 1)[-1]  # the voice server prefixes recent turns
         model = "haiku" if len(said) <= 40 and LOOKUP.search(said) and not MULTI_STEP.search(said) else "sonnet"
     path = path or td.get("path") or settings["claude_path"]
-    if path == "auto":
-        path = "api" if API_KEY else "claude_code"
+    if path == "auto":  # a key on disk never switches a full gateway off claude.ai's connectors: "api" is opt-in
+        path = "claude_code" if MODE == "full" else "api"
     if MODE == "limited":
         path = "api"  # never `claude -p` (no OAuth login, no claude.ai connectors) on a team machine
     if model not in MODELS:
@@ -518,7 +648,7 @@ async def ask_claude_code(text, model, session):
     devices = await fresh_devices()
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
-    servers, allowed, run_settings, run_env = run_args(settings, devices)
+    servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
     resume = await resume_id(session)
     cfg, proc = None, None
     if WARM and not session.startswith(COLD_SESSIONS):
@@ -558,6 +688,8 @@ async def ask_claude_code(text, model, session):
                 for block in content if isinstance(content, list) else []:
                     if block.get("type") == "tool_result" and block.get("tool_use_id") in open_tools:
                         yield activity("tool_end", open_tools.pop(block["tool_use_id"]))
+            elif e.get("type") == "rate_limit_event":
+                note_quota(e)
             elif e.get("type") == "result":
                 u = e.get("usage", {})
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
@@ -582,10 +714,11 @@ async def ask_claude_code(text, model, session):
 discovery = connectors.Discovery(CLAUDE)
 
 
-def run_args(settings, devices):
+def run_args(settings, devices, requester=""):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
-    custom servers the user switched on, plus the device daemons."""
-    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME)
+    custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
+    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME, device_tokens,
+                               {"X-Azel-Requester": requester} if requester else None)
 
 
 async def resume_id(session):
@@ -608,7 +741,7 @@ async def prewarm(session, persona_id=None):
         if path != "claude_code":
             return
         style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
-        servers, allowed, run_settings, run_env = run_args(settings, devices)
+        servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
         await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session),
                             run_settings, run_env)
     except Exception as e:
@@ -619,7 +752,9 @@ async def mcp(url, method, params):
     """One JSON-RPC call to a daemon's stateless streamable-HTTP MCP endpoint (JSON or SSE answer)."""
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                         headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/json, text/event-stream"})
+                         headers={"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}",
+                                  "Accept": "application/json, text/event-stream",
+                                  **({"X-Azel-Requester": requester_ctx.get()} if requester_ctx.get() else {})})
     r.raise_for_status()
     if r.headers.get("content-type", "").startswith("text/event-stream"):
         msgs = [json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")]
@@ -641,6 +776,8 @@ async def device_tools(devices):
             print("tools/list failed:", d["id"], type(e).__name__, flush=True)
             continue
         for t in listed:
+            if t["name"] == "delegate" and d.get("limited"):
+                continue  # a team device only reads and diagnoses: never hand it work
             name = f"{d['id']}__{t['name']}"[:64]
             where[name] = (d["url"], t["name"])
             tools.append({"name": name, "description": f"[{d['name']}] {t.get('description') or ''}"[:1024],
@@ -651,6 +788,8 @@ async def device_tools(devices):
 async def run_tool(block, where):
     try:
         url, name = where[block["name"]]
+        if name == "delegate" and url in limited_urls:
+            raise RuntimeError("delegate is not allowed on a limited device")
         res = await mcp(url, "tools/call", {"name": name, "arguments": block["input"]})
         text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
         return {"type": "tool_result", "tool_use_id": block["id"], "content": text[:20000] or "(empty)",
@@ -676,6 +815,10 @@ async def ask_api(text, model, session):
     devices = await fresh_devices()
     tools, where = await device_tools(devices)
     settings = await load_settings()
+    if MODE == "full":  # opt-in path: prompt caching and the Cygnus bridge (claude_api.py)
+        async for item in ask_api_full(text, model, settings, devices, tools, where):
+            yield item
+        return
     system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
     messages = [{"role": "user", "content": text}]
     final = {"model": model, "path": "api", "input_tokens": 0, "output_tokens": 0}
@@ -701,6 +844,69 @@ async def ask_api(text, model, session):
     yield final
 
 
+async def ask_api_full(text, model, settings, devices, dev_tools, where):
+    """A full gateway's Messages API turn: Cygnus bridge tools plus the devices' tools, stable cached prefix."""
+    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)
+    by_name = {t["name"] for t in cyg_tools}
+
+    async def run(name, args):
+        if name in by_name:
+            return await cyg_run(name, args)
+        r = await run_tool({"name": name, "input": args, "id": "x"}, where)
+        if r.get("is_error"):
+            raise RuntimeError("device tool failed")
+        return r["content"]
+    system = name_prompt(settings) + FULL_API_STYLE + device_prompt(settings, devices)
+    yield activity("thinking")
+    async for kind, v in claude_api.ask(API_KEY, model, system, text, cyg_tools + dev_tools, run):
+        if kind == "text":
+            yield v
+        elif kind == "tool":
+            yield activity("tool_start", v)
+        else:
+            yield {"model": model, "path": "api", "input_tokens": v["input_tokens"] + v["cache_read_input_tokens"]
+                   + v["cache_creation_input_tokens"], "output_tokens": v["output_tokens"], "cost_usd": v["cost_usd"]}
+
+
+# Measured on the cost eval (brain session): NIM models put markdown and 반말 into spoken replies, misdated
+# weekdays without the date, and doubted data the tools had already given.
+NIM_STYLE = (" 반드시 존댓말로만 말해. 별표(**), 샵(#), 번호 목록 같은 마크다운은 절대 쓰지 마. 날짜와 요일은 아래의 지금"
+             " 날짜를 기준으로 계산하고, 도구 결과에 나온 상태(완료 여부 등)는 그대로 믿고 다시 묻지 마.")
+SPOKEN_MARKDOWN = re.compile(r"\*\*|__|^#{1,6}\s*|`", re.M)
+
+
+async def ask_nim(text, model, session):
+    """The hosted NVIDIA NIM path: streams like Claude, with the devices' tools when the model takes tools."""
+    settings = await load_settings()
+    cfg = settings["providers"]["nim"]
+    if not cfg["enabled"]:
+        yield {"type": "error", "code": "nim_off", "message": "엔비디아 모델이 꺼져 있어요. 앱의 설정에서 켜 주세요."}
+        return
+    devices = await fresh_devices()
+    tools, where = await device_tools(devices)
+    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)  # the brain's read-only Cygnus tools, when this host has them
+    cyg = {t["name"] for t in cyg_tools}
+    now = datetime.now(KST)
+    system = (name_prompt(settings) + API_STYLE + device_prompt(settings, devices) + NIM_STYLE
+              + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}(한국 시간)이야.")
+
+    async def run(b):
+        if b["name"] in cyg:
+            return {"content": await cyg_run(b["name"], b["input"]), "is_error": False}
+        return await run_tool(b, where)
+
+    def act(phase, tool=""):
+        return activity(phase, tool if tool in cyg or not tool else f"mcp__{tool}")
+    try:
+        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, cyg_tools + tools, run, act):
+            yield SPOKEN_MARKDOWN.sub("", item) if isinstance(item, str) else item
+    except nim.NimError as e:
+        yield {"type": "error", "code": e.code, "message": e.message}
+    except httpx.HTTPError as e:
+        print("nim failed:", type(e).__name__, flush=True)  # never the key: it is only in a header
+        yield {"type": "error", "code": "nim_error", "message": "지금은 엔비디아 모델에 연결할 수 없어요."}
+
+
 async def ask_stream(text, session, model=None, path=None, task=None):
     if not CLAUDE_OK:
         yield {"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}
@@ -711,28 +917,41 @@ async def ask_stream(text, session, model=None, path=None, task=None):
         return
     settings = await load_settings()
     budget = settings["monthly_budget_usd"]
-    if await month_cost() >= budget:
-        yield {"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}
-        return
+    if MODE == "limited" and model == "nim":
+        model = None  # a limited gateway has no NIM: its usual Claude path
     model, path = resolve(settings, model, path, task, text)
-    gen = ask_claude_code if path == "claude_code" else ask_api
-    said = False
-    async for item in gen(text, model, session):
-        if isinstance(item, str):
-            said = said or bool(item.strip())
-            yield {"type": "text", "delta": item}
-        elif item.get("type") == "activity":
-            yield item
-        else:
-            await record_usage({"model": model, "path": path, "task": task or "",
-                                "input_tokens": item.get("input_tokens", 0),
-                                "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
-            if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
-                yield claude_failure(item.get("result", ""))
-                return
-            spent = await month_cost()
-            yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
-                   "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+    # Only paid paths are held to the budget: a spent API budget must not stop subscription (claude_code) asks.
+    if path in settings["budget_paths"] and await month_cost(settings) >= budget:
+        yield {"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}
+        return
+    token = requester_ctx.set(requester_id("ask", session))  # this ask's daemon calls carry it; reset below
+    try:
+        gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
+        said = False
+        async for item in gen(text, model, session):
+            if isinstance(item, str):
+                said = said or bool(item.strip())
+                yield {"type": "text", "delta": item}
+            elif item.get("type") in ("activity", "error"):
+                yield item
+                if item["type"] == "error":
+                    return
+            else:
+                await record_usage({"model": item.get("model") or model, "path": path, "task": task or "",
+                                    "input_tokens": item.get("input_tokens", 0),
+                                    "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
+                if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
+                    yield claude_failure(item.get("result", ""))
+                    return
+                spent = await month_cost(settings)
+                yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
+                       "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+    finally:
+        try:
+            requester_ctx.reset(token)  # never leaks into later work in the same task
+        except ValueError:
+            pass  # the generator was finalized from another context (garbage collected): nothing to undo
+
 
 
 LIMIT_WORDS = re.compile(r"limit|429|rate|quota|resets?|한도|사용량", re.I)
@@ -746,7 +965,7 @@ def claude_failure(result):
         hint = ""
         if when:
             h = int(when.group(1)) % 12 + (12 if when.group(3).lower() == "pm" else 0)
-            hint = f" {'오전' if h < 12 else '오후'} {h % 12 or 12}시{' ' + when.group(2) + '분' if when.group(2) and when.group(2) != '00' else ''}쯤 풀려요."
+            hint = f" {day_part(h)} {h % 12 or 12}시{' ' + when.group(2) + '분' if when.group(2) and when.group(2) != '00' else ''}쯤 풀려요."
         return {"type": "error", "code": "limit",
                 "message": "지금은 Claude 사용 한도에 걸려서 답할 수 없어요." + (hint or " 조금 뒤에 다시 물어봐 주세요.")}
     return {"type": "error", "code": "claude_error", "message": "지금은 Claude가 답하지 못했어요. 조금 뒤에 다시 물어봐 주세요."}
@@ -772,9 +991,10 @@ async def send_voip_push(payload):
     return await apns_send(payload, "voip")
 
 
-async def send_alert_push(title, body):
-    """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token."""
-    return await apns_send({"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}, "alert")
+async def send_alert_push(title, body, **extra):
+    """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token. `extra` rides at the
+    payload's top level next to `aps` (a task push: `type: "task"`, `task_id`, so the app opens azel://task/<id>)."""
+    return await apns_send({"aps": {"alert": {"title": title, "body": body}, "sound": "default"}, **extra}, "alert")
 
 
 async def apns_send(payload, kind):
@@ -1142,10 +1362,14 @@ def next_at(at, repeat, now=None):
             return dt.timestamp()
 
 
+def day_part(hour):
+    return "밤" if hour == 0 else "낮" if hour == 12 else "오전" if hour < 12 else "오후"  # not "오전 12시"
+
+
 def spoken_when(at, repeat=None, now=None):
     """'내일 오전 10시', '매일 오전 7시', '평일 오전 6시 40분', '매주 월요일 오전 9시'."""
     dt, today = datetime.fromtimestamp(at, KST), datetime.fromtimestamp(now or time.time(), KST).date()
-    clock = f"{'오전' if dt.hour < 12 else '오후'} {dt.hour % 12 or 12}시" + (f" {dt.minute}분" if dt.minute else "")
+    clock = f"{day_part(dt.hour)} {dt.hour % 12 or 12}시" + (f" {dt.minute}분" if dt.minute else "")
     if repeat == "daily":
         day = "매일"
     elif repeat == "weekdays":
@@ -1342,6 +1566,8 @@ async def handle_link(ws):
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
+        elif m.get("type") == "task" and isinstance(m.get("id"), str):
+            tasks[m["id"]] = asyncio.create_task(serve_task(m))
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "call_answered":
@@ -1385,6 +1611,9 @@ async def lifespan(app):
     tasks = [asyncio.create_task(voice_link()), asyncio.create_task(reap_warm())]
     if MODE == "full":  # scheduled jobs need personal data
         tasks.append(asyncio.create_task(scheduler()))
+        if static_devices:
+            tasks.append(asyncio.create_task(static_prober()))
+        tasks.append(asyncio.create_task(fail_orphan_tasks_safe()))
         if CLAUDE_OK:
             tasks.append(asyncio.create_task(discovery.refresh()))
         if OLD_DB.exists() and not MIGRATED.exists():
@@ -1392,7 +1621,17 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    for run in list(task_runs.values()):  # a stopping gateway kills its task processes
+        run.cancel()
+    await asyncio.gather(*task_runs.values(), return_exceptions=True)
     await warm_pool.close_all()
+
+
+async def fail_orphan_tasks_safe():
+    try:
+        await fail_orphan_tasks()
+    except StateDown:
+        pass
 
 
 async def reap_warm():
@@ -1429,7 +1668,7 @@ async def ask(body: dict):
 
 @app.get("/v1/settings")
 async def get_settings():
-    return await load_settings()
+    return settings_view(await load_settings())
 
 
 @app.put("/v1/settings")
@@ -1444,6 +1683,8 @@ async def put_settings(body: dict):
         raise HTTPException(400, "assistant_name: 1-12 Hangul/Latin letters or spaces")
     if name is not None:
         body["assistant_name"] = " ".join(name.split())
+    if "user_title" in body:
+        body["user_title"] = check_title(body["user_title"], "user_title")
     if "proactive" in body:  # a partial update merges into the current values, one level deep
         if not isinstance(body["proactive"], dict):
             raise HTTPException(400, "proactive must be an object")
@@ -1468,6 +1709,30 @@ async def put_settings(body: dict):
             body["connectors"] = connectors.check(body["connectors"])
         except ValueError as e:
             raise HTTPException(400, str(e))
+    if "default_model" in body and body["default_model"] not in CHOOSABLE:
+        raise HTTPException(400, f"default_model: one of {list(CHOOSABLE)}")
+    if "task_defaults" in body:
+        td = body["task_defaults"]
+        if not isinstance(td, dict) or not all(isinstance(v, dict) and v.get("model", "auto") in CHOOSABLE
+                                               for v in td.values()):
+            raise HTTPException(400, f"task_defaults: {{task: {{model: one of {list(CHOOSABLE)}, path?}}}}")
+    if "providers" in body:
+        full_only()
+        prov = body["providers"]
+        if not isinstance(prov, dict) or set(prov) - {"nim"}:
+            raise HTTPException(400, "providers: {nim: {...}}")
+        try:
+            cur = (await load_settings())["providers"]
+            body["providers"] = {**cur, **({"nim": nim.check(prov["nim"], cur["nim"])} if "nim" in prov else {})}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if body["providers"]["nim"]["base_url"] != cur["nim"]["base_url"]:
+            nim.write_key(HOME, "")  # a key is never carried over to a different endpoint: enter it again
+    if "budget_paths" in body:
+        bp = body["budget_paths"]
+        if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
+            raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
+        body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -1476,22 +1741,29 @@ async def put_settings(body: dict):
     prim["name"], prim["personality"] = s["assistant_name"], s["personality"]
     await save_settings({k: v for k, v in s.items() if k != "personality_default"})
     await link_send({"type": "settings", "value": s})
-    return s
+    return settings_view(s)
 
 
 @app.get("/v1/usage")
 async def usage():
-    rows = await month_rows()
-    by = lambda k: {v: round(sum(r["cost_usd"] for r in rows if r[k] == v), 4) for v in {r[k] for r in rows}}  # noqa: E731
+    rows, settings = await month_rows(), await load_settings()
+    by = lambda k, rs=rows: {v: round(sum(r["cost_usd"] for r in rs if r[k] == v), 4) for v in {r[k] for r in rs}}  # noqa: E731
+    paid = [r for r in rows if r["path"] in settings["budget_paths"]]  # cost_usd and the budget mean this paid part
+    cc = [r for r in rows if r["path"] == "claude_code"]
     return {"month": datetime.now(KST).strftime("%Y-%m"), "calls": len(rows), "by_model": by("model"),
-            "by_path": by("path"), "by_device": by("device"), "cost_usd": round(sum(r["cost_usd"] for r in rows), 4),
-            "budget_usd": (await load_settings())["monthly_budget_usd"]}
+            "by_path": by("path"), "by_device": by("device"), "cost_usd": round(sum(r["cost_usd"] for r in paid), 4),
+            "budget_usd": settings["monthly_budget_usd"],
+            "paid": {"cost_usd": round(sum(r["cost_usd"] for r in paid), 4), "by_path": by("path", paid)},
+            "subscription": {"claude_code": {
+                "turns": len(cc), "input_tokens": sum(r.get("input_tokens") or 0 for r in cc),
+                "output_tokens": sum(r.get("output_tokens") or 0 for r in cc),
+                "equivalent_usd": round(sum(r["cost_usd"] for r in cc), 4), "quota": quota_view()}}}
 
 
 async def probe(url, token=False):
     """Reachability only. The token goes along only when asked (a trusted daemon); health routes need none."""
     t = time.perf_counter()
-    headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {TOKEN}"} if token else {})
+    headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}"} if token else {})
     try:
         # Headers only: an MCP endpoint may answer GET with a stream that never ends.
         async with httpx.AsyncClient(timeout=3) as c, c.stream("GET", url, headers=headers) as r:
@@ -1503,12 +1775,12 @@ async def probe(url, token=False):
 
 @app.get("/v1/status")
 async def status():
-    devs = await state.get("/v1/state/devices", list(local_devices.values()))
+    devs = with_static(await state.get("/v1/state/devices", list(local_devices.values())))
     probes = await asyncio.gather(probe(f"{VOICE_URL}/health"), probe(f"{TTS_URL}/health"),
                                   probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
-            "devices": [{"id": d["id"], "name": d["name"], **p,
+            "devices": [{"id": d["id"], "name": d["name"], "limited": bool(d.get("limited")), **p,
                          "fresh": time.time() - d["last_seen"] < DEVICE_FRESH_S} for d, p in zip(devs, probes[3:])]}
 
 
@@ -1530,7 +1802,7 @@ async def register(body: dict):
 
 @app.get("/v1/devices")
 async def devices():
-    return await state.get("/v1/state/devices", list(local_devices.values()))
+    return with_static(await state.get("/v1/state/devices", list(local_devices.values())))
 
 
 def full_only():
@@ -1538,13 +1810,42 @@ def full_only():
         raise HTTPException(403, "not available on a limited gateway")
 
 
-# Korean labels for the TTS server's speakers (Qwen3-TTS CustomVoice); unknown speakers show their id.
+@app.get("/v1/providers/nim/models")
+async def nim_models():
+    """Suggested model ids from NIM's /models (cached 10 min); the model setting stays free text."""
+    full_only()
+    key = nim.read_key(HOME)
+    if not key:
+        raise HTTPException(409, "no NIM key: PUT /v1/providers/nim/key first")
+    cfg = (await load_settings())["providers"]["nim"]
+    try:
+        return {"models": await nim.list_models(cfg, key)}
+    except nim.NimError as e:
+        raise HTTPException(502, e.message)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"NIM unreachable ({type(e).__name__})")
+
+
+@app.put("/v1/providers/nim/key", status_code=204)
+async def nim_key(body: dict):
+    """Write-only: the key goes to HOME/providers/nim_key (0600) and is never returned; "" deletes it."""
+    full_only()
+    try:
+        nim.write_key(HOME, nim.check_key(body.get("value")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    nim._models.update(at=0.0)  # a new key may see other models
+    return Response(status_code=204)
+
+
+# Labels for the TTS server's speakers (Qwen3-TTS CustomVoice): the voice's character only, never a language or
+# nationality. `lang` stays in /v1/voices for older apps (not shown). Unknown speakers show their id.
 VOICE_INFO = {
-    "sohee": ("소희", "따뜻한 한국어 여성", "ko"), "vivian": ("비비안", "밝고 또렷한 중국어 여성", "zh"),
-    "serena": ("세레나", "부드럽고 차분한 중국어 여성", "zh"), "uncle_fu": ("푸 아저씨", "나이 지긋하고 묵직한 중국어 남성", "zh"),
-    "dylan": ("딜런", "베이징 말씨의 젊은 남성", "zh"), "eric": ("에릭", "쓰촨 말씨의 쾌활한 남성", "zh"),
-    "ryan": ("라이언", "힘 있는 영어 남성", "en"), "aiden": ("에이든", "밝고 친근한 영어 남성", "en"),
-    "ono_anna": ("오노 안나", "경쾌한 일본어 여성", "ja"),
+    "sohee": ("소희", "따뜻하고 감정이 풍부한 여성", "ko"), "vivian": ("비비안", "밝고 또렷한, 살짝 톡 쏘는 젊은 여성", "zh"),
+    "serena": ("세레나", "부드럽고 다정한 젊은 여성", "zh"), "uncle_fu": ("푸 아저씨", "낮고 묵직한, 연륜 있는 남성", "zh"),
+    "dylan": ("딜런", "맑고 자연스러운 젊은 남성", "zh"), "eric": ("에릭", "활기차고 살짝 허스키한 남성", "zh"),
+    "ryan": ("라이언", "리듬감 있고 힘찬 남성", "en"), "aiden": ("에이든", "밝고 시원한 청년", "en"),
+    "ono_anna": ("오노 안나", "경쾌하고 발랄한 여성", "ja"),
 }
 _tts_voices: dict = {"at": 0.0, "voices": []}
 _sample_at: list = [0.0]  # voice samples: one per 2 s on this gateway
@@ -1603,7 +1904,7 @@ async def tts_voices():
     return _tts_voices["voices"]
 
 
-PERSONA_FIELDS = {"name", "voice", "voice_style", "personality", "color", "default_model", "share_memory"}
+PERSONA_FIELDS = {"name", "voice", "voice_style", "personality", "color", "default_model", "share_memory", "user_title"}
 
 
 async def check_persona(body, s, pid=None):
@@ -1613,7 +1914,7 @@ async def check_persona(body, s, pid=None):
         raise HTTPException(400, f"unknown persona fields: {sorted(unknown)}")
     if pid is not None and "voice" in body and body["voice"] is None:
         del body["voice"]  # edit: null keeps the current voice (create still requires one)
-    for k in ("voice_style", "personality", "color"):  # the app sends null for "unset"
+    for k in ("voice_style", "personality", "user_title", "color"):  # the app sends null for "unset"
         if k in body and body[k] is None:
             if pid is not None and k != "color":
                 body[k] = ""  # edit: clear the text; a null color keeps the current one
@@ -1626,9 +1927,11 @@ async def check_persona(body, s, pid=None):
         if any(p["name"] == body["name"] and p["id"] != pid for p in live_personas(s)):
             raise HTTPException(400, "name: another persona already has it")
     if "voice" in body and (not isinstance(body["voice"], str) or body["voice"].lower() not in await tts_voices()):
-        raise HTTPException(400, "voice: not a TTS speaker (GET the TTS server's /v1/audio/voices)")
+        raise HTTPException(400, "voice: not a TTS speaker (GET /v1/voices)")
     if not isinstance(body.get("voice_style", ""), str) or len(body.get("voice_style", "")) > 200:
         raise HTTPException(400, "voice_style: text up to 200 characters")
+    if "user_title" in body:
+        body["user_title"] = check_title(body["user_title"], "user_title")
     if not isinstance(body.get("personality", ""), str) or len(body.get("personality", "")) > 600:
         raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
     if "color" in body:
@@ -1636,15 +1939,16 @@ async def check_persona(body, s, pid=None):
         if not (isinstance(c, str) and (COLOR_RE.fullmatch(c) or c.lower() in TINTS)):
             raise HTTPException(400, f"color: #rrggbb or a tint name ({'|'.join(sorted(TINTS))})")
         body["color"] = c if c.startswith("#") else c.lower()
-    if body.get("default_model") not in (None, *MODELS):
-        raise HTTPException(400, f"default_model: null or one of {sorted(MODELS)}")
+    if body.get("default_model") not in (None, "nim", *MODELS):
+        raise HTTPException(400, f"default_model: null, nim or one of {sorted(MODELS)}")
     if not isinstance(body.get("share_memory", False), bool):
         raise HTTPException(400, "share_memory: true or false")
 
 
 def persona_view(p):
-    return {k: p.get(k) for k in ("id", "name", "voice", "voice_style", "personality", "color", "default_model",
-                                  "share_memory", "created_at", "primary", "deleted_at")}
+    return {**{k: p.get(k) for k in ("id", "name", "voice", "voice_style", "personality", "color", "default_model",
+                                     "share_memory", "created_at", "primary", "deleted_at")},
+            "user_title": p.get("user_title") or ""}
 
 
 async def save_personas(s):
@@ -1673,7 +1977,7 @@ async def personas_create(body: dict):
     if not (isinstance(pid, str) and PERSONA_ID.fullmatch(pid)) or persona_by_id(s, pid, include_deleted=True):
         raise HTTPException(400, "id: a new ASCII slug (a-z, 0-9, _ -)")
     p = {"id": pid, "voice_style": "", "personality": "", "color": "celadon", "default_model": None,
-         "share_memory": False, **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
+         "share_memory": False, "user_title": "", **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
     s["personas"].append(p)
     await save_personas(s)
     return persona_view(p)
@@ -1853,15 +2157,28 @@ async def history_prune(older_than_days: float):
     return await state.call("DELETE", "/v1/state/history", older_than_days=older_than_days)
 
 
+APP_BUNDLE = "xyz.scian.biseo"
+MAX_PUSH_TOKENS = 10
+
+
 @app.post("/v1/push/register")
 async def push_register(body: dict):
-    if not body.get("voip_token") or not body.get("bundle_id"):
-        raise HTTPException(400, "voip_token and bundle_id required")
-    await state.call("PUT", f"/v1/state/push_tokens/{quote(body['voip_token'], safe='')}",
-                     {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox")})
-    if body.get("alert_token"):  # ordinary notifications (missed scheduled calls)
-        await state.call("PUT", f"/v1/state/push_tokens/{quote(body['alert_token'], safe='')}",
-                         {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox"), "kind": "alert"})
+    if body.get("bundle_id") != APP_BUNDLE:
+        raise HTTPException(400, f"bundle_id must be {APP_BUNDLE}")
+    if not (body.get("voip_token") or body.get("alert_token")):
+        raise HTTPException(400, "voip_token and/or alert_token required")  # macOS: alert only
+    for kind, tok in (("voip", body.get("voip_token")), ("alert", body.get("alert_token"))):
+        if not tok:
+            continue
+        if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Za-z_-]{3,200}", tok)):
+            raise HTTPException(400, f"{kind}_token: a device token")
+        await state.call("PUT", f"/v1/state/push_tokens/{quote(tok, safe='')}",
+                         {"bundle_id": APP_BUNDLE, "env": body.get("env", "sandbox"),
+                          **({"kind": "alert"} if kind == "alert" else {})})
+    rows = await state.call("GET", "/v1/state/push_tokens") or []  # newest first
+    for kind in ("voip", "alert"):  # at most MAX_PUSH_TOKENS per kind: the oldest go
+        for old in [r for r in rows if r.get("kind", "voip") == kind][MAX_PUSH_TOKENS:]:
+            await state.call("DELETE", f"/v1/state/push_tokens/{quote(old['token'], safe='')}")
     await push_tokens()  # refresh the restart-proof copy
     return {"ok": True}
 
@@ -1926,14 +2243,148 @@ async def alerts_to_ring(names, now):
         return new
 
 
+# ---------- approvals: risky or unlisted device commands wait for the user's tap ----------
+# The approval row (device, tool, command, cwd, status) lives in ruchba's approvals table; what the table has no
+# column for sits in kv: `approval-<id>` (expiry, requester, decision), `approval-rules` ("always" rules) and
+# `approval-audit` (approved runs). A pending approval expires after APPROVAL_TTL_S.
+APPROVAL_TTL_S = 300
+APPROVED_RUN_S = 600  # an approved command must run within this long of the tap, once (state's atomic "use")
+DECISIONS = ("once", "always", "deny")
+# "Always" rules only for read-only programs; anything else is approved once (and the app says why).
+ALWAYS_OK = {"open", "ls", "cat", "head", "tail", "wc", "du", "df", "pwd", "rg", "grep", "find", "sw_vers", "uptime",
+             "pmset", "system_profiler", "git"}
+GIT_ALWAYS = {"status", "log", "diff", "show", "branch"}
+GIT_BRANCH_WRITE = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-u", "-f", "--force",
+                    "--unset-upstream", "--edit-description", "--track", "--no-track", "--create-reflog"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+ALWAYS_NO = "항상 허용은 조회용 명령(ls, cat, git status, 앱이나 웹 주소 열기 같은 것)에만 쓸 수 있어서 이번 한 번만 허용했어요."
+task_approvals: dict[str, set] = {}  # task id -> approval ids created while it ran (only those resume it)
+REQUESTER_RE = re.compile(r"(ask|task):[A-Za-z0-9_:.-]{1,100}")
+requester_ctx: contextvars.ContextVar = contextvars.ContextVar("requester", default="")  # API/NIM paths' daemon calls
+
+
+def requester_id(kind, key):
+    """`ask:<persona:session>` or `task:<id>`: sent to daemons per run, back with the approvals they create."""
+    return f"{kind}:" + re.sub(r"[^A-Za-z0-9_:.-]", "_", str(key))[:100]
+
+
+def parse_requester(v):
+    if not isinstance(v, str) or not REQUESTER_RE.fullmatch(v):
+        return None
+    kind, key = v.split(":", 1)
+    return {"task_id": key} if kind == "task" else {"session": key, "persona": key.split(":", 1)[0] if ":" in key else None}
+
+
+def always_ok(command):
+    """True when an approval of `command` may become an "always" rule."""
+    try:
+        t = shlex.split(command)
+    except ValueError:
+        return False
+    if not t or os.path.basename(t[0]).lower() not in ALWAYS_OK:
+        return False
+    n, rest = os.path.basename(t[0]).lower(), t[1:]
+    if n == "git":
+        if not rest or rest[0] not in GIT_ALWAYS or any(r in ("--ext-diff", "--textconv") or r.startswith("--output")
+                                                        for r in rest):
+            return False
+        if rest[0] == "branch":  # listing only: no positional name (creates), no delete/move/copy/upstream
+            return all(r.startswith("-") and r not in GIT_BRANCH_WRITE for r in rest[1:])
+        return True
+    if n == "find":
+        return not FIND_ACTIONS & {r.lower() for r in rest}
+    if n == "pmset":
+        return rest[:1] == ["-g"]
+    if n == "open":  # only `-a <App name>` and http(s)/mailto URLs: no files, no --args/-n/--env/-b
+        k = 0
+        while k < len(rest):
+            if rest[k] == "-a" and k + 1 < len(rest) and "/" not in rest[k + 1]:
+                k += 2
+            elif re.match(r"(https?://|mailto:)", rest[k], re.I):
+                k += 1
+            else:
+                return False
+        return bool(rest)
+    return True
+
+
+async def approval_meta(aid):
+    if MODE == "limited":  # kv needs the full token: team-device approvals are plain state rows
+        return {}
+    return await state.call("GET", f"/v1/state/kv/approval-{aid}") or {}
+
+
+def approval_view(row, meta, now=None):
+    now = now or time.time()
+    expires = meta.get("expires_at") or (row.get("created") or now) + APPROVAL_TTL_S
+    status = row["status"]
+    if status == "pending" and now >= expires:
+        status = "expired"
+    elif status == "approved" and row.get("decided") and now >= row["decided"] + APPROVED_RUN_S:
+        status = "expired"  # approved but never run in time: no longer usable
+    return {**row, "status": status, "expires_at": expires, "decision": meta.get("decision"),
+            "requester": meta.get("requester"), "rule_id": meta.get("rule_id")}
+
+
 @app.post("/v1/approvals")
 async def create_approval(body: dict):
-    return await state.call("POST", "/v1/state/approvals", {k: body.get(k, "") for k in ("device", "tool", "command", "cwd")})
+    row = {k: str(body.get(k) or "") for k in ("device", "tool", "command", "cwd")}
+    if not row["device"] or not row["command"]:
+        raise HTTPException(400, "device and command required")
+    now = time.time()
+    created = await state.call("POST", "/v1/state/approvals", row)
+    aid = created["approval_id"]
+    if MODE == "limited":  # no kv, rules or pushes with the limited token: the row alone, as before
+        return {"approval_id": aid, "status": "pending"}
+    requester = parse_requester(body.get("requester"))  # the ask or task whose run asked (daemon header)
+    if requester and requester.get("task_id"):
+        task_approvals.setdefault(requester["task_id"], set()).add(aid)
+    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    rule = None if requester and requester.get("task_id") else next(  # a task's commands always need a tap
+        (r for r in rules if (r["device"], r["command"], r.get("cwd")) == (row["device"], row["command"], row["cwd"])), None)
+    meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None}
+    if rule:  # an "always" rule: approved on the spot, still audited when it runs
+        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+        meta.update(decision="rule", rule_id=rule["id"])
+        await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+        return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
+    await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+    try:  # the app shows it; the command text only (never output), shortened
+        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", type="approval",
+                              approval_id=aid)  # the command itself only in the app, never on the lock screen
+    except Exception as e:
+        print("approval push failed:", type(e).__name__, flush=True)
+    return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
 
 
 @app.get("/v1/approvals")
 async def list_approvals():
-    return await state.call("GET", "/v1/state/approvals")
+    now, out = time.time(), []
+    for row in await state.call("GET", "/v1/state/approvals") or []:
+        v = approval_view(row, await approval_meta(row["id"]), now)
+        if v["status"] == "pending":
+            out.append(v)
+    return out
+
+
+@app.get("/v1/approvals/rules")
+async def approval_rules():
+    return await state.call("GET", "/v1/state/kv/approval-rules") or []
+
+
+@app.delete("/v1/approvals/rules/{rid}")
+async def approval_rule_delete(rid: str):
+    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    keep = [r for r in rules if r["id"] != rid]
+    if len(keep) == len(rules):
+        raise HTTPException(404, "no such rule")
+    await state.call("PUT", "/v1/state/kv/approval-rules", keep)
+    return {"deleted": rid}
+
+
+@app.get("/v1/approvals/audit")
+async def approval_audit(limit: int = 50):
+    return (await state.call("GET", "/v1/state/kv/approval-audit") or [])[:max(1, min(limit, 500))]
 
 
 @app.get("/v1/approvals/{aid}")
@@ -1941,12 +2392,388 @@ async def get_approval(aid: str):
     row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
     if row is None:
         raise HTTPException(404, "no such approval")
-    return row
+    return approval_view(row, await approval_meta(aid))
 
 
 @app.post("/v1/approvals/{aid}")
 async def decide(aid: str, body: dict):
-    return await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": bool(body.get("approve"))})
+    """`{"decision": "once"|"always"|"deny"}` (older apps: `{"approve": bool}` = once / deny)."""
+    full_only()
+    decision = body.get("decision") or ("once" if body.get("approve") else "deny")
+    if decision not in DECISIONS:
+        raise HTTPException(400, f"decision: one of {list(DECISIONS)}")
+    row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+    if row is None:
+        raise HTTPException(404, "no such approval")
+    meta = await approval_meta(aid)
+    view = approval_view(row, meta)
+    if view["status"] != "pending":
+        raise HTTPException(409, f"approval is {view['status']}")
+    forced = decision == "always" and not always_ok(row["command"])
+    if forced:
+        decision = "once"  # only read-only commands become standing rules
+    out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
+    if decision == "always":
+        rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+        rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "cwd": row["cwd"],
+                "created": time.time()}
+        await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
+        meta["rule_id"] = rule["id"]
+    meta["decision"] = decision
+    await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+    return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
+            **({"forced_once": True, "forced_reason": ALWAYS_NO} if forced else {})}
+
+
+@app.post("/v1/approvals/{aid}/use")
+async def approval_use(aid: str, body: dict):
+    """A daemon spends an approval right before running it: atomic and once, for its own device, the exact
+    command and cwd, within APPROVED_RUN_S of the tap (409 otherwise)."""
+    use = {k: body.get(k) for k in ("device", "command", "cwd")}
+    if not all(isinstance(v, str) and v for v in use.values()):
+        raise HTTPException(400, "device, command and cwd required")
+    return await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}/use", {**use, "window_s": APPROVED_RUN_S})
+
+
+@app.post("/v1/approvals/{aid}/ran")
+async def approval_ran(aid: str, body: dict):
+    """A daemon ran an approved command: the audit log gets device, command, exit code, time and decision."""
+    full_only()  # the audit lives in kv (team devices' runs stay in their daemon logs)
+    row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+    if row is None or row["status"] not in ("approved", "used"):
+        raise HTTPException(404, "no such approved approval")
+    code = body.get("exit_code")
+    entry = {"approval_id": aid, "device": row["device"], "command": row["command"], "cwd": row["cwd"],
+             "exit_code": code if isinstance(code, int) and not isinstance(code, bool) else None,
+             "status": str(body.get("status") or "")[:20], "at": time.time(),
+             "decision": (await approval_meta(aid)).get("decision")}
+    audit = await state.call("GET", "/v1/state/kv/approval-audit") or []
+    await state.call("PUT", "/v1/state/kv/approval-audit", [entry, *audit][:500])
+    return {"ok": True}
+
+
+# ---------- tasks: background Claude Code runs on the devices ("…해 줘, 끝나면 알려 줘") ----------
+# Full gateways only. A task is not a voice turn: its own `claude -p` process (never the warm voice pool), at most
+# TASK_SLOTS at once, hard limits on time and estimated cost, steps logged without arguments or results, approvals
+# waited for, and a call or push at the end. Stored in ruchba's kv (`task-<id>` + the `tasks-index` list).
+TASK_SLOTS = 2
+TASK_DEFAULT_MIN, TASK_DEFAULT_USD = 30, 2.0
+TASK_MAX_ROUNDS = 4  # one approval wait per round
+TASK_STATUSES = ("queued", "running", "waiting_approval", "done", "failed", "cancelled")
+TASK_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로"
+              " 요약해. 도구가 pending_approval을 돌려주면 그 명령을 다시 시도하지 말고 'APPROVAL_PENDING <approval_id>'"
+              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
+task_slots = asyncio.Semaphore(TASK_SLOTS)
+task_runs: dict[str, asyncio.Task] = {}  # tasks this gateway is running
+
+
+def task_key(tid):
+    return f"/v1/state/kv/task-{tid}"
+
+
+async def task_save(t):
+    t["updated"] = time.time()
+    await state.call("PUT", task_key(t["id"]), t)
+
+
+async def task_index_add(t):
+    # shortcut: read-modify-write of one list; two gateways creating tasks in the same instant can drop one entry
+    # from the index (the task itself is kept). Move to a state table if tasks get busy.
+    ids = [i for i in (await state.call("GET", "/v1/state/kv/tasks-index") or []) if i != t["id"]]
+    await state.call("PUT", "/v1/state/kv/tasks-index", [t["id"], *ids][:200])
+
+
+def task_step(t, kind, **fields):
+    t["steps"].append({"at": time.time(), "kind": kind, **fields})
+    del t["steps"][:-200]
+
+
+def check_task(body):
+    goal = body.get("goal")
+    if not isinstance(goal, str) or not 1 <= len(goal.strip()) <= 2000:
+        raise HTTPException(400, "goal: 1-2000 characters")
+    notify = body.get("notify", "push")
+    if notify not in ("call", "push", "none"):
+        raise HTTPException(400, "notify: call, push or none")
+    budget = body.get("budget_usd", TASK_DEFAULT_USD)
+    minutes = body.get("max_minutes", TASK_DEFAULT_MIN)
+    for name, v, top in (("budget_usd", budget, 50), ("max_minutes", minutes, 240)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= top:
+            raise HTTPException(400, f"{name}: a number above 0, at most {top}")
+    device = body.get("device")
+    if device is not None and not (isinstance(device, str) and re.fullmatch(r"[a-z0-9_-]{1,32}", device)):
+        raise HTTPException(400, "device: a device id")
+    persona = body.get("persona")
+    if persona is not None and not (isinstance(persona, str) and PERSONA_ID.fullmatch(persona)):
+        raise HTTPException(400, "persona: a persona id")
+    return {"goal": goal.strip(), "notify": notify, "budget_usd": float(budget), "max_minutes": float(minutes),
+            "device": device, "persona": persona}
+
+
+async def task_create(body, source="api"):
+    full_only()
+    if not CLAUDE_OK:
+        raise HTTPException(503, "Claude is not available on this gateway")
+    spec = check_task(body)
+    settings = await load_settings()
+    if spec["persona"] and not persona_by_id(settings, spec["persona"]):
+        raise HTTPException(400, "persona: no such persona")
+    t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
+         "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
+         "cost_usd": 0.0, "cancel_requested": False}
+    await task_save(t)
+    await task_index_add(t)
+    task_runs[t["id"]] = asyncio.create_task(run_task(t))
+    return t
+
+
+def task_prompt(t, devices):
+    where = f"작업 기기: {t['device']}." if t["device"] else "작업 기기는 기본 순서대로 골라."
+    limited = [d["id"] for d in devices if d.get("limited")]
+    note = f" 한도 기기(읽기·진단만): {', '.join(limited)}." if limited else ""
+    return f"{where}{note}\n\n목표: {t['goal']}"
+
+
+async def task_round(t, prompt, resume, deadline):
+    """One `claude -p` run of a task: (session id, pending approval id or None). Kills on time or cost."""
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    settings = await load_settings()
+    devices = await fresh_devices()
+    model = settings["task_defaults"].get("task", {}).get("model")
+    model = t["model"] = model if model in MODELS else "sonnet"
+    style = name_prompt(settings) + TASK_STYLE + device_prompt(settings, devices)
+    servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("task", t["id"]))
+    cfg = None
+    if servers:
+        fd, cfg = tempfile.mkstemp(suffix=".json")  # holds tokens: 0600, deleted after the run
+        with os.fdopen(fd, "w") as f:
+            json.dump({"mcpServers": servers}, f)
+    cmd = base_cmd(MODELS[model], style, allowed, cfg, resume, run_settings)
+    text = prompt if resume else task_prompt(t, devices)
+    proc = await asyncio.create_subprocess_exec(cmd[0], "-p", text, *cmd[1:], cwd=WORKDIR,
+                                                env=os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"} | run_env,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                                                limit=2**24)
+    pin, pout = PRICES[model]
+    spent_before, session, pending, said = t["cost_usd"], resume, None, ""
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TaskLimit("time", f"{t['max_minutes']:g}분 시간 한도를 넘어 멈췄어요.")
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), min(left, 5))
+            except asyncio.TimeoutError:
+                if (await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"):
+                    raise asyncio.CancelledError
+                continue
+            if not raw:
+                break
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if e.get("type") == "assistant":
+                msg = e.get("message") or {}
+                for b in msg.get("content") or []:
+                    if b.get("type") == "tool_use":
+                        task_step(t, "tool", tool=b.get("name", ""), label=tool_label(b.get("name", "")))
+                    elif b.get("type") == "text" and b.get("text", "").strip():
+                        said = b["text"].strip()
+                u = msg.get("usage") or {}
+                t["cost_usd"] += (u.get("input_tokens", 0) * pin + u.get("output_tokens", 0) * pout) / 1e6
+                await task_save(t)
+                if t["cost_usd"] >= t["budget_usd"]:
+                    raise TaskLimit("budget", f"예산 {t['budget_usd']:g}달러를 넘어 멈췄어요.")
+            elif e.get("type") == "user":
+                for b in (e.get("message") or {}).get("content") or []:
+                    if b.get("type") == "tool_result":  # only an approval this task's own run created
+                        found = PENDING_RE.findall(json.dumps(b.get("content"), ensure_ascii=False).replace('\\"', '"'))
+                        pending = next((a for a in found if a in task_approvals.get(t["id"], ())), pending)
+            elif e.get("type") == "result":
+                session = e.get("session_id") or session
+                if e.get("total_cost_usd"):  # the CLI's own figure replaces the estimate for this round
+                    t["cost_usd"] = spent_before + float(e["total_cost_usd"])
+                said = str(e.get("result") or said)
+                if e.get("is_error") and not pending:
+                    raise TaskLimit("error", claude_failure(said)["message"])
+        await proc.wait()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if cfg:
+            os.unlink(cfg)
+    t["result"] = re.sub(r"APPROVAL_PENDING\s+\S+", "", said).strip()[:2000] or None
+    return session, pending
+
+
+class TaskLimit(Exception):
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind, self.message = kind, message
+
+
+async def wait_approval(t, aid):
+    """Poll the approval until decided (the task's clock stands still meanwhile): True if approved."""
+    t["status"] = "waiting_approval"
+    task_step(t, "approval", approval_id=aid)
+    await task_save(t)
+    await task_notify(t, approval=True)
+    while True:
+        row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+        a = approval_view(row, await approval_meta(aid)) if row else {"status": "rejected"}
+        if a["status"] in ("approved", "rejected", "expired"):
+            t["status"] = "running"
+            task_step(t, "approval_" + a["status"], approval_id=aid)
+            await task_save(t)
+            return a["status"] == "approved"
+        if (await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"):
+            raise asyncio.CancelledError
+        await asyncio.sleep(TASK_APPROVAL_POLL_S)
+
+
+TASK_APPROVAL_POLL_S = 3
+
+
+async def run_task(t):
+    try:
+        async with task_slots:
+            if t["cancel_requested"]:
+                raise asyncio.CancelledError
+            t.update(status="running", started=time.time())
+            await task_save(t)
+            deadline = time.monotonic() + t["max_minutes"] * 60
+            session, prompt = None, None
+            for _ in range(TASK_MAX_ROUNDS):
+                session, pending = await task_round(t, prompt, session, deadline)
+                if not pending:
+                    break
+                waited = time.monotonic()
+                ok = await wait_approval(t, pending)
+                deadline += time.monotonic() - waited
+                prompt = (f"승인됐어 (approval_id={pending}). 같은 명령을 approval_id와 함께 다시 실행하고 이어서 해." if ok else
+                          "사용자가 그 명령을 거절했어. 그 명령 없이 할 수 있는 만큼 하고 결과를 요약해.")
+            t.update(status="done", finished=time.time())
+    except asyncio.CancelledError:
+        t.update(status="cancelled", finished=time.time(), error="취소됐어요.")
+    except TaskLimit as e:
+        t.update(status="failed", finished=time.time(), error=e.message)
+        task_step(t, "killed", reason=e.kind)
+    except Exception as e:  # keep the gateway alive; the task records why
+        print("task failed:", t["id"], type(e).__name__, e, flush=True)
+        t.update(status="failed", finished=time.time(), error="작업이 실패했어요.")
+    finally:
+        task_runs.pop(t["id"], None)
+        try:
+            await task_save(t)
+            # a task runs on `claude -p`: the subscription path, so it counts like any claude_code ask
+            await record_usage({"model": t.get("model") or "sonnet", "path": "claude_code", "task": "task",
+                                "input_tokens": 0, "output_tokens": 0, "cost_usd": round(t["cost_usd"], 6)})
+        except StateDown:
+            print("task not saved:", t["id"], flush=True)
+        if t["status"] != "cancelled":
+            await task_notify(t)
+
+
+def task_summary(t):
+    if t["status"] == "waiting_approval":
+        return "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요."
+    if t["status"] == "done":
+        return f"맡기신 작업 끝났어요. {t['result'] or '결과는 앱에서 확인해 주세요.'}"[:600]
+    return f"맡기신 작업이 끝나지 못했어요. {t['error'] or ''}"[:600]
+
+
+async def task_notify(t, approval=False):
+    """When a task finishes, fails or needs an approval: a call as its persona, or an alert push the app opens
+    as azel://task/<id>."""
+    try:
+        if t["notify"] == "call":
+            await place_call("task_approval" if approval else "task", opening=task_summary(t), persona_id=t["persona"])
+        elif t["notify"] == "push":
+            title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
+            what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
+            goal = t["goal"] if len(t["goal"]) <= 40 else t["goal"][:39] + "…"
+            await send_alert_push(title, f"{what}: {goal}", type="task", task_id=t["id"])  # no model output
+    except Exception as e:
+        print("task notify failed:", t["id"], type(e).__name__, flush=True)
+
+
+async def fail_orphan_tasks():
+    """At start: this gateway's tasks that were running when it stopped can never finish."""
+    for tid in await state.call("GET", "/v1/state/kv/tasks-index") or []:
+        t = await state.call("GET", task_key(tid))
+        if t and t.get("owner") == DEVICE and t["status"] in ("queued", "running", "waiting_approval"):
+            t.update(status="failed", finished=time.time(), error="게이트웨이가 다시 시작돼서 멈췄어요.")
+            await task_save(t)
+
+
+def task_view(t, steps=True):
+    keep = ("id", "goal", "status", "device", "persona", "notify", "budget_usd", "max_minutes", "created", "started",
+            "finished", "result", "error", "cost_usd", "owner")
+    return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
+
+
+@app.post("/v1/tasks", status_code=201)
+async def tasks_post(body: dict):
+    return task_view(await task_create(body))
+
+
+@app.get("/v1/tasks")
+async def tasks_list(limit: int = 20):
+    full_only()
+    out = []
+    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:max(1, min(limit, 100))]:
+        if t := await state.call("GET", task_key(tid)):
+            out.append(task_view(t, steps=False))
+    return out
+
+
+@app.get("/v1/tasks/{tid}")
+async def tasks_get(tid: str):
+    full_only()
+    t = await state.call("GET", task_key(quote(tid, safe=""))) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
+    if not t:
+        raise HTTPException(404, "no such task")
+    return task_view(t)
+
+
+@app.post("/v1/tasks/{tid}/cancel")
+async def tasks_cancel(tid: str):
+    full_only()
+    t = await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
+    if not t:
+        raise HTTPException(404, "no such task")
+    if t["status"] in ("done", "failed", "cancelled"):
+        raise HTTPException(409, f"task already {t['status']}")
+    if run := task_runs.get(tid):  # ours: stop it now (the claude process is killed on the way out)
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+    else:  # another gateway's: it sees the flag within seconds
+        t["cancel_requested"] = True
+        await task_save(t)
+    return task_view(await state.call("GET", task_key(tid)) or t, steps=False)
+
+
+DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크"}
+
+
+async def serve_task(m):
+    """A task request from the voice server ("…해 줘, 끝나면 알려 줘"): start it, answer what to say."""
+    reply = {"id": m["id"], "type": "task_result", "ok": True}
+    try:
+        current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
+        t = await task_create({k: m[k] for k in ("goal", "device", "persona", "notify") if m.get(k) is not None},
+                              source="voice")
+        settings = await load_settings()
+        dev = t["device"] or settings["default_device"]
+        then = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림 드릴게요.", "none": "앱에서 진행 상황을 볼 수 있어요."}
+        reply.update(task_id=t["id"], say=f"{DEVICE_WORD.get(dev, dev)}에서 시작할게요. {then[t['notify']]}")
+    except (HTTPException, StateDown) as e:
+        print("voice task refused:", getattr(e, "detail", e), flush=True)
+        reply.update(ok=False, say="지금은 작업을 맡을 수 없어요.")
+    await link_send(reply)
 
 
 OLD_DB = HOME / "gateway.db"  # the per-host SQLite of the single-gateway era

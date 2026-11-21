@@ -40,9 +40,24 @@ answering a call the assistant placed; the server then speaks that call's openin
   runs VAD, so the client never decides when a turn ends.
 - Server → client **binary**: mono PCM16 little-endian, **24 kHz**, play in order.
 - Server → client **text** (JSON, one object per message):
-  - `{"type":"state","value":"listening"|"thinking"|"speaking"}`
+  - `{"type":"state","value":"listening"|"thinking"|"speaking"}` — `speaking` lasts until the client has
+    played every byte sent (the server tracks that from the audio length, pauses included) plus 300 ms
+    (`PLAY_TAIL_MS`), not just until generation ends; only then come `turn_done` and `listening`. Speech in
+    that window is a barge-in (`pause`/check), never a new turn.
   - `{"type":"transcript","text":"…"}` — what the user said
-  - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — sentence being spoken
+  - `{"type":"reply_start","reply_id":N}` — sent right before the first audio frame of each reply (an answer, a
+    briefing, a placed call's opening); `N` increases per reply. Binary frames carry no id, so the app treats every
+    binary frame after a `reply_start` as belonging to that reply: on a `reply_start` (or an `interrupt`) it drops
+    whatever is still queued from an older reply. The server guarantees no frame of an interrupted or superseded
+    reply is sent after its `interrupt` (each reply has a generation; an interrupt bumps it and cancels and awaits
+    the old reply's TTS, Qwen and Claude work before sending `interrupt`).
+  - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — text of the audio chunk that follows: one or
+    more whole sentences (or a clause ending in ", "), never under 5 syllables unless it is the whole reply,
+    never cut mid-word. Chinese characters, kana, Cyrillic and Thai are dropped from it (and from the audio
+    and history). Model reasoning (`<think>…</think>`, a stray `</think>` with everything before it, an unclosed
+    `<think>`, any `reasoning_content` field) is never spoken, captioned or stored, from Qwen, Claude or NIM alike;
+    thinking stays on, and the call stays in `thinking` meanwhile. A reply that was only reasoning is answered with a
+    short "생각이 길어져서 답을 못 정했어요. 한 번만 더 말씀해 주시겠어요?".
   - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
   - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
@@ -57,7 +72,8 @@ answering a call the assistant placed; the server then speaks that call's openin
     name, e.g. `mcp__claude_ai_Gmail__search_threads`; `label` in Korean, e.g. "메일 확인 중",
     "macbook에서 명령 실행 중"). Never carries tool arguments or results. `/v1/turn` NDJSON carries the
     same objects between its `audio` lines.
-  - `{"type":"turn_done","timings":{…}}`
+  - `{"type":"turn_done","timings":{…},"audio_ends_in_ms":N}` — sent once playback has finished (see
+    `state`); `audio_ends_in_ms` is how much audio was still queued when generation ended (diagnostic).
   - `{"type":"error","message":"…"}`
 - Briefing (`intent=briefing`, without `call_id`): the server first asks a full gateway for the situation
   (`briefing_context` over the link, 2 s timeout). With a situation note, the local Qwen composes a
@@ -84,7 +100,9 @@ answering a call the assistant placed; the server then speaks that call's openin
   `VAD_THRESHOLD`, `NOISE_MARGIN_DB`, `MIN_VOICED_MS`, `BARGE_MIN_VOICED_MS` and their `NOISY_` variants.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
-  answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
+  answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}` (every interrupt, voice or tap, ends
+  with exactly that pair; a cancelled reply's own `listening` is dropped, and an interrupt overtaken by a newer one or
+  by a new reply sends nothing). During a placed call's
   opening the first sentence still finishes first.
 
 ## 1b. Gateway link — `WS /v1/gateway-link` on the voice server
@@ -161,11 +179,13 @@ get only the current utterance, never the call's earlier turns (which may be per
 For the phone without Tailscale. Exposed paths only; everything else is blocked at the proxy:
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
-  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
+  `POST /v1/approvals/{id}`, `GET /v1/approvals/rules`, `DELETE /v1/approvals/rules/{id}`, `GET /v1/approvals/audit`,
+  `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
   `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
   `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
-  `GET|POST|DELETE /v1/wake/enroll` (bearer header).
+  `GET|POST|DELETE /v1/wake/enroll`, `GET /v1/providers/nim/models`, `PUT /v1/providers/nim/key`,
+  `GET|POST /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -212,14 +232,14 @@ device that created them.
   `claude -p` path (labels mapped from the tool name only: gistra_* 학사 일정, planit_* 할 일, Google
   Calendar 캘린더, Gmail 메일, memory_* 기억, infra_* 서버 상태, Notion 노션, daemon run_command /
   list_dir·read_file·search / browse / delegate, anything else "도구 준비 중"), one `thinking` on the API path.
-  `model`: `haiku|sonnet|opus|auto`; `path`: `api|claude_code|auto`
+  `model`: `haiku|sonnet|opus|auto|nim`; `path`: `api|claude_code|auto`
   (auto = API when a key is configured, else `claude -p`). Omitted → settings defaults.
 - `GET /v1/settings` / `PUT /v1/settings` — whole JSON document:
   ```json
   {"default_model":"auto","claude_path":"auto",
    "task_defaults":{"chat":{"model":"qwen"},"schedule":{"model":"sonnet"},
                     "code":{"model":"opus","path":"claude_code"},"mac":{"model":"sonnet"}},
-   "monthly_budget_usd":500,"budget_warn_pct":80,
+   "monthly_budget_usd":500,"budget_warn_pct":80,"budget_paths":["api","nim"],
    "proactive":{"enabled":true,
                 "morning_briefing":{"enabled":true,"time":"08:00"},
                 "deadline_check":{"enabled":true,"time":"20:00"},
@@ -227,8 +247,12 @@ device that created them.
                 "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
-   "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":""}
+   "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":"","user_title":""}
   ```
+  `user_title`: how the assistant addresses the user, 0–12 Hangul/Latin letters or spaces (whitespace collapsed,
+  null → `""`); `""` = no fixed title, address the user naturally. A persona's own `user_title` overrides it. The
+  title in effect goes into Claude's persona block and Qwen's prompt as "사용자를 '<title>'(이)라고 부른다." (left out
+  when empty).
   `personality` (text up to 600 chars, else 400) is Azel's character: one persona block (`assistant_name` +
   personality) goes into Qwen's system prompt, Claude's voice style, briefings and autonomous-call openings,
   so both models sound like the same person. `""`, whitespace, `null` or a missing key mean the built-in
@@ -275,39 +299,104 @@ device that created them.
     or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
     `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
     Claude processes. Each full gateway that should use the server needs its own copy.
+- NVIDIA NIM provider (full gateways only; `gateway/nim.py`). The hosted, OpenAI-compatible API, never a local
+  container. Setting `"providers":{"nim":{"enabled":false,"base_url":"https://integrate.api.nvidia.com/v1",
+  "model":"nvidia/nemotron-3-ultra-550b-a55b","prices":{}}}`; GET adds the read-only `"has_key"`. A partial
+  `providers.nim` merges into the current one; `base_url` must be https on `integrate.api.nvidia.com` or another
+  `*.api.nvidia.com` host (port 443, no credentials); changing it deletes the stored key (enter it again); `model` is free text;
+  `prices` `{model: [usd_in, usd_out] per MTok}` (absent → cost 0). `default_model`, `task_defaults.*.model`, a
+  persona's `default_model` and `/v1/ask`'s `model` accept `"nim"`; the voice server sends `model:"nim"` for
+  "엔비디아로 …". The NIM path streams like Claude (text deltas, `activity` thinking/tool_start/tool_end, `done`) with
+  the brain's read-only Cygnus tools (when the host has `brain/cygnus.py` and a PAT) and the devices' MCP tools as function
+  tools; a model that answers 400 to a request with tools is asked again without
+  them (remembered per model). Speakable errors: `nim_key` (no key, or the key refused), `nim_off`, `nim_error`.
+  Usage rows: `path:"nim"`, `model` = the NIM model id. A limited gateway treats `nim` as its usual Claude path.
+  - `GET /v1/providers/nim/models` → `{"models":[ids]}` from NIM's `/models` (cached 10 min; 409 without a key,
+    502 when NIM refuses or is unreachable). A suggestion list only.
+  - `PUT /v1/providers/nim/key` `{"value":"nvapi-…"}` → **204**; `""` deletes it. Write-only: stored in
+    `~/.config/biseo/providers/nim_key` (0600, directory 0700, temp file + rename), sent only to `base_url`, never
+    returned or logged.
 - Wake-word enrollment (full gateways only; not mounted on limited ones; `gateway/wake_enroll.py`, owned by the
   wakeword session): `POST /v1/wake/enroll` multipart `clips[]` (16 kHz mono 16-bit WAV, 0.4–2.5 s) →
   `{"accepted","rejected":[{"index","reason"}],"training"}`; `GET /v1/wake/enroll` → `{"clips","trained_at",
   "status":"none"|"training"|"ready"|"failed"}`; `DELETE /v1/wake/enroll` → 204. Clips stay on that gateway's host.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
+  `budget_paths` (a list of `api|nim|claude_code`, default `["api","nim"]`) are the usage paths that count toward
+  `monthly_budget_usd` and its warning; `claude_code` runs on the subscription and costs no money, so by default it
+  does not count. The budget gate applies after the route is resolved and only when the resolved path is in
+  `budget_paths`: a spent paid budget never stops a subscription (`claude_code`) ask. Tasks run on `claude -p` and
+  are recorded as path `claude_code` with `task:"task"` and the task's model. `cost_usd` is the counted (paid) total; `by_*` still cover every row. Also
+  `"paid":{"cost_usd","by_path"}` and `"subscription":{"claude_code":{"turns","input_tokens","output_tokens",
+  "equivalent_usd","quota"}}`, where `quota` is null until a `claude -p` run has reported the subscription windows
+  (`rate_limit_event`), else `{"window":"5h"|"weekly" (the fullest),"utilization_pct","resets_at" (epoch s),
+  "windows":{"5h":{…},"weekly":{…}}}`; kept in memory per gateway, windows past their reset are dropped.
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
   haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.
 - `GET /v1/status` → `{"spark":{"ok","ms"},"tts":…,"state":…,"gateway":{"device","mode","link"},
   "devices":[{"name","ok","ms"}]}`
 - `POST /v1/devices/register` `{"name","url","harness":["claude_code",…]}` — daemons call
   this on start and every 60 s. `GET /v1/devices` lists them with `last_seen`.
-- `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production","alert_token"?}` —
-  the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
+- Tasks (full gateways only; 403 on limited): background Claude Code runs on the devices, not voice turns.
+  - `POST /v1/tasks` `{"goal":"…","device"?:"macbook","persona"?:"azel","notify":"call"|"push"|"none" (default push),
+    "budget_usd"?:2,"max_minutes"?:30}` → **201** the task. Limits are hard: the run is killed when its estimated
+    cost (token usage × list price, replaced by the CLI's own figure at each result) reaches `budget_usd` (≤ 50) or
+    after `max_minutes` (≤ 240; time spent waiting for an approval does not count). At most 2 run at once per gateway,
+    in their own `claude -p` process (never the 4-process warm voice pool); later ones stay `queued`.
+  - `GET /v1/tasks?limit=20` → newest first, without steps. `GET /v1/tasks/{id}` → `{"id","goal","status","device",
+    "persona","notify","budget_usd","max_minutes","created","started","finished","result","error","cost_usd","owner",
+    "steps":[{"at","kind":"tool","tool","label"} | {"kind":"approval"|"approval_approved"|"approval_rejected",
+    "approval_id"} | {"kind":"killed","reason":"time"|"budget"|"error"}]}`. Steps never carry tool arguments or results.
+    `status`: `queued|running|waiting_approval|done|failed|cancelled`.
+  - `POST /v1/tasks/{id}/cancel` → the task without steps (`cancelled`; 409 once finished). Another gateway's task is
+    flagged and stops within about 5 s.
+  - Approvals: when a device tool answers `pending_approval`, the run stops, the task shows `waiting_approval` with
+    the existing approval (`GET|POST /v1/approvals`), and resumes the same Claude session with the decision.
+  - `notify` (default `"push"`) fires when the task finishes, fails, or needs an approval: `"call"` rings as the
+    task's persona with the result as the opening (reason `task`; `task_approval` with "맡기신 작업에 승인이 필요해요…");
+    `"push"` sends an alert push (not VoIP) to the `alert_token`s from `/v1/push/register`, titled "작업 완료" /
+    "작업 실패" / "승인 필요", body "작업이 끝났어요: <goal, 40 chars>" / "작업이 실패했어요: …" / "승인이 필요해요: …"
+    (never model output), with `"type":"task","task_id":"<id>"` at the payload's top level next to `aps` (the app
+    opens `azel://task/<id>`); `"none"` sends nothing. A cancelled task sends nothing. A task resumes only on approvals
+    its own run created (never on an id that merely appears in tool output). Usage: path `claude_code`, `task:"task"`. Stored in ruchba's kv (`task-<id>`, index `tasks-index`, newest 200); a gateway restarting marks its own
+    unfinished tasks `failed`.
+  - Voice: "…해 줘, 끝나면 알려 줘" (push when it says 알림/푸시) or a job on a named device ("맥북 다운로드 폴더 정리해
+    줘") becomes a task over the gateway link (`{"type":"task","goal","notify","persona","device"?}` →
+    `{"type":"task_result","ok","task_id","say"}`), and the assistant says e.g. "맥북에서 시작할게요. 끝나면 전화드릴게요."
+- Static devices (full gateways only): team devices (`tag:vujade`: vd-spark, vd-core) cannot dial a jh gateway, so
+  their daemons never register. Each full gateway lists them in `~/.config/biseo/static_devices.json` (or env
+  `BISEO_STATIC_DEVICES`): `[{"id":"spark","name":"vd-spark","url":"http://100.64.0.11:8893/mcp","mode":"limited"}]`
+  (`mode` must be `limited`; anything else refuses to start). Each needs that daemon's own bearer token in
+  `~/.config/biseo/device_tokens/<id>` (0600); without it the entry is skipped (the shared token never goes to a team
+  device). The gateway probes them every 60 s and lists them in `GET /v1/devices` / `GET /v1/status` with
+  `"writer":"full","limited":true,"static":true` (only in that gateway's memory, not in the shared devices table).
+  A limited device is never given `delegate`: dropped from the API/NIM tool list, refused by the tool runner, and
+  denied (`permissions.deny`) in `claude -p` runs. Its daemon config must also allow only read/diagnostic tools.
+- `POST /v1/push/register` `{"voip_token"?,"bundle_id","env":"sandbox"|"production","alert_token"?}` —
+  the app sends its PushKit token and/or its ordinary APNs token (missed-call notices, task pushes). macOS sends
+  only `alert_token`. `bundle_id` must be `xyz.scian.biseo` and at least one token is required (400 otherwise). At
+  most 10 tokens per kind are kept; registering an 11th evicts the oldest.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
   `{"id" (slug a-z0-9_-),"name" (1–12 Hangul/Latin/space, unique),"voice" (a TTS speaker),"voice_style"
   (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb" or a tint name celadon|indigo|amber|azalea|sprout|sky|plum|ash; default celadon),
-  "default_model" (null|haiku|sonnet|opus),"share_memory" (bool, default false),"created_at","primary",
+  "default_model" (null|haiku|sonnet|opus|nim),"user_title" (same rules as the setting; `""` = use the shared
+  `user_title`; null on create or edit → `""`),"share_memory" (bool, default false),"created_at","primary",
   "deleted_at"}`. Stored in the shared settings as `personas`; settings without it migrate to one persona
   `azel` (primary) holding `assistant_name` and `personality`, which stay readable (and writable) as the
   primary's for older clients. `GET /v1/personas` (`?include=deleted`), `POST /v1/personas` → 201
   (`name`, `voice` required; max 8 live personas), `GET|PUT /v1/personas/{id}` (PUT: any field but id,
   primary, created_at), `DELETE /v1/personas/{id}` (marks `deleted_at`: its calls, history and schedule
   keep `persona_id` and the name stays resolvable; the primary cannot be deleted → 400),
-  `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices`
-  (fallback `BISEO_TTS_VOICES`; neither reachable → 503). `DELETE /v1/personas/{id}?delete_history=true|false`
+  `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices` (all nine
+  Qwen3-TTS speakers; fallback `BISEO_TTS_VOICES`; neither reachable → 503); anything else → 400. `DELETE /v1/personas/{id}?delete_history=true|false`
   (default false): the persona's own notes and call summaries (memory records with `meta.persona_id`) and
   its calls' follow-up contexts are always deleted; its call history is deleted with `delete_history=true`,
   otherwise it stays with `"persona_deleted": true` on each item (the app shows "삭제된 비서"). If ruchba
   cannot do that (503), the persona is not deleted either. `GET /v1/voices` →
-  `[{"id","label","desc","lang"}]`, the TTS speakers with Korean labels (e.g. `{"id":"sohee","label":"소희",
-  "desc":"따뜻한 한국어 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
+  `[{"id","label","desc","lang"}]`, every speaker the TTS server offers, with Korean labels and a description of
+  the voice's character (never a language or nationality); `lang` is kept for compatibility and is not shown (e.g. `{"id":"sohee","label":"소희",
+  "desc":"따뜻하고 감정이 풍부한 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
   (text 1–60 chars) → `audio/wav` for the editor's "들어보기"; at most one per 2 s per gateway (429);
   502 if the TTS server cannot be reached. `assistant_name` stays a read/write alias of the primary persona's
   name.
@@ -380,19 +469,84 @@ device that created them.
 - Scheduled jobs (morning briefing, deadline check) run on every full gateway's clock; the one that
   takes lease `job:<name>:<date>` (24 h) fires it. Lease holder = `<device>-<random per process>`,
   so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
-- `GET /v1/approvals` / `POST /v1/approvals/{id}` `{"approve":true|false}` — risky
-  daemon actions waiting for the user (the app shows them).
+- Approvals: risky or (on `approve_unlisted` devices) unlisted daemon commands waiting for the user's tap.
+  - `POST /v1/approvals` `{"device","tool","command","cwd","requester"?}` (daemons) → `{"approval_id","status":"pending",
+    "expires_at"}` and an alert push (`"type":"approval","approval_id"`, body "<device>에서 명령 실행 승인이 필요해요";
+    the command is shown only in the app). If an `always` rule matches (same device, exact command and cwd) →
+    `{"approval_id","status":"approved","rule_id"}` at once, no push (still audited when it runs), except when the
+    request comes from a task: a task's commands always need a tap.
+  - `GET /v1/approvals` → pending ones only: `[{"id","device","tool","command","cwd","status","created","decided",
+    "expires_at","decision","requester","rule_id"}]`. `requester`: the run that asked, per ask or task (never "whoever
+    ran last"): each `claude -p` run and each API/NIM daemon call carries `X-Azel-Requester: ask:<persona:session>` or
+    `task:<id>` to the daemon, which passes it back as `requester`; shown as `{"session","persona"}` or `{"task_id"}`,
+    null when missing or malformed. A task resumes only on approvals whose requester is that task. `GET /v1/approvals/{id}` → the
+    same object; `status` `pending|approved|used|rejected|expired` (a pending one expires 5 minutes after it was
+    made; an approved one that has not run within 10 minutes of the tap expires too; `used` once it ran).
+  - `POST /v1/approvals/{id}` `{"decision":"once"|"always"|"deny"}` (older apps: `{"approve":bool}` = once / deny)
+    → `{"id","status","decision","rule_id"?,"forced_once"?,"forced_reason"?}`; 409 when it is no longer pending.
+    `always` stores a rule `{"id","device","command","cwd","created"}` only for read-only programs: `open` with only
+    `-a <App name>` and http(s)/mailto URLs (no files, `--args`, `-n`, `--env`, `-b`), `ls`, `cat`, `head`, `tail`,
+    `wc`, `du`, `df`, `pwd`, `git status|log|diff|show` (no `--ext-diff`, `--textconv`, `--output`), `git branch` to
+    list only (no name, delete, move, copy or upstream), `rg`, `grep`, `find` without `-exec`/`-delete`, `sw_vers`,
+    `uptime`, `pmset -g`, `system_profiler`. Anything else is approved once, with `"forced_once":true` and a Korean
+    `forced_reason` for the app to show. Full gateways only (403 on limited).
+  - `GET /v1/approvals/rules` → the rules; `DELETE /v1/approvals/rules/{id}` revokes one (404 if unknown).
+  - `POST /v1/approvals/{id}/use` `{"device","command","cwd"}` (daemons, right before an approved run) spends the
+    approval in ruchba atomically and once: approved, for that device, exact command and cwd, within 10 minutes of
+    the tap → `{"id","status":"used"}`, else 409.
+  - `POST /v1/approvals/{id}/ran` `{"exit_code","status"}` (daemons, after an approved run) appends to the audit log;
+    `GET /v1/approvals/audit?limit=50` → `[{"approval_id","device","command","cwd","exit_code","status","at",
+    "decision":"once"|"always"|"rule"}]` (newest 500 kept; never output).
+  - Kept in ruchba's approvals table plus kv (`approval-<id>`, `approval-rules`, `approval-audit`): no schema change.
+    A limited gateway has no kv access: it only creates and reads the approval rows (no rules, push, audit or
+    decisions), as before.
+  - In a call, Claude says "앱에서 허용해 주세요", then calls `run_command` again with the `approval_id`, which waits for
+    the decision (below); rejected or expired → it tells the user it was not allowed. Tasks wait as described under
+    Tasks.
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
 Registration body: `{"id":"macbook","name":"macbook","url","harness":[…]}` — `id` and `name` are the same English device name (macbook, albireo, gienah, deneb, spark); `id` is an ASCII
 slug used as the MCP server name on the Claude side.
 
-Approval flow: an approval-required `run_command` posts
-`{"device","tool":"run_command","command","cwd"}` to `POST /v1/approvals` and returns
-`pending_approval`. After the user approves in the app, Claude calls `run_command` again
-with `approval_id`; the daemon checks `GET /v1/approvals/{id}` → `{"status":"approved",
-"command","cwd"}`, requires an exact command/cwd match, and accepts each id once.
+Approval flow: an approval-required `run_command` (or, with `approve_unlisted = true`, any command not in
+`allowed_commands`) posts `{"device","tool":"run_command","command","cwd"}` to `POST /v1/approvals` and returns
+`pending_approval` (an `always` rule answers `approved` and it runs at once). Claude calls `run_command` again with
+`approval_id`; the daemon waits up to `approval_wait_s` (120) for the decision (`pending_approval` again after that),
+then checks `GET /v1/approvals/{id}` → `{"status":"approved","device","command","cwd"}`, requires its own device id
+and an exact command/cwd match, spends it with `POST /v1/approvals/{id}/use` (central, atomic, once, within 10 min of
+the tap; also kept in the local used-ids file), runs it, and reports `POST /v1/approvals/{id}/ran`
+`{"exit_code","status"}` (no output).
+Approved runs may use any existing directory under `$HOME` as cwd, except one that is, is inside, or contains a
+protected path (so never `~` itself); allowlisted runs without approval stay inside `allowed_roots` with `check_args`.
+`approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,
+vd-core and sadr (unlisted commands are refused there, approval id or not).
+Never runnable, refused before any approval exists (and for approved runs). Names compare case-insensitively and
+every argv position counts, so wrappers (env incl. `-S`/`--split-string`, xargs, `find -exec`, nice, nohup, time,
+timeout, caffeinate, command) hide nothing:
+- `sudo`/`su`/`doas`/`pkexec`; `security`; `osascript`; `awk`/`gawk`/`nawk`, `expect`, `sqlite3`, `vim`/`vi`/`nvim`,
+  `emacs`, `tmux`, `screen`, `bun`, `deno`, `php`, `make`, `xcrun`, `launchctl`, `crontab`, `at`, `periodic`;
+- inline code: `sh|bash|zsh|… -c`, `python* -c`, `perl -e/-E`, `ruby -e`, `node -e/-p/--eval`, `lua -e`;
+- options that run commands: `rg --pre*|--hostname-bin` (also for allowlisted runs without approval);
+  `git -c|--config*|--exec-path|--upload-pack|--receive-pack` and `core.sshCommand` (`git -C <dir>` is fine);
+  `git config` except read-only (`--get*`, `--list`/`-l`); `tar -P`/`--absolute-paths` (also bundled, `-xPf`,
+  `xPf`) and `pax -r`; `plutil -replace|-insert|-remove`;
+  `ssh|scp|sftp -o|-F|-S|-e` and ProxyCommand/LocalCommand/ProxyJump; `rsync -e|--rsh`; `zip -TT|--unzip-command`;
+  `tar -I|--use-compress-program|--to-command|--checkpoint-action`; `less`/`more` with `!`; `defaults … write|import|
+  delete|rename` (anywhere, `-currentHost` too); variables such as `GIT_SSH_COMMAND`, `PAGER`, `EDITOR`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`;
+- `open -a|-b` of Terminal or iTerm; `open` of `.command|.tool|.sh|.scpt|.applescript|.workflow|.terminal|
+  .fileloc|.app|.action|.inetloc` paths or of any existing file with an exec bit;
+- `rm -r` or `find … -delete` on `/` or the home directory (or above it); any `diskutil` subcommand except `list` and
+  `info`; `mkfs*`/`newfs*`; `dd` with an `of=` that resolves under `/dev` (`//dev/disk2` too);
+- `ln -s` whose target, resolved from the link's own directory (and from the cwd), is or covers a protected path;
+- any path (argument, `--opt=value`, every attached short-option value such as `-Cx/..`, cwd; relative paths also
+  resolved against each `-C`/`--directory`; symlinks resolved first) that is, is inside, or is an ancestor of a
+  protected path: `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains`, `~/.zshrc`, `~/.zprofile`,
+  `~/.zshenv`, `~/.zlogin`, `~/.zlogout`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zsh_history`,
+  `~/Library/LaunchAgents`, `~/.gitconfig`, `~/.config/git`, `~/.config/fish`, `~/.config/gh`, `~/.local/bin`,
+  `~/.aws`, `~/.netrc` (so `~`, `~/.config`, `~/.local`, `~/Library`, `/Users`, `/` too);
+- any repo's `.git` directory itself, anything in a `.git/hooks`, any `.git/config`, and a cwd inside a `.git`.
+Still no shell: argv only.
 
 Tools: `list_dir(path)`, `read_file(path, max_bytes?)`, `search(query, path?)`,
 `run_command(command, cwd?, approval_id?)`, `delegate(task, cwd, harness?, model?)` →
@@ -447,7 +601,8 @@ records, search, contacts and context, answers 403) when either:
   row whose writer is `full` (403). `GET /v1/state/devices` *limited* →
   `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
   token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
-- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`.
+- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`
+  (newest first, with `ts`); `DELETE /v1/state/push_tokens/{token}` → `{"deleted"}`.
 - Autonomous calls (full callers only): `POST /v1/state/proactive_log` (one decision, fields as in
   section 3) → `{"id"}`; `GET /v1/state/proactive_log?since=<epoch>&called=true|false&limit=100` → newest
   first. `GET|PUT /v1/state/kv/{key}` (key `[a-z0-9_]{1,40}`, not `settings`): small shared JSON values,
@@ -462,7 +617,9 @@ records, search, contacts and context, answers 403) when either:
 - `POST /v1/state/approvals` *limited* `{"id"?,"device","tool","command","cwd"}` → `{"approval_id"}` (`id`,
   12 hex chars, only from full callers, for migrated approvals; an existing id is left unchanged);
   `GET /v1/state/approvals?status=pending`; `GET /v1/state/approvals/{id}` *limited*;
-  `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending.
+  `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending;
+  `POST /v1/state/approvals/{id}/use` *limited* `{"device","command","cwd","window_s"?:600}` → `{"id","status":"used"}`
+  (atomic: approved, matching, decided within `window_s`; 409 otherwise).
 - `GET|PUT /v1/state/sessions/{voice_session}` `{"claude_session","device"}` (404 if unknown).
 - `POST /v1/state/leases/{name}` `{"holder","ttl_s","priority"?}` (0 < ttl ≤ 7 days, priority default 100)
   → `{"held","holder","priority","expires"}`. Atomic: taken if free or expired, renewed if `holder`
@@ -499,6 +656,13 @@ asks, call_logs or schedule requests.
   Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
   `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
   schedule list). Timeout 3 s.
+  Cygnus tools (when the brain has a Cygnus PAT, `~/.config/biseo/cygnus_pat`, 0600, read-only): the brain's hello adds
+  `"tools": [names]` (the voice server then forwards exactly those names, else the five above), and each persona's
+  block lists them. Curated read-only set, arguments validated by the brain: `gistra_today{date?}`,
+  `gistra_schedule{from,to,kinds?}` (≤ 31 days), `gistra_assignments{course?}`, `planit_get_day{date?}`,
+  `planit_search_tasks{query}`, `memory_recall{query}` (personas with share_memory only), `infra_health{}`,
+  `infra_status{}` (problems only), `infra_alerts{}`. Results are trimmed to 1500 chars and cached for 60 s. With
+  `infra_health` listed, a server *status* question is no longer pre-routed to Claude (an action on a server still is).
 - voice → brain `{"type":"recall","id","text"}` → `{"id","type":"recall_result","hits":["…"]}` (≤ 2 memory hits);
   the voice server waits at most 400 ms, then answers without them.
 

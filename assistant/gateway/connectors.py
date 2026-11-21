@@ -156,9 +156,13 @@ def _headers(home, ref):
     return {"Authorization": f"Bearer {raw}"}
 
 
-def run_args(conn, disc, devices, token, home):
-    """(mcp_servers for --mcp-config, allowed tool prefixes, run-scoped --settings JSON, extra env) for one run."""
-    servers = {d["id"]: {"type": "http", "url": d["url"], "headers": {"Authorization": f"Bearer {token}"}}
+def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
+    """(mcp_servers for --mcp-config, allowed tool prefixes, run-scoped --settings JSON, extra env) for one run.
+    `tokens`: daemon url -> its own bearer (team devices); others get `token`. A limited device's `delegate` is
+    denied in the run's settings."""
+    tokens = tokens or {}
+    servers = {d["id"]: {"type": "http", "url": d["url"],
+                         "headers": {"Authorization": f"Bearer {tokens.get(d['url'], token)}", **(extra or {})}}
                for d in devices}
     for c in conn.get("custom", []):
         h = _headers(home, c.get("auth_ref"))
@@ -167,6 +171,8 @@ def run_args(conn, disc, devices, token, home):
     ai = [c for c in disc.connectors if enabled(conn, c["name"])]
     allowed = [f"mcp__claude_ai_{re.sub(r'[^A-Za-z0-9_-]', '_', c['name'])}" for c in ai] + [f"mcp__{s}" for s in servers]
     settings = {"enabledPlugins": {p: False for p in disc.plugins}}
+    if deny := [f"mcp__{d['id']}__delegate" for d in devices if d.get("limited")]:
+        settings["permissions"] = {"deny": deny}
     if disc.connectors:  # shortcut: until discovery ran, every claude.ai connector loads (slow, but nothing missing)
         settings["allowedMcpServers"] = [{"serverUrl": c["url"]} for c in ai] + \
                                         [{"serverUrl": s["url"]} for s in servers.values()]

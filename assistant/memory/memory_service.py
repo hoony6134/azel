@@ -393,7 +393,12 @@ def put_push_token(token: str, p: PushToken):
 
 @app.get("/v1/state/push_tokens", dependencies=[v1])
 def list_push_tokens():
-    return db(f"select token, bundle_id, env, kind from {STATE}.push_tokens")
+    return db(f"select token, bundle_id, env, kind, {EPOCH.format('ts')} from {STATE}.push_tokens order by ts desc")
+
+
+@app.delete("/v1/state/push_tokens/{token}", dependencies=[v1])
+def delete_push_token(token: str):
+    return {"deleted": len(db(f"delete from {STATE}.push_tokens where token=%s returning token", (token,)))}
 
 
 class Call(BaseModel):
@@ -462,6 +467,24 @@ def decide_approval(aid: str, d: Decision):
               (status, aid)):
         raise HTTPException(409, "not pending")
     return {"id": aid, "status": status}
+
+
+class Use(BaseModel):
+    device: str = Field(min_length=1)
+    command: str = Field(min_length=1)
+    cwd: str
+    window_s: int = Field(600, ge=1, le=3600)
+
+
+@app.post("/v1/state/approvals/{aid}/use", dependencies=[lim])
+def use_approval(aid: str, u: Use):
+    """Spend an approval, atomically and once: approved, for this device, command and cwd, within `window_s`
+    of the decision. A second use, another device or a stale approval → 409."""
+    if not db(f"update {STATE}.approvals set status='used' where id=%s and status='approved' and device=%s"
+              f" and command=%s and cwd=%s and decided > now() - make_interval(secs => %s) returning id",
+              (aid, u.device, u.command, u.cwd, u.window_s)):
+        raise HTTPException(409, "not usable: not approved, already used, another device or command, or stale")
+    return {"id": aid, "status": "used"}
 
 
 class Session(BaseModel):
