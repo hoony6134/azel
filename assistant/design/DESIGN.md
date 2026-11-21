@@ -245,9 +245,10 @@ Top to bottom, on `bg` with a faint celadon glaze top-center:
 6. **최근 대화**: the top 3 items of `GET /v1/history` (§15) as cards (`card`, radius 22),
    with a trailing "모두 보기" link to the 기록 tab. Each: title = the user's first utterance
    (body, text, 1 line); meta row = direction glyph, time and duration ("오전 9:12 · 4분",
-   footnote text3) and the route mix as chips (로컬 and/or Claude); then, when the item has
-   them, the assistant's last reply (subheadline, text2, 2 lines) and the steps line
-   (§13.5). Tap → the history detail (§15.3). Offline: the cached list (§15.6). Empty: "아직 대화가 없어요" + "첫 전화를 걸어 보세요" (text3).
+   footnote text3) and the route mix as chips (로컬 and/or Claude); then the assistant's
+   last reply from `last_reply` (subheadline, text2, 2 lines) and the steps line from
+   `kinds` (§13.5). Legacy items (recorded before the server added these fields) skip both
+   lines. Tap → the history detail (§15.3). Offline: the cached list (§15.6). Empty: "아직 대화가 없어요" + "첫 전화를 걸어 보세요" (text3).
 
 ### 7.3 Call screen (listening / thinking / speaking)
 
@@ -561,10 +562,10 @@ transcript line when `current` clears.
 
 ### 13.5 Recents card
 
-Each history item (§15) can list its done-step kinds. The card
+Each history item (§15) carries `kinds`, its distinct done-step kinds. The card
 shows them as one footnote `text3` line under the meta row: up to 3 glyphs + "캘린더 · 노션
-확인" (texts joined with " · ", category nouns only, ellipsized). Omitted when a call had no
-steps.
+확인" (texts joined with " · ", category nouns only, ellipsized). Omitted when `kinds` is empty
+(a local-only Qwen call) or absent (a legacy item).
 
 ### 13.6 Accessibility
 
@@ -638,23 +639,34 @@ activity event carries `"route":"claude"` and a `kind` (§13.2).
 
 ### 15.1 Data
 
-- `GET /v1/history` → items: `id`, `title` (first user utterance), start time, duration,
-  `direction` (`incoming` = 아젤 called, `outgoing` = the user called), route mix, turn
-  count. `GET /v1/history/{id}` → turns (user / assistant, `route` per assistant turn,
-  activity steps with `kind` + label, `interrupted`). Delete one, or everything older than
+- `GET /v1/history` → items: `id`, `session`, `title` (first user utterance), start time,
+  duration, `direction` (`incoming` = 아젤 called, `outgoing` = the user called), route
+  mix, turn count, `last_reply` (≤ 120 chars), `kinds`. `GET /v1/history?q=…` searches full
+  transcripts and adds a `match` snippet per hit. `GET /v1/history/{id}` → turns (user /
+  assistant, `route` per assistant turn, `at` seconds from call start, activity steps with
+  `kind`, label and `at`, `interrupted`). Delete one, or everything older than
   N days; retention is `history_days` in `/v1/settings` (§7.5 card 10).
-- Recordings never leave the device that made them (§7.4). A detail shows the player only
-  when a local file for that call exists.
+- Recordings never leave the device that made them (§7.4). They are named by `session`, so
+  a detail shows the player when `Recordings/<session>-*.m4a` exists on this device.
+- **Legacy items** (recorded before the server added `session`, `last_reply`, `kinds`, `at`,
+  `match`): the client treats every one of these fields as optional only for them. Without
+  `last_reply`/`kinds` the cards skip those lines; without `session` the recording is
+  matched by start time (±60 s) or not shown; without `at` the player plays but the
+  transcript doesn't follow; they are found by title only in offline search.
 - Cache: the last loaded list and every opened transcript, as JSON in Caches, for offline
-  viewing (§15.6). The cache is a mirror; the server wins on every successful load.
+  viewing (§15.4). The cache is a mirror; the server wins on every successful load.
 
 ### 15.2 기록 tab (iPhone list)
 
 `NavigationStack` + `List(.insetGrouped)` styled with our tokens (`bg` background,
 `card` rows, `stroke` separators), large title "기록".
 
-- **Search**: `.searchable(prompt: "기록 검색")`, always visible under the title. Filters
-  titles client-side on the loaded list; results keep their day grouping. No results:
+- **Search**: `.searchable(prompt: "기록 검색")`, always visible under the title. Typing
+  (debounced 300 ms) calls `GET /v1/history?q=`; results keep their day grouping and each
+  row gets a third line with the `match` snippet (footnote text2, 2 lines, the query in
+  semibold `text`). A spinner replaces the search field's magnifier while loading. Offline,
+  search falls back to filtering cached titles, with the footnote "오프라인이라 제목만
+  찾아요". No results:
   "‘{query}’에 맞는 기록이 없어요" (subheadline text2) centered.
 - **Sections by day**: 오늘 · 어제 · then "11월 19일 수요일" (footnote semibold text2,
   sticky headers). Pagination: load more when the last section appears.
@@ -699,11 +711,12 @@ static (no animation), so it reads as "a call, replayed".
    - interrupted turns end with a text3 "…" and a footnote tag "말이 끊겼어요" with
      `scissors` glyph, so the record shows where the user cut in;
    - 24 pt between turns, 6 pt between a turn's meta row and text.
-4. **Following playback** (only with a recording and per-turn offsets, §15.7 Q2): the turn
+4. **Following playback** (whenever a recording exists; uses each turn's `at`): the turn
    being played is at full `text`; others drop to text3; the list auto-scrolls to keep the
    current turn at 1/3 from the top (`ScrollViewReader`, `smooth`). If the user scrolls by
    hand, following pauses and a "현재 위치로" capsule appears at the bottom; tapping it
-   resumes. Tapping any turn seeks there. Reduce Motion: jump instead of animated scroll.
+   resumes. Tapping any turn seeks to its `at`. Expanded activity steps also seek to their
+   own `at`. Reduce Motion: jump instead of animated scroll.
 
 ### 15.4 States
 
@@ -741,13 +754,8 @@ a `Window("기록", id: "history")`, default 820 × 560, min 640 × 420.
   gets `.isSelected` so VoiceOver users can find it.
 - Every state in §15.4 has a text, never colour alone.
 
-### 15.7 Open questions (for the PM)
+### 15.7 Resolved (PM)
 
-1. Home and the popover showed the assistant's last reply and the steps line. Can list
-   items carry `last_reply` (first 120 chars) and `kinds` (distinct activity kinds)? The
-   cards hide those lines when absent.
-2. Following playback needs each turn's offset from call start (e.g. `at` in seconds).
-   Without it the player still works but nothing follows.
-3. How does a device match its local recording to a history item? The spec assumes the
-   item carries the call `session` (recordings are named by session).
-4. Search: is a server `?q=` over transcripts planned? Until then search covers titles only.
+List items carry `session`, `last_reply` and `kinds`; turns and steps carry `at`; `?q=`
+searches full transcripts with a `match` snippet. Fallbacks apply to legacy items only
+(§15.1).
