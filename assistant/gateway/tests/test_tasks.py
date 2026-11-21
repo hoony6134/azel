@@ -201,3 +201,56 @@ def test_call_mode_rings_on_failure(tgw):
     while not notes and time.time() < end:
         time.sleep(0.02)
     assert t["status"] == "failed" and notes == [("call", "task", "맡기신 작업이 끝나지 못했어요. " + t["error"], "azel")]
+
+
+def test_list_carries_steps_for_the_apps_detail(tgw):
+    """The app's task sheet renders the list item: without steps it said "아직 시작 전이에요" while the task ran."""
+    g, c, _ = tgw
+    tid = c.post("/v1/tasks", json={"goal": "맥북 정리", "notify": "none"}).json()["id"]
+    wait_for(c, tid, ("done",))
+    item = next(x for x in c.get("/v1/tasks").json() if x["id"] == tid)
+    assert item["status"] == "done" and [s["kind"] for s in item["steps"]] == ["tool"]
+
+
+def test_waiting_for_a_slot_says_why(tgw):
+    g, c, _ = tgw
+    ids = [c.post("/v1/tasks", json={"goal": f"TASK-SLOW {i}", "notify": "none"}).json()["id"] for i in range(3)]
+    time.sleep(0.5)
+    third = c.get(f"/v1/tasks/{ids[2]}").json()
+    assert third["status"] == "queued" and third["note"] == "다른 작업 2개가 끝나길 기다리는 중"
+    c.post(f"/v1/tasks/{ids[0]}/cancel")
+    t = wait_for(c, ids[2], ("running",))
+    assert t["note"] is None  # cleared once it starts
+    for i in ids:
+        c.post(f"/v1/tasks/{i}/cancel")
+
+
+def test_queued_task_without_a_runner_is_picked_up(tgw):
+    """A queued task this gateway owns but is not running (a restart, a lost runner) starts again; one that was
+    running when the gateway stopped fails on startup instead of hanging."""
+    g, c, _ = tgw
+    q = {"id": "aaaaaaaaaaaa", "goal": "맥북 정리", "notify": "none", "budget_usd": 2.0, "max_minutes": 30.0,
+         "device": None, "persona": None, "status": "queued", "created": time.time(), "started": None, "finished": None,
+         "owner": "macbook", "source": "api", "steps": [], "result": None, "error": None, "cost_usd": 0.0,
+         "cancel_requested": False}
+    r = {**q, "id": "bbbbbbbbbbbb", "status": "running"}
+    other = {**q, "id": "cccccccccccc", "owner": "deneb"}
+    for t in (q, r, other):
+        g.fake.db["kv"][f"task-{t['id']}"] = dict(t)
+    g.fake.db["kv"]["tasks-index"] = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
+
+    c.portal.call(g.fail_orphan_tasks, True)  # on the app's own loop, like the startup watcher
+    assert wait_for(c, "aaaaaaaaaaaa", ("done", "failed"))["status"] == "done"  # picked up and run
+    assert c.get("/v1/tasks/bbbbbbbbbbbb").json()["status"] == "failed"  # was running: cannot resume
+    assert c.get("/v1/tasks/cccccccccccc").json()["status"] == "queued"  # another gateway's: left alone
+
+
+def test_runner_crash_is_logged_and_marked_failed(tgw, monkeypatch, capsys):
+    g, c, notes = tgw
+
+    async def boom(*a, **k):
+        raise KeyError("no such field")
+    monkeypatch.setattr(g, "task_round", boom)
+    tid = c.post("/v1/tasks", json={"goal": "맥북 정리", "notify": "none"}).json()["id"]
+    t = wait_for(c, tid, ("failed",))
+    assert t["error"] == "작업이 실패했어요." and "task failed" in capsys.readouterr().out
