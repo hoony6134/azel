@@ -7,8 +7,8 @@ n_samples: 1500
 n_samples_val: 400
 tts_batch_size: 50
 augmentation_batch_size: 16
-piper_sample_generator_path: "/nonexistent"
-output_dir: "/work/clips"
+piper_sample_generator_path: "/work/piper_stub"
+output_dir: "/work/out"  # not /work/clips: that dir is root-owned from an old container run
 rir_paths: ["/work/data/rirs"]
 background_paths: ["/work/data/background"]
 background_paths_duplication_rate: [1]
