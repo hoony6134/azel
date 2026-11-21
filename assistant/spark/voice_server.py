@@ -238,9 +238,9 @@ class GatewayLinks:
         except Exception as e:
             print(msg.get("type"), "dropped:", msg.get("event", ""), type(e).__name__, flush=True)
 
-    async def request(self, msg, timeout=10):
+    async def request(self, msg, timeout=10, need_claude=False):
         """Ask a full-mode link and wait for its one reply (e.g. a schedule request)."""
-        lk, rid, q = self.pick(personal=True, need_claude=False), uuid.uuid4().hex, asyncio.Queue()
+        lk, rid, q = self.pick(personal=True, need_claude=need_claude), uuid.uuid4().hex, asyncio.Queue()
         self.queues[rid] = (q, lk)
         try:
             await lk.send({**msg, "id": rid})
@@ -965,6 +965,34 @@ async def schedule_reply(text, action, session, now=None):
     return str(reply.get("say") or "지금은 예약을 받을 수 없어요.")
 
 
+# ---------- background tasks: "…해 줘, 끝나면 알려 줘" (a full gateway runs them, gateway.py "tasks") ----------
+TASK_NOTIFY = re.compile(r"(끝나면|다 ?되면|완료되면|마치면|끝내고|끝나고).{0,12}(알려|전화|연락|말해|불러|깨워)")
+_DEV = {"맥북": "macbook", "macbook": "macbook", "알비레오": "albireo", "albireo": "albireo", "기에나": "gienah",
+        "gienah": "gienah", "데네브": "deneb", "deneb": "deneb", "스파크": "spark", "spark": "spark",
+        "코어": "core", "vd-core": "core"}
+DEVICE_JOB = re.compile(r"(" + "|".join(_DEV) + r")\S*\s.{0,30}(정리|설치|업데이트|빌드|백업|돌려|분석|조사|옮겨|만들어|고쳐)"
+                        r"\S*\s*(해\s*)?(줘|주세요|줄래)", re.I)
+
+
+def task_intent(text):
+    """None, or how to report back ("call" / "push") when the request is a background task: an explicit
+    "끝나면 알려 줘", or a job on a named device (several steps; the caller should not wait on the line)."""
+    if TASK_NOTIFY.search(text):
+        return "push" if re.search(r"푸시|알림|메시지|문자", text) else "call"
+    return "call" if DEVICE_JOB.search(text) else None
+
+
+async def task_reply(text, notify):
+    dev = next((v for k, v in _DEV.items() if re.search(k, text, re.I)), None)
+    msg = {"type": "task", "goal": text, "notify": notify, "persona": (CALL_PERSONA.get() or {}).get("id"),
+           **({"device": dev} if dev else {})}
+    try:
+        reply = await links.request(msg, need_claude=True)
+    except (RuntimeError, asyncio.TimeoutError):
+        return "지금은 작업을 맡을 수 없어요."
+    return str(reply.get("say") or "지금은 작업을 맡을 수 없어요.")
+
+
 _tts_cache: dict[str, tuple[bytes, int]] = {}
 # Measured 2026-11-21 against the shared TTS server (sohee): ~0.15 s of synthesis per syllable (about 0.7x real
 # time), one request at a time behind a GPU lock: two concurrent requests took longer than the same two in a row.
@@ -1020,10 +1048,11 @@ async def respond(text, session, t0, timings, on_event=None):
     name = persona["name"]
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
+    job = None if sched else task_intent(bare)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
-    to_claude, model = (False, None) if sched else pre_route(bare, settings, local=bool(ctx), tools=links.brain_tools() if ctx else ())
+    to_claude, model = (False, None) if sched or job else pre_route(bare, settings, local=bool(ctx), tools=links.brain_tools() if ctx else ())
     sentences: asyncio.Queue = asyncio.Queue()
-    route = {"value": "schedule" if sched else "claude" if to_claude else "qwen"}
+    route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
 
     async def via_claude():
         route["value"] = "claude"
@@ -1062,6 +1091,10 @@ async def respond(text, session, t0, timings, on_event=None):
         try:
             if sched:  # handled here and by a full gateway; neither Qwen's answer nor Claude
                 for s in split_ready(await schedule_reply(bare, sched, session), final=True)[0]:
+                    await sentences.put(s)
+                return
+            if job:  # a background task: confirm it and let the caller go
+                for s in split_ready(await task_reply(bare, job), final=True)[0]:
                     await sentences.put(s)
                 return
             if to_claude:
@@ -1863,6 +1896,9 @@ if __name__ == "__main__":
         assert client_activity({"phase": "tool_start", "kind": "<script>"})["kind"] == "generic"
         assert "SECRET" not in json.dumps(seen) and said == ["내일은 수업이 없어요."]
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
+        assert task_intent("맥북 다운로드 폴더 정리해 줘") == "call" and task_intent("논문 찾아서 요약하고 끝나면 알려 줘") == "call"
+        assert task_intent("빌드 돌리고 다 되면 알림으로 알려 줘") == "push" and task_intent("맥북 켜져 있어?") is None
+        assert task_intent("내일 10시에 전화해 줘") is None and task_intent("오늘 날씨 알려 줘") is None
         assert pre_route("엔비디아로 답해 줘", {}) == (True, "nim") and pre_route("선생님으로 불러 줘", {})[1] is None
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
@@ -2380,6 +2416,32 @@ if __name__ == "__main__":
                     say = {"create": "내일 오전 10시에 깨워 드릴게요.", "list": "예약된 전화가 없어요.",
                            "cancel": "취소할 예약이 없어요."}[m["action"]]
                     links.receive(self.lk, {"id": m["id"], "type": "schedule_result", "ok": True, "say": say})
+
+        class TaskWS(FakeWS):  # a full gateway with Claude that starts tasks
+            async def send_text(self, raw):
+                await super().send_text(raw)
+                m = json.loads(raw)
+                if m.get("type") == "task":
+                    links.receive(self.lk, {"id": m["id"], "type": "task_result", "ok": True, "task_id": "t1",
+                                            "say": "맥북에서 시작할게요. 끝나면 전화드릴게요."})
+
+        async def task_check():
+            tw = TaskWS()
+            tw.lk = links.add(tw)
+            links.receive(tw.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+
+            async def no_tts(sentence):
+                return b"", 24000
+            globals()["tts"] = no_tts
+            history.pop("azel:tk", None)
+            said = [(s, r) async for s, r, *_ in respond("맥북 다운로드 폴더 정리해 줘", "tk", time.perf_counter(), {})]
+            req = tw.sent[-1]
+            links.remove(tw.lk)
+            return said, req
+        said, req = asyncio.run(task_check())
+        globals()["tts"] = real[1]
+        assert said == [("맥북에서 시작할게요.", "task"), ("끝나면 전화드릴게요.", "task")], said
+        assert req["type"] == "task" and req["device"] == "macbook" and req["notify"] == "call" and req["goal"].startswith("맥북")
 
         async def schedule_check():
             gw_ws = GatewayWS()
