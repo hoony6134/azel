@@ -2,10 +2,17 @@
 
 `down = True` makes every call answer 503, which the gateway treats as ruchba unreachable.
 """
+import re
 import time
 import uuid
+from pathlib import Path as FilePath
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Path, Request
+
+# The memory service's own kv key rule, read from its source (not imported: its dependencies are not the gateway's),
+# so a key it would refuse fails here too.
+KV_KEY = re.search(r'^KV_KEY = r"(.+?)"', (FilePath(__file__).parents[2] / "memory" / "memory_service.py").read_text(),
+                   re.M).group(1)
 from fastapi.responses import JSONResponse
 
 
@@ -136,13 +143,13 @@ def make():
         return {"held": True, **db["leases"][name]}
 
     @app.get("/v1/state/kv/{key}")
-    def kv_get(key: str):
+    def kv_get(key: str = Path(pattern=KV_KEY)):
         if key not in db["kv"]:
             raise HTTPException(404)
         return db["kv"][key]
 
     @app.put("/v1/state/kv/{key}")
-    async def kv_put(key: str, request: Request):
+    async def kv_put(request: Request, key: str = Path(pattern=KV_KEY)):
         db["kv"][key] = await request.json()
         return db["kv"][key]
 
