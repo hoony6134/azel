@@ -99,6 +99,9 @@ struct AppSettings: Codable, Equatable {
     /// Whether the gateway knows `user_title` (its GET included the key). Today's gateway doesn't, and
     /// rejects unknown keys on PUT, so the 호칭 rows stay hidden and the field is never sent until it does.
     @MainActor static var supportsUserTitle = false
+    /// claude_api | claude_code | nim | qwen: the default engine for tasks. nil on older gateways,
+    /// which then never get it back (synthesized encoding omits nil).
+    var task_backend: String?
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 

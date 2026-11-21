@@ -53,3 +53,35 @@ final class PushRegisterTests: XCTestCase {
         XCTAssertEqual(voipOnly["voip_token"] as? String, "01")
     }
 }
+
+final class TaskBackendTests: XCTestCase {
+    private let base = #"{"default_model":"auto","claude_path":"auto","task_defaults":{},"monthly_budget_usd":500,"budget_warn_pct":80,"default_device":"macbook","device_fallback":[],"proactive":{"morning_briefing":"08:00"}"#
+
+    func testOldGatewayNeverGetsTaskBackend() throws {
+        let s = try JSONDecoder().decode(AppSettings.self, from: Data((base + "}").utf8))
+        XCTAssertNil(s.task_backend, "hidden picker")
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(s), as: UTF8.self).contains("task_backend"))
+    }
+
+    func testNewGatewayRoundTripsIt() throws {
+        var s = try JSONDecoder().decode(AppSettings.self, from: Data((base + #","task_backend":"claude_api"}"#).utf8))
+        XCTAssertEqual(s.task_backend, "claude_api")
+        s.task_backend = "qwen"
+        XCTAssertTrue(String(decoding: try JSONEncoder().encode(s), as: UTF8.self).contains(#""task_backend":"qwen""#))
+    }
+
+    func testNIMOnlyWhenEnabled() {
+        XCTAssertEqual(TaskBackend.options(nimEnabled: false, current: "claude_api"), [.claude_api, .claude_code, .qwen])
+        XCTAssertEqual(TaskBackend.options(nimEnabled: true, current: "claude_api").count, 4)
+        XCTAssertTrue(TaskBackend.options(nimEnabled: false, current: "nim").contains(.nim), "the chosen one stays visible")
+    }
+
+    func testTaskShowsBackendAndFallback() throws {
+        let t = try JSONDecoder().decode(AgentTask.self, from: Data(#"{"id":"t1","goal":"메일 정리","status":"done","backend":"claude_code","fallback_reason":"Google 연결이 끊겼어요"}"#.utf8))
+        XCTAssertEqual(TaskBackend.label(t.backend!), "Claude Code")
+        XCTAssertEqual(t.fallback_reason, "Google 연결이 끊겼어요")
+        let old = try JSONDecoder().decode(AgentTask.self, from: Data(#"{"id":"t2","goal":"x","status":"running"}"#.utf8))
+        XCTAssertNil(old.backend)
+        XCTAssertEqual(TaskBackend.label("mystery"), "mystery")
+    }
+}

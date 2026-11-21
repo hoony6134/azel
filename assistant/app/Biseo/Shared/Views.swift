@@ -536,6 +536,31 @@ struct SettingsScreen<Extra: View>: View {
 
     private func taskCard(_ s: Binding<AppSettings>) -> some View {
         Card("작업별") {
+            if let current = s.wrappedValue.task_backend {
+                VStack(alignment: .leading, spacing: Theme.s) {
+                    Text("작업 기본 엔진").foregroundStyle(Theme.text)
+                    ForEach(TaskBackend.options(nimEnabled: s.wrappedValue.providers?.nim?.enabled == true, current: current)) { b in
+                        Button { s.wrappedValue.task_backend = b.rawValue } label: {
+                            HStack(spacing: Theme.m) {
+                                Image(systemName: current == b.rawValue ? "largecircle.fill.circle" : "circle")
+                                    .foregroundStyle(current == b.rawValue ? Theme.celadon : Theme.text3)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(b.label).foregroundStyle(Theme.text)
+                                    Text(b.detail).font(.footnote).foregroundStyle(Theme.text3)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(b.label), \(b.detail)")
+                        .accessibilityAddTraits(current == b.rawValue ? .isSelected : [])
+                    }
+                    Text("메일·캘린더는 Google 연결이 끊기면, 예산을 다 쓰면 Claude Code로 대신 처리해요")
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                }
+                Divider()
+            }
             ForEach(tasks, id: \.0) { key, name in
                 let task = Binding(get: { s.wrappedValue.task_defaults[key] ?? .init(model: "auto") },
                                    set: { s.wrappedValue.task_defaults[key] = $0 })
