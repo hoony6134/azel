@@ -1,3 +1,4 @@
+import CoreMotion
 import SwiftUI
 
 /// DESIGN §7.2: status, greeting, idle jar, call capsule, quick actions, recent calls.
@@ -11,6 +12,9 @@ struct HomeView: View {
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @ObservedObject private var personas = PersonaModel.shared
 
+    @StateObject private var tilt = TiltModel()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         ScrollView {
             VStack(spacing: Theme.xl) {
@@ -23,6 +27,7 @@ struct HomeView: View {
                     MoonJar(state: model.statusError == nil ? .idle : .offline, levels: .silent,
                             tint: personas.selected?.glaze ?? Theme.glazeCeladon)
                         .animation(Theme.state, value: personas.selectedID)
+                        .offset(x: tilt.offset.width, y: tilt.offset.height)
                         .frame(width: geo.size.width, height: geo.size.width)
                         .contentShape(Circle())
                         .onTapGesture { if model.statusError == nil { call.startCall() } }
@@ -49,11 +54,15 @@ struct HomeView: View {
         .background(alignment: .top) {
             ZStack(alignment: .top) {
                 Theme.bg
-                RadialGradient(colors: [Theme.glazeCeladon.opacity(0.18), .clear], center: .top, startRadius: 0, endRadius: 380)
+                RadialGradient(colors: [(personas.selected?.glaze ?? Theme.glazeCeladon).opacity(0.18), .clear], center: .top, startRadius: 0, endRadius: 380)
+                    .animation(Theme.state, value: personas.selectedID)
             }
             .ignoresSafeArea()
         }
         .toolbar(.hidden, for: .navigationBar)
+        .onAppear { if !reduceMotion { tilt.start() } }
+        .onDisappear { tilt.stop() }
+        .onChange(of: reduceMotion) { _, on in on ? tilt.stop() : tilt.start() }
         .overlay(alignment: .bottom) {
             if let toast {
                 Text(toast).font(.subheadline).foregroundStyle(Theme.text)
@@ -149,5 +158,46 @@ struct HomeView: View {
                 NavigationLink(value: item) { HistoryCard(item: item) }.buttonStyle(.plain)
             }
         }
+    }
+}
+
+/// Home orb parallax (user request, 2026-11-22): the orb leans a few points the way the phone tilts,
+/// then drifts back to centre as the new pose becomes the rest pose. Off with Reduce Motion.
+@MainActor
+final class TiltModel: ObservableObject {
+    @Published private(set) var offset: CGSize = .zero
+    private let motion = CMMotionManager()
+    private var follow = TiltFollower()
+
+    func start() {
+        guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
+        motion.deviceMotionUpdateInterval = 1.0 / 30
+        motion.startDeviceMotionUpdates(to: .main) { [weak self] m, _ in
+            guard let self, let g = m?.gravity else { return }
+            let o = self.follow.step(x: g.x, y: g.y)
+            withAnimation(.interactiveSpring(response: 0.35, dampingFraction: 0.8)) { self.offset = CGSize(width: o.x, height: o.y) }
+        }
+    }
+
+    func stop() {
+        motion.stopDeviceMotionUpdates()
+        follow = TiltFollower()
+        withAnimation(.spring(duration: 0.4)) { offset = .zero }
+    }
+}
+
+/// Gravity in, orb offset in points out. The rest pose follows slowly, so only changes show.
+struct TiltFollower {
+    static let gain = 40.0, limit = 14.0, drift = 0.02
+    private var rest: (x: Double, y: Double)?
+
+    mutating func step(x: Double, y: Double) -> (x: Double, y: Double) {
+        guard var r = rest else { rest = (x, y); return (0, 0) }
+        r.x += (x - r.x) * Self.drift
+        r.y += (y - r.y) * Self.drift
+        rest = r
+        func clamp(_ v: Double) -> Double { max(-Self.limit, min(Self.limit, v)) }
+        // Screen y grows downward; tilting the top away (gravity.y rising) moves the orb up.
+        return (clamp((x - r.x) * Self.gain), clamp(-(y - r.y) * Self.gain))
     }
 }

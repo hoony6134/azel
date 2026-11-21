@@ -44,10 +44,21 @@ struct Persona: Codable, Identifiable, Equatable, Hashable {
 
     /// The persona's tint key (§17.2); unknown values fall back to 청자.
     var tintKey: PersonaTint { PersonaTint(rawValue: color ?? "") ?? PersonaTint.nearest(hex: color) ?? .celadon }
+    /// A colour the user picked (#RRGGBB) that isn't one of the eight tints: from the server, or
+    /// kept on this device while the gateway only accepts palette keys.
+    var customHex: UInt32? {
+        if let h = CustomTint.hex(color), PersonaTint.nearest(hex: color) == nil { return h }
+        // The local colour counts only while the server still holds the stand-in tint we sent for it.
+        guard !id.isEmpty, let l = CustomTint.local(id), color == CustomTint.nearestTint(l).rawValue else { return nil }
+        return l
+    }
+    /// Only the colour field itself (the editor, where a swatch tap must win over the local colour).
+    var pickedHex: UInt32? { PersonaTint.nearest(hex: color) == nil ? CustomTint.hex(color) : nil }
+    var pickedGlaze: Color { pickedHex.map { Color(dark: $0, light: $0) } ?? tintKey.glaze }
     /// Text, chips and the call button.
-    var tint: Color { tintKey.accent }
+    var tint: Color { customHex.map(CustomTint.accent) ?? tintKey.accent }
     /// The orb, mini orbs, idle/listening glaze and ring.
-    var glaze: Color { tintKey.glaze }
+    var glaze: Color { customHex.map { Color(dark: $0, light: $0) } ?? tintKey.glaze }
 
     /// Swatch keys offered in the editor, in order.
     static let palette = PersonaTint.allCases.map(\.rawValue)
@@ -189,20 +200,29 @@ final class PersonaModel: ObservableObject {
     @discardableResult
     func save(_ p: Persona) async throws -> String? {
         var note: String?
+        var p = p
+        // A picked colour the gateway may not take yet (it validates palette keys): remember it here
+        // and send the nearest tint, so other devices still get something close.
+        let custom = CustomTint.hex(p.color).flatMap { PersonaTint.nearest(hex: p.color) == nil ? $0 : nil }
+        if let custom { p.color = CustomTint.nearestTint(custom).rawValue }
         do {
-            try await write(p)
+            p = try await write(p)
         } catch GatewayError.rejected(let detail) where p.user_title?.isEmpty == false && Self.isUnknownField(detail) {
             var rest = p
             rest.user_title = nil
-            try await write(rest)
+            p = try await write(rest)
             note = "호칭은 서버 업데이트 후 저장돼요"
         }
+        if !p.id.isEmpty { CustomTint.setLocal(p.id, custom) }
         await refresh()
         return note
     }
 
-    private func write(_ p: Persona) async throws {
-        if p.id.isEmpty { _ = try await PersonaAPI.create(p) } else { try await PersonaAPI.update(p) }
+    /// Returns the saved persona (with its new id after a create).
+    private func write(_ p: Persona) async throws -> Persona {
+        if p.id.isEmpty { return try await PersonaAPI.create(p) }
+        try await PersonaAPI.update(p)
+        return p
     }
 
     /// "unknown persona fields: user_title" and the like.
@@ -256,6 +276,7 @@ enum PersonaTint: String, CaseIterable, Identifiable {
     }
 
     var glaze: Color { Color(dark: hex.glazeDark, light: hex.glazeLight) }
+    var glazeHex: UInt32 { hex.glazeDark }
     var accent: Color { Color(dark: hex.accentDark, light: hex.accentLight) }
 
     /// Older builds stored hex colours: map a hex to the tint whose glaze it matches.
@@ -264,6 +285,73 @@ enum PersonaTint: String, CaseIterable, Identifiable {
         if s.hasPrefix("#") { s.removeFirst() }
         guard s.count == 6, let v = UInt32(s, radix: 16) else { return nil }
         return allCases.first { $0.hex.glazeDark == v || $0.hex.glazeLight == v || $0.hex.accentLight == v }
+    }
+}
+
+/// User-picked persona colours (#RRGGBB).
+enum CustomTint {
+    private static let key = "customPersonaColors"
+
+    static func hex(_ s: String?) -> UInt32? {
+        guard var s = s?.trimmingCharacters(in: .whitespaces), s.hasPrefix("#") else { return nil }
+        s.removeFirst()
+        return s.count == 6 ? UInt32(s, radix: 16) : nil
+    }
+
+    /// The sRGB value of a colour from the picker.
+    static func hex(of c: Color) -> UInt32? {
+        let r = c.resolve(in: EnvironmentValues())
+        return pack((Double(r.red), Double(r.green), Double(r.blue)))
+    }
+
+    static func string(_ v: UInt32) -> String { String(format: "#%06X", v & 0xFFFFFF) }
+
+    static func local(_ id: String) -> UInt32? { (UserDefaults.standard.dictionary(forKey: key)?[id] as? String).flatMap(hex) }
+
+    static func setLocal(_ id: String, _ v: UInt32?) {
+        var d = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+        d[id] = v.map(string)
+        UserDefaults.standard.set(d, forKey: key)
+    }
+
+    private static func rgb(_ v: UInt32) -> (Double, Double, Double) {
+        (Double((v >> 16) & 0xFF) / 255, Double((v >> 8) & 0xFF) / 255, Double(v & 0xFF) / 255)
+    }
+
+    private static func pack(_ c: (Double, Double, Double)) -> UInt32 {
+        func b(_ x: Double) -> UInt32 { UInt32((min(1, max(0, x)) * 255).rounded()) }
+        return b(c.0) << 16 | b(c.1) << 8 | b(c.2)
+    }
+
+    static func luminance(_ v: UInt32) -> Double {
+        func lin(_ c: Double) -> Double { c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
+        let (r, g, b) = rgb(v)
+        return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    }
+
+    /// Mixes toward black (light mode) or white (dark mode) until text in it reads on the background
+    /// (4.5:1 against the light bg F5F3EC / dark bg 0D1113).
+    static func readable(_ v: UInt32, dark: Bool) -> UInt32 {
+        let bg = dark ? luminance(0x0D1113) : luminance(0xF5F3EC)
+        let (r, g, b) = rgb(v)
+        for step in 0...20 {
+            let t = Double(step) / 20, k = dark ? 1.0 : 0.0
+            let c = pack((r + (k - r) * t, g + (k - g) * t, b + (k - b) * t))
+            let l = luminance(c)
+            if (max(l, bg) + 0.05) / (min(l, bg) + 0.05) >= 4.5 { return c }
+        }
+        return dark ? 0xFFFFFF : 0x000000
+    }
+
+    static func accent(_ v: UInt32) -> Color { Color(dark: readable(v, dark: true), light: readable(v, dark: false)) }
+
+    /// The palette tint closest to a custom colour, for gateways that only take palette keys.
+    static func nearestTint(_ v: UInt32) -> PersonaTint {
+        let (r, g, b) = rgb(v)
+        return PersonaTint.allCases.min { a, c in
+            func d(_ t: PersonaTint) -> Double { let (x, y, z) = rgb(t.glazeHex); return (x - r) * (x - r) + (y - g) * (y - g) + (z - b) * (z - b) }
+            return d(a) < d(c)
+        }!
     }
 }
 

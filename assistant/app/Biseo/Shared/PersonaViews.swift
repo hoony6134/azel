@@ -187,8 +187,10 @@ struct PersonaEditor: View {
 
     init(model: PersonaModel, original: Persona) {
         self.model = model
-        self.original = original
-        _p = State(initialValue: original)
+        var o = original
+        if let h = original.customHex { o.color = CustomTint.string(h) }   // show the colour kept on this device
+        self.original = o
+        _p = State(initialValue: o)
     }
 
     private var trimmedName: String { p.name.trimmingCharacters(in: .whitespaces) }
@@ -208,7 +210,7 @@ struct PersonaEditor: View {
             VStack(spacing: Theme.l) {
                 // 1. preview
                 VStack(spacing: Theme.s) {
-                    MoonJar(state: .idle, levels: .silent, tint: p.glaze).frame(width: 96, height: 96)
+                    MoonJar(state: .idle, levels: .silent, tint: p.pickedGlaze).frame(width: 96, height: 96)
                     Text(trimmedName.isEmpty ? " " : trimmedName).font(.headline).foregroundStyle(Theme.text)
                 }
                 .animation(Theme.state, value: p.color)
@@ -221,7 +223,7 @@ struct PersonaEditor: View {
                 Card("색") {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: Theme.m) {
                         ForEach(PersonaTint.allCases) { t in
-                            let on = p.tintKey == t
+                            let on = p.pickedHex == nil && p.tintKey == t
                             Button { p.color = t.rawValue } label: {
                                 Circle().fill(t.glaze).frame(width: 44, height: 44)
                                     .overlay(Circle().strokeBorder(on ? t.accent : .clear, lineWidth: 2).padding(-3))
@@ -230,6 +232,15 @@ struct PersonaEditor: View {
                             .buttonStyle(.plain)
                             .accessibilityLabel(t.name)
                             .accessibilityValue(on ? "선택됨" : "")
+                        }
+                    }
+                    HStack {
+                        ColorPicker("직접 고르기", selection: Binding(get: { p.pickedGlaze }, set: { c in
+                            if let h = CustomTint.hex(of: c) { p.color = CustomTint.string(h) }
+                        }), supportsOpacity: false)
+                        .foregroundStyle(Theme.text)
+                        if p.pickedHex != nil {
+                            Circle().fill(p.pickedGlaze).frame(width: 22, height: 22).accessibilityHidden(true)
                         }
                     }
                 }
