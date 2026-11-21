@@ -464,7 +464,9 @@ def gateway_tools_text(defs):
             "허용해야 실행돼. 전화를 걸 수 없다고 말하지 마."
             + ("\n사용자, 주변 사람, 지난 일, 취향, 계획을 물으면 '모르겠어요' 하기 전에 memory_recall이나 people_lookup을 먼저 "
                "불러. 결과에 없는 사실은 지어내지 마. '기억해', '잊지 마'라고 하면 remember로 저장하고 결과 문장을 그대로 말해."
-               if any(t["name"] == "memory_recall" for t in defs) else ""))
+               if any(t["name"] == "memory_recall" for t in defs) else "")
+            + ("\n날씨, 뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '기상청 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
+               if any(t["name"] == "web_search" for t in defs) else ""))
 
 
 async def gateway_tool(name, args, on_say=None):
@@ -609,7 +611,11 @@ FOREIGN = re.compile(r"[\u2e80-\u2fdf\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf9
 foreign_dropped = [0]  # sentences cleaned since start (route_eval reports it)
 
 
+URL = re.compile(r"\s*[(（]?\s*(?:https?://|www\.)[^\s)）]+[)）]?")
+
+
 def korean_only(s: str) -> str:
+    s = URL.sub("", s)  # sources are said by name ("기상청 기준으로"), never read out as addresses
     t = FOREIGN.sub("", s)
     if t == s:
         return s
@@ -684,7 +690,8 @@ def pre_route(text, settings, local=False, tools=()):
             and not WEB_LIVE.search(text)
         server_status = status and "infra_health" in tools
         device_status = status and "device_status" in tools and DEVICE_Q.search(text)
-        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status and not device_status
+        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status and not device_status \
+            and not ("web_search" in tools and WEB_LIVE.search(text))  # weather, news, prices: Qwen searches
         task = pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
         keywords = USE_CLAUDE.search(text) or live or (task and not device_status)
     else:
@@ -2244,6 +2251,10 @@ if __name__ == "__main__":
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
+        for ask in ("오늘 광주 날씨 어때?", "비트코인 시세 알려줘"):  # with the gateway's web_search: Qwen answers
+            assert not pre_route(ask, {}, local=True, tools=("web_search",))[0] and pre_route(ask, {}, local=True)[0], ask
+        assert korean_only("기상청 기준으로 맑아요 (https://www.weather.go.kr/w/index.do).") == "기상청 기준으로 맑아요."
+        assert korean_only("자세한 건 www.example.com 참고하세요.") == "자세한 건 참고하세요."
         for ask in ("내가 좋아하는 커피 뭐였지?", "내 주변 사람 누구 있어?", "내가 좋아하는 커피 기억해 줘", "지도교수님 누구야?"):
             assert not pre_route(ask, {}, local=True, tools=("memory_recall", "people_lookup"))[0], ask  # Qwen looks first
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")

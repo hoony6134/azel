@@ -271,7 +271,7 @@ def test_schedule_task_and_approval_tools():
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
         run(b.call("call_user", {"when": when, "reason": note}, caller="app"))
-    assert [t["name"] for t in run(b.tools("api"))[0]][3:16] == [t["name"] for t in TB.OWN_TOOLS]
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:18] == [t["name"] for t in TB.OWN_TOOLS]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
     assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"},

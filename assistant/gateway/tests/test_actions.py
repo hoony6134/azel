@@ -39,8 +39,11 @@ def test_registry_covers_every_surface(tgw):  # noqa: F811
         assert ("external" in meta["scopes"]) == (name in TB.SCOPES["external"]), name
         assert ("qwen" in meta["scopes"]) == (name in model_tools), name
         assert ("app" in meta["scopes"]) == (name in TB.APP_ACTIONS), name
-        method, path = meta["rest"]
-        assert (method, path) in routes(g), (name, method, path)
+        if meta["rest"] is None:
+            assert meta.get("no_rest", "").strip() and "app" not in meta["scopes"], name  # a reason, and not the app's
+        else:
+            method, path = meta["rest"]
+            assert (method, path) in routes(g), (name, method, path)
         assert name in eval_actions.CASES, f"{name}: no eval case"
         schema = TB.OWN_SCHEMAS[name]
         assert schema.get("type") == "object" and schema.get("properties") is not None, name  # never {} (Claude API)
@@ -86,6 +89,8 @@ def norm(r):
 def test_rest_and_tool_give_the_same_result(tgw, name):  # noqa: F811
     g, c, _ = tgw
     meta = g.tools_bridge.ACTIONS[name]
+    if meta["rest"] is None:
+        pytest.skip("no REST route (ACTIONS no_rest)")
     if name == "call_user":
         g.call_warm_keys["x"] = "azel:s"  # in a call: a refusal both ways, and nothing rings in the test
     valid, invalid = meta["examples"]

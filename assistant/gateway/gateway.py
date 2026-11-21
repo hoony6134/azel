@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import agent_loop
 import cron
+import web
 import openings
 import connectors
 import google_tools
@@ -786,6 +787,8 @@ def run_args(settings, devices, requester=""):
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
                                                               {"X-Azel-Requester": requester} if requester else None)
+    if MODE == "full":  # live web lookups: never on limited gateways (Bash, Edit and Write stay disallowed)
+        allowed = [*allowed, "WebSearch", "WebFetch"]
     if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
         url = f"http://{HOST}:{PORT}/v1/mcp"
         servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {"Authorization": f"Bearer {TOKEN}"}}}
@@ -3207,12 +3210,34 @@ bridge = tools_bridge.Bridge(
     memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
-    cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid), cygnus_write=lambda name, args: cygnus_write(name, args),
+    cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
+    web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
 
 
 async def none():
     return None
+
+
+async def web_search(query, n):
+    """Haiku with the server-side search (path api, held to the paid budget); a spent budget or no key: the
+    daemon's browse on a search page instead."""
+    settings = await load_settings()
+    spent = "api" in settings["budget_paths"] and await month_cost(settings) >= settings["monthly_budget_usd"]
+    if API_KEY and not spent:
+        r = await web.search(API_KEY, query, n)
+        u = r["usage"]
+        await record_usage({"model": "haiku", "path": "api", "task": "web_search",
+                            "input_tokens": u.get("input_tokens", 0), "output_tokens": u.get("output_tokens", 0),
+                            "cost_usd": r["cost_usd"]})
+        return r
+    _, where = await bridge.tools("api")
+    browse = next((n for n, (_, tool) in where.items() if tool == "browse"), None)
+    if not browse:
+        raise HTTPException(503, "지금은 웹을 볼 수 없어요.")
+    url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+    res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
+    return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
 
 
 async def persona_shares(pid):

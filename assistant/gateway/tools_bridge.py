@@ -225,6 +225,21 @@ class Bridge:
             return await self.approval_status(args)
         if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
             return await getattr(self, name)(args, persona_id)
+        if name == "web_search":
+            q = str(args["query"]).strip()
+            if not q:
+                raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
+            r = await self.d["web_search"](q, int(args.get("max") or 5))
+            src = "; ".join(f"{x['title'] or x['url']} <{x['url']}>" for x in r["sources"][:5])
+            first = re.split(r"(?<=[.!?。])\s+|\n", r["text"].strip())[0] if r["text"] else "찾은 결과가 없어요."
+            return first[:200], r, (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
+                "\n(답할 때 출처는 사이트 이름만 짧게, URL은 읽지 마.)"
+        if name == "web_fetch":
+            try:
+                r = await self.d["web_fetch"](str(args["url"]))
+            except ValueError as e:
+                raise Fail("invalid", str(e))
+            return r["text"][:200], r, f"{r['text']}\n(출처: {r['url']}; 말할 때는 사이트 이름만.)"
         for source in ("cygnus", "google"):  # read-only sources with their own allowlist and checks
             defs, run = self.d.get(source, lambda: ([], None))()
             if run and name in {t["name"] for t in defs}:
@@ -737,12 +752,24 @@ FORGET = {
 MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것 목록(최근 순, 직접 기억한 것과 통화에서 자동으로 남긴 것).",
                "input_schema": {"type": "object", "additionalProperties": False, "properties": {
                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
+WEB_SEARCH = {
+    "name": "web_search",
+    "description": ("웹 검색(날씨, 뉴스, 가격·환율, 사실 확인처럼 지금 정보가 필요할 때). 답할 때는 '○○ 기준으로'처럼 출처 "
+                    "사이트 이름만 짧게 말하고 URL은 읽지 마."),
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
+        "query": {"type": "string", "maxLength": 200}, "max": {"type": "integer", "minimum": 1, "maximum": 8}}}}
+WEB_FETCH = {
+    "name": "web_fetch",
+    "description": "웹 페이지 하나를 읽어 글만 돌려준다(http/https 주소만, 내부 주소는 안 됨). 출처는 사이트 이름만 말해.",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["url"], "properties": {
+        "url": {"type": "string", "maxLength": 2000}}}}
+WEB_NAMES = {"web_search", "web_fetch"}  # the Claude API path has native server tools by these names
 # schedule_create: call_user that must have a time (the app's "new schedule" form); same handler, same checks.
 SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST)
+             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
@@ -751,7 +778,7 @@ MCP_TOOLS = ALL_OWN  # claude -p already has the daemons, Cygnus and the claude.
 SCOPES = {"full": {t["name"] for t in MCP_TOOLS},
           "external": {"call_user", "schedule_create", "schedule_list", "schedule_cancel", "schedule_update",
                        "create_task", "task_status", "task_cancel"}}  # no personal reads or memory by default
-APP_ACTIONS = {t["name"] for t in ALL_OWN}  # the app: its own actions; device and personal reads stay with models
+APP_ACTIONS = None  # set below from ACTIONS: the app's actions; device tools and the web stay with models
 # ACTIONS.md §1 metadata. rest: the dedicated route (method, path, how the action's args map), or the reason there
 # is none. examples: (valid, invalid) inputs for the conformance test.
 ACTIONS = {
@@ -788,6 +815,16 @@ ACTIONS = {
     "memory_list": {"read_only": True, "scopes": ("internal", "qwen", "app"),
                     "rest": ("GET", "/v1/memories"), "examples": ({}, {"limit": 0})},
 }
+for _n, _m in {
+    "web_search": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                   "no_rest": "앱에는 검색 화면이 없어요(모델 경로 전용; claude -p는 자체 WebSearch).",
+                   "examples": ({"query": "광주 날씨"}, {"query": ""})},
+    "web_fetch": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                  "no_rest": "앱에는 페이지 읽기 화면이 없어요(모델 경로 전용).",
+                  "examples": ({"url": "https://example.com"}, {"url": "file:///etc/passwd"})},
+}.items():
+    ACTIONS[_n] = _m
+APP_ACTIONS = {n for n, m in ACTIONS.items() if "app" in m["scopes"]}
 NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); tailnet POST /v1/tools/call reaches them
     "device": "기기 작업은 앱에서 create_task로 맡겨요(명령 실행은 승인과 함께 모델 경로에서만).",
     "cygnus": "앱에 아직 화면이 없는 개인 조회예요.",

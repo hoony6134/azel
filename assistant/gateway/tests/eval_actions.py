@@ -37,6 +37,8 @@ CASES = {
     "remember": ("내가 좋아하는 커피는 아이스 바닐라 라떼야, 기억해 줘", "model"),
     "forget": ("커피 취향 기억한 거 지워 줘", "model"),
     "memory_list": ("너 나에 대해 뭐 기억하고 있어? 목록 보여 줘", "model"),
+    "web_search": ("오늘 광주 날씨 어때?", "model"),
+    "web_fetch": ("https://example.com 이 페이지에 뭐라고 써 있어?", "model"),
 }
 
 
