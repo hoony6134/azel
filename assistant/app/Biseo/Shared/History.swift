@@ -18,13 +18,15 @@ struct HistoryItem: Codable, Identifiable, Equatable {
     var kinds: [String]?
     var match: String?              // only in search results
     var persona_id: String?
+    /// The persona was deleted with its history kept: shown as "삭제된 비서".
+    var persona_deleted: Bool?
 
     var start: Date { Date(timeIntervalSince1970: started_at) }
     var incoming: Bool { direction == "incoming" }
     var routeList: [String] { ["qwen", "claude"].filter { (routes?[$0] ?? 0) > 0 } }
 
     enum CodingKeys: String, CodingKey {
-        case id, session, title, last_reply, started_at, duration_s, direction, reason, turns, routes, kinds, match, persona_id
+        case id, session, title, last_reply, started_at, duration_s, direction, reason, turns, routes, kinds, match, persona_id, persona_deleted
     }
 
     init(id: String, session: String? = nil, title: String? = nil, last_reply: String? = nil, started_at: Double, duration_s: Double? = nil,
@@ -50,6 +52,7 @@ struct HistoryItem: Codable, Identifiable, Equatable {
         match = try c.decodeIfPresent(String.self, forKey: .match)
         if let s = try? c.decodeIfPresent(String.self, forKey: .persona_id) { persona_id = s }
         else if let n = try? c.decodeIfPresent(Int.self, forKey: .persona_id) { persona_id = String(n) }
+        persona_deleted = try? c.decodeIfPresent(Bool.self, forKey: .persona_deleted)
     }
 }
 

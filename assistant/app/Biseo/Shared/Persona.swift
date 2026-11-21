@@ -139,9 +139,9 @@ final class PersonaModel: ObservableObject {
     }
 
     /// History label for a persona id: its name, or "삭제된 비서" when it no longer exists.
-    func label(for id: String?) -> (name: String, tint: Color)? {
+    func label(for id: String?, deleted: Bool = false) -> (name: String, tint: Color)? {
         guard let id else { return nil }
-        if let p = persona(id: id) { return (p.name, p.tint) }
+        if !deleted, let p = persona(id: id) { return (p.name, p.tint) }
         return ("삭제된 비서", PersonaTint.ash.accent)
     }
 

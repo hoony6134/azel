@@ -94,6 +94,9 @@ final class PersonaTests: XCTestCase {
         XCTAssertEqual(PersonaModel(store: store).ordered.map(\.id), ["p1", "p3", "2"], "order survives a relaunch")
         XCTAssertEqual(model.label(for: "p3")?.name, "하나")
         XCTAssertEqual(model.label(for: "gone")?.name, "삭제된 비서")
+        XCTAssertEqual(model.label(for: "p3", deleted: true)?.name, "삭제된 비서", "the server's persona_deleted flag wins")
+        let flagged = try JSONDecoder().decode(HistoryItem.self, from: Data(#"{"id":"h","started_at":1,"persona_id":"p3","persona_deleted":true}"#.utf8))
+        XCTAssertEqual(flagged.persona_deleted, true)
         XCTAssertNil(model.label(for: nil))
     }
 

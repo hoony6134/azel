@@ -72,7 +72,7 @@ struct HistoryRow: View {
                 Text(item.title ?? "제목 없음").foregroundStyle(Theme.text).lineLimit(1)
                 HStack(spacing: 4) {
                     // §17.7: "● 소담 · 오전 8:02 · 4분 · 6턴"; a removed persona reads "삭제된 비서".
-                    if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id) {
+                    if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id, deleted: item.persona_deleted == true) {
                         Circle().fill(who.tint).frame(width: 8, height: 8)
                         Text(who.name + " ·").foregroundStyle(who.name == "삭제된 비서" ? Theme.text3 : Theme.text2)
                     }
@@ -375,7 +375,7 @@ struct HistoryDetailView: View {
             Text(item.title ?? "제목 없음").font(.title3.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(3)
             HStack(spacing: Theme.xs) {
                 DirectionGlyph(incoming: item.incoming).font(.footnote)
-                if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id) {
+                if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id, deleted: item.persona_deleted == true) {
                     PersonaChip(name: who.name, tint: who.tint)
                 }
                 Text(HistoryFormat.dayTitle(item.start) + " " + HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text2)
