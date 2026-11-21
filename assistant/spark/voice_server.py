@@ -709,15 +709,20 @@ def pre_route(text, settings, local=False, tools=()):
         task = pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
         keywords = USE_CLAUDE.search(text) or live or (task and not device_status)
     else:
-        keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
+        # a personal word alone ("할 일이 많아.") is talk, not a request for the data: only a question or ask goes
+        personal = re.search(PLANS_ASK, text) or (PERSONAL.search(text) and QUESTION.search(text))
+        task = pick(TASK_WORDS, text)
+        keywords = USE_CLAUDE.search(text) or personal or NEEDS_CLAUDE.search(text) or (task and (task != "schedule" or personal))
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
 
 
 # A reply with no content: acknowledgements and promises only ("네.", "알겠습니다", "네, 확인해 볼게요").
 ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알았어요|좋아요|그럼요|물론이죠|맞아요|그렇죠|그래요|"
                        r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
-TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|"
+TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|여보세요|여보|"
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
+SMALL_TALK = ("이건 질문이나 부탁이 아니라 그냥 하는 말이야. 도구나 확인 없이, 네 성격대로 한두 문장으로 자연스럽게 "
+              "대꾸해. 일정이나 할 일 내용은 지어내지 마.")
 NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
          f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
 
@@ -775,8 +780,10 @@ def content_free(reply):
 
 
 def needs_answer(text):
-    """A question or request (not a greeting, thanks or yes/no confirmation): a bare "네" is no answer."""
-    return not TRIVIAL.fullmatch(text.strip())
+    """A question or request (not a greeting, thanks, confirmation or a plain statement): a bare "네" is no answer.
+    Small talk ("네, 알겠습니다.", "할 일이 많아.", "자기야 안녕") is answered by whatever Qwen says, never escalated."""
+    t = text.strip()
+    return bool(QUESTION.search(t)) and not TRIVIAL.fullmatch(t)
 
 
 def hold_tag_prefix(buf):
@@ -1437,14 +1444,17 @@ async def respond(text, session, t0, timings, on_event=None):
                 + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
-            ack_held, flushed, nudged = [], False, False
+            ack_held, flushed, nudged, chatted, dropped = [], False, False, False, False
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
 
             async def say(s):
-                nonlocal flushed
+                nonlocal flushed, dropped
                 sources = ctx + "\n".join(m["content"] for m in messages if m["role"] == "user")
                 if not grounded(s, sources):
                     timings["ungrounded"] = s[:80]
+                    if not guard:  # small talk: leave the unsourced sentence out instead of handing the turn over
+                        dropped = True
+                        return
                     raise Ungrounded
                 if ACTION_CLAIM.search(s) and not confirmed["ok"]:
                     timings["unconfirmed"] = s[:80]
@@ -1469,6 +1479,12 @@ async def respond(text, session, t0, timings, on_event=None):
                         if state in ("maybe", "tool"):
                             continue  # might be a tag; a tool call is collected whole
                         if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
+                            answered = said_round or re.search(r"[가-힣]", buf.split(ROUTE_TAG)[0])
+                            if state != "tag" and answered and not guard:  # small talk already answered: keep it
+                                buf = buf.split(ROUTE_TAG)[0]
+                                break
+                            if state == "tag" and not guard and not chatted:  # small talk handed over: ask Qwen once more
+                                break
                             return await via_claude()
                         if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
                             before, _, after = buf.partition(TOOL_TAG)
@@ -1484,6 +1500,10 @@ async def respond(text, session, t0, timings, on_event=None):
                             timings.setdefault("first_sentence_ms", ms(t0))
                             said_round.append(s)
                             await say(s)
+                    if state == "tag" and not guard and not chatted:
+                        chatted = True
+                        messages += [{"role": "assistant", "content": ROUTE_TAG}, {"role": "user", "content": SMALL_TALK}]
+                        continue
                     if state == "tool" and (ctx or gw_defs) and rounds < 2:
                         t_tool = time.perf_counter()
 
@@ -1505,6 +1525,9 @@ async def respond(text, session, t0, timings, on_event=None):
                     for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
                         said_round.append(s)
                         await say(s)
+                    if not guard and not flushed and dropped:  # small talk whose only sentence was left out
+                        await sentences.put("네.")
+                        break
                     if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
                         ack_held.clear()
                         if nudged:
@@ -2420,6 +2443,27 @@ if __name__ == "__main__":
         assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        # Live regression: greetings, acknowledgements and small talk went to Claude. On every persona they stay on Qwen.
+        for persona in ({"id": "azel", "name": "아젤", "primary": True, "voice": "sohee", "personality": "전문적이고 귀여운 비서"},
+                        {"id": "harin", "name": "하린", "primary": True, "voice": "sohee", "personality": "다정한 여자친구, 반말로 편하게"},
+                        {"id": "spica", "name": "스피카", "primary": True, "voice": "sohee", "personality": "결론부터, 냉철한 조언자"}):
+            links.settings = {"personas": [persona]}
+            for user, reply in [("네, 알겠습니다.", "네, 알겠습니다."), ("여보세요?", "네."), ("할 일이 많아.", "네."),
+                                ("가보세요.", "네, 들어가세요."), ("자기야 안녕", "안녕, 반가워요. [CLAUDE]"), ("응", "네.")]:
+                said, calls = asyncio.run(ack_check([reply], user=user))
+                assert len(calls) == 1 and "클로드가 답해요." not in said and not any("CLAUDE" in x for x in said), \
+                    (persona["id"], user, said, len(calls))
+            links.settings = {}
+        for persona_reply in (["[CLAUDE]", "할 일이 많으시군요. 하나씩 해 봐요."],  # small talk handed over: asked once more
+                              ["내일 일정이 빡빡하시면 일찍 주무세요."]):  # an unsourced plan in small talk: left out
+            said, calls = asyncio.run(ack_check(persona_reply, user="오늘 좀 피곤하다"))
+            assert "클로드가 답해요." not in said, (persona_reply, said)
+        said, calls = asyncio.run(ack_check(["[CLAUDE]", "[CLAUDE]"], user="오늘 좀 피곤하다"))
+        assert said == ["클로드가 답해요."] and len(calls) == 2  # Qwen insists twice: Claude it is
+        assert pre_route("할 일이 많아.", {}) == (False, None) and pre_route("오늘 할 일 알려 줘", {})[0]
+        assert pre_route("내일 해야 될 일 정리해 줘", {})[0]  # plan questions still go to Claude
+        said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."], user="내 과제 마감 언제야?"))
+        assert said == ["클로드가 답해요."]  # a real question with an empty reply still escalates
         async def title_turns():  # same session all day: a new title must not be fought by the old turns
             seen = []
 
