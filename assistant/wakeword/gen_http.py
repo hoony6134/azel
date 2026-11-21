@@ -4,7 +4,7 @@ Loading another TTS model on the Spark (next to the 125B Qwen) ran the GPU out o
 memory and rebooted it twice on 2026-11-21, so this uses only the live TTS server
 (9 speakers + style instructions) and the voice server's Whisper, one request at a time.
 
-usage: uv run --project ../client gen_http.py --out clips/park_biseo --n-train 2500 --n-test 400
+usage: uv run --project ../client gen_http.py --out clips/azel --n-train 2500 --n-test 400
 Resumable: each split tops up to its target. Writes 16 kHz mono PCM16 WAVs.
 """
 import argparse
@@ -78,7 +78,7 @@ def one_clip(c, token, out, rejected, make_text, positive, wake, rng):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--wake", default="박비서")
+    ap.add_argument("--wake", default="아젤")
     ap.add_argument("--n-train", type=int, default=2500)
     ap.add_argument("--n-test", type=int, default=400)
     args = ap.parse_args()

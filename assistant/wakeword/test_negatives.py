@@ -1,9 +1,8 @@
 """Run: PYTHONPATH=. ../client/.venv/bin/python test_negatives.py"""
 from gen_clips import ADVERSARIAL, leaked
 
-assert not leaked("박비서"), leaked("박비서")
-assert "박 비서관님" not in ADVERSARIAL
-assert leaked("박비") == ["박비"]  # the check does fire
-for near in ["김비서", "박비", "박씨", "박사", "박수", "박서방", "바비"]:
+assert not leaked("아젤"), leaked("아젤")
+assert leaked("아저") == ["아저", "아저씨"]  # the check does fire
+for near in ["아저씨", "엔젤", "아제", "아재", "젤리", "아델", "하젤", "앗 젤", "아일", "에젤", "박비서", "김비서"]:
     assert near in ADVERSARIAL, near
 print("ok")

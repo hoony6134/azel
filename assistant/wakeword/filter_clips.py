@@ -4,7 +4,7 @@ Positives must be heard as the wake word (allowing one wrong syllable, e.g.
 박비사); negatives must NOT contain it. Rejected files move to <split>_rejected/
 so nothing is lost.
 
-usage: python filter_clips.py /work/clips/park_biseo 박비서
+usage: python filter_clips.py /work/clips/azel 아젤
 """
 import sys
 from pathlib import Path
@@ -20,6 +20,7 @@ def close_to(wake, heard, tolerance=1):
     if tolerance == 0:
         return False
     n = len(wake)
+    tolerance = min(tolerance, (n - 1) // 2)  # a 2-syllable word allows no wrong syllable
     spans = (heard[i:i + n] for i in range(len(heard) - n + 1))
     return any(s[0] == wake[0] and sum(a != b for a, b in zip(wake, s)) <= tolerance for s in spans)
 
@@ -52,4 +53,6 @@ def main(root, wake):
 if __name__ == "__main__":
     assert close_to("박비서", "박비서야") and close_to("박비서", "박 비사!") and not close_to("박비서", "김밥 주세요")
     assert not close_to("박비서", "이비서") and not close_to("박비서", "박비사", tolerance=0)
+    assert close_to("아젤", "아젤아") and not close_to("아젤", "아제") and not close_to("아젤", "엔젤")
+    assert not close_to("아젤", "아저씨")
     main(sys.argv[1], sys.argv[2])

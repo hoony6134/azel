@@ -1,7 +1,7 @@
-# openWakeWord training config for "박비서". Clips come from gen_http.py (Qwen3-TTS voices,
+# openWakeWord training config for "아젤". Clips come from gen_http.py (Qwen3-TTS voices,
 # Whisper-filtered); --generate_clips is never used (it needs English Piper TTS).
-model_name: "park_biseo"
-target_phrase: ["박비서"]
+model_name: "azel"
+target_phrase: ["아젤"]
 custom_negative_phrases: []
 n_samples: 2500
 n_samples_val: 400
