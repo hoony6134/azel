@@ -40,9 +40,15 @@ answering a call the assistant placed; the server then speaks that call's openin
   runs VAD, so the client never decides when a turn ends.
 - Server → client **binary**: mono PCM16 little-endian, **24 kHz**, play in order.
 - Server → client **text** (JSON, one object per message):
-  - `{"type":"state","value":"listening"|"thinking"|"speaking"}`
+  - `{"type":"state","value":"listening"|"thinking"|"speaking"}` — `speaking` lasts until the client has
+    played every byte sent (the server tracks that from the audio length, pauses included) plus 300 ms
+    (`PLAY_TAIL_MS`), not just until generation ends; only then come `turn_done` and `listening`. Speech in
+    that window is a barge-in (`pause`/check), never a new turn.
   - `{"type":"transcript","text":"…"}` — what the user said
-  - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — sentence being spoken
+  - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — text of the audio chunk that follows: one or
+    more whole sentences (or a clause ending in ", "), never under 5 syllables unless it is the whole reply,
+    never cut mid-word. Chinese characters, kana, Cyrillic and Thai are dropped from it (and from the audio
+    and history).
   - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
   - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
@@ -57,7 +63,8 @@ answering a call the assistant placed; the server then speaks that call's openin
     name, e.g. `mcp__claude_ai_Gmail__search_threads`; `label` in Korean, e.g. "메일 확인 중",
     "macbook에서 명령 실행 중"). Never carries tool arguments or results. `/v1/turn` NDJSON carries the
     same objects between its `audio` lines.
-  - `{"type":"turn_done","timings":{…}}`
+  - `{"type":"turn_done","timings":{…},"audio_ends_in_ms":N}` — sent once playback has finished (see
+    `state`); `audio_ends_in_ms` is how much audio was still queued when generation ended (diagnostic).
   - `{"type":"error","message":"…"}`
 - Briefing (`intent=briefing`, without `call_id`): the server first asks a full gateway for the situation
   (`briefing_context` over the link, 2 s timeout). With a situation note, the local Qwen composes a
@@ -300,13 +307,15 @@ device that created them.
   (`name`, `voice` required; max 8 live personas), `GET|PUT /v1/personas/{id}` (PUT: any field but id,
   primary, created_at), `DELETE /v1/personas/{id}` (marks `deleted_at`: its calls, history and schedule
   keep `persona_id` and the name stays resolvable; the primary cannot be deleted → 400),
-  `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices`
-  (fallback `BISEO_TTS_VOICES`; neither reachable → 503). `DELETE /v1/personas/{id}?delete_history=true|false`
+  `POST /v1/personas/{id}/primary`. Voices must be one of the Korean-capable set `sohee`, `ryan`, `aiden`
+  and offered by the TTS server's `/v1/audio/voices` (fallback `BISEO_TTS_VOICES`; neither reachable → 503);
+  anything else → 400. A stored persona on another voice (the dropped Chinese/Japanese-native speakers
+  vivian, serena, uncle_fu, dylan, eric, ono_anna) is read back with `voice: "sohee"`. `DELETE /v1/personas/{id}?delete_history=true|false`
   (default false): the persona's own notes and call summaries (memory records with `meta.persona_id`) and
   its calls' follow-up contexts are always deleted; its call history is deleted with `delete_history=true`,
   otherwise it stays with `"persona_deleted": true` on each item (the app shows "삭제된 비서"). If ruchba
   cannot do that (503), the persona is not deleted either. `GET /v1/voices` →
-  `[{"id","label","desc","lang"}]`, the TTS speakers with Korean labels (e.g. `{"id":"sohee","label":"소희",
+  `[{"id","label","desc","lang"}]`, only the Korean-capable speakers the TTS server offers, with Korean labels (e.g. `{"id":"sohee","label":"소희",
   "desc":"따뜻한 한국어 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
   (text 1–60 chars) → `audio/wav` for the editor's "들어보기"; at most one per 2 s per gateway (429);
   502 if the TTS server cannot be reached. `assistant_name` stays a read/write alias of the primary persona's
