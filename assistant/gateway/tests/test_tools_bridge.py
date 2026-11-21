@@ -152,7 +152,7 @@ def test_call_user_now_later_in_call_and_cap():
     w = World()
     assert run(w.bridge().call("call_user", {"reason": "회의 알림"}, "luna"))["content"] == "지금 전화를 걸게요."
     assert w.calls == [("user_request", "말씀하신 대로 전화드렸어요. 회의 알림", "luna")]
-    r = run(w.bridge().call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "기상"}))
+    r = run(w.bridge().call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "기상"}, caller="app"))
     assert r["content"] == "내일 오전 10시에 전화드릴게요." and w.schedule[0]["kind"] == "reminder"
     w.in_call = True
     assert run(w.bridge().call("call_user", {"reason": "x"}))["content"].startswith("이미 통화 중이에요")
@@ -270,17 +270,18 @@ def test_schedule_task_and_approval_tools():
     w = World()
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
-        run(b.call("call_user", {"when": when, "reason": note}))
+        run(b.call("call_user", {"when": when, "reason": note}, caller="app"))
     assert [t["name"] for t in run(b.tools("api"))[0]][3:10] == ["call_user", "schedule_list", "schedule_cancel",
                                                                   "schedule_update", "create_task", "task_status",
                                                                   "approval_status"]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
-    assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"})) \
+    assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"},
+                                     caller="app")) \
         ["content"] + run(b.call("schedule_cancel", {"description": "약"}))["content"]  # two match: none cancelled
     assert run(b.call("schedule_cancel", {"description": "없는것"}))["content"] == "그런 예약이 없어요."
     assert run(b.call("call_user", {"when": "2026-11-23T07:00:00+09:00", "reason": "x", "kind": "wake",
-                                    "repeat": "weekdays"}))["is_error"] is False
+                                    "repeat": "weekdays"}, caller="app"))["is_error"] is False
     assert w.schedule[-1]["kind"] == "wake" and w.schedule[-1]["repeat"] == "weekdays" and w.schedule[-1]["note"] == ""
     assert "running" in run(b.call("task_status", {}))["content"]
     assert run(b.call("task_status", {"id": "t00000000001"}))["content"].endswith("→ 끝")
@@ -347,12 +348,16 @@ def test_call_user_rules_need_a_yes_unless_simple():
 def test_schedule_update_picks_one_and_asks_otherwise():
     w = Rules()
     b = w.bridge()
-    assert run(b.call("schedule_update", {"description": "약", "when": "2026-11-23T18:00:00+09:00"}))["content"] == "바꿨어요."
+    assert run(b.call("schedule_update", {"description": "약", "when": "2026-11-23T18:00:00+09:00"},
+                      caller="app"))["content"] == "바꿨어요."
     assert w.updates[-1] == ("one", {"when": "2026-11-23T18:00:00+09:00"}, None)
-    assert run(b.call("schedule_update", {"when": "2026-11-23T18:00:00+09:00"}))["content"].startswith("어느 것인지")
+    assert run(b.call("schedule_update", {"when": "2026-11-23T18:00:00+09:00"}, caller="app"))["content"].startswith(
+        "어느 것인지")
+    r = run(b.call("schedule_update", {"description": "약", "when": "2026-11-23T18:00:00+09:00"}))  # a model's own time
+    assert r["is_error"] and "when_text" in r["content"]
     assert run(b.call("schedule_update", {"id": "one"}))["content"] == "무엇을 바꿀지 말씀해 주세요."
     assert run(b.call("schedule_update", {"description": "없는것", "purpose": "x"}))["content"] == "그런 예약이 없어요."
-    r = run(b.call("schedule_update", {"id": "one", "when": "0 8 * * *"}))
+    r = run(b.call("schedule_update", {"id": "one", "when": "0 8 * * *"}, caller="app"))
     assert r["is_error"] and "repeat_cron" in r["content"]  # a cron in `when` is refused, not passed on
     assert len(w.updates) == 1  # nothing else changed
 
@@ -367,11 +372,13 @@ def test_schedule_update_on_rules_needs_a_scope():
     assert w.updates[-1] == ("rule", {"purpose": "물 마시기"}, None)
     # "오늘 12시 건만 1시로": that fire, picked by its time
     run(b.call("schedule_update", {"at": "2026-11-23T12:00:00+09:00", "scope": "occurrence",
-                                   "when": "2026-11-23T13:00:00+09:00"}))
+                                   "when": "2026-11-23T13:00:00+09:00"}, caller="app"))
     assert w.updates[-1] == ("rule", {"when": "2026-11-23T13:00:00+09:00"}, "2026-11-23T12:00:00+09:00")
     to = "2026-11-23T15:00:00+09:00"
-    assert "at으로" in run(b.call("schedule_update", {"id": "rule", "scope": "occurrence", "when": to}))["content"]
-    run(b.call("schedule_update", {"id": "rule", "at": "2026-11-23T16:00:00+09:00", "scope": "occurrence", "when": to}))
+    assert "at으로" in run(b.call("schedule_update", {"id": "rule", "scope": "occurrence", "when": to},
+                                  caller="app"))["content"]
+    run(b.call("schedule_update", {"id": "rule", "at": "2026-11-23T16:00:00+09:00", "scope": "occurrence", "when": to},
+               caller="app"))
     assert w.updates[-1] == ("rule", {"when": to}, "2026-11-23T16:00:00+09:00")  # id picks, at names the fire
     assert "한 번만" in run(b.call("schedule_update", {"id": "rule", "scope": "occurrence",
                                                      "repeat_cron": "0 9 * * *"}))["content"]
@@ -413,3 +420,30 @@ def test_mcp_scopes():
     run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                           "params": {"name": "create_task", "arguments": {"goal": "정리"}}}, scope="external"))
     assert w.tasks[-1]["notify"] == "push"  # the user is at a terminal, not in a call
+
+
+def test_when_text_is_resolved_by_the_gateway_not_the_model():
+    from datetime import datetime as dt
+    w = Rules()
+    b = w.bridge()
+    b.d["now"] = lambda: dt(2026, 11, 23, 9, 0, tzinfo=TB.KST)
+    # the model's own (wrong) `when` loses to the words it was told
+    run(b.call("schedule_update", {"id": "one", "when_text": "6시로", "when": "2026-11-24T06:00:00+09:00"}))
+    assert w.updates[-1] == ("one", {"when": "2026-11-23T18:00:00+09:00"}, None)  # 오후 10시 → 오후 6시
+    r = run(b.call("schedule_update", {"id": "rule", "scope": "occurrence", "at": "2026-11-23T14:00:00+09:00",
+                                       "when_text": "3시로"}))
+    assert w.updates[-1] == ("rule", {"when": "2026-11-23T15:00:00+09:00"}, "2026-11-23T14:00:00+09:00")
+    b.d["now"] = lambda: dt(2026, 11, 23, 21, 0, tzinfo=TB.KST)
+    r = run(b.call("schedule_update", {"id": "one", "when_text": "7시로"}))
+    assert r["is_error"] and "이미 지났어요" in r["content"] and len(w.updates) == 2
+    b.d["now"] = lambda: dt(2026, 11, 23, 9, 0, tzinfo=TB.KST)
+    r = run(b.call("call_user", {"reason": "회의", "when_text": "내일 7시"}))
+    assert r["is_error"] and "아침 7시요, 저녁 7시요?" in r["content"] and not w.schedule
+    run(b.call("call_user", {"reason": "회의", "when_text": "7시", "when": "2026-11-24T07:00:00+09:00"}))
+    assert w.schedule[-1]["at"] == "2026-11-23T19:00:00+09:00"
+    assert "이미 예약했어요" in run(b.call("call_user", {"reason": "회의", "when_text": "7시"}))["content"]
+    assert len(w.schedule) == 1  # the same call twice in a row creates one item
+    b.d["now"] = lambda: dt(2026, 11, 23, 0, 30, tzinfo=TB.KST)
+    r = run(b.call("call_user", {"reason": "과제", "when_text": "내일 오후 1시"}))
+    assert r["content"].startswith("오늘(11월 23일) 오후 1시로 잡았어요.")
+    assert w.schedule[-1]["interpretation"] == "새벽 '내일' → 오늘로 해석"

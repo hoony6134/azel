@@ -28,17 +28,24 @@ def at_(h, d=23):
     return f"2026-11-{d}T{h:02d}:00:00+09:00"
 
 
-# (request, check(updates, cancels) -> bool, expected)
+# (request, check(world, final text) -> bool, expected)
 CASES = [
-    ("오늘 오후 10시 알림 6시로 바꿔줘", lambda u, c: u == [("one", {"when": at_(18)}, None)], "one → 18:00"),
-    ("오늘 2시 스트레칭은 3시로 미뤄줘", lambda u, c: u == [("rule", {"when": at_(15)}, at_(14))], "occurrence 14→15"),
+    ("오늘 오후 10시 알림 6시로 바꿔줘", lambda w, t: w.updates == [("one", {"when": at_(18)}, None)], "one → 18:00"),
+    ("오늘 2시 스트레칭은 3시로 미뤄줘", lambda w, t: w.updates == [("rule", {"when": at_(15)}, at_(14))], "occurrence 14→15"),
     ("매일 아침 7시에 깨우는 거 8시로 바꿔줘",
-     lambda u, c: len(u) == 1 and u[0][0] == "old" and u[0][2] is None and
-     (u[0][1].get("repeat_cron", "").split()[:2] == ["0", "8"] or u[0][1].get("when", "").endswith("08:00:00+09:00")),
-     "rule old → 8:00"),
-    ("약 먹기 알림 내용을 물 마시기로 바꿔줘", lambda u, c: u == [("one", {"purpose": "물 마시기"}, None)], "purpose"),
-    ("스트레칭은 전화 말고 알림으로 바꿔줘", lambda u, c: u == [("rule", {"notify": "push"}, None)], "notify push, rule"),
-    ("내일 오전 10시 스트레칭만 빼줘", lambda u, c: c == [("rule", None, at_(10, 24))] and not u, "skip one fire"),
+     lambda w, t: len(w.updates) == 1 and w.updates[0][0] == "old" and w.updates[0][2] is None and
+     (w.updates[0][1].get("repeat_cron", "").split()[:2] == ["0", "8"] or
+      w.updates[0][1].get("when", "").endswith("08:00:00+09:00")), "rule old → 8:00"),
+    ("약 먹기 알림 내용을 물 마시기로 바꿔줘", lambda w, t: w.updates == [("one", {"purpose": "물 마시기"}, None)], "purpose"),
+    ("스트레칭은 전화 말고 알림으로 바꿔줘", lambda w, t: w.updates == [("rule", {"notify": "push"}, None)], "notify push, rule"),
+    ("내일 오전 10시 스트레칭만 빼줘", lambda w, t: w.cancels == [("rule", None, at_(10, 24))] and not w.updates,
+     "skip one fire"),
+    # bare hours: the gateway resolves the words, never the model
+    ("약 먹기 알림 11시 반으로 미뤄줘", lambda w, t: w.updates == [("one", {"when": "2026-11-23T23:30:00+09:00"}, None)],
+     "inherit 오후 → 23:30"),
+    ("7시에 전화해줘", lambda w, t: [x["at"] for x in w.schedule] == [at_(19)], "call 19:00 today"),
+    ("내일 7시에 전화해줘", lambda w, t: not w.schedule and "아침 7시" in t and "저녁 7시" in t, "asks 아침/저녁"),
+    ("3시에 전화해줘", lambda w, t: [x["at"] for x in w.schedule] == [at_(15)], "call 15:00"),
 ]
 
 
@@ -48,6 +55,11 @@ def system():
 
 
 class World(Rules):
+    async def schedule_create(self, body, created_by):  # a realistic confirmation, so models don't retry
+        self.schedule.append(body)
+        t = datetime.fromisoformat(body["at"])
+        return {"at": body["at"]}, f"{t.month}월 {t.day}일 {late_night.clock_ko(t.hour, t.minute)}에 전화드릴게요."
+
     async def schedule_text(self):
         return "\n".join(f"- id {i['id']}: {i.get('rule_text') or i['spoken']} 다음 {i['at']} 목적 {i['purpose'] or '-'}"
                          for i in self.items)
@@ -55,7 +67,8 @@ class World(Rules):
     def bridge(self):
         b = super().bridge()
         b.d["schedule_list_text"] = self.schedule_text
-        b.d["cygnus"] = lambda: ([], None)  # the fake Cygnus tool has no real schema (the Claude API would 400)
+        b.d["cygnus"] = lambda: ([], None)
+        b.d["now"] = lambda: NOW  # the fake Cygnus tool has no real schema (the Claude API would 400)
         return b
 
 
@@ -69,7 +82,7 @@ async def one(backend, text):
                                    0.05, 2, never):
         if ev["type"] in ("done", "failed"):
             last = ev.get("result") or ev.get("message", "")
-    return w.updates, w.cancels, last
+    return w, last
 
 
 async def main():
@@ -79,12 +92,13 @@ async def main():
         score[backend] = 0
         for text, check, want in only:
             try:
-                u, c, last = await one(backend, text)
+                w, last = await one(backend, text)
             except Exception as e:  # noqa: BLE001
-                u, c, last = [], [], f"ERROR {type(e).__name__}: {e}"[:120]
-            good = check(u, c)
+                w, last = World(), f"ERROR {type(e).__name__}: {e}"[:120]
+            good = check(w, last)
             score[backend] += good
-            print(f"{backend:10} {'OK  ' if good else 'FAIL'} {text:28} want {want:20} | {u} {c} | {last[:60]!r}")
+            print(f"{backend:10} {'OK  ' if good else 'FAIL'} {text:28} want {want:20} | {w.updates} {w.cancels} "
+                  f"{[x.get('at') for x in w.schedule]} | {last[:70]!r}")
     print(" | ".join(f"{b} {s}/{len(only)}" for b, s in score.items()))
 
 if __name__ == "__main__":

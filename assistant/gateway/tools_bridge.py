@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import cron as C
+import late_night as L
 
 KST = timezone(timedelta(hours=9))
 APPROVAL_WAIT_S = 300
@@ -31,10 +32,14 @@ READ_TOOLS = {"list_dir", "read_file", "search", "browse", "job_status", "list_j
 
 CALL_USER = {
     "name": "call_user",
-    "description": ("사용자에게 전화를 건다. when이 없으면 지금 걸고(통화 중이면 거절), 있으면 그 시각(KST, ISO 8601)에 "
-                    "예약 전화를 건다. reason은 전화를 받았을 때 첫마디로 말할 이유."),
+    "description": ("사용자에게 전화를 건다. 시각이 없으면 지금 걸고(통화 중이면 거절), 있으면 그 시각에 예약 전화를 건다. "
+                    "시각은 사용자가 말한 그대로 when_text에 넣어(예: '7시', '내일 오후 1시'). '7시'처럼 애매해 보여도 먼저 묻지 "
+                    "말고 넘겨: 도구가 정하거나, 물어볼 말을 돌려줘. reason은 전화의 목적."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["reason"], "properties": {
-        "when": {"type": ["string", "null"], "description": "예: 2026-11-22T10:00:00+09:00, 지금이면 null"},
+        "when": {"type": ["string", "null"], "description": "정확한 ISO 시각을 이미 알 때만(앱 등). 지금이면 null"},
+        "when_text": {"type": "string", "maxLength": 60, "description": (
+            "사용자가 말한 시각 표현 그대로(예: '6시', '내일 오후 1시', '30분 뒤', '금요일 3시 반'). 시각은 게이트웨이가 정하니 "
+            "직접 계산하지 마. 애매하면 도구가 물어볼 말을 돌려줘")},
         "reason": {"type": "string", "maxLength": 200},
         "kind": {"type": "string", "enum": ["reminder", "wake"], "description": "wake = 깨우는 전화"},
         "repeat": {"type": ["string", "null"], "description": "옛 방식: daily, weekdays, weekly:0..6(0=월). repeat_cron을 쓸 것"},
@@ -68,9 +73,11 @@ SCHEDULE_UPDATE = {
                     "at=그 회차 시각)이야. 한 회차를 빼려고 반복 규칙(repeat_cron)을 고치지 마."),
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
         **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]},
+        "when_text": {"type": "string", "maxLength": 60, "description": (
+            "사용자가 말한 시각 표현 그대로(예: '6시', '내일 오후 1시', '30분 뒤', '금요일 3시 반'). 시각은 게이트웨이가 정하니 "
+            "직접 계산하지 마. 애매하면 도구가 물어볼 말을 돌려줘")},
         "when": {"type": "string", "description": (
-            "새 시각, ISO 8601 KST(예: 2026-11-23T18:00:00+09:00). 오전·새벽 없이 1~6시라고만 하면 오후. 반복 전체면 이 시각의 "
-            "시·분이 새 규칙의 시각. cron은 여기 말고 repeat_cron에")},
+            "정확한 ISO 시각을 이미 알 때만(앱 등). 반복 전체면 이 시각의 시·분이 새 규칙의 시각. cron은 repeat_cron에")},
         "purpose": {"type": "string", "maxLength": 60},
         "notify": {"type": "string", "enum": ["call", "push"], "description": (
             "사용자가 받는 방식을 바꾸라고 할 때만('전화 말고 알림으로' → push). '10시 알림'의 '알림'은 예약을 가리키는 말일 뿐, "
@@ -104,6 +111,7 @@ class Bridge:
 
     def __init__(self, **deps):
         self.d = deps
+        self.recent = {}  # (at, cron) -> (monotonic, say): a model repeating the same call_user creates nothing
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -120,6 +128,9 @@ class Bridge:
         """{"content": str, "is_error": bool, "waited_s": seconds spent waiting for an approval}."""
         args = args if isinstance(args, dict) else {}
         try:
+            if name in ("call_user", "schedule_update") and args.get("when") and not args.get("when_text") \
+                    and caller != "app":
+                raise Refused("시각은 직접 계산하지 말고, 사용자가 말한 표현 그대로 when_text로 주세요(예: '6시', '내일 오후 1시').")
             if name == "call_user":
                 return ok(await self.call_user(args, persona_id))
             if name == "create_task":
@@ -193,14 +204,25 @@ class Bridge:
         pid = args.get("persona_id") if isinstance(args.get("persona_id"), str) else persona_id
         when = args.get("when")
         kind = args.get("kind") if args.get("kind") in ("reminder", "wake") else "reminder"
+        heard = None
+        if args.get("when_text"):  # the user's words win over any time a model worked out itself
+            heard = self.heard(args["when_text"], None, kind, "만들지")
+            when = heard["at"].isoformat()
         if args.get("repeat_cron"):
             return await self.call_user_rule(args, reason, kind, pid)
+        key = (str(when or ""), str(args.get("repeat_cron") or ""))  # a retry often rewords the reason
+        if when and key in self.recent and time.monotonic() - self.recent[key][0] < 60:
+            return self.recent[key][1] + " (이미 예약했어요)"
         if when:
             item, say = await self.d["schedule_create"]({"at": when, "kind": kind, "note": "" if kind == "wake" else reason,
                                                          "repeat": args.get("repeat") or None,
+                                                         **({"interpretation": heard["note"]}
+                                                            if heard and heard["note"] else {}),
                                                          **({"notify": args["notify"]} if args.get("notify") else {}),
                                                          **({"persona_id": pid} if pid else {})}, "voice")
             await self.log_call(reason, item.get("at"), pid)
+            say = heard["say"] if heard and heard["say"] else say
+            self.recent[key] = (time.monotonic(), say)
             return say
         if self.d["in_call"]():
             return "이미 통화 중이에요. 지금은 전화를 걸 수 없어요."
@@ -211,6 +233,16 @@ class Bridge:
         await self.d["place_call"]("user_request", f"말씀하신 대로 전화드렸어요. {reason}", pid)
         await self.log_call(reason, None, pid)
         return "지금 전화를 걸게요."
+
+    def now(self):
+        return self.d.get("now", lambda: datetime.now(KST))()
+
+    def heard(self, words, inherit, kind, verb):
+        """late_night.when_from_words, or Refused with the one question to ask the user."""
+        r = L.when_from_words(words, self.now(), inherit, kind)
+        if r["at"] is None:
+            raise Refused(f"아직 {verb} 않았어요. 사용자에게 \"{r['ask']}\"라고 물어보고, 답한 말을 when_text로 다시 불러 주세요.")
+        return r
 
     @staticmethod
     def rule_check(args, expr):
@@ -262,6 +294,10 @@ class Bridge:
         if msg:
             return msg
         changes = {k: args[k] for k in ("when", "purpose", "notify", "repeat_cron") if args.get(k)}
+        if args.get("when_text"):  # a bare hour keeps this item's (or this fire's) 오전/오후 and day
+            base = datetime.fromisoformat(args["at"] if args.get("at") and args.get("scope") == "occurrence"
+                                          else item["at"])
+            changes["when"] = self.heard(args["when_text"], base, item.get("kind", "reminder"), "바꾸지")["at"].isoformat()
         changes.update({k: args[k] for k in ("start_date", "end_date") if k in args})
         if not changes:
             return "무엇을 바꿀지 말씀해 주세요."
