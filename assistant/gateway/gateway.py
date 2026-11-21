@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import connectors
 import nim
 import wake_enroll
+import claude_api
 from claude_warm import Pool, base_cmd
 
 HOME = Path(os.environ.get("BISEO_HOME", Path.home() / ".config/biseo"))
@@ -182,6 +183,13 @@ VOICE_BASE = (
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
     "macbook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
+)
+# Full gateways on the Messages API path (claude_path "api", opt-in): Cygnus through our read-only bridge, no
+# Gmail or Calendar (those are claude.ai connectors).
+FULL_API_STYLE = VOICE_BASE + (
+    "사용자의 일정, 과제, 할 일, 기억, 서버 상태는 주어진 Cygnus 도구로 확인하고, 확인하지 못한 것은 지어내지 마. "
+    "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해. 기기 작업은 주어진 기기 도구로만 해. "
+    "위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
 API_STYLE = VOICE_BASE + (
     "너는 일정, 메일, 메모리, GISTRA, Planit 같은 개인 데이터를 볼 수 없어. 그런 요청이면 "
@@ -508,8 +516,8 @@ def resolve(settings, model, path, task, text=""):
         said = text.rsplit("\n\n", 1)[-1]  # the voice server prefixes recent turns
         model = "haiku" if len(said) <= 40 and LOOKUP.search(said) and not MULTI_STEP.search(said) else "sonnet"
     path = path or td.get("path") or settings["claude_path"]
-    if path == "auto":
-        path = "api" if API_KEY else "claude_code"
+    if path == "auto":  # a key on disk never switches a full gateway off claude.ai's connectors: "api" is opt-in
+        path = "claude_code" if MODE == "full" else "api"
     if MODE == "limited":
         path = "api"  # never `claude -p` (no OAuth login, no claude.ai connectors) on a team machine
     if model not in MODELS:
@@ -737,6 +745,10 @@ async def ask_api(text, model, session):
     devices = await fresh_devices()
     tools, where = await device_tools(devices)
     settings = await load_settings()
+    if MODE == "full":  # opt-in path: prompt caching and the Cygnus bridge (claude_api.py)
+        async for item in ask_api_full(text, model, settings, devices, tools, where):
+            yield item
+        return
     system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
     messages = [{"role": "user", "content": text}]
     final = {"model": model, "path": "api", "input_tokens": 0, "output_tokens": 0}
@@ -760,6 +772,30 @@ async def ask_api(text, model, session):
     pin, pout = PRICES[model]
     final["cost_usd"] = (final["input_tokens"] * pin + final["output_tokens"] * pout) / 1e6
     yield final
+
+
+async def ask_api_full(text, model, settings, devices, dev_tools, where):
+    """A full gateway's Messages API turn: Cygnus bridge tools plus the devices' tools, stable cached prefix."""
+    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)
+    by_name = {t["name"] for t in cyg_tools}
+
+    async def run(name, args):
+        if name in by_name:
+            return await cyg_run(name, args)
+        r = await run_tool({"name": name, "input": args, "id": "x"}, where)
+        if r.get("is_error"):
+            raise RuntimeError("device tool failed")
+        return r["content"]
+    system = name_prompt(settings) + FULL_API_STYLE + device_prompt(settings, devices)
+    yield activity("thinking")
+    async for kind, v in claude_api.ask(API_KEY, model, system, text, cyg_tools + dev_tools, run):
+        if kind == "text":
+            yield v
+        elif kind == "tool":
+            yield activity("tool_start", v)
+        else:
+            yield {"model": model, "path": "api", "input_tokens": v["input_tokens"] + v["cache_read_input_tokens"]
+                   + v["cache_creation_input_tokens"], "output_tokens": v["output_tokens"], "cost_usd": v["cost_usd"]}
 
 
 async def ask_nim(text, model, session):

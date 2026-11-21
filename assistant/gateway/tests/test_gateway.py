@@ -1438,3 +1438,45 @@ def test_limited_has_no_connectors(limited):
     assert c.put("/v1/connectors/secret/x", json={"value": "v"}).status_code == 403
     assert c.put("/v1/settings", json={"connectors": {"claude_ai": {}}}).status_code == 403
     assert not (tmp / "mcp").exists()
+
+
+def test_api_key_alone_never_moves_a_full_gateway_off_claude_code(tmp_path, monkeypatch):
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    g = start(tmp_path, monkeypatch)
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        assert g.resolve(g.DEFAULTS, None, None, "chat", "안녕")[1] == "claude_code"  # "auto" = claude -p
+        assert g.resolve(g.DEFAULTS, None, "api", "chat", "안녕")[1] == "api"  # explicit opt-in
+        c.post("/v1/ask", json={"text": "a", "session": "s1"})
+        assert (tmp_path / "args.json").exists()  # the claude -p fake ran
+
+
+def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatch):
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    g = start(tmp_path, monkeypatch)
+    seen = {}
+
+    async def fake_ask(key, model, system, text, tools, run):
+        seen.update(key=key, model=model, system=system, tools=[t["name"] for t in tools])
+        seen["result"] = await run("macbook__list_dir", {"path": "~"})
+        yield "tool", "macbook__list_dir"
+        yield "text", "홈 폴더에 파일이 세 개 있어요.\n"
+        yield "done", {"input_tokens": 100, "cache_read_input_tokens": 1500, "cache_creation_input_tokens": 0,
+                       "output_tokens": 20, "cost_usd": 0.0001}
+
+    async def dev_tools(devices):
+        return [{"name": "macbook__list_dir", "description": "x", "input_schema": {"type": "object"}}], \
+            {"macbook__list_dir": ("http://d", "list_dir")}
+
+    async def fake_run_tool(block, where):
+        return {"type": "tool_result", "tool_use_id": block["id"], "content": "a b c", "is_error": False}
+    monkeypatch.setattr(g.claude_api, "ask", fake_ask)
+    monkeypatch.setattr(g, "device_tools", dev_tools)
+    monkeypatch.setattr(g, "run_tool", fake_run_tool)
+    monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))  # no PAT in tests
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        evs = events(c.post("/v1/ask", json={"text": "홈 폴더 봐 줘", "session": "s", "path": "api", "model": "haiku"}))
+    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir"]
+    assert "Cygnus 도구" in seen["system"] and g.PERSONAL_REFUSAL not in seen["system"] and seen["result"] == "a b c"
+    assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
+    done = evs[-1]
+    assert done["type"] == "done" and done["path"] == "api" and done["input_tokens"] == 1600
