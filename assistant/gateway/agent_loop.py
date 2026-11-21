@@ -86,7 +86,8 @@ async def _claude(system, goal, defs, cfg):
     messages, carried = [{"role": "user", "content": goal}], 0.0
     async with httpx.AsyncClient(timeout=180) as c:
         while True:
-            body = claude_api.request_body(model, system, [*defs, *WEB_TOOLS], messages, max_tokens=4096)
+            own = [d for d in defs if d["name"] not in ("web_search", "web_fetch")]  # the native ones below instead
+            body = claude_api.request_body(model, system, [*own, *WEB_TOOLS], messages, max_tokens=4096)
             r = await c.post(claude_api.API_URL, json=body,
                              headers={"x-api-key": cfg["api_key"], "anthropic-version": "2023-06-01"})
             r.raise_for_status()

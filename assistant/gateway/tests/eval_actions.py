@@ -32,6 +32,13 @@ CASES = {
     "task_status": ("아까 맡긴 작업 어떻게 됐어?", "model"),
     "task_cancel": ("작업 a00000000001 그만해", "model"),
     "approval_status": ("승인 기다리는 거 있어?", "model"),
+    "memory_recall": ("내가 좋아하는 커피 뭐였지?", "model"),
+    "people_lookup": ("내 주변 사람 누구 있어?", "model"),
+    "remember": ("내가 좋아하는 커피는 아이스 바닐라 라떼야, 기억해 줘", "model"),
+    "forget": ("커피 취향 기억한 거 지워 줘", "model"),
+    "memory_list": ("너 나에 대해 뭐 기억하고 있어? 목록 보여 줘", "model"),
+    "web_search": ("오늘 광주 날씨 어때?", "model"),
+    "web_fetch": ("https://example.com 이 페이지에 뭐라고 써 있어?", "model"),
 }
 
 

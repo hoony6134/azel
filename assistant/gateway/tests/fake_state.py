@@ -183,6 +183,32 @@ def make():
         app.persona_data = (pid, history)
         return {"notes_deleted": 0, "calls": 0, "history_deleted": history}
 
+    @app.post("/v1/records")
+    def r_add(body: dict):
+        rid = len(db.setdefault("records", {})) + 1
+        db["records"][rid] = {"id": rid, "kind": body["kind"], "text": body["text"], "meta": body.get("meta") or {},
+                              "created": "2026-11-23T09:00:00+09:00", "session": None, "device": None}
+        return {"id": rid, "created": db["records"][rid]["created"]}
+
+    @app.post("/v1/search")
+    def r_search(body: dict):  # shortcut: word overlap stands in for the embedding search
+        words = [w for w in body["query"].split() if w]
+        rows = [{**r, "score": sum(w in r["text"] for w in words) / max(1, len(words))}
+                for r in db.setdefault("records", {}).values() if not body.get("kinds") or r["kind"] in body["kinds"]]
+        return sorted([r for r in rows if r["score"] > 0], key=lambda r: -r["score"])[:body.get("limit", 10)]
+
+    @app.get("/v1/records")
+    def r_list(kind: str = "note", memory: bool = False, limit: int = 50):
+        rows = [r for r in db.setdefault("records", {}).values() if r["kind"] == kind and (not memory or "memory" in r["meta"])]
+        return sorted(rows, key=lambda r: -r["id"])[:limit]
+
+    @app.delete("/v1/records/{rid}")
+    def r_delete(rid: int):
+        r = db.setdefault("records", {}).get(rid)
+        if not r or "memory" not in r["meta"]:
+            raise HTTPException(404)
+        return db["records"].pop(rid)
+
     @app.post("/v1/state/schedule")
     def s_add(body: dict):
         sid = uuid.uuid4().hex[:12]

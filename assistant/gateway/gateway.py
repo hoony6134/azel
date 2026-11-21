@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import agent_loop
 import cron
 import late_night
+import web
 import openings
 import connectors
 import google_tools
@@ -549,6 +550,41 @@ async def record_call_log(m):
     await history_outbox.put({k: v for k, v in m.items() if k != "type"})
 
 
+POST_CALL_DELAY_S = 20  # the call's turns reach ruchba through the history outbox first
+AUTO_FACTS = ("아래 통화에서 오래 기억해 둘 만한 사용자에 대한 사실이나 취향만 최대 3개 뽑아. 사용자가 직접 말한 것만. "
+              "인사, 날씨, 한 번 물어본 정보 같은 사소한 것과 건강·돈·연애·비밀번호·계좌 같은 민감한 것은 빼. "
+              "각 사실은 '사용자는 …' 같은 짧은 한 문장. 없으면 빈 목록. JSON 하나만: {\"facts\": [\"...\"]}")
+SENSITIVE = re.compile(r"병|질환|약 ?먹|진단|우울|임신|연봉|대출|빚|월급|계좌|연애|이혼|종교|정치", re.I)
+
+
+async def post_call_facts(log_id, persona_id):
+    """After a call: at most 3 durable facts into Azel memory, marked auto (never Cygnus: only "기억해" goes there).
+    The app's memory list shows them and can delete them."""
+    try:
+        await asyncio.sleep(POST_CALL_DELAY_S)
+        row = await state.call("GET", f"/v1/state/history/{quote(log_id, safe='')}")
+        turns = (row or {}).get("turns") or []
+        said = "\n".join(f"사용자: {t.get('user', '')}\n비서: {' '.join(t.get('assistant') or [])[:200]}"
+                         for t in turns)[-4000:]
+        if sum(len(t.get("user", "")) for t in turns) < 20:
+            return  # nothing worth reading
+        d = await llm_json(AUTO_FACTS, said)
+        facts = [f.strip() for f in (d or {}).get("facts", []) if isinstance(f, str) and 4 <= len(f.strip()) <= 200][:3]
+        settings = await load_settings()
+        persona = persona_by_id(settings, persona_id) or primary_persona(settings)
+        import cygnus  # the same secret rule as explicit "기억해"
+        for f in facts:
+            if cygnus.SECRET.search(f) or SENSITIVE.search(f):
+                continue
+            near = await memory_search(f, 1)
+            if near and near[0].get("score", 0) >= 0.85:
+                continue  # already known
+            await memory_add(f, {"memory": True, "source": "auto", "call": log_id,
+                                 "persona": None if persona.get("share_memory", True) else persona["id"]})
+    except Exception as e:  # a background nicety: never crash the link
+        print("post-call facts failed:", type(e).__name__, flush=True)
+
+
 async def push_tokens():
     return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
 
@@ -758,6 +794,8 @@ def run_args(settings, devices, requester=""):
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
                                                               {"X-Azel-Requester": requester} if requester else None)
+    if MODE == "full":  # live web lookups: never on limited gateways (Bash, Edit and Write stay disallowed)
+        allowed = [*allowed, "WebSearch", "WebFetch"]
     if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
         url = f"http://{HOST}:{PORT}/v1/mcp"
         servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {"Authorization": f"Bearer {TOKEN}"}}}
@@ -1812,6 +1850,7 @@ async def handle_link(ws):
                 asyncio.create_task(prewarm(warm_key, pid))
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
+                asyncio.create_task(post_call_facts(m["log_id"], warm_key.split(":", 1)[0]))
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = served(serve_schedule(m), m)
@@ -2364,6 +2403,31 @@ async def connectors_secret(name: str, body: dict):
         raise HTTPException(400, str(e))
     await warm_pool.close_all()  # running processes still hold the old secret
     return Response(status_code=204)
+
+
+@app.get("/v1/memories")
+async def memories_get(request: Request, limit: int = 50):
+    return await act("memory_list", {"limit": limit}, request=request)
+
+
+@app.post("/v1/memories")
+async def memories_post(request: Request, body: dict):
+    return await act("remember", body, created=True, request=request)
+
+
+@app.delete("/v1/memories/{mid}")
+async def memories_delete(request: Request, mid: str):
+    return await act("forget", {"id": mid, "confirmed": True}, request=request)  # the app asked before deleting
+
+
+@app.post("/v1/memories/recall")
+async def memories_recall(request: Request, body: dict):
+    return await act("memory_recall", body, request=request)
+
+
+@app.post("/v1/memories/people")
+async def memories_people(request: Request, body: dict):
+    return await act("people_lookup", body, request=request)
 
 
 # ---------- REST adapters: each route is one action (ACTIONS.md); no checks or logic of their own ----------
@@ -3227,11 +3291,70 @@ bridge = tools_bridge.Bridge(
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
     llm=lambda system, user: llm_json(system, user),
+    memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),
+    memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
+    memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
+    cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
+    web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
 
 
 async def none():
     return None
+
+
+async def web_search(query, n):
+    """Haiku with the server-side search (path api, held to the paid budget); a spent budget or no key: the
+    daemon's browse on a search page instead."""
+    settings = await load_settings()
+    spent = "api" in settings["budget_paths"] and await month_cost(settings) >= settings["monthly_budget_usd"]
+    if API_KEY and not spent:
+        r = await web.search(API_KEY, query, n)
+        u = r["usage"]
+        await record_usage({"model": "haiku", "path": "api", "task": "web_search",
+                            "input_tokens": u.get("input_tokens", 0), "output_tokens": u.get("output_tokens", 0),
+                            "cost_usd": r["cost_usd"]})
+        return r
+    _, where = await bridge.tools("api")
+    browse = next((n for n, (_, tool) in where.items() if tool == "browse"), None)
+    if not browse:
+        raise HTTPException(503, "지금은 웹을 볼 수 없어요.")
+    url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+    res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
+    return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def persona_shares(pid):
+    settings = await load_settings()
+    p = persona_by_id(settings, pid or "") or primary_persona(settings)
+    return p["id"] == primary_persona(settings)["id"] or bool(p.get("share_memory"))
+
+
+def cygnus_can_write():
+    """The memory-scoped write PAT: full gateways only (the Mac); never a limited or team device."""
+    if MODE != "full" or not (HOME / "cygnus_pat_rw").is_file():
+        return False
+    os.environ.setdefault("BISEO_HOME", str(HOME))
+    import cygnus
+    return cygnus.can_write()
+
+
+async def cygnus_write(name, args):
+    import cygnus
+    return await cygnus.write(name, args)
+
+
+async def none_list():
+    return []
+
+
+async def memory_search(q, n):
+    return await state.call("POST", "/v1/search", {"query": q, "kinds": ["note", "transcript"], "limit": n}) or []
+
+
+async def memory_add(text, meta):
+    return await state.call("POST", "/v1/records", {"kind": "note", "text": text, "device": DEVICE,
+                                                     "meta": {k: v for k, v in meta.items() if v is not None}})
 
 
 async def bridge_schedule_items(include=None, persona_id=None):

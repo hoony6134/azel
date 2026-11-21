@@ -39,8 +39,11 @@ def test_registry_covers_every_surface(tgw):  # noqa: F811
         assert ("external" in meta["scopes"]) == (name in TB.SCOPES["external"]), name
         assert ("qwen" in meta["scopes"]) == (name in model_tools), name
         assert ("app" in meta["scopes"]) == (name in TB.APP_ACTIONS), name
-        method, path = meta["rest"]
-        assert (method, path) in routes(g), (name, method, path)
+        if meta["rest"] is None:
+            assert meta.get("no_rest", "").strip() and "app" not in meta["scopes"], name  # a reason, and not the app's
+        else:
+            method, path = meta["rest"]
+            assert (method, path) in routes(g), (name, method, path)
         assert name in eval_actions.CASES, f"{name}: no eval case"
         schema = TB.OWN_SCHEMAS[name]
         assert schema.get("type") == "object" and schema.get("properties") is not None, name  # never {} (Claude API)
@@ -57,13 +60,15 @@ def make_target(g, c, kind):
             when = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
             r = c.post("/v1/schedule", json={"reason": "약 먹기", "when": when.isoformat()}, headers=V2)
         return r.json()["data"]["id"]
+    if kind == "{mem}":
+        return c.post("/v1/memories", json={"fact": "테스트로 기억할 사실"}, headers=V2).json()["data"]["id"]
     t = c.post("/v1/tasks", json={"goal": "정리", "notify": "none", "backend": "claude_code"}, headers=V2).json()["data"]
     wait_for(c, t["id"], ("done", "failed"))
     return t["id"]
 
 
 def fill(g, c, args):
-    return {k: (make_target(g, c, v) if v in ("{id}", "{task}") else v) for k, v in args.items()}
+    return {k: (make_target(g, c, v) if v in ("{id}", "{task}", "{mem}") else v) for k, v in args.items()}
 
 
 def rest_call(c, meta, args):
@@ -84,6 +89,8 @@ def norm(r):
 def test_rest_and_tool_give_the_same_result(tgw, name):  # noqa: F811
     g, c, _ = tgw
     meta = g.tools_bridge.ACTIONS[name]
+    if meta["rest"] is None:
+        pytest.skip("no REST route (ACTIONS no_rest)")
     if name == "call_user":
         g.call_warm_keys["x"] = "azel:s"  # in a call: a refusal both ways, and nothing rings in the test
     valid, invalid = meta["examples"]
