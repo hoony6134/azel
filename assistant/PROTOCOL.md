@@ -172,7 +172,8 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
   `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
   `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
-  `GET|POST|DELETE /v1/wake/enroll`, `GET /v1/providers/nim/models`, `PUT /v1/providers/nim/key` (bearer header).
+  `GET|POST|DELETE /v1/wake/enroll`, `GET /v1/providers/nim/models`, `PUT /v1/providers/nim/key`,
+  `GET|POST /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -308,6 +309,28 @@ device that created them.
   "devices":[{"name","ok","ms"}]}`
 - `POST /v1/devices/register` `{"name","url","harness":["claude_code",…]}` — daemons call
   this on start and every 60 s. `GET /v1/devices` lists them with `last_seen`.
+- Tasks (full gateways only; 403 on limited): background Claude Code runs on the devices, not voice turns.
+  - `POST /v1/tasks` `{"goal":"…","device"?:"macbook","persona"?:"azel","notify":"call"|"push"|"none" (default push),
+    "budget_usd"?:2,"max_minutes"?:30}` → **201** the task. Limits are hard: the run is killed when its estimated
+    cost (token usage × list price, replaced by the CLI's own figure at each result) reaches `budget_usd` (≤ 50) or
+    after `max_minutes` (≤ 240; time spent waiting for an approval does not count). At most 2 run at once per gateway,
+    in their own `claude -p` process (never the 4-process warm voice pool); later ones stay `queued`.
+  - `GET /v1/tasks?limit=20` → newest first, without steps. `GET /v1/tasks/{id}` → `{"id","goal","status","device",
+    "persona","notify","budget_usd","max_minutes","created","started","finished","result","error","cost_usd","owner",
+    "steps":[{"at","kind":"tool","tool","label"} | {"kind":"approval"|"approval_approved"|"approval_rejected",
+    "approval_id"} | {"kind":"killed","reason":"time"|"budget"|"error"}]}`. Steps never carry tool arguments or results.
+    `status`: `queued|running|waiting_approval|done|failed|cancelled`.
+  - `POST /v1/tasks/{id}/cancel` → the task without steps (`cancelled`; 409 once finished). Another gateway's task is
+    flagged and stops within about 5 s.
+  - Approvals: when a device tool answers `pending_approval`, the run stops, the task shows `waiting_approval` with
+    the existing approval (`GET|POST /v1/approvals`), and resumes the same Claude session with the decision.
+  - On `done`/`failed`: `notify:"call"` rings as the task's persona with the result as the opening (reason `task`),
+    `"push"` sends an alert ("작업 완료" / "작업 실패"); a cancelled task sends nothing. Cost goes into usage as path
+    `task`. Stored in ruchba's kv (`task-<id>`, index `tasks-index`, newest 200); a gateway restarting marks its own
+    unfinished tasks `failed`.
+  - Voice: "…해 줘, 끝나면 알려 줘" (push when it says 알림/푸시) or a job on a named device ("맥북 다운로드 폴더 정리해
+    줘") becomes a task over the gateway link (`{"type":"task","goal","notify","persona","device"?}` →
+    `{"type":"task_result","ok","task_id","say"}`), and the assistant says e.g. "맥북에서 시작할게요. 끝나면 전화드릴게요."
 - Static devices (full gateways only): team devices (`tag:vujade`: vd-spark, vd-core) cannot dial a jh gateway, so
   their daemons never register. Each full gateway lists them in `~/.config/biseo/static_devices.json` (or env
   `BISEO_STATIC_DEVICES`): `[{"id":"spark","name":"vd-spark","url":"http://100.64.0.11:8893/mcp","mode":"limited"}]`
