@@ -168,14 +168,25 @@ class GatewayLinks:
     def receive(self, lk, msg):
         t = msg.get("type")
         if t == "hello":
-            lk.device = str(msg.get("device", "?"))
-            lk.mode = "limited" if lk.locked else msg.get("mode", "full")  # a limited token cannot claim full
-            lk.priority = int(msg.get("priority", 50))
-            for old in [o for o in self.links if o is not lk and o.device == lk.device]:
+            device = str(msg.get("device", "?"))
+            mode = "limited" if lk.locked or msg.get("mode") == "limited" else "full"  # limited tokens stay limited
+            same = [o for o in self.links if o is not lk and o.device == device]
+            if any(o.mode != mode for o in same):
+                return  # never let a link of the other mode evict (or pose as) that device's link
+            lk.device, lk.mode = device, mode
+            try:
+                lk.priority = int(msg.get("priority", 50))
+            except (TypeError, ValueError):
+                lk.priority = 50
+            for old in same:
                 self.remove(old)  # that gateway reconnected; its old socket is dead
+        elif t in ("settings", "call") and lk.mode != "full":
+            return  # shared settings and call openings come from full gateways only
         elif t == "settings":
-            self.settings = msg.get("value") or {}
+            self.settings = msg.get("value") if isinstance(msg.get("value"), dict) else {}
         elif t == "call":
+            if not isinstance(msg.get("call_id"), str) or not msg["call_id"]:
+                return  # malformed: ignore it rather than drop the link
             if len(self.openings) > 100:
                 old = self.openings.pop(next(iter(self.openings)))
                 if old["audio"]:
@@ -672,18 +683,24 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     guard = OpeningGuard()
 
     async def speak_opening(op):
+        done = False
         try:
-            pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
-        except Exception:
-            pcms = None
-        await send({"type": "state", "value": "speaking"})
-        for i, s in enumerate(op["parts"]):
-            pcm = pcms[i] if pcms else (await tts(s))[0]
-            await send({"type": "reply", "text": s, "route": "opening"})
-            await send(audio=pcm)
-            if i == 0:
-                guard.first_end = current["play_end"]
-            guard.play_end = current["play_end"]
+            try:
+                pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
+            except Exception:
+                pcms = None
+            await send({"type": "state", "value": "speaking"})
+            for i, s in enumerate(op["parts"]):
+                pcm = pcms[i] if pcms else (await tts(s))[0]
+                await send({"type": "reply", "text": s, "route": "opening"})
+                await send(audio=pcm)
+                if i == 0:
+                    guard.first_end = current["play_end"]
+                guard.play_end = current["play_end"]
+            done = True
+        finally:
+            if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
+                guard.first_end = guard.play_end = current["play_end"]
 
     async def interrupt(protected=False):
         # Let the opening's first sentence finish playing; re-read, since its end is known only once sent.
@@ -817,7 +834,9 @@ if __name__ == "__main__":
         gl.receive(alb, {"type": "hello", "device": "albireo", "mode": "full", "priority": 20})
         gl.receive(spark, {"type": "hello", "device": "spark", "mode": "limited", "priority": 90})
         gl.receive(alb, {"type": "settings", "value": {"default_model": "opus"}})  # settings from any link
-        gl.receive(spark, {"type": "call", "call_id": "c1", "opening": "좋은 아침이에요."})  # openings too
+        gl.receive(alb, {"type": "call", "call_id": "c1", "opening": "좋은 아침이에요."})  # openings too
+        gl.receive(spark, {"type": "call", "call_id": "c2", "opening": "x"})  # but never from a limited link
+        assert "c2" not in gl.openings
         assert gl.settings["default_model"] == "opus" and gl.openings["c1"]["text"] == "좋은 아침이에요."
         assert gl.pick(True) is mac and gl.pick(False) is mac
         mac.fails = 3  # unhealthy: the next full link by priority takes over
@@ -857,6 +876,20 @@ if __name__ == "__main__":
         except RuntimeError as e:
             assert str(e) == NO_PERSONAL
         gl.remove(locked)
+        full_mac = gl.add(FakeWS())
+        gl.receive(full_mac, {"type": "hello", "device": "macbook", "mode": "full", "priority": 10})
+        intruder = gl.add(FakeWS(), limited=True)  # a link_limited token posing as macbook
+        gl.receive(intruder, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+        assert full_mac in gl.links and intruder.device == "?" and intruder.mode == "limited"
+        gl.receive(intruder, {"type": "settings", "value": {"assistant_name": "해커"}})
+        gl.receive(intruder, {"type": "call", "call_id": "evil", "opening": "가짜 전화예요."})
+        assert gl.settings.get("assistant_name") != "해커" and "evil" not in gl.openings
+        gl.receive(full_mac, {"type": "call", "opening": "call_id 없음"})  # ignored, no KeyError
+        gl.receive(full_mac, {"type": "call", "call_id": 7})
+        gl.receive(full_mac, {"type": "hello", "device": "macbook", "mode": "full", "priority": "x"})
+        assert full_mac.priority == 50 and full_mac in gl.links
+        gl.remove(full_mac)
+        gl.remove(intruder)
         old = gl.add(FakeWS())  # a gateway that predates hello counts as full
         assert gl.pick(True) is old
         gl.remove(old)
@@ -987,10 +1020,12 @@ if __name__ == "__main__":
         g.protect(100.0)
         assert g.wait(100.0) > 3000 and g.start(100.1) == "hold"  # protected before its audio is even known
 
-        def tap_check(tap_after):
+        def tap_check(tap_after, broken_tts=False):
             """Place a 2-sentence opening (0.3 s per sentence), tap interrupt after `tap_after` s, and return
             (seconds from connect to the server's interrupt, messages after it)."""
             async def slow_tts(sentence):
+                if broken_tts:
+                    raise httpx.ConnectError("tts down")
                 return b"\0" * 14400, 24000  # 0.3 s at 24 kHz
             from fastapi.testclient import TestClient
             globals().update(tts=slow_tts, SileroVoiceActivityDetector=lambda: (lambda frame: 0.0))
@@ -1060,4 +1095,6 @@ if __name__ == "__main__":
         assert 0.25 <= at < 1.0 and after == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.4)  # after the first sentence: immediate
         assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
+        at, after = tap_check(0.05, broken_tts=True)  # TTS failed: the protection is dropped, not held an hour
+        assert at < 0.5 and after == {"type": "state", "value": "listening"}, (at, after)
         print("voice_server checks ok")

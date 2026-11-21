@@ -66,10 +66,12 @@ JSON text frames:
 
 - gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority"}` first on every
   connect (`priority`: lower is preferred; a link that never says hello counts as full, priority 50;
-  a new hello from the same `device` replaces that device's older link),
-  `{"type":"settings","value":{…}}` (on connect and every change; from any link, the last one wins,
-  since all gateways read the same shared settings),
-  `{"type":"call","call_id","opening"}` (sent before the VoIP push; may arrive on any link),
+  a new hello from the same `device` replaces that device's older link of the same mode; a hello that
+  would replace a link of the other mode is ignored),
+  `{"type":"settings","value":{…}}` (on connect and every change; from any full-mode link, the last
+  one wins, since all gateways read the same shared settings; ignored from limited links),
+  `{"type":"call","call_id","opening"}` (sent before the VoIP push; accepted from any full-mode link,
+  ignored without a string `call_id`; the voice server synthesizes the opening on arrival),
   `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
