@@ -319,7 +319,7 @@ struct SettingsScreen<Extra: View>: View {
             PersonaListCard(model: personas)
         }
         Card("대화") {
-            VStack(alignment: .leading, spacing: Theme.xs) {
+            if s.wrappedValue.user_title != nil { VStack(alignment: .leading, spacing: Theme.xs) {
                 row("호칭") {
                     TextField("예: 정훈님, 오빠, 대표님", text: $titleDraft)
                         .multilineTextAlignment(.trailing).frame(maxWidth: 180)
@@ -329,7 +329,7 @@ struct SettingsScreen<Extra: View>: View {
                 }
                 if let titleError { Text(titleError).font(.footnote).foregroundStyle(Theme.danger) }
                 else { Text("나를 부르는 말이에요. 비우면 호칭 없이 불러요.").font(.footnote).foregroundStyle(Theme.text3) }
-            }
+            } }
             row("답변 길이") {
                 Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
                                                    set: { s.wrappedValue.reply_length = $0 })) {
@@ -734,6 +734,7 @@ struct SettingsScreen<Extra: View>: View {
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
             titleDraft = s.user_title ?? ""
+            AppSettings.supportsUserTitle = s.user_title != nil
             noiseMode = s.noise_mode ?? "normal"
             loadError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }

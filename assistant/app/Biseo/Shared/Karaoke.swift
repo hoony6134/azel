@@ -49,6 +49,14 @@ struct KaraokeTimeline: Equatable {
         open = false
     }
 
+    /// The player dropped the previous reply's leftover audio and its clock restarts at zero: keep
+    /// the sentences still waiting for audio (the new reply), drop the ones already voiced.
+    mutating func restartClock() {
+        segments = segments.filter { $0.samples == 0 }.map { var s = $0; s.start = 0; return s }
+        scheduled = 0
+        frozen = nil
+    }
+
     /// Characters heard so far, counted over the sentences joined with single spaces (as CallLog
     /// joins them). `stepped`: only whole chunks count (Reduce Motion).
     func spoken(played: Int, stepped: Bool) -> Double {

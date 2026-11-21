@@ -93,3 +93,30 @@ final class ApprovalTests: XCTestCase {
         XCTAssertTrue(list[0].isPending)
     }
 }
+
+/// Today's gateway has no `user_title` and answers 400 "unknown keys" to it on PUT.
+@MainActor
+final class UserTitleGuardTests: XCTestCase {
+    func testSavingAnotherSettingOnAnOldGatewayWorks() async throws {
+        URLProtocol.registerClass(FakeServer.self)
+        Config.testOverride = (gateway: "https://fake.test", token: "test-token")
+        defer { URLProtocol.unregisterClass(FakeServer.self); Config.testOverride = nil; FakeServer.routes = [:]; AppSettings.supportsUserTitle = false }
+        let old = #"{"default_model":"auto","claude_path":"auto","task_defaults":{},"monthly_budget_usd":500,"budget_warn_pct":80,"default_device":"macbook","device_fallback":[],"proactive":{"morning_briefing":"08:00"}}"#
+        FakeServer.seen = []
+        FakeServer.routes = ["GET /v1/settings": (200, old), "PUT /v1/settings": (200, "{}")]
+
+        var s = try await Gateway.get("/v1/settings") as AppSettings
+        AppSettings.supportsUserTitle = s.user_title != nil
+        XCTAssertFalse(AppSettings.supportsUserTitle)
+        s.monthly_budget_usd = 300
+        s.user_title = "정훈님"            // even if something set it, it must not go out
+        try await Gateway.saveSettings(s)
+        let body = String(decoding: FakeServer.seen.last!.body, as: UTF8.self)
+        XCTAssertFalse(body.contains("user_title"), body)
+        XCTAssertTrue(body.contains("300"))
+
+        AppSettings.supportsUserTitle = true
+        try await Gateway.saveSettings(s)
+        XCTAssertTrue(String(decoding: FakeServer.seen.last!.body, as: UTF8.self).contains("user_title"))
+    }
+}

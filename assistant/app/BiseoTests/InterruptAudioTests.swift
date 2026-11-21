@@ -56,3 +56,25 @@ final class InterruptAudioTests: XCTestCase {
         XCTAssertTrue(a.admits)
     }
 }
+
+final class ReplyStartTests: XCTestCase {
+    func testOnlyADifferentReplyIdCountsAsNew() {
+        var a = AudioAdmission()
+        XCTAssertTrue(a.replyStart(1))
+        XCTAssertFalse(a.replyStart(1), "a repeated reply_start for the same reply keeps its audio")
+        XCTAssertTrue(a.replyStart(2))
+        XCTAssertTrue(a.replyStart(nil), "no id: treat as new")
+    }
+
+    func testKaraokeKeepsTheNewReplyWhenTheOldAudioIsDropped() {
+        var k = KaraokeTimeline()
+        k.apply(type: "reply", text: "예전 답")
+        k.audio(samples: 1000)
+        k.apply(type: "turn_done", text: nil)
+        k.apply(type: "reply", text: "새 답")           // text first, then reply_start, then audio
+        k.restartClock()
+        XCTAssertEqual(k.texts, ["새 답"])
+        k.audio(samples: 400)
+        XCTAssertEqual(k.spoken(played: 200, stepped: false), 1.5, accuracy: 0.01, "half of \"새 답\" (3 characters) at the restarted clock")
+    }
+}

@@ -279,8 +279,8 @@ struct PersonaEditor: View {
                     Text("\((p.personality ?? "").count)/\(Persona.personalityLimit)").font(.footnote.monospacedDigit())
                         .foregroundStyle(tooLong ? Theme.danger : Theme.text3)
                 }
-                // 호칭 for this persona
-                Card("호칭") {
+                // 호칭 for this persona, once the gateway knows the field
+                if AppSettings.supportsUserTitle { Card("호칭") {
                     TextField("기본 호칭 사용", text: Binding(get: { p.user_title ?? "" }, set: { p.user_title = $0.isEmpty ? nil : $0 }))
                         .textFieldStyle(.roundedBorder)
                     if let t = p.user_title, AssistantName.validatedTitle(t) == nil {
@@ -288,7 +288,7 @@ struct PersonaEditor: View {
                     } else {
                         Text("비워 두면 설정의 호칭을 써요.").font(.footnote).foregroundStyle(Theme.text3)
                     }
-                }
+                } }
                 // 7. 기억 공유
                 Card {
                     Toggle("기억 공유", isOn: $p.share_memory).tint(p.tint).foregroundStyle(Theme.text)

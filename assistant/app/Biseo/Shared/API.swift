@@ -13,6 +13,7 @@ struct CallEvent: Decodable, Equatable {
     var label: String?        // activity, server wording
     var tool: String?         // activity
     var kind: String?         // activity: calendar | mail | memory | … (DESIGN §13.2)
+    var reply_id: Int?        // reply_start
 }
 
 struct AppSettings: Codable, Equatable {
@@ -95,6 +96,9 @@ struct AppSettings: Codable, Equatable {
     var history_days: Int?
     /// How the assistant addresses the user ("" = no 호칭). Optional for older gateways.
     var user_title: String?
+    /// Whether the gateway knows `user_title` (its GET included the key). Today's gateway doesn't, and
+    /// rejects unknown keys on PUT, so the 호칭 rows stay hidden and the field is never sent until it does.
+    @MainActor static var supportsUserTitle = false
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 
@@ -210,6 +214,8 @@ enum Gateway {
     }
 
     static func saveSettings(_ s: AppSettings) async throws {
+        var s = s
+        if await !AppSettings.supportsUserTitle { s.user_title = nil }   // an old gateway 400s on unknown keys
         _ = try await send("PUT", "/v1/settings", json: try JSONEncoder().encode(s))
     }
 

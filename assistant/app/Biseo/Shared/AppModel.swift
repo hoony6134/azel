@@ -35,7 +35,10 @@ final class AppModel: ObservableObject {
         case .success(let s): status = s; statusError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { statusError = e }
         }
-        if case .success(let s) = await settingsResult, let name = s.assistant_name { AssistantName.current = name }
+        if case .success(let s) = await settingsResult {
+            if let name = s.assistant_name { AssistantName.current = name }
+            AppSettings.supportsUserTitle = s.user_title != nil
+        }
         switch await approvalsResult {
         case .success(let data):
             if let items = try? Gateway.parseApprovals(data) { approvals = items }

@@ -170,7 +170,17 @@ final class CallClient {
             if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
             if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
             // Event order matters for audio, so these run here, before the UI hop.
-            admissionLock.lock(); admission.apply(type: event.type, value: event.value); admissionLock.unlock()
+            admissionLock.lock()
+            let newReply = event.type == "reply_start" && admission.replyStart(event.reply_id)
+            admission.apply(type: event.type, value: event.value)
+            admissionLock.unlock()
+            // A new reply while the previous one is still playing (the server's playback estimate
+            // ended early): drop the rest of the old one. Its text events already arrived, so the
+            // karaoke keeps them and only restarts its clock.
+            if newReply && audio.speechPlaying {
+                audio.flush()
+                karaokeLock.lock(); karaoke.restartClock(); karaokeLock.unlock()
+            }
             switch event.type {
             case "interrupt":
                 cutPlayback()
@@ -350,8 +360,15 @@ struct PlaybackGate: Equatable {
 /// `reply_start` (or, from a server that doesn't send it, the next `state: speaking`).
 struct AudioAdmission: Equatable {
     private(set) var admits = true
+    private(set) var replyID: Int?
 
     mutating func interrupt() { admits = false }
+
+    /// `reply_start`: true when it starts a different reply than the last one (no id counts as new).
+    mutating func replyStart(_ id: Int?) -> Bool {
+        defer { replyID = id }
+        return id == nil || id != replyID
+    }
 
     mutating func apply(type: String, value: String?) {
         switch type {
