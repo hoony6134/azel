@@ -187,9 +187,11 @@ def test_call_history_round_trip(client):
 def test_call_history_search_running_call(client):
     client.post("/v1/state/history/live1/start", json={"session": "s9"})
     client.post("/v1/state/history/live1/turns", json={"user": "주차 요금 알려줘", "assistant": ["시간당 삼천 원이에요."]})
-    hits = client.get("/v1/state/history?q=주차").json()  # not ended: no transcript record yet, still found
-    assert [h["id"] for h in hits] == ["live1"] and "주차" in hits[0]["match"]
-    client.delete("/v1/state/history/live1")
+    try:  # the ended call h1 from test_call_history_round_trip exists and must not show up for "주차"
+        hits = client.get("/v1/state/history?q=주차").json()  # not ended: no transcript record yet, still found
+        assert [h["id"] for h in hits] == ["live1"] and "주차" in hits[0]["match"]
+    finally:
+        client.delete("/v1/state/history/live1")  # never leak into later tests
 
 
 def test_call_history_delete_and_prune(client):
