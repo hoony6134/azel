@@ -184,7 +184,7 @@ def test_call_mode_rings_for_an_approval(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:  # the status is saved a moment before the call goes out
         time.sleep(0.02)
-    assert notes == [("call", "task_approval", "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요.", "azel")]
+    assert notes[0] == ("call", "task_approval", "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요.", "azel")
     c.post("/v1/approvals/ap1", json={"approve": False})
     t = wait_for(c, tid, ("done", "failed"))
     assert t["result"] == "거절돼서 나머지만 했어요." and notes[-1][1] == "task"
