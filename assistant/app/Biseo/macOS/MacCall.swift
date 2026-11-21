@@ -34,7 +34,7 @@ final class MacCall: ObservableObject {
 
     private init() {
         client.onEvent = { [weak self] in self?.handle($0) }
-        client.onClose = { [weak self] in self?.end(error: nil, keepPanel: true) }
+        client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
     }
 
     /// "누르고 말하기" (default) or "눌러서 켜고 끄기".
@@ -265,6 +265,7 @@ struct CallPanelView: View {
     var body: some View {
         HStack(spacing: Theme.m) {
             MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: 68, height: 68)
+                .contentShape(Circle())
                 .onTapGesture { call.interrupt() }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
             VStack(alignment: .leading, spacing: 2) {

@@ -4,6 +4,7 @@ import SwiftUI
 struct HomeView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @Binding var tab: Int
     @ObservedObject private var call = CallManager.shared
     @State private var toast: String?
@@ -28,7 +29,13 @@ struct HomeView: View {
                 .aspectRatio(1, contentMode: .fit)
                 .padding(.horizontal, 60)
                 callButton
+                if let e = call.error, !call.inCall {
+                    Label(e, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(Theme.danger)
+                        .multilineTextAlignment(.leading)
+                        .accessibilityElement(children: .combine)
+                }
                 quickActions
+                ScheduleCard(schedule: schedule)
                 recents
             }
             .padding(.horizontal, 20)
@@ -52,7 +59,7 @@ struct HomeView: View {
             }
         }
         .navigationDestination(for: HistoryItem.self) { HistoryDetailView(item: $0, history: history) }
-        .refreshable { await model.refresh(); await history.refresh() }
+        .refreshable { await model.refresh(); await history.refresh(); await schedule.refresh() }
     }
 
     @ViewBuilder private var statusLine: some View {
@@ -66,7 +73,7 @@ struct HomeView: View {
         } else if let s = model.status {
             HStack(spacing: Theme.s) {
                 StatusDot(ok: model.online)
-                Text(model.online ? "연결됨 · 스파크 \(Int(s.spark.ms ?? 0)) ms" : "일부 서비스가 응답하지 않아요")
+                Text(model.online ? "연결됨 · spark \(Int(s.spark.ms ?? 0)) ms" : "일부 서비스가 응답하지 않아요")
                     .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
             }
             .accessibilityElement(children: .combine)

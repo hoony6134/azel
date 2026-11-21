@@ -4,21 +4,33 @@ import SwiftUI
 struct BiseoApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "iphone")
     @StateObject private var history = HistoryModel()
+    @StateObject private var schedule = ScheduleModel()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
         _ = CallManager.shared // PushKit must be registered on every launch, including background VoIP launches
         Recordings.cleanup()
+        Config.migrateAddresses()
     }
 
     var body: some Scene {
         WindowGroup {
             Group {
-                if model.configured {
-                    RootView(model: model, history: history)
+                #if DEBUG
+                if let i = CommandLine.arguments.firstIndex(of: "-callPreview"), i + 1 < CommandLine.arguments.count {
+                    CallScreen().onAppear { CallManager.shared.debugPreview(state: CommandLine.arguments[i + 1]) }
+                } else if model.configured {
+                    RootView(model: model, history: history, schedule: schedule)
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
+                #else
+                if model.configured {
+                    RootView(model: model, history: history, schedule: schedule)
+                } else {
+                    SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
+                }
+                #endif
             }
             .preferredColorScheme(nil)
             .tint(Theme.celadon)
@@ -34,12 +46,13 @@ struct BiseoApp: App {
 struct RootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @ObservedObject private var call = CallManager.shared
     @State private var tab = 0
 
     var body: some View {
         TabView(selection: $tab) {
-            NavigationStack { HomeView(model: model, history: history, tab: $tab) }
+            NavigationStack { HomeView(model: model, history: history, schedule: schedule, tab: $tab) }
                 .tabItem { Label("홈", systemImage: "circle.circle") }.tag(0)
             NavigationStack {
                 HistoryList(model: history, onCall: { CallManager.shared.startCall() })

@@ -6,10 +6,12 @@ struct BiseoMacApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "mac")
     @StateObject private var wake = WakeModel()
     @StateObject private var history = HistoryModel()
+    @StateObject private var schedule = ScheduleModel()
     @ObservedObject private var call = MacCall.shared
 
     init() {
         Recordings.cleanup()
+        Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
         HotKey.register()
     }
@@ -24,7 +26,7 @@ struct BiseoMacApp: App {
         .menuBarExtraStyle(.window)
 
         Window("Azel", id: "main") {
-            MainWindow(model: model, wake: wake, history: history)
+            MainWindow(model: model, wake: wake, history: history, schedule: schedule)
         }
         .defaultSize(width: 760, height: 720)
 
@@ -41,23 +43,17 @@ struct BiseoMacApp: App {
     }
 }
 
-/// The jar silhouette as a 16 pt template image for the menu bar; filled during a call, dot for approvals.
+/// The menu-bar orb (assistant/design/icon templates): outline when idle, filled during a call,
+/// plus a dot when approvals are pending. Always a template image so it follows the menu bar.
 enum JarIcon {
     static func make(filled: Bool, dot: Bool) -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 16), flipped: true) { rect in
-            let path = JarPath.make(center: CGPoint(x: 8, y: 8), R: 6.2, t: 0, level: 0, from: .idle, to: .idle, mix: 1, reduceMotion: true)
-            let ns = NSBezierPath()
-            path.forEach { el in
-                switch el {
-                case .move(let p): ns.move(to: p)
-                case .line(let p): ns.line(to: p)
-                case .closeSubpath: ns.close()
-                default: break
-                }
-            }
+        let base = NSImage(named: filled ? "MenuBarTemplateFilled" : "MenuBarTemplate") ?? NSImage()
+        guard dot else { base.isTemplate = true; return base }
+        let size = NSSize(width: base.size.width + 4, height: base.size.height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(origin: .zero, size: base.size))
             NSColor.black.set()
-            if filled { ns.fill() } else { ns.lineWidth = 1.4; ns.stroke() }
-            if dot { NSBezierPath(ovalIn: NSRect(x: 13, y: 0, width: 5, height: 5)).fill() }
+            NSBezierPath(ovalIn: NSRect(x: size.width - 6, y: size.height - 6, width: 6, height: 6)).fill()
             return true
         }
         image.isTemplate = true
@@ -118,7 +114,7 @@ struct Popover: View {
             } else {
                 HStack(spacing: Theme.m) {
                     MoonJar(state: call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
-                            levels: call.levels).frame(width: 64, height: 64)
+                            levels: call.levels, sway: true).frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: Theme.s) {
                         Text(MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요").font(.subheadline).foregroundStyle(Theme.text2)
                         Button { call.inCall ? call.hangUp() : call.start(panel: true) } label: {
@@ -237,6 +233,7 @@ struct MainWindow: View {
     @ObservedObject var model: AppModel
     @ObservedObject var wake: WakeModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @State private var section: String? = "home"
 
     var body: some View {
@@ -255,7 +252,7 @@ struct MainWindow: View {
                     case "approvals": ApprovalsScreen(model: model)
                     case "history": HistorySplit(history: history)
                     case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
-                    default: MacHome(model: model, history: history) { section = "history" }
+                    default: MacHome(model: model, history: history, schedule: schedule) { section = "history" }
                     }
                 }
             } else {
@@ -271,6 +268,7 @@ struct MainWindow: View {
 struct MacHome: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     var showAll: () -> Void
     @ObservedObject private var call = MacCall.shared
     @State private var openItem: HistoryItem?
@@ -326,6 +324,7 @@ struct MacHome: View {
             }
             .buttonStyle(.plain).disabled(model.statusError != nil)
             Text("어디서든 \(HotKey.label)로 부를 수 있어요").font(.footnote).foregroundStyle(Theme.text3)
+            ScheduleCard(schedule: schedule)
             VStack(alignment: .leading, spacing: Theme.m) {
                 HStack {
                     Text("최근 대화").font(.headline).foregroundStyle(Theme.text)

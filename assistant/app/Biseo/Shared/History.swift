@@ -37,8 +37,8 @@ struct HistoryItem: Codable, Identifiable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeFlexibleID(.id)
         session = try c.decodeIfPresent(String.self, forKey: .session)
-        title = try c.decodeIfPresent(String.self, forKey: .title)
-        last_reply = try c.decodeIfPresent(String.self, forKey: .last_reply)
+        title = LegacyText.clean(try c.decodeIfPresent(String.self, forKey: .title))
+        last_reply = LegacyText.clean(try c.decodeIfPresent(String.self, forKey: .last_reply))
         started_at = try c.decode(Double.self, forKey: .started_at)
         duration_s = try c.decodeIfPresent(Double.self, forKey: .duration_s)
         direction = try c.decodeIfPresent(String.self, forKey: .direction)
@@ -72,9 +72,9 @@ struct HistoryCall: Codable, Equatable {
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             at = try c.decodeIfPresent(Double.self, forKey: .at)
-            user = try c.decodeIfPresent(String.self, forKey: .user)
-            if let list = try? c.decodeIfPresent([String].self, forKey: .assistant) { assistant = list.joined(separator: " ") }
-            else { assistant = try c.decodeIfPresent(String.self, forKey: .assistant) }
+            user = LegacyText.clean(try c.decodeIfPresent(String.self, forKey: .user))
+            if let list = try? c.decodeIfPresent([String].self, forKey: .assistant) { assistant = LegacyText.clean(list.joined(separator: " ")) }
+            else { assistant = LegacyText.clean(try c.decodeIfPresent(String.self, forKey: .assistant)) }
             route = try c.decodeIfPresent(String.self, forKey: .route)
             activity = try c.decodeIfPresent([Step].self, forKey: .activity)
             interrupted = try c.decodeIfPresent(Bool.self, forKey: .interrupted)

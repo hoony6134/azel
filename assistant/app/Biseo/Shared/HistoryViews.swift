@@ -28,6 +28,10 @@ enum HistoryFormat {
         return out
     }
 
+    /// From the user's side, like the phone's call log: incoming = the assistant called.
+    static func directionLabel(incoming: Bool) -> String { incoming ? "받은 전화" : "건 전화" }
+    static func directionGlyph(incoming: Bool) -> String { incoming ? "phone.arrow.down.left" : "phone.arrow.up.right" }
+
     static let kindNames = ["calendar": "캘린더", "mail": "메일", "memory": "기억", "schedule": "일정", "server": "서버",
                             "files": "파일", "notes": "노션", "web": "웹", "terminal": "명령"]
 
@@ -35,7 +39,7 @@ enum HistoryFormat {
         var parts = [item.start.formatted(date: .omitted, time: .shortened), item.title ?? "제목 없음"]
         if let d = item.duration_s { parts.append("\(max(1, Int((d / 60).rounded())))분") }
         if let t = item.turns { parts.append("\(t)턴") }
-        parts.append(item.incoming ? "\(AssistantName.josa(AssistantName.current, "이", "가")) 건 전화" : "내가 건 전화")
+        parts.append(directionLabel(incoming: item.incoming))
         if item.routeList.contains("claude") { parts.append("Claude 사용") }
         return parts.joined(separator: ", ")
     }
@@ -45,10 +49,10 @@ enum HistoryFormat {
 struct DirectionGlyph: View {
     let incoming: Bool
     var body: some View {
-        Image(systemName: incoming ? "phone.arrow.down.left" : "phone.arrow.up.right")
+        Image(systemName: HistoryFormat.directionGlyph(incoming: incoming))
             .font(.system(size: 17)).frame(width: 20)
             .foregroundStyle(incoming ? Theme.celadon : Theme.text2)
-            .accessibilityHidden(true)
+            .accessibilityLabel(HistoryFormat.directionLabel(incoming: incoming))
     }
 }
 
@@ -375,14 +379,13 @@ struct HistoryDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.leading, 60)
             }
+            if turn.assistant == nil, turn.interrupted == true { InterruptedMark() }
             if let reply = turn.assistant {
                 VStack(alignment: .leading, spacing: 6) {
                     if let route = turn.route { RouteChip(route: route) }
                     Text(reply + (turn.interrupted == true ? " …" : "")).font(.title3).foregroundStyle(dim ? Theme.text3 : Theme.text)
                         .textSelection(.enabled)
-                    if turn.interrupted == true {
-                        Label("말이 끊겼어요", systemImage: "scissors").font(.footnote).foregroundStyle(Theme.text3)
-                    }
+                    if turn.interrupted == true { InterruptedMark() }
                     if let steps = turn.activity, !steps.isEmpty { trail(i, steps) }
                 }
             }
@@ -551,4 +554,12 @@ struct RecordingPlayerBar: View {
     }
 
     private func clock(_ t: Double) -> String { String(format: "%d:%02d", Int(t) / 60, Int(t) % 60) }
+}
+
+/// Subtle "끊김" mark on an interrupted turn.
+struct InterruptedMark: View {
+    var body: some View {
+        Label("끊김", systemImage: "scissors").font(.footnote).foregroundStyle(Theme.text3)
+            .accessibilityLabel("말이 끊김")
+    }
 }

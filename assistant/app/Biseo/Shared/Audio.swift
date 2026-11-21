@@ -52,6 +52,8 @@ extension PCM {
 /// every frame by the jar's Canvas; deliberately not @Published.
 final class Levels: @unchecked Sendable {
     static let silent = Levels()
+
+    init(mic: Float = 0, out: Float = 0) { _mic = mic; _out = out }
     private let lock = NSLock()
     private var _mic: Float = 0, _out: Float = 0, _loudAt: Double = -.infinity
     var mic: Float { lock.lock(); defer { lock.unlock() }; return _mic }
