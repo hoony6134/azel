@@ -11,6 +11,7 @@ Contract: ../PROTOCOL.md section 3. Run: uv run gateway.py  (binds the Tailscale
 """
 import asyncio
 import copy
+import hashlib
 import hmac
 import json
 import os
@@ -44,6 +45,9 @@ CLAUDE_OK = os.environ.get("BISEO_NO_CLAUDE", "") not in ("1", "true", "yes")
 # Scheduled calls fire on one gateway: the scheduler lease goes to the lowest value among live gateways.
 SCHED_PRIORITY = int(os.environ.get("BISEO_SCHEDULER_PRIORITY", os.environ.get("BISEO_PRIORITY", "10")))
 STATE_URL = os.environ.get("BISEO_STATE_URL", "http://100.64.0.10:8894")
+# The local Qwen on vd-spark decides autonomous calls (free, no Claude).
+LLM_URL = os.environ.get("BISEO_LLM_URL", "http://100.64.0.11:8888/v1/chat/completions")
+LLM_MODEL = os.environ.get("BISEO_LLM_MODEL", "Qwen3.8-Flash-Next")
 VOICE_URL = os.environ.get("BISEO_VOICE_URL", "http://100.64.0.11:8891")
 TTS_URL = os.environ.get("BISEO_TTS_URL", "http://100.64.0.11:8890")
 CLAUDE = os.environ.get("BISEO_CLAUDE", "claude")
@@ -669,12 +673,22 @@ async def scheduler_tick(now, fired):
                 await state.call("DELETE", "/v1/state/history", older_than_days=s["history_days"])
         except StateDown:
             pass  # tomorrow, then
+    p = s["proactive"]
     try:  # scheduled calls: only the scheduler lease holder fires (renewed every tick, lowest priority wins)
         if await take_lease("scheduler", 150, SCHED_PRIORITY):
             await fire_scheduled(now.timestamp())
+            if now.minute in (0, 30) and p["enabled"] and p["autonomous"]["enabled"]:
+                await autonomous_tick(now, p["autonomous"])
     except StateDown:
         pass
-    p = s["proactive"]
+    a = p["autonomous"]
+    if CLAUDE_OK and p["enabled"] and a["enabled"] and hm in a["checkpoints"] and fired.get(f"cp{hm}") != today:
+        fired[f"cp{hm}"] = today
+        try:
+            if await take_lease(f"job:checkpoint:{today}:{hm}", 86400):
+                await run_checkpoint()
+        except StateDown:
+            pass
     jobs = {"morning_briefing": lambda: place_call("morning_briefing"), "deadline_check": deadline_call}
     if not CLAUDE_OK or not p["enabled"]:
         jobs = {}  # briefings and deadline checks need Claude; the master switch stops every proactive call
@@ -690,6 +704,170 @@ async def scheduler_tick(now, fired):
 
 
 RETENTION_AT = "04:00"  # call history older than history_days is deleted daily
+
+
+# ---------- autonomous calls: the server decides when to call, with guardrails ----------
+SITUATION = "azel-situation"  # memory-service task context the Claude checkpoint writes
+CHECKPOINT_PROMPT = (
+    "자율 전화 판단용 상황 메모를 써. GISTRA(과제·시험·수업), Planit(할 일), 캘린더, 메일을 확인해서 "
+    "앞으로 48시간 안에 마감이거나 사용자의 결정·답장이 필요한 것만, 한 줄에 하나씩 '[긴급도 1-5] 무엇 — 언제까지 — "
+    "왜 사용자가 필요함' 형식으로 10줄 이내로 써. 없으면 '없음'이라고만 써. 인사나 설명은 쓰지 마."
+)
+DECIDE_PROMPT = (
+    "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
+    "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
+    'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
+    '"opening": "전화 첫마디, 이유를 한두 문장으로, 존댓말"}'
+)
+
+
+async def run_checkpoint():
+    """One `claude -p` that reads GISTRA/Planit/Calendar/Gmail and leaves a compact situation note in memory."""
+    text = await ask_text(CHECKPOINT_PROMPT, session=f"checkpoint-{uuid.uuid4().hex[:8]}", model="sonnet",
+                          task="schedule")
+    if text:
+        await state.call("PUT", f"/v1/context/{SITUATION}", {"summary": text[:4000], "open_questions": []})
+
+
+async def device_jobs(now):
+    """Delegated jobs that finished or failed in the last 2 h, per trusted daemon (list_jobs over MCP)."""
+    out = []
+    for d in await fresh_devices():
+        try:
+            res = await mcp(d["url"], "tools/call", {"name": "list_jobs", "arguments": {}})
+            jobs = json.loads("".join(c.get("text", "") for c in res.get("content", [])))["jobs"]
+        except Exception:
+            continue
+        for j in jobs:
+            fin = j.get("finished")
+            if j.get("status") not in ("running", "pending", "queued") and isinstance(fin, (int, float)) \
+                    and now - fin < 7200:
+                out.append(f"{d['id']}: {str(j.get('task', ''))[:60]} → {j.get('status')}")
+    return out
+
+
+async def gather_signals(now):
+    """Everything the decision may use, without Claude. Short strings only; each source fails on its own."""
+    sig: dict[str, list] = {}
+
+    async def source(name, fn):
+        try:
+            sig[name] = await fn()
+        except Exception as e:
+            print("signal failed:", name, type(e).__name__, flush=True)
+            sig[name] = []
+
+    async def alerts_recent():
+        rows = await state.call("GET", "/v1/state/kv/alerts_recent") or []
+        return [f"{r['names']} ({round((now - r['at']) / 60)}분 전)" for r in rows if now - r["at"] < 86400]
+
+    async def approvals():
+        rows = await state.call("GET", "/v1/state/approvals") or []
+        return [f"{r['device']}: {r['command'][:60]} ({round((now - r['created']) / 60)}분째 승인 대기)"
+                for r in rows if now - r["created"] > 1800]
+
+    async def missed():
+        rows = await state.call("GET", "/v1/state/schedule", status="missed") or []
+        return [f"{spoken_when(r['at'], r['repeat'], now)} {'기상' if r['kind'] == 'wake' else '예약'} 전화 못 받음"
+                for r in rows if now - (r["last_attempt"] or 0) < 86400]
+
+    async def contexts():
+        rows = await state.call("GET", "/v1/context", recent=20) or []
+        return [f"{r['task_id']}: {r['summary'][:80]} / 열린 질문: {'; '.join(r['open_questions'])[:120]}"
+                for r in rows if r["open_questions"] and r["task_id"] != SITUATION]
+
+    for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
+                     ("tasks", contexts), ("device_jobs", lambda: device_jobs(now))):
+        await source(name, fn)
+    note = None
+    try:
+        note = await state.call("GET", f"/v1/context/{SITUATION}")
+    except Exception:
+        pass
+    sig["situation"] = [note["summary"][:1500]] if note and note.get("summary") else []
+    return sig
+
+
+async def llm_json(system, user):
+    """One request to the local Qwen; the first {...} in its answer, or None."""
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(LLM_URL, json={"model": LLM_MODEL, "max_tokens": 300, "temperature": 0.2,
+                                        "messages": [{"role": "system", "content": system},
+                                                     {"role": "user", "content": user}]})
+    r.raise_for_status()
+    out = r.json()["choices"][0]["message"]["content"]
+    try:
+        return json.loads(out[out.index("{"):out.rindex("}") + 1])
+    except ValueError:
+        return None
+
+
+async def qwen_decide(signals, now):
+    """Qwen's verdict, normalized; never trusted beyond its shape (the guardrails decide what happens)."""
+    if not any(signals.values()):
+        return {"call": False, "urgency": 0, "reason": "신호 없음", "opening": ""}
+    when = datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d %H:%M (%a)")
+    try:
+        d = await llm_json(DECIDE_PROMPT, f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
+    except Exception as e:
+        print("autonomous decision failed:", type(e).__name__, flush=True)
+        d = None
+    if not isinstance(d, dict):
+        return {"call": False, "urgency": 0, "reason": "판단 실패", "opening": ""}
+    u = d.get("urgency")
+    urgency = u if isinstance(u, int) and not isinstance(u, bool) and 0 <= u <= 5 else 0  # strict: no 4.9, no "5"
+    reason = str(d.get("reason") or "")[:200]
+    return {"call": d.get("call") is True, "urgency": urgency, "reason": reason,
+            "opening": str(d.get("opening") or reason)[:200]}
+
+
+def reason_hash(reason):
+    return hashlib.sha256(re.sub(r"[\W_]+", "", reason.lower()).encode()).hexdigest()[:16]
+
+
+def guard(decision, now, called_recent, a):
+    """Why this decision may not ring (None = ring). `called_recent`: proactive_log rows that called, last 24 h."""
+    hm, today = datetime.fromtimestamp(now, KST).strftime("%H:%M"), datetime.fromtimestamp(now, KST).date()
+    if not decision["call"]:
+        return "no_call"
+    if decision["urgency"] < 4:
+        return "urgency"
+    if not a["window"][0] <= hm < a["window"][1]:
+        return "window"
+    if sum(datetime.fromtimestamp(r["at"], KST).date() == today for r in called_recent) >= a["max_per_day"]:
+        return "max_per_day"
+    if any(now - r["at"] < a["min_gap_minutes"] * 60 for r in called_recent):
+        return "min_gap"
+    if any(r["reason_hash"] == reason_hash(decision["reason"]) for r in called_recent):
+        return "duplicate"
+    return None
+
+
+async def autonomous_tick(now_dt, a):
+    """Every 30 min on the scheduler lease holder: signals → local Qwen → guardrails → maybe a call. Every
+    decision is logged, called or not, so the user can see why it called or didn't."""
+    now = now_dt.timestamp()
+    signals = await gather_signals(now)
+    decision = await qwen_decide(signals, now)
+    recent = await state.call("GET", "/v1/state/proactive_log", since=now - 86400, called="true") or []
+    blocked = guard(decision, now, recent, a)
+    entry = {**decision, "reason_hash": reason_hash(decision["reason"]), "called": False, "blocked_by": blocked,
+             "signals": {k: v[:10] for k, v in signals.items()}}
+    if blocked is None:
+        call = await place_call("autonomous", decision["opening"] or decision["reason"])
+        entry.update(called=True, call_id=call["call_id"])
+    await state.call("POST", "/v1/state/proactive_log", entry)
+    return entry
+
+
+async def remember_alert(names, now):
+    """Critical alerts become an autonomous-call signal (kept 24 h, at most 20)."""
+    try:
+        rows = await state.call("GET", "/v1/state/kv/alerts_recent") or []
+        rows = [r for r in rows if now - r["at"] < 86400][-19:] + [{"names": names, "at": now}]
+        await state.call("PUT", "/v1/state/kv/alerts_recent", rows)
+    except (StateDown, HTTPException):
+        pass
 
 
 # ---------- scheduled calls ("내일 10시에 깨워 줘"); no Claude involved ----------
@@ -1080,6 +1258,13 @@ def full_only():
         raise HTTPException(403, "not available on a limited gateway")
 
 
+@app.get("/v1/proactive/log")
+async def proactive_log(limit: int = 50, since: float = 0):
+    """Why the assistant called, or decided not to: every autonomous decision, newest first."""
+    full_only()
+    return await state.call("GET", "/v1/state/proactive_log", limit=max(1, min(limit, 500)), since=since)
+
+
 @app.get("/v1/schedule")
 async def schedule_get(include: str = ""):
     """Pending and fired items, soonest first; `include=all` adds answered, missed and cancelled ones."""
@@ -1167,9 +1352,12 @@ async def alerts(body: dict):
     s = await load_settings()
     firing = [a for a in body.get("alerts", []) if a.get("status") == "firing"
               and a.get("labels", {}).get("severity") == "critical"]
-    if not firing or not s["proactive"]["enabled"] or not s["proactive"]["server_alerts"]:
+    if not firing:
         return {"called": False}
     names = ", ".join(sorted({a["labels"].get("alertname", "알 수 없는 경보") for a in firing}))
+    await remember_alert(names, time.time())
+    if not s["proactive"]["enabled"] or not s["proactive"]["server_alerts"]:
+        return {"called": False}
     try:  # Alertmanager may post the same alert to several gateways: one call per alert set per 10 min
         if not await take_lease(f"alert:{names}", 600):
             return {"called": False, "reason": "another gateway is calling"}

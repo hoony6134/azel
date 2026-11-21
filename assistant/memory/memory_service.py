@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Path as FPath, Query, Request
 from huggingface_hub import hf_hub_download
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -98,6 +98,12 @@ create table if not exists {STATE}.scheduled_calls(
     attempts int not null default 0, call_id text, last_attempt timestamptz,
     created timestamptz not null default now());
 create index if not exists scheduled_calls_at on {STATE}.scheduled_calls (status, at);
+create table if not exists {STATE}.proactive_log(
+    id bigserial primary key, at timestamptz not null default now(), call boolean not null default false,
+    urgency int not null default 0, reason text not null default '', opening text not null default '',
+    reason_hash text not null default '', called boolean not null default false, blocked_by text,
+    signals jsonb not null default '{{}}', call_id text);
+create index if not exists proactive_log_at on {STATE}.proactive_log (at desc);
 create table if not exists {STATE}.call_history(
     id text primary key, session text, call_id text, direction text, reason text, client text, opening text,
     started_at timestamptz not null default now(), ended_at timestamptz, duration_s double precision);
@@ -500,6 +506,56 @@ def take_lease(name: str, lease: Lease):
 def release_lease(name: str, holder: str):
     return {"released": bool(db(f"delete from {STATE}.leases where name=%s and holder=%s returning name",
                                 (name, holder)))}
+
+
+# ---------- autonomous calls: every decision, and small shared values (full gateways only) ----------
+class ProactiveEntry(BaseModel):
+    call: bool = False
+    urgency: int = Field(0, ge=0, le=5)
+    reason: str = Field("", max_length=500)
+    opening: str = Field("", max_length=500)
+    reason_hash: str = Field("", max_length=64)
+    called: bool = False
+    blocked_by: str | None = Field(None, max_length=40)
+    signals: dict = {}
+    call_id: str | None = None
+
+
+@app.post("/v1/state/proactive_log", dependencies=[v1])
+def add_proactive(e: ProactiveEntry):
+    return db(f"insert into {STATE}.proactive_log(call, urgency, reason, opening, reason_hash, called, blocked_by,"
+              " signals, call_id) values(%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id",
+              (e.call, e.urgency, e.reason, e.opening, e.reason_hash, e.called, e.blocked_by, Jsonb(e.signals),
+               e.call_id))[0]
+
+
+@app.get("/v1/state/proactive_log", dependencies=[v1])
+def list_proactive(since: float = 0, called: bool | None = None, limit: int = 100):
+    return db(f"select id, {EPOCH.format('at')}, call, urgency, reason, opening, reason_hash, called, blocked_by,"
+              f" signals, call_id from {STATE}.proactive_log where at >= to_timestamp(%s)"
+              " and (%s::boolean is null or called = %s) order by at desc limit %s",
+              (since, called, called, max(1, min(limit, 500))))
+
+
+KV_KEY = r"^[a-z0-9_]{1,40}$"
+
+
+@app.get("/v1/state/kv/{key}", dependencies=[v1])
+def get_kv(key: str = FPath(pattern=KV_KEY)):
+    if key == "settings":
+        raise HTTPException(400, "use /v1/state/settings")
+    rows = db(f"select value from {STATE}.kv where key=%s", (key,))
+    if not rows:
+        raise HTTPException(404, "no such key")
+    return rows[0]["value"]
+
+
+@app.put("/v1/state/kv/{key}", dependencies=[v1])
+def put_kv(body: dict | list = Body(...), key: str = FPath(pattern=KV_KEY)):
+    if key == "settings":
+        raise HTTPException(400, "use /v1/state/settings")
+    return db(f"insert into {STATE}.kv values(%s, %s, now()) on conflict(key) do update set value=excluded.value,"
+              " updated=now() returning value", (key, Jsonb(body)))[0]["value"]
 
 
 # ---------- scheduled calls (full gateways only) ----------

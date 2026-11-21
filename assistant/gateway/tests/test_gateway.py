@@ -647,6 +647,148 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
     assert ran == []  # no briefing without Claude
 
 
+# ---------- autonomous calls ----------
+A = {"enabled": True, "max_per_day": 3, "min_gap_minutes": 120, "window": ["08:00", "23:00"],
+     "checkpoints": ["08:30", "13:00", "18:00"]}
+
+
+def test_guardrails(gw):
+    g, _, _ = gw
+    at = lambda h, m=0: kst(2026, 11, 22, h, m).timestamp()  # noqa: E731
+    yes = {"call": True, "urgency": 5, "reason": "서버 다운", "opening": "서버가 다운됐어요."}
+    called = lambda t, reason="다른 일": {"at": t, "reason_hash": g.reason_hash(reason)}  # noqa: E731
+    assert g.guard(yes, at(10), [], A) is None
+    assert g.guard({**yes, "call": False}, at(10), [], A) == "no_call"
+    assert g.guard({**yes, "urgency": 3}, at(10), [], A) == "urgency"
+    for h, m in [(2, 0), (7, 59), (23, 0), (23, 30)]:  # Qwen can never ring outside the window
+        assert g.guard(yes, at(h, m), [], A) == "window", (h, m)
+    assert g.guard(yes, at(20), [called(at(8)), called(at(11)), called(at(14))], A) == "max_per_day"
+    assert g.guard(yes, at(20), [called(at(8)), called(at(11))], A) is None  # two today: one left
+    assert g.guard(yes, at(20), [called(at(8) - 86400), called(at(11) - 86400), called(at(14) - 86400)], A) is None
+    assert g.guard(yes, at(12), [called(at(11))], A) == "min_gap"  # 60 min < 120
+    assert g.guard(yes, at(13, 1), [called(at(11))], A) is None
+    assert g.guard(yes, at(20), [called(at(9), "서버 다운!")], A) == "duplicate"  # same reason, other punctuation
+
+
+def auto_setup(g, monkeypatch, verdict):
+    placed, asked = [], []
+
+    async def fake_place(reason, opening=None):
+        placed.append((reason, opening))
+        return {"call_id": f"call{len(placed)}"}
+
+    async def fake_llm(system, user):
+        asked.append(user)
+        return verdict
+    monkeypatch.setattr(g, "place_call", fake_place)
+    monkeypatch.setattr(g, "llm_json", fake_llm)
+    g.fake.db["kv"]["alerts_recent"] = [{"names": "NodeDown", "at": time.time() - 300}]
+    return placed, asked
+
+
+def test_autonomous_tick_calls_logs_and_dedupes(gw, monkeypatch):
+    g, c, _ = gw
+    verdict = {"call": True, "urgency": 5, "reason": "ruchba 디스크 경보", "opening": "ruchba 디스크가 꽉 찼어요. 볼까요?"}
+    placed, asked = auto_setup(g, monkeypatch, verdict)
+    now = datetime.now(g.KST).replace(hour=10, minute=0)
+    g.fake.now = lambda: now.timestamp()
+    entry = asyncio.run(g.autonomous_tick(now, A))
+    assert placed == [("autonomous", "ruchba 디스크가 꽉 찼어요. 볼까요?")] and entry["called"] and entry["call_id"] == "call1"
+    assert "NodeDown" in asked[0]  # the signal reached the decision
+    later = now + timedelta(hours=3)  # past the gap, same reason
+    g.fake.now = lambda: later.timestamp()
+    entry = asyncio.run(g.autonomous_tick(later, A))
+    assert entry["blocked_by"] == "duplicate" and len(placed) == 1
+    log = c.get("/v1/proactive/log").json()
+    assert [r["called"] for r in log] == [False, True] and log[0]["blocked_by"] == "duplicate"
+    assert log[1]["signals"]["alerts"][0].startswith("NodeDown")
+
+
+def test_autonomous_never_calls_outside_the_window(gw, monkeypatch):
+    g, _, _ = gw
+    placed, _ = auto_setup(g, monkeypatch, {"call": True, "urgency": 5, "reason": "급함", "opening": "급해요."})
+    night = datetime.now(g.KST).replace(hour=2, minute=0)
+    entry = asyncio.run(g.autonomous_tick(night, A))
+    assert placed == [] and entry["blocked_by"] == "window" and g.fake.db["plog"][-1]["blocked_by"] == "window"
+
+
+def test_autonomous_tick_only_when_enabled(gw, monkeypatch):
+    g, c, _ = gw
+    placed, asked = auto_setup(g, monkeypatch, {"call": True, "urgency": 5, "reason": "x", "opening": "x"})
+    noon = datetime(2026, 11, 22, 12, 0, tzinfo=g.KST)
+    asyncio.run(g.scheduler_tick(noon, {}))
+    assert asked == [] and g.fake.db["plog"] == []  # autonomous is off by default
+    c.put("/v1/settings", json={"proactive": {"autonomous": {"enabled": True}}})
+    asyncio.run(g.scheduler_tick(noon.replace(minute=7), {}))
+    assert asked == []  # only at :00 and :30
+    asyncio.run(g.scheduler_tick(noon, {}))
+    assert len(asked) == 1
+    c.put("/v1/settings", json={"proactive": {"enabled": False}})  # master switch off
+    asyncio.run(g.scheduler_tick(noon.replace(minute=30), {}))
+    assert len(asked) == 1
+
+
+def test_bad_qwen_output_never_calls(gw, monkeypatch):
+    g, _, _ = gw
+    for verdict in [None, "call", {"call": "true", "urgency": 5, "reason": "x"}, {"call": True, "urgency": "많이"},
+                    {"call": True, "urgency": 4.9, "reason": "y"}, {"call": True, "urgency": "5", "reason": "z"},
+                    {"call": True, "urgency": 9, "reason": "w"}, {"call": True, "urgency": True, "reason": "v"}]:
+        placed, _ = auto_setup(g, monkeypatch, verdict)
+        entry = asyncio.run(g.autonomous_tick(datetime.now(g.KST).replace(hour=10, minute=0), A))
+        assert placed == [] and entry["blocked_by"] in ("no_call", "urgency"), verdict
+
+
+def test_signals_and_checkpoint(gw, monkeypatch):
+    g, c, _ = gw
+    now = time.time()
+    g.fake.db["approvals"]["a1"] = {"id": "a1", "device": "macbook", "command": "git push", "status": "pending",
+                                    "created": now - 3600}
+    g.fake.db["approvals"]["a2"] = {"id": "a2", "device": "macbook", "command": "ls", "status": "pending",
+                                    "created": now - 60}
+    g.fake.db["schedule"]["m1"] = {"id": "m1", "at": now - 900, "repeat": None, "kind": "wake", "note": "",
+                                   "status": "missed", "attempts": 3, "call_id": "c", "last_attempt": now - 600}
+    g.fake.db["context"]["t1"] = {"task_id": "t1", "summary": "치과 예약", "open_questions": ["몇 시?"]}
+    g.fake.db["context"]["t2"] = {"task_id": "t2", "summary": "끝난 일", "open_questions": []}
+    c.post("/v1/devices/register", json={"id": "macbook", "name": "macbook", "url": "http://x/mcp"})
+
+    async def fake_mcp(url, method, params):
+        return {"content": [{"type": "text", "text": json.dumps({"jobs": [
+            {"job_id": "j1", "status": "failed", "task": "빌드", "finished": now - 120},
+            {"job_id": "j2", "status": "running", "task": "테스트", "finished": None}]})}]}
+    monkeypatch.setattr(g, "mcp", fake_mcp)
+
+    async def fake_ask(*a, **k):
+        return "[5] 토론지 — 내일 23시 — 아직 안 냄"
+    monkeypatch.setattr(g, "ask_text", fake_ask)
+    asyncio.run(g.run_checkpoint())
+    sig = asyncio.run(g.gather_signals(now))
+    assert sig["approvals"] == ["macbook: git push (60분째 승인 대기)"]
+    assert len(sig["missed_calls"]) == 1 and sig["missed_calls"][0].endswith("기상 전화 못 받음")
+    assert sig["tasks"] == ["t1: 치과 예약 / 열린 질문: 몇 시?"]
+    assert sig["device_jobs"] == ["macbook: 빌드 → failed"]
+    assert sig["situation"] == ["[5] 토론지 — 내일 23시 — 아직 안 냄"]
+    alert = {"alerts": [{"status": "firing", "labels": {"severity": "critical", "alertname": "DiskFull"}}]}
+    c.put("/v1/settings", json={"proactive": {"server_alerts": False}})
+    c.post("/v1/alerts", json=alert)  # no call, but remembered as a signal
+    assert asyncio.run(g.gather_signals(time.time()))["alerts"][0].startswith("DiskFull")
+
+
+def test_checkpoint_runs_at_its_times_with_claude_only(gw, monkeypatch):
+    g, c, _ = gw
+    ran = []
+
+    async def fake_cp():
+        ran.append(1)
+    monkeypatch.setattr(g, "run_checkpoint", fake_cp)
+    c.put("/v1/settings", json={"proactive": {"autonomous": {"enabled": True}}})
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 22, 13, 0, tzinfo=g.KST), {}))
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 22, 13, 1, tzinfo=g.KST), {}))
+    assert ran == [1]
+    monkeypatch.setattr(g, "CLAUDE_OK", False)
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 22, 18, 0, tzinfo=g.KST), {}))
+    assert ran == [1]
+
+
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
     g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}
@@ -734,6 +876,7 @@ def test_limited_has_no_call_history(limited):
     g, c, _ = limited
     for method, path in [("get", "/v1/history"), ("get", "/v1/history/L1"), ("delete", "/v1/history/L1"),
                          ("delete", "/v1/history?older_than_days=30"), ("get", "/v1/schedule"),
+                         ("get", "/v1/proactive/log"),
                          ("delete", "/v1/schedule/s1")]:
         assert getattr(c, method)(path).status_code == 403, path
     asyncio.run(g.handle_link(LinkWS(CALL_LOG)))

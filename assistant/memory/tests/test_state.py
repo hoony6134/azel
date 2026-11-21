@@ -241,6 +241,26 @@ def test_scheduled_calls(client):
     assert limited_client("100.64.0.8", "l1m").get("/v1/state/schedule").status_code == 403
 
 
+def test_proactive_log_and_kv(client):
+    t0 = time.time()
+    client.post("/v1/state/proactive_log", json={"call": True, "urgency": 5, "reason": "서버 다운", "reason_hash": "ab",
+                                                 "called": True, "call_id": "c1", "signals": {"alerts": ["NodeDown"]}})
+    client.post("/v1/state/proactive_log", json={"call": False, "urgency": 2, "reason": "별일 없음",
+                                                 "blocked_by": "no_call"})
+    rows = client.get(f"/v1/state/proactive_log?since={t0 - 5}").json()
+    assert [r["reason"] for r in rows] == ["별일 없음", "서버 다운"]  # newest first
+    assert [r["reason"] for r in client.get("/v1/state/proactive_log?called=true").json()] == ["서버 다운"]
+    assert rows[1]["signals"] == {"alerts": ["NodeDown"]} and rows[0]["blocked_by"] == "no_call"
+    assert client.post("/v1/state/proactive_log", json={"urgency": 9}).status_code == 422
+    assert client.get("/v1/state/kv/alerts_recent").status_code == 404
+    assert client.put("/v1/state/kv/alerts_recent", json=[{"names": "NodeDown", "at": t0}]).json()[0]["names"] == "NodeDown"
+    assert client.get("/v1/state/kv/alerts_recent").json() == [{"names": "NodeDown", "at": t0}]
+    assert client.put("/v1/state/kv/settings", json={}).status_code == 400  # settings have their own route
+    assert client.get("/v1/state/kv/Bad-Key").status_code == 422
+    lim = limited_client("100.64.0.8", "l1m")
+    assert lim.get("/v1/state/proactive_log").status_code == 403 and lim.get("/v1/state/kv/alerts_recent").status_code == 403
+
+
 def test_bad_tokens(client):
     for token in ["nope", "", "l1m-", "t0k-"]:
         assert limited_client("100.64.0.8", token).get("/v1/state/settings").status_code == 401

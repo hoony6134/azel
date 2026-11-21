@@ -118,7 +118,7 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
   `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|DELETE /v1/history`, `GET|DELETE
-  /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}` (bearer header).
+  /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`, `GET /v1/proactive/log` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -134,7 +134,9 @@ Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BIS
 slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
 `BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`, `BISEO_NO_CLAUDE=1` (this
 gateway has no Claude: asks answer `code: "no_claude"`, no briefings or deadline checks),
-`BISEO_SCHEDULER_PRIORITY` (default `BISEO_PRIORITY`; lowest live value fires scheduled calls). Token files (0600, else the
+`BISEO_SCHEDULER_PRIORITY` (default `BISEO_PRIORITY`; lowest live value fires scheduled calls),
+`BISEO_LLM_URL` / `BISEO_LLM_MODEL` (the local Qwen for autonomous-call decisions; default vd-spark
+`http://100.64.0.11:8888/v1/chat/completions`, `Qwen3.8-Flash-Next`). Token files (0600, else the
 gateway refuses to start): `token`, `link_token` (falls back to `token` until link tokens are rolled
 out), and in limited mode `state_token_limited` (required).
 
@@ -215,6 +217,23 @@ device that created them.
   `missed` and sends an alert push. Answered (voice `call_answered`) → `answered`; repeating items go back
   to `pending` at their next occurrence (also after a miss). Status changes are compare-and-set, so two
   gateways never fire the same attempt.
+- Autonomous calls ("서버가 생각해서 알아서 부르기"; `proactive.enabled` and `proactive.autonomous.enabled`,
+  the latter off by default):
+  - Checkpoints: at each `autonomous.checkpoints` time (default 08:30, 13:00, 18:00) one full gateway
+    with Claude (lease `job:checkpoint:<date>:<HH:MM>`) runs one `claude -p` that reads GISTRA, Planit,
+    Calendar and Gmail and writes a compact situation note (what is due within 48 h, what needs the user,
+    urgency 1–5 per line) to the memory service's task context `azel-situation`. About 3 runs a day.
+  - Decision: at :00 and :30 the scheduler lease holder gathers signals without Claude (critical alerts
+    of the last 24 h, delegated device jobs finished or failed in the last 2 h via each trusted daemon's
+    `list_jobs`, approvals pending > 30 min, scheduled calls missed in the last 24 h, task contexts with
+    open questions, the situation note) and asks the local Qwen for `{"call","urgency","reason","opening"}`.
+  - Guardrails, all required to ring: `call` is `true`, `urgency` an integer ≥ 4, now inside `window`,
+    fewer than `max_per_day` autonomous calls today, the last one at least `min_gap_minutes` ago, and no
+    autonomous call about the same reason (hash of the normalized reason) in the last 24 h. The call opens
+    with Qwen's `opening` (≤ 200 chars).
+  - Every decision is logged, called or not: `GET /v1/proactive/log?limit=50&since=<epoch>` → newest first,
+    `[{"id","at","call","urgency","reason","opening","reason_hash","called","blocked_by"
+    (no_call|urgency|window|max_per_day|min_gap|duplicate|null),"signals","call_id"}]` (full only).
 - Call history (full gateways only; limited → 403), stored in ruchba (section 5):
   `GET /v1/history?limit=20&before=<epoch>&q=` → `[{"id","session","title" (first user utterance),
   "last_reply" (last assistant reply, first 120 chars),"started_at","duration_s","direction","reason",
@@ -302,6 +321,10 @@ records, search, contacts and context, answers 403) when either:
   `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
   token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
 - `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env","kind":"voip"|"alert"}`; `GET /v1/state/push_tokens`.
+- Autonomous calls (full callers only): `POST /v1/state/proactive_log` (one decision, fields as in
+  section 3) → `{"id"}`; `GET /v1/state/proactive_log?since=<epoch>&called=true|false&limit=100` → newest
+  first. `GET|PUT /v1/state/kv/{key}` (key `[a-z0-9_]{1,40}`, not `settings`): small shared JSON values,
+  e.g. `alerts_recent` (critical alerts of the last 24 h, kept by the gateways for the decision).
 - Scheduled calls (full callers only; internal, epoch seconds; gateways convert to the `/v1/schedule`
   shape): `POST /v1/state/schedule` `{"at": epoch,"repeat","kind","note","created_by":"voice"|"app"}` → the row; `GET /v1/state/schedule?status=pending,fired`; `POST /v1/state/schedule/{id}`
   `{"status"?,"attempts"?,"call_id"?,"at"?,"last_attempt"?,"expect_status"?}` (compare-and-set on
