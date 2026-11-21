@@ -1,3 +1,4 @@
+from pathlib import Path
 import base64
 import json
 
@@ -183,3 +184,32 @@ def test_watch_key_tracks_model_and_verifier_files(tmp_path):
     k = bw.watch_key(cfg)
     assert k[0] > 0 and k[1] > 0
     assert bw.watch_key({"model": "hey_jarvis", "verifier": ""}) == (0, 0)  # built-in model, verifier off
+
+
+def test_bad_reload_keeps_old_model_and_startup_falls_back(tmp_path, monkeypatch, capsys):
+    m = tmp_path / "azel.onnx"
+    m.write_bytes(b"good")
+    cfg = {"model": str(m), "verifier": ""}
+    l = Listener.__new__(Listener)
+    l.cfg, l.oww = cfg, "old"
+    seen = bw.watch_key(cfg)
+    assert l.reload_if_changed(seen) == seen and l.oww == "old"  # nothing changed
+
+    def load(c):
+        if Path(c["model"]).read_bytes() == b"bad":
+            raise RuntimeError("corrupt")
+        return "model:" + Path(c["model"]).name
+    monkeypatch.setattr(bw, "load_oww", load)
+    m.write_bytes(b"bad")
+    import os
+    os.utime(m, (1, 1))  # a changed mtime
+    seen2 = l.reload_if_changed(seen)
+    assert l.oww == "old" and seen2 != seen and "reload failed" in capsys.readouterr().out
+    assert l.reload_if_changed(seen2) == seen2  # not retried until it changes again
+    (tmp_path / "azel.prev.onnx").write_bytes(b"good")
+    assert bw.load_oww_or_fallback(cfg) == "model:azel.prev.onnx"
+    (tmp_path / "azel.base.onnx").write_bytes(b"good")
+    assert bw.load_oww_or_fallback(cfg) == "model:azel.base.onnx"
+    (tmp_path / "azel.base.onnx").unlink(), (tmp_path / "azel.prev.onnx").unlink()
+    with pytest.raises(RuntimeError):
+        bw.load_oww_or_fallback(cfg)

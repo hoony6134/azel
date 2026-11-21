@@ -99,13 +99,22 @@ class Listener:
         frames = iter(frames)
         seen = watch_key(self.cfg)
         for n, frame in enumerate(self.live(frames)):
-            if n % 30 == 0 and watch_key(self.cfg) != seen:  # ~every 5 s
-                seen = watch_key(self.cfg)
-                self.oww = load_oww(self.cfg)
+            if n % 30 == 0:  # ~every 5 s
+                seen = self.reload_if_changed(seen)
             self.ring = (self.ring + [frame])[-int(2 / FRAME_S):]
             score = max(self.oww.predict(frame).values())
             if score >= self.cfg["threshold"]:
                 self.on_wake(score, frames)
+
+    def reload_if_changed(self, seen):
+        """Load a changed model; a bad file keeps the working one (logged once, not retried until it changes again)."""
+        now = watch_key(self.cfg)
+        if now != seen:
+            try:
+                self.oww = load_oww(self.cfg)
+            except Exception as e:
+                print(f"model reload failed ({type(e).__name__}: {e}); keeping the old one", flush=True)
+        return now
 
     def on_wake(self, score, frames):
         entry = {"time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -224,6 +233,22 @@ def load_oww(cfg):
     return Model(wakeword_models=[m], inference_framework="onnx")
 
 
+def load_oww_or_fallback(cfg):
+    """Startup load; if the model file is broken, fall back to the generic or previous model so launchd never crash-loops."""
+    try:
+        return load_oww(cfg)
+    except Exception as e:
+        m = Path(cfg["model"]).expanduser()
+        for name in (f"{m.stem}.base.onnx", f"{m.stem}.prev.onnx"):
+            if m.suffix == ".onnx" and (m.parent / name).exists():
+                print(f"{m.name} failed to load ({type(e).__name__}: {e}); falling back to {name}", flush=True)
+                try:
+                    return load_oww(cfg | {"model": str(m.parent / name)})
+                except Exception:
+                    continue
+        raise
+
+
 def watch_key(cfg):
     """mtimes of the model and the verifier (0 when absent or off): a change means a retrain finished, enrollment
     was deleted, or the verifier was toggled."""
@@ -273,7 +298,7 @@ def main():
     ap.add_argument("--score", help="print the best wake score of a 16 kHz mono WAV and exit")
     args = ap.parse_args()
     cfg = load_config(args.config)
-    oww = load_oww(cfg)
+    oww = load_oww_or_fallback(cfg)
     if args.score:
         pcm, sr = sf.read(args.score, dtype="int16")
         assert sr == SR, "WAV must be 16 kHz mono"

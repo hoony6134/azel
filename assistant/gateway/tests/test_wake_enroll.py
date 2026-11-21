@@ -115,3 +115,28 @@ def test_training_never_sticks(tmp_path, monkeypatch):
     assert not m.state["running"] and m.status()["status"] == "failed"
     (m.DIR / "status.json").write_text("{not json")  # a crash mid-write
     assert m.status()["status"] == "failed"
+
+
+def test_request_limits_and_truth_from_samples(api):
+    m, c, home, runs = api
+    big = c.post("/v1/wake/enroll", files=files(wav()), headers={"content-length": str(m.MAX_REQUEST + 1)})
+    assert big.status_code == 413
+    # the length comes from the samples read, not from a header that claims more frames than exist
+    buf = io.BytesIO(wav(0.1))
+    raw = bytearray(buf.getvalue())
+    raw[40:44] = (16000 * 2 * 2).to_bytes(4, "little")  # data chunk says 2 s, only 0.1 s follow
+    assert m.check_clip(bytes(raw)) == f"length must be {m.MIN_S}-{m.MAX_S} s"
+
+
+def test_stale_training_status_reads_as_failed_and_delete_refuses_while_training(api):
+    m, c, home, runs = api
+    m.private_dir(m.DIR)
+    (m.DIR / "clips").mkdir(exist_ok=True)
+    (m.DIR / "clips" / "a.wav").write_bytes(wav())
+    m.write_status(status="training")  # a leftover: the gateway died mid-training, nothing is running
+    s = c.get("/v1/wake/enroll").json()
+    assert s["status"] == "failed" and s["error"] == "학습이 중단됐어요"
+    m.state["running"] = True
+    assert c.delete("/v1/wake/enroll").status_code == 409  # checked under the lock, so it cannot slip past a starting POST
+    m.state["running"] = False
+    assert c.delete("/v1/wake/enroll").status_code == 204

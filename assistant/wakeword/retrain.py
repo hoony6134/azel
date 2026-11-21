@@ -167,6 +167,8 @@ def main():
     ap.add_argument("--freeze-first", action="store_true", help="train only the later layers")
     ap.add_argument("--anchor", type=float, default=200.0, help="weight of staying close to the current model on generic data")
     ap.add_argument("--user-per-batch", type=int, default=5)
+    ap.add_argument("--heldout-file", type=Path, default=HOME / "wake-enroll/heldout.json",
+                    help="clips kept out of training across runs, so later results stay comparable")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true", help="measure, never replace the model")
     a = ap.parse_args()
@@ -175,10 +177,15 @@ def main():
     torch.manual_seed(a.seed)
     from openwakeword.utils import AudioFeatures
     F = AudioFeatures()
+    for d in (HOME, a.data):  # voice-derived data: owner only, even if the folders already existed
+        if d.is_dir():
+            d.chmod(0o700)
     files = sorted(a.clips.glob("*.wav"))
     rng.shuffle(files)
-    n_held = max(1, round(0.2 * len(files)))
-    held_f, train_f = files[:n_held], files[n_held:]
+    before_held = set(json.loads(a.heldout_file.read_text())) if a.heldout_file.exists() else set()
+    held_f = [f for f in files if f.name in before_held]  # earlier hold-outs stay held out
+    held_f += [f for f in files if f.name not in before_held][: max(0, max(1, round(0.2 * len(files))) - len(held_f))]
+    train_f = [f for f in files if f not in held_f]
     assert train_f, "need more enrollment clips"
     held = [trim(read(f)) for f in held_f]
     D = a.data
@@ -221,20 +228,26 @@ def main():
     m1 = evaluate(net, F, data, held, near, everyday, a.threshold)
     t2 = time.time()
 
-    better = (m1["recall"] or 0) > (m0["recall"] or 0)
+    # with only a few held-out clips one clip is a big swing: do not block a model that is not worse
+    few = len(held_f) < 6
+    better = (m1["recall"] or 0) >= (m0["recall"] or 0) if few else (m1["recall"] or 0) > (m0["recall"] or 0)
     safe = (m1["fa_nearmiss"] <= 0.05 and m1["fa_everyday"] <= 0.01 and m1["tts_recall"] >= 0.9 * m0["tts_recall"]
             and m1["fp_per_hour"] <= max(0.5, 1.5 * m0["fp_per_hour"]))
     improved = bool(better and safe)
+    if not a.dry_run:
+        a.heldout_file.parent.mkdir(parents=True, exist_ok=True)
+        a.heldout_file.write_text(json.dumps(sorted(f.name for f in held_f)))
+        a.heldout_file.chmod(0o600)
     if improved and not a.dry_run:
         tmp = a.model.with_suffix(".new.onnx")
+        os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))  # 0600 before any weights are written
         save_onnx(net, str(a.model), str(tmp))
-        tmp.chmod(0o600)
         base = a.model.with_name(a.model.stem + ".base.onnx")
         if not base.exists():  # the generic model, restored when the user deletes their voice data
             shutil.copy2(a.model, base)
         shutil.copy2(a.model, a.model.with_name(a.model.stem + ".prev.onnx"))
         os.replace(tmp, a.model)  # the listener reloads on the file's mtime
-    res = {"improved": improved, "threshold": a.threshold, "clips_train": len(train_f), "clips_held_out": len(held_f),
+    res = {"improved": improved, "threshold": a.threshold, "clips_train": len(train_f), "clips_held_out": len(held_f), "held_out_few": few,
            "recall_before": m0["recall"], "recall_after": m1["recall"], "tts_recall_before": m0["tts_recall"],
            "tts_recall_after": m1["tts_recall"], "fa_nearmiss": m1["fa_nearmiss"], "fa_everyday": m1["fa_everyday"],
            "fa_nearmiss_before": m0["fa_nearmiss"], "fa_everyday_before": m0["fa_everyday"],
