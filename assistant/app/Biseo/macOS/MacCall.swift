@@ -26,6 +26,8 @@ final class MacCall: ObservableObject {
     @Published private(set) var activity = ActivityLog()
     @Published private(set) var surgeAt: Date?
     @Published private(set) var pulseAt: Date?
+    /// The thinking pulse's visual twin: a shimmer across the orb.
+    @Published private(set) var shimmerAt: Date?
     /// Last interrupt (server or tap), drives the jar's ripple.
     @Published private(set) var interruptedAt: Date?
     /// Device UIDs for the call engine; nil = system default. Saved across launches.
@@ -42,6 +44,7 @@ final class MacCall: ObservableObject {
     private init() {
         client.onEvent = { [weak self] in self?.handle($0) }
         client.onPlayback = { [weak self] in self?.playing = $0 }
+        client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date() } }
         client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
         client.onWarning = { [weak self] in self?.error = $0 }
     }
@@ -280,7 +283,7 @@ struct CallPanelView: View {
 
     var body: some View {
         HStack(spacing: Theme.m) {
-            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt,
+            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt,
                     tint: call.activePersona?.glaze ?? Theme.glazeCeladon).frame(width: 68, height: 68)
                 .contentShape(Circle())
                 .onTapGesture { call.interrupt() }

@@ -131,7 +131,7 @@ final class AudioIO {
     func playCue(_ cue: Cue) {
         guard engine.isRunning, let buf = cueBuffers[cue] else { return }
         cuePlayer.volume = speechPlaying ? 0.4 : 1
-        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick ? [] : .interrupts)
+        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick || cue == .pulse ? [] : .interrupts) // a pulse never cuts another cue
         if !cuePlayer.isPlaying { cuePlayer.play() }
     }
 

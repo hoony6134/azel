@@ -187,6 +187,8 @@ final class CallClient {
     private var pulseTimer: Timer?
     /// Playback started or drained (main queue): the UI keeps 말하는 중 until the queue is empty.
     var onPlayback: ((Bool) -> Void)?
+    /// A cue actually played (main queue): the UI shows its visual twin (§14.3).
+    var onCuePlayed: ((Cue) -> Void)?
     private var wasPlaying = false
 
     /// What the call UI shows: the server may report listening/turn_done before the reply's last
@@ -200,7 +202,9 @@ final class CallClient {
     func cue(_ cue: Cue, listening: Bool, waited: Double = 0) {
         let now = ProcessInfo.processInfo.systemUptime
         switch gate.decide(cue, now: now, listening: listening, userLoudAt: audio.levels.micLoudAt, waited: waited, enabled: Earcon.enabled) {
-        case .play: audio.playCue(cue)
+        case .play:
+            audio.playCue(cue)
+            onCuePlayed?(cue)
         case .drop: break
         case .wait:
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.cue(cue, listening: listening, waited: waited + 0.05) }

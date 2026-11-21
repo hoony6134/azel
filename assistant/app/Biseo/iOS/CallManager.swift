@@ -26,6 +26,8 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var activity = ActivityLog()
     @Published private(set) var surgeAt: Date?
     @Published private(set) var pulseAt: Date?
+    /// The thinking pulse's visual twin: a shimmer across the orb.
+    @Published private(set) var shimmerAt: Date?
     /// Last interrupt (server or tap), drives the jar's ripple.
     @Published private(set) var interruptedAt: Date?
     /// Incoming calls show the push's `caller`; outgoing ones the cached assistant name.
@@ -54,6 +56,7 @@ final class CallManager: NSObject, ObservableObject {
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
         client.onPlayback = { [weak self] in self?.playing = $0 }
+        client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date() } }
         client.onClose = { [weak self] in self?.fail($0) }
         client.onWarning = { [weak self] in self?.error = $0 }
         pushRegistry.delegate = self

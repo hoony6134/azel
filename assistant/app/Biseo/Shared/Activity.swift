@@ -40,6 +40,8 @@ enum Cue: CaseIterable { case working, tick, done, error, wake, ack, pulse }
 /// lasted 3 s, until the first reply audio, an error or an interrupt (PM, 2026-11-21).
 struct ThinkingCues {
     static let pulseAfter = 3.0, pulseEvery = 3.0
+    /// After 30 s of thinking the pulse slows to every 6 s (long Claude tasks shouldn't tick like a metronome).
+    static let slowAfter = 30.0, slowEvery = 6.0
 
     private(set) var since: Double?
     private var lastPulse: Double?
@@ -68,7 +70,8 @@ struct ThinkingCues {
 
     mutating func tick(now: Double) -> Cue? {
         guard let since, now - since >= Self.pulseAfter else { return nil }
-        if let lastPulse, now - lastPulse < Self.pulseEvery { return nil }
+        let every = now - since >= Self.slowAfter ? Self.slowEvery : Self.pulseEvery
+        if let lastPulse, now - lastPulse < every { return nil }
         lastPulse = now
         return .pulse
     }
