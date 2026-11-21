@@ -22,6 +22,8 @@ LEAK_RE = re.compile(r"(하라고|라고\b|라고[ .,]|해\s*줘|해\s*달라|�
 def purpose_rule(raw):
     """'오후 1시에 역사 특강 과제하라고 전화해줘' -> '역사 특강 과제'; '약 먹으라고' -> '약 먹기'; '' when nothing is left."""
     text = CALL_RE.sub("", TIME_RE.sub(" ", str(raw or ""))).strip()  # the call verb only once: "엄마한테 전화" stays
+    if m := re.search(r"^(.*\S)\s*시간(이에요|이야|입니다|이네요|이다)?[.!~]*$", text):  # "약 드실 시간이에요." (old notes)
+        return f"{m.group(1)} 시간"[:MAX_PURPOSE] if valid_purpose(m.group(1)) else ""
     for _ in range(3):
         m = QUOTE_RE.search(text)
         if not m:
@@ -71,7 +73,9 @@ def _attributive(stem):
 
 
 def what_time(p):
-    """'역사 특강 과제' -> '역사 특강 과제 하실 시간'; '약 먹기' -> '약 먹을 시간'."""
+    """'역사 특강 과제' -> '역사 특강 과제 하실 시간'; '약 먹기' -> '약 먹을 시간'; '약 드실 시간' stays."""
+    if p.endswith(" 시간"):
+        return p
     return f"{_attributive(p[:-1])} 시간" if p.endswith("기") and len(p) > 1 else f"{p} 하실 시간"
 
 

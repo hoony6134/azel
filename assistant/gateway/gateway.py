@@ -33,6 +33,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import agent_loop
+import cron
+import openings
 import connectors
 import google_tools
 import tools_bridge
@@ -1330,45 +1332,95 @@ MAX_DAYS, MAX_ATTEMPTS, RETRY_EVERY_S, ANSWER_WAIT_S = 30, 3, 120, 60
 LATE_S = 600  # a scheduled call more than 10 min late (gateway down) becomes missed instead of ringing
 
 
-def check_schedule(body, created_by, now=None):
-    """Validate a new scheduled call from the app or the voice server (a trust boundary)."""
+def item_cron(row):
+    """An item's rule as cron: its own, or its legacy repeat at its time of day; None for a one-off."""
+    if row.get("cron"):
+        return row["cron"]
+    return cron.legacy(row["repeat"], datetime.fromtimestamp(row["at"], KST)) if row.get("repeat") else None
+
+
+def item_dates(row):
+    return cron.as_date(row.get("start_date")), cron.as_date(row.get("end_date"))
+
+
+def item_fires(row, after, until):
+    """The item's fire times in (after, until] as epoch seconds (a one-off: its own time)."""
+    expr = item_cron(row)
+    if not expr:
+        return [row["at"]] if after < row["at"] <= until else []
+    start, end = item_dates(row)
+    a, u = datetime.fromtimestamp(after, KST), datetime.fromtimestamp(until, KST)
+    return [t.timestamp() for t in cron.fires(expr, a, u, start, end, row.get("skips") or ())]
+
+
+def upcoming(items, now, skip_id=None):
+    """Every active item's fires over cron's horizon, as KST datetimes (for the daily cap)."""
+    until = now + cron.HORIZON_DAYS * 86400
+    return [datetime.fromtimestamp(t, KST) for i in items if i["id"] != skip_id
+            for t in item_fires(i, now, until)]
+
+
+def check_schedule(body, created_by, now=None, others=()):
+    """Validate a new scheduled call from the app, a model or the voice server (a trust boundary).
+    A one-off needs `at` (ISO with an offset); a rule needs `cron` (cron.py), with optional start/end dates."""
     now = now or time.time()
-    try:
-        dt = datetime.fromisoformat(body.get("at"))
-        if dt.tzinfo is None:
-            raise ValueError("no offset")
-        at = dt.timestamp()
-    except (TypeError, ValueError):
-        raise HTTPException(400, "at: an ISO 8601 string with an offset, e.g. 2026-11-22T10:00:00+09:00")
-    if not now + 30 <= at <= now + MAX_DAYS * 86400 + 60:
-        raise HTTPException(400, f"at must be ahead and within {MAX_DAYS} days")
-    repeat = body.get("repeat") or None
-    if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
-        raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<0-6> (0 = Monday)")
-    if repeat and repeat.startswith("weekly:") and datetime.fromtimestamp(at, KST).weekday() != int(repeat[7:]):
-        raise HTTPException(400, "repeat weekly:<dow> must match the weekday of at (0 = Monday)")
+    nowdt = datetime.fromtimestamp(now, KST)
+    expr = " ".join(str(body.get("cron") or "").split()) or None
+    start = end = None
+    if expr:
+        start, end = cron.as_date(body.get("start_date")), cron.as_date(body.get("end_date"))
+        cron.check(expr, nowdt, start, end, others)
+        first = cron.next_fire(expr, nowdt + timedelta(seconds=30), start, end)
+        at, repeat = first.timestamp(), None
+    else:
+        try:
+            dt = datetime.fromisoformat(body.get("at"))
+            if dt.tzinfo is None:
+                raise ValueError("no offset")
+            at = dt.timestamp()
+        except (TypeError, ValueError):
+            raise HTTPException(400, "at: an ISO 8601 string with an offset, e.g. 2026-11-22T10:00:00+09:00")
+        if not now + 30 <= at <= now + MAX_DAYS * 86400 + 60:
+            raise HTTPException(400, f"{MAX_DAYS}일 안의 앞으로의 시각만 예약할 수 있어요.")
+        repeat = body.get("repeat") or None
+        if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
+            raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<0-6> (0 = Monday)")
+        if repeat and repeat.startswith("weekly:") and datetime.fromtimestamp(at, KST).weekday() != int(repeat[7:]):
+            raise HTTPException(400, "repeat weekly:<dow> must match the weekday of at (0 = Monday)")
+        day = datetime.fromtimestamp(at, KST).date()
+        if sum(o.date() == day for o in others) + 1 > cron.DAY_CAP:
+            raise HTTPException(400, f"하루 전화가 {cron.DAY_CAP}번을 넘게 돼요.")
     kind = body.get("kind") or "wake"
-    note = body.get("note") or ""
-    if kind not in ("wake", "reminder") or not isinstance(note, str) or len(note) > 200:
-        raise HTTPException(400, "kind: wake|reminder; note: up to 200 characters")
-    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": created_by}
+    note, purpose, request = (body.get(k) or "" for k in ("note", "purpose", "request"))
+    notify = body.get("notify") or "call"
+    if kind not in ("wake", "reminder") or notify not in ("call", "push") or \
+            not all(isinstance(x, str) for x in (note, purpose, request)) or len(note) > 200 or len(purpose) > 60:
+        raise HTTPException(400, "kind: wake|reminder; notify: call|push; note up to 200, purpose up to 60 characters")
+    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": created_by, "cron": expr,
+            "start_date": start and start.isoformat(), "end_date": end and end.isoformat(), "notify": notify,
+            "purpose": purpose.strip(), "request": request.strip()[:300]}
 
 
 def public_item(row):
     """The /v1/schedule item shape (app and voice alike): `at` as ISO 8601 in KST, no internal fields."""
+    expr, (start, end) = item_cron(row), item_dates(row)
     return {"id": row["id"], "at": datetime.fromtimestamp(row["at"], KST).isoformat(), "repeat": row["repeat"],
             "kind": row["kind"], "note": row["note"], "status": row["status"], "attempts": row["attempts"],
-            "created_by": row["created_by"], "persona_id": row.get("persona_id", "azel")}
+            "created_by": row["created_by"], "persona_id": row.get("persona_id", "azel"),
+            "next_at": datetime.fromtimestamp(row["at"], KST).isoformat(), "cron": expr,
+            "rule_text": cron.rule_text(expr, start, end) if expr else None, "start_date": row.get("start_date"),
+            "end_date": row.get("end_date"), "notify": row.get("notify") or "call",
+            "purpose": row.get("purpose") or openings.purpose_rule(row["note"])}
 
 
-def next_at(at, repeat, now=None):
-    """The next occurrence of a repeating call after `now`."""
-    now, dt = now or time.time(), datetime.fromtimestamp(at, KST)
-    step = timedelta(days=7 if repeat.startswith("weekly") else 1)
-    while True:
-        dt += step
-        if dt.timestamp() > now and (repeat != "weekdays" or dt.weekday() < 5):
-            return dt.timestamp()
+def next_fire_of(row, now):
+    """The rule's next fire after `now` (and after this one), or None when it has ended."""
+    expr = item_cron(row)
+    if not expr:
+        return None
+    start, end = item_dates(row)
+    t = cron.next_fire(expr, datetime.fromtimestamp(max(now, row["at"]), KST), start, end, row.get("skips") or ())
+    return t.timestamp() if t else None
 
 
 def day_part(hour):
@@ -1391,42 +1443,144 @@ def spoken_when(at, repeat=None, now=None):
     return f"{day} {clock}"
 
 
+def spoken_item(row, now=None):
+    """A rule by its rule text, a legacy repeat or a one-off by its time."""
+    if row.get("cron"):
+        return cron.rule_text(row["cron"], *item_dates(row))
+    return spoken_when(row["at"], row["repeat"], now)
+
+
 def confirm_text(item, now=None):
-    verb = "깨워 드릴게요" if item["kind"] == "wake" else "전화드릴게요"
-    return f"{spoken_when(item['at'], item['repeat'], now)}에 {verb}."
+    verb = "알림 드릴게요" if item.get("notify") == "push" else "깨워 드릴게요" if item["kind"] == "wake" else "전화드릴게요"
+    when = spoken_item(item, now)
+    return f"{when}{'' if when.endswith('마다') else '에'} {verb}."
 
 
 async def schedule_create(body, created_by, now=None):
-    """(public item, sentence to speak)."""
+    """(public item, sentence to speak). The purpose is normalized here, once, for every surface."""
     settings = await load_settings()
     pid = body.get("persona_id") or primary_persona(settings)["id"]
     if not persona_by_id(settings, pid):
         raise HTTPException(400, "persona_id: no such persona")
-    row = await state.call("POST", "/v1/state/schedule", {**check_schedule(body, created_by, now), "persona_id": pid})
+    now = now or time.time()
+    raw = str(body.get("request") or body.get("note") or "")
+    if body.get("interpretation"):
+        raw = f"{raw} [{body['interpretation']}]".strip()
+    purpose = body.get("purpose") or (await openings.purpose(raw.split(" [")[0], llm_json) if raw else "")
+    checked = check_schedule({**body, "purpose": purpose, "request": raw}, created_by, now,
+                             upcoming(await schedule_list(), now))
+    row = await state.call("POST", "/v1/state/schedule", {**checked, "persona_id": pid})
     return public_item(row), confirm_text(row, now)
 
 
-async def schedule_list():
-    return await state.call("GET", "/v1/state/schedule") or []
+async def schedule_list(include=None, persona=None):
+    status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
+    return await state.call("GET", "/v1/state/schedule", status=status, **({"persona": persona} if persona else {})) or []
 
 
 def list_text(items, now=None):
     if not items:
         return "예약된 전화가 없어요."
-    parts = [spoken_when(i["at"], i["repeat"], now) + (" 기상" if i["kind"] == "wake" else " 알림") for i in items[:3]]
+    parts = [spoken_item(i, now) + (" 기상" if i["kind"] == "wake" else f" {i.get('purpose') or '알림'}")
+             for i in items[:3]]
     more = f" 외 {len(items) - 3}개" if len(items) > 3 else ""
     return f"예약된 전화는 {', '.join(parts)}{more}이에요."
 
 
-async def schedule_cancel(sid=None, at=None, now=None):
-    """Cancel by id, else the item at `at` (within a minute), else the soonest one."""
+async def find_item(sid):
+    item = next((i for i in await schedule_list() if i["id"] == sid), None)
+    if not item:
+        raise HTTPException(404, "그런 예약이 없어요.")
+    return item
+
+
+def changed_text(before, after, now=None):
+    """'오늘 오후 10시 → 오후 6시로 바꿨어요.': the day is said again only when it changes."""
+    if before.split(" ")[0] == after.split(" ")[0] and after.split(" ")[0] in ("오늘", "내일", "모레"):
+        after = after.split(" ", 1)[1]
+    return f"{before} → {after}로 바꿨어요."
+
+
+async def schedule_update(sid, changes, occurrence=None, now=None):
+    """(public item, sentence): one fire moved (skip it + a one-off), or the item/rule changed in place."""
+    now = now or time.time()
+    item = await find_item(sid)
+    items = await schedule_list()
+    if occurrence:
+        occ = datetime.fromisoformat(occurrence).timestamp()
+        if not item_cron(item) or occ not in item_fires(item, occ - 1, occ):
+            raise HTTPException(404, "그 시각에는 이 예약이 없어요.")
+        when = changes.get("when") or occurrence
+        one = check_schedule({"at": when, "kind": item["kind"], "note": item["note"],
+                              "purpose": changes.get("purpose") or item.get("purpose") or "",
+                              "notify": changes.get("notify") or item.get("notify") or "call",
+                              "request": item.get("request") or ""}, "voice", now,
+                             [o for o in upcoming(items, now) if o.timestamp() != occ])
+        skips = [*(item.get("skips") or []), occ]
+        fields = {"skips": skips}
+        if abs(item["at"] - occ) < 1:  # it was the next one: the rule now waits for the one after
+            nxt = next_fire_of({**item, "skips": skips}, occ)
+            fields.update({"at": nxt} if nxt else {"status": "cancelled"})
+        await update_item(item, **fields)
+        row = await state.call("POST", "/v1/state/schedule", {**one, "persona_id": item.get("persona_id", "azel")})
+        return public_item(row), changed_text(spoken_when(occ, None, now), spoken_when(row["at"], None, now), now)
+    fields, says = {}, []
+    expr = item_cron(item)
+    if changes.get("repeat_cron") or (expr and changes.get("when")) or "start_date" in changes or "end_date" in changes:
+        new = changes.get("repeat_cron") or expr
+        if changes.get("when") and not changes.get("repeat_cron"):  # "매일 7시 → 8시": the rule's time of day
+            t = datetime.fromisoformat(changes["when"]).astimezone(KST)
+            new = " ".join([str(t.minute), str(t.hour), *new.split()[2:]])
+        start = cron.as_date(changes["start_date"]) if "start_date" in changes else item_dates(item)[0]
+        end = cron.as_date(changes["end_date"]) if "end_date" in changes else item_dates(item)[1]
+        cron.check(new, datetime.fromtimestamp(now, KST), start, end, upcoming(items, now, skip_id=sid))
+        first = cron.next_fire(new, datetime.fromtimestamp(now + 30, KST), start, end, item.get("skips") or ())
+        fields.update(cron=new, start_date=start and start.isoformat(), end_date=end and end.isoformat(),
+                      at=first.timestamp())
+    elif changes.get("when"):
+        fields["at"] = check_schedule({"at": changes["when"], "kind": item["kind"]}, "voice", now,
+                                      upcoming(items, now, skip_id=sid))["at"]
+    for k in ("purpose", "notify"):
+        if changes.get(k):
+            fields[k] = changes[k]
+    if not fields:
+        raise HTTPException(400, "무엇을 바꿀지 말씀해 주세요.")
+    row = await update_item(item, **fields)
+    if row is None:
+        raise HTTPException(409, "방금 다른 곳에서 바뀌었어요. 다시 해 주세요.")
+    before, after = spoken_item(item, now), spoken_item(row, now)
+    if before != after:
+        says.append(changed_text(before, after, now))
+    if changes.get("purpose"):
+        says.append(f"내용은 '{row['purpose']}'(으)로 바꿨어요.")
+    if changes.get("notify"):
+        says.append("이제 알림으로 알려 드릴게요." if row["notify"] == "push" else "이제 전화로 알려 드릴게요.")
+    return public_item(row), " ".join(says) or "바꿨어요."
+
+
+async def schedule_cancel(sid=None, at=None, now=None, occurrence=None):
+    """Cancel by id, else the item at `at` (within a minute), else the soonest one. `occurrence` (ISO) skips one
+    fire of a rule and keeps the rule."""
     items = await schedule_list()
     pick = next((i for i in items if i["id"] == sid), None) if sid else \
         next((i for i in items if abs(i["at"] - float(at)) < 60), None) if at else (items[0] if items else None)
     if not pick:
         return None
+    if occurrence and item_cron(pick):
+        occ = datetime.fromisoformat(occurrence).timestamp()
+        if occ not in item_fires(pick, occ - 1, occ):
+            raise HTTPException(404, "그 시각에는 이 예약이 없어요.")
+        skips = [*(pick.get("skips") or []), occ]
+        fields = {"skips": skips}
+        if abs(pick["at"] - occ) < 1:
+            nxt = next_fire_of({**pick, "skips": skips}, occ)
+            fields.update({"at": nxt} if nxt else {"status": "cancelled"})
+        row = await update_item(pick, **fields)
+        if row is None:
+            raise HTTPException(409, "방금 다른 곳에서 바뀌었어요. 다시 해 주세요.")
+        return public_item(row), f"{spoken_when(occ, None, now)} 한 번만 건너뛸게요."
     row = await state.call("DELETE", f"/v1/state/schedule/{quote(pick['id'], safe='')}")
-    return (public_item(row), f"{spoken_when(row['at'], row['repeat'], now)} 예약을 취소했어요.") if row else None
+    return (public_item(row), f"{spoken_item(row, now)} 예약을 취소했어요.") if row else None
 
 
 async def serve_schedule(m):
@@ -1454,10 +1608,16 @@ async def serve_schedule(m):
     await link_send(reply)
 
 
-def opening_for(item):
-    if item["kind"] == "wake":  # shortcut: no day summary yet (it would need cached calendar data without Claude)
-        return "일어나실 시간이에요." + (f" {item['note']}" if item["note"] else "")
-    return f"말씀하신 시간이에요. {item['note']}" if item["note"] else "말씀하신 시간이 돼서 전화드렸어요."
+async def opening_for(item):
+    """The first words of a scheduled call: title, time, purpose; never the raw request (openings.py). Items made
+    before purposes existed get one from their note now."""
+    settings = await load_settings()
+    persona = persona_by_id(settings, item.get("persona_id") or "") or primary_persona(settings)
+    dt = datetime.fromtimestamp(item["at"], KST)
+    purpose = item.get("purpose") or openings.purpose_rule(item["note"])
+    return await openings.compose(item["kind"], user_title(settings, persona), dt.hour, dt.minute, purpose,
+                                  raw=item.get("request") or item["note"], persona=persona_block(settings),
+                                  llm=llm_json)
 
 
 async def update_item(item, **fields):
@@ -1489,20 +1649,34 @@ async def fire_scheduled(now):
 async def attempt(item, now):
     call_id = uuid.uuid4().hex  # in the claim itself, so call_answered always finds this attempt
     claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now, call_id=call_id)
-    if claimed:
-        await place_call(item["kind"], opening_for(item), call_id=call_id, persona_id=item.get("persona_id"))
+    if not claimed:
+        return
+    opening = await opening_for(item)
+    if item.get("notify") == "push":  # a reminder by notification: delivered is done, nothing to answer
+        settings = await load_settings()
+        persona = persona_by_id(settings, item.get("persona_id") or "") or primary_persona(settings)
+        await send_alert_push(persona.get("name") or settings["assistant_name"], opening, type="schedule",
+                              schedule_id=item["id"])
+        await finish(claimed, now, "answered")
+        return
+    await place_call(item["kind"], opening, call_id=call_id, persona_id=item.get("persona_id"))
+
+
+async def finish(item, now, status):
+    """After a fire: a rule waits for its next time (or ends); a one-off takes `status`."""
+    nxt = next_fire_of(item, now) if item_cron(item) else None
+    if nxt:
+        return await update_item(item, status="pending", attempts=0, at=nxt)
+    return await update_item(item, status=status)
 
 
 async def missed(item, now, late=False):
-    if item["repeat"]:  # the next one still happens
-        done = await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"], now))
-    else:
-        done = await update_item(item, status="missed")
+    done = await finish(item, now, "missed")
     if done:
         what = "기상 전화" if item["kind"] == "wake" else "예약 전화"
         how = "를 제때 걸지 못했어요" if late else "를 받지 않으셨어요"
         await send_alert_push((await load_settings())["assistant_name"],
-                              f"{spoken_when(item['at'], item['repeat'], now)} {what}{how}.")
+                              f"{spoken_when(item['at'], None, now)} {what}{how}.")
 
 
 async def call_answered(call_id):
@@ -1511,10 +1685,7 @@ async def call_answered(call_id):
         return
     for item in await schedule_list():
         if item["status"] == "fired" and item["call_id"] == call_id:
-            if item["repeat"]:
-                await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"]))
-            else:
-                await update_item(item, status="answered")
+            await finish(item, time.time(), "answered")
 
 
 async def scheduler():
@@ -2113,28 +2284,55 @@ async def connectors_secret(name: str, body: dict):
     return Response(status_code=204)
 
 
+# ---------- REST adapters: each route is one action (ACTIONS.md); no checks or logic of their own ----------
+RESULT_V2 = "x-azel-result"  # "2": the whole {ok, spoken, data, needs, error}; else the pre-batch-5 bodies
+
+
+async def act(name, args, created=False, request=None, full=True):
+    """Run an action for the app. With `X-Azel-Result: 2` the answer is the whole result (needs on 200). Without it
+    (app builds before batch 5) the same result is shaped as before: the resource on success, an HTTP error with
+    `detail` otherwise (needs as 409 with the question). Same action, same checks either way."""
+    if full:
+        full_only()
+    r = await bridge.run(name, args, args.get("persona_id"), caller="app", surface="rest")
+    if request is not None and request.headers.get(RESULT_V2) == "2":
+        status = (201 if created else 200) if r["ok"] or r["needs"] else tools_bridge.HTTP_OF[r["error"]["code"]]
+        return JSONResponse(tools_bridge.public(r) | ({"detail": r["error"]["message"]} if r["error"] else {}),
+                            status if r["ok"] or not r["needs"] else 200)
+    if r["ok"]:
+        return JSONResponse(r["data"], 201 if created else 200)
+    if r["needs"]:
+        return JSONResponse({"detail": r["needs"]["question"], "needs": r["needs"]}, 409)
+    return JSONResponse({"detail": r["error"]["message"]}, tools_bridge.HTTP_OF[r["error"]["code"]])
+
+
 @app.get("/v1/schedule")
-async def schedule_get(include: str = "", persona: str | None = None):
+async def schedule_get(request: Request, include: str = "", persona: str | None = None):
     """Pending and fired items, soonest first; `include=all` adds answered, missed and cancelled ones."""
-    full_only()
-    status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
-    params = {"status": status} | ({"persona": persona} if persona else {})
-    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", **params) or []]
+    return await act("schedule_list", {**({"include": include} if include else {}),
+                                       **({"persona_id": persona} if persona else {})}, request=request)
 
 
-@app.post("/v1/schedule", status_code=201)
-async def schedule_post(body: dict):
-    full_only()
-    return (await schedule_create(body, "app"))[0]
+@app.post("/v1/schedule")
+async def schedule_post(request: Request, body: dict):
+    if "at" in body and "when" not in body:  # the field's name before batch 5
+        body = {**{k: v for k, v in body.items() if k != "at"}, "when": body["at"]}
+    if "reason" not in body:
+        body = {**body, "reason": body.get("purpose") or body.get("note") or "예약 전화"}
+    return await act("schedule_create", {k: v for k, v in body.items() if k != "note"}, created=True, request=request)
+
+
+@app.put("/v1/schedule/{sid}")
+async def schedule_put(request: Request, sid: str, body: dict, occurrence: str | None = None):
+    scope = "occurrence" if occurrence else body.get("scope") or "rule"
+    return await act("schedule_update", {**body, "id": sid, "scope": scope, **({"at": occurrence} if occurrence else {})},
+                     request=request)
 
 
 @app.delete("/v1/schedule/{sid}")
-async def schedule_delete(sid: str):
-    full_only()
-    done = await schedule_cancel(sid=sid)
-    if done is None:
-        raise HTTPException(404, "no such scheduled call")
-    return done[0]
+async def schedule_delete(request: Request, sid: str, occurrence: str | None = None):
+    return await act("schedule_cancel", {"id": sid, **({"scope": "occurrence", "at": occurrence} if occurrence else {})},
+                     request=request)
 
 
 @app.get("/v1/history")
@@ -2198,8 +2396,9 @@ async def push_register(body: dict):
 
 
 @app.post("/v1/calls")
-async def calls(body: dict):
-    return await place_call(body.get("reason", "manual"), body.get("opening"))
+async def calls(request: Request, body: dict):
+    """Ring the user now (call_user): the same daily cap and in-call refusal as when a model asks."""
+    return await act("call_user", {k: body[k] for k in ("reason", "persona_id") if k in body}, request=request)
 
 
 @app.get("/v1/calls/{call_id}")
@@ -2372,6 +2571,10 @@ async def create_approval(body: dict):
 
 
 @app.get("/v1/approvals")
+async def approvals_get(request: Request):
+    return await act("approval_status", {}, request=request, full=False)  # daemons on limited devices too
+
+
 async def list_approvals():
     now, out = time.time(), []
     for row in await state.call("GET", "/v1/state/approvals") or []:
@@ -2402,6 +2605,10 @@ async def approval_audit(limit: int = 50):
 
 
 @app.get("/v1/approvals/{aid}")
+async def approval_get(request: Request, aid: str):
+    return await act("approval_status", {"id": aid}, request=request, full=False)
+
+
 async def get_approval(aid: str):
     row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
     if row is None:
@@ -2738,45 +2945,40 @@ def task_view(t, steps=True):
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
-@app.post("/v1/tasks", status_code=201)
-async def tasks_post(body: dict):
-    return task_view(await task_create(body))
+@app.post("/v1/tasks")
+async def tasks_post(request: Request, body: dict):
+    return await act("create_task", body, created=True, request=request)
 
 
 @app.get("/v1/tasks")
-async def tasks_list(limit: int = 20):
-    full_only()
-    out = []
-    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:max(1, min(limit, 100))]:
-        if t := await state.call("GET", task_key(tid)):
-            out.append(task_view(t, steps=False))
-    return out
+async def tasks_list(request: Request, limit: int = 20):
+    return await act("task_status", {"limit": max(1, min(limit, 100))}, request=request)
 
 
 @app.get("/v1/tasks/{tid}")
-async def tasks_get(tid: str):
-    full_only()
-    t = await state.call("GET", task_key(quote(tid, safe=""))) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
-    if not t:
-        raise HTTPException(404, "no such task")
-    return task_view(t)
+async def tasks_get(request: Request, tid: str):
+    return await act("task_status", {"id": tid}, request=request)
 
 
 @app.post("/v1/tasks/{tid}/cancel")
-async def tasks_cancel(tid: str):
-    full_only()
+async def tasks_cancel(request: Request, tid: str):
+    return await act("task_cancel", {"id": tid}, request=request)
+
+
+async def task_cancel(tid):
+    """(task view, sentence): stop a task; another gateway's sees the flag within seconds."""
     t = await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
     if not t:
-        raise HTTPException(404, "no such task")
+        raise HTTPException(404, "그런 작업이 없어요.")
     if t["status"] in ("done", "failed", "cancelled"):
-        raise HTTPException(409, f"task already {t['status']}")
+        raise HTTPException(409, "이미 끝난 작업이에요.")
     if run := task_runs.get(tid):  # ours: stop it now (the claude process is killed on the way out)
         run.cancel()
         await asyncio.gather(run, return_exceptions=True)
     else:  # another gateway's: it sees the flag within seconds
         t["cancel_requested"] = True
         await task_save(t)
-    return task_view(await state.call("GET", task_key(tid)) or t, steps=False)
+    return task_view(await state.call("GET", task_key(tid)) or t, steps=False), "작업을 멈췄어요."
 
 
 DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크"}
@@ -2859,21 +3061,31 @@ bridge = tools_bridge.Bridge(
     schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
     state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
     in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME),
-    schedule_list_text=lambda: bridge_schedule_text(), schedule_items=lambda: bridge_schedule_items(),
-    schedule_cancel=lambda sid, at: schedule_cancel(sid=sid, at=at),
-    task_get=lambda tid: state.call("GET", task_key(tid)), task_recent=lambda n: bridge_recent_tasks(n),
+    schedule_list_text=lambda: bridge_schedule_text(), schedule_items=lambda **kw: bridge_schedule_items(**kw),
+    schedule_cancel=lambda sid, at, occurrence=None: schedule_cancel(sid=sid, at=at, occurrence=occurrence),
+    schedule_update=lambda sid, changes, occ: schedule_update(sid, changes, occ),
+    task_get=lambda tid: state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else none(),
+    task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t, steps=full),
+    task_cancel=lambda tid: task_cancel(tid),
+    approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
 
 
-async def bridge_schedule_items():
-    return [{**public_item(i), "spoken": spoken_when(i["at"], i["repeat"]), "note": i["note"]} for i in await schedule_list()]
+async def none():
+    return None
+
+
+async def bridge_schedule_items(include=None, persona_id=None):
+    return [{**public_item(i), "spoken": spoken_item(i), "note": i["note"]}
+            for i in await schedule_list(include, persona_id)]
 
 
 async def bridge_schedule_text():
     items = await schedule_list()
-    return list_text(items) + ("\n" + "\n".join(f"- id {i['id']}: {spoken_when(i['at'], i['repeat'])} "
-                                                f"{'기상' if i['kind'] == 'wake' else i['note'][:40] or '알림'}" for i in items[:10])
-                               if items else "")
+    return list_text(items) + ("\n" + "\n".join(
+        f"- id {i['id']}: {spoken_item(i)}" + (f" (다음: {spoken_when(i['at'])})" if item_cron(i) else "")
+        + f" {'기상' if i['kind'] == 'wake' else public_item(i)['purpose'] or '알림'}"
+        + (" [알림]" if i.get("notify") == "push" else "") for i in items[:10]) if items else "")
 
 
 async def bridge_recent_tasks(n):

@@ -87,10 +87,10 @@ class World:
         return None
 
     async def task_get(self, tid):
-        return {"id": tid, "status": "done", "goal": "정리", "result": "끝"} if tid == "t00000000001" else None
+        return {"id": tid, "status": "done", "goal": "정리", "result": "끝"} if tid == "a00000000001" else None
 
     async def task_recent(self, n):
-        return [{"id": "t00000000001", "status": "running", "goal": "정리"}][:n]
+        return [{"id": "a00000000001", "status": "running", "goal": "정리"}][:n]
 
     async def cygnus_run(self, name, args):
         return "albireo disk 15%"
@@ -284,7 +284,7 @@ def test_schedule_task_and_approval_tools():
                                     "repeat": "weekdays"}, caller="app"))["is_error"] is False
     assert w.schedule[-1]["kind"] == "wake" and w.schedule[-1]["repeat"] == "weekdays" and w.schedule[-1]["note"] == ""
     assert "running" in run(b.call("task_status", {}))["content"]
-    assert run(b.call("task_status", {"id": "t00000000001"}))["content"].endswith("→ 끝")
+    assert run(b.call("task_status", {"id": "a00000000001"}))["content"].endswith("→ 끝")
     w.approvals["a9"] = {"id": "a9", "status": "pending", "device": "macbook", "command": "open x"}
     w.kv["/v1/state/approvals"] = None
     assert "그런 승인 요청이 없어요." == run(b.call("approval_status", {"id": "zz"}))["content"]

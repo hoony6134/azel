@@ -57,7 +57,8 @@ PICK = {  # how schedule_cancel and schedule_update choose their item
     "description": {"type": "string", "maxLength": 100, "description": "메모나 '내일 7시' 같은 말"}}
 SCHEDULE_LIST = {"name": "schedule_list", "description": "예약된 전화 목록(id, 반복 규칙, 다음 시각 포함).",
                  "input_schema": {"type": "object", "additionalProperties": False, "properties": {
-                     "include": {"type": "string", "enum": ["all"], "description": "all이면 끝난 것과 취소된 것도"}}}}
+                     "include": {"type": "string", "enum": ["all"], "description": "all이면 끝난 것과 취소된 것도"},
+                     "persona_id": {"type": "string", "maxLength": 32}}}}
 SCHEDULE_CANCEL = {
     "name": "schedule_cancel",
     "description": "예약된 전화 하나를 취소한다. id, 시각(at), 또는 설명(description: 메모나 '내일 7시' 같은 말)으로 고른다. "
@@ -107,7 +108,9 @@ CREATE_TASK = {
         "notify": {"type": "string", "enum": ["call", "push", "none"]},
         "backend": {"type": "string", "enum": ["claude_api", "claude_code", "nim", "qwen"],
                     "description": "보통은 비워 둬(설정의 기본값)"},
-        "persona": {"type": "string", "maxLength": 32}}},
+        "persona": {"type": "string", "maxLength": 32},
+        "budget_usd": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"},
+        "max_minutes": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"}}},
 }
 
 
@@ -144,6 +147,8 @@ class Bridge:
         try:
             if caller == "app" and name not in APP_ACTIONS:
                 raise Fail("not_found", f"없는 기능이에요: {str(name)[:40]}")
+            if name in OWN_SCHEMAS:
+                check_args(OWN_SCHEMAS[name], args)
             out = await self.dispatch(name, args, persona_id, caller, on_progress, where)
             if isinstance(out, dict):  # a device tool's own result
                 r = result(not out["is_error"], out["content"],
@@ -189,15 +194,15 @@ class Bridge:
                 and not args.get("when_text") and caller != "app":
             raise Fail("invalid", "시각은 직접 계산하지 말고, 사용자가 말한 표현 그대로 when_text로 주세요(예: '6시', '내일 오후 1시').")
         if name == "call_user":
-            return await self.call_user(args, persona_id)
+            return await self.call_user(args, persona_id, caller)
         if name == "schedule_create":
             if not (args.get("when") or args.get("when_text") or args.get("repeat_cron")):
                 raise Fail("invalid", "언제 걸지 알려 주세요.")
-            return await self.call_user(args, persona_id)
+            return await self.call_user(args, persona_id, caller)
         if name == "create_task":
             return await self.create_task(args, persona_id, caller)
         if name == "schedule_list":
-            items = await self.d["schedule_items"](**({"include": args["include"]} if args.get("include") else {}))
+            items = await self.d["schedule_items"](**{k: args[k] for k in ("include", "persona_id") if args.get(k)})
             text = await self.d["schedule_list_text"]()
             return text.split("\n")[0], items, text
         if name == "schedule_cancel":
@@ -259,7 +264,7 @@ class Bridge:
                 "waited_s": time.monotonic() - t0, "approval": "expired"}
 
     # ---------- the assistant's own tools ----------
-    async def call_user(self, args, persona_id):
+    async def call_user(self, args, persona_id, caller="api"):
         reason = str(args.get("reason") or "").strip()[:200]
         if not reason:
             raise Fail("invalid", "무엇 때문에 전화할지(reason)를 알려 주세요.")
@@ -270,10 +275,11 @@ class Bridge:
         if args.get("when_text"):  # the user's words win over any time a model worked out itself
             heard = self.heard(args["when_text"], None, kind, "만들지")
             when = heard["at"].isoformat()
+        by = "app" if caller == "app" else "voice"
         if args.get("repeat_cron"):
-            return await self.call_user_rule(args, reason, kind, pid)
-        key = (str(when or ""), str(args.get("repeat_cron") or ""))  # a retry often rewords the reason
-        if when and key in self.recent and time.monotonic() - self.recent[key][0] < 60:
+            return await self.call_user_rule(args, reason, kind, pid, by)
+        key = (str(when or ""), pid)  # a model's retry often rewords the reason; a person's form never repeats by itself
+        if when and caller != "app" and key in self.recent and time.monotonic() - self.recent[key][0] < 60:
             return self.recent[key][1] + " (이미 예약했어요)", self.recent[key][2]
         if when:
             item, say = await self.d["schedule_create"]({"at": when, "kind": kind, "note": "" if kind == "wake" else reason,
@@ -281,7 +287,7 @@ class Bridge:
                                                          **({"interpretation": heard["note"]}
                                                             if heard and heard["note"] else {}),
                                                          **({"notify": args["notify"]} if args.get("notify") else {}),
-                                                         **({"persona_id": pid} if pid else {})}, "voice")
+                                                         **({"persona_id": pid} if pid else {})}, by)
             await self.log_call(reason, item.get("at"), pid)
             say = heard["say"] if heard and heard["say"] else say
             self.recent[key] = (time.monotonic(), say, item)
@@ -321,13 +327,13 @@ class Bridge:
                                      "다시 불러 주세요.")
         return expr, start, end
 
-    async def call_user_rule(self, args, reason, kind, pid):
+    async def call_user_rule(self, args, reason, kind, pid, by="voice"):
         expr, start, end = self.rule_check(args, args["repeat_cron"])
         body = {"cron": expr, "start_date": start and start.isoformat(), "end_date": end and end.isoformat(),
                 "kind": kind, "notify": args.get("notify") or "call", "note": "" if kind == "wake" else reason,
                 "request": reason, **({"at": args["when"]} if args.get("when") else {}),
                 **({"persona_id": pid} if pid else {})}
-        item, say = await self.d["schedule_create"](body, "voice")
+        item, say = await self.d["schedule_create"](body, by)
         await self.log_call(reason, item.get("at"), pid)
         return say, item
 
@@ -338,7 +344,7 @@ class Bridge:
         if args.get("id"):
             hits = [i for i in items if i["id"] == args["id"]]
         elif args.get("at"):
-            t = datetime.fromisoformat(args["at"])
+            t = iso(args["at"])
             hits = [i for i in items if datetime.fromisoformat(i["at"]) == t] or \
                 [i for i in items if (e := rule_of(i)) and C.next_fire(e, t - timedelta(minutes=1)) == t]
         elif desc := str(args.get("description") or "").strip():
@@ -359,16 +365,15 @@ class Bridge:
         item, _ = await self.pick(args, soonest=False)
         changes = {k: args[k] for k in ("when", "purpose", "notify", "repeat_cron") if args.get(k)}
         if args.get("when_text"):  # a bare hour keeps this item's (or this fire's) 오전/오후 and day
-            base = datetime.fromisoformat(args["at"] if args.get("at") and args.get("scope") == "occurrence"
-                                          else item["at"])
+            base = iso(args["at"] if args.get("at") and args.get("scope") == "occurrence" else item["at"])
             changes["when"] = self.heard(args["when_text"], base, item.get("kind", "reminder"), "바꾸지")["at"].isoformat()
         changes.update({k: args[k] for k in ("start_date", "end_date") if k in args})
         if not changes:
             raise Fail("invalid", "무엇을 바꿀지 말씀해 주세요.")
         if changes.get("when"):
             try:
-                datetime.fromisoformat(changes["when"])
-            except ValueError:
+                iso(changes["when"])
+            except Fail:
                 raise Fail("invalid", "when은 2026-11-23T18:00:00+09:00 같은 ISO 시각이에요. 반복 규칙은 repeat_cron에 주세요.")
         scope = args.get("scope")
         if rule_of(item) and scope not in ("occurrence", "rule"):
@@ -387,7 +392,7 @@ class Bridge:
                 raise Need("clarify", "어느 회차를 바꿀까요?",
                            f"아직 바꾸지 않았어요. 바꿀 회차의 원래 시각을 at으로 주세요(예: 다음 회차 {item['at']}). "
                            "id나 설명과 함께 줘도 돼요.")
-            occurrence = args["at"]
+            occurrence = iso(args["at"]).isoformat()
         new, say = await self.d["schedule_update"](item["id"], changes, occurrence)
         return say, new
 
@@ -402,6 +407,8 @@ class Bridge:
         """By id or time through the gateway's schedule_cancel; by description only when exactly one item matches.
         scope="occurrence" on a recurring item skips one fire (the one at `at`, else the next) and keeps the rule."""
         if args.get("scope") == "occurrence":
+            if args.get("at"):
+                iso(args["at"])
             item, _ = await self.pick(args, soonest=True)
             if not rule_of(item):
                 args = {**args, "id": item["id"]}  # a one-off item: cancelling its only occurrence is cancelling it
@@ -428,12 +435,20 @@ class Bridge:
             raise Fail("not_found", "그런 작업이 없어요.")
         if not ts:
             return "맡긴 작업이 없어요.", []
-        view = self.d.get("task_view", lambda t: t)
+        view = self.d.get("task_view", lambda t, full=False: t)
+        one = bool(args.get("id"))
         return "\n".join(f"- {t['id']} {t['status']}: {t['goal'][:60]}" + (f" → {str(t.get('result') or t.get('error'))[:200]}"
                                                                        if t.get("result") or t.get("error") else "")
-                         for t in ts), (view(ts[0]) if args.get("id") else [view(t) for t in ts])
+                         for t in ts), (view(ts[0], True) if one else [view(t) for t in ts])
 
     async def approval_status(self, args):
+        if args.get("id") and "approval_get" in self.d:  # the gateway's own view (expiry, requester)
+            a = await self.d["approval_get"](args["id"])
+            return f"{a.get('device', '')}의 '{str(a.get('command', ''))[:60]}': {a.get('status')}", a
+        if "approval_list" in self.d:
+            rows = await self.d["approval_list"]()
+            return ("\n".join(f"- {a['id']} {a.get('device', '')}: {str(a.get('command', ''))[:60]}" for a in rows[:5])
+                    or "기다리는 승인 요청이 없어요."), rows
         if args.get("id"):
             a = await self.d["state"]("GET", f"/v1/state/approvals/{args['id']}")
             if not a:
@@ -451,10 +466,12 @@ class Bridge:
             raise Fail("invalid", "맡길 일(goal)을 알려 주세요.")
         body = {"goal": goal, "notify": notify, **({"device": args["device"]} if args.get("device") else {}),
                 **({"backend": args["backend"]} if args.get("backend") else {}),
+                **{k: args[k] for k in ("budget_usd", "max_minutes") if k in args},
                 **({"persona": args.get("persona") or persona_id} if args.get("persona") or persona_id else {})}
-        t = await self.d["task_create"](body, "tool")
+        t = await self.d["task_create"](body, "app" if caller == "app" else "tool")
         how = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림으로 알려 드릴게요.", "none": ""}[notify]
-        return f"작업으로 맡겼어요. {how}".strip() + f" (작업 {t['id']})", self.d.get("task_view", lambda t: t)(t)
+        return f"작업으로 맡겼어요. {how}".strip() + f" (작업 {t['id']})", \
+            self.d.get("task_view", lambda t, full=False: t)(t, True)
 
 
 class Need(Exception):
@@ -472,6 +489,38 @@ class Fail(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code, self.message = code, message
+
+
+def check_args(schema, args, path=""):
+    """The subset of JSON Schema our own tools use: type, required, enum, pattern, maxLength, minimum, maximum,
+    additionalProperties false. Invalid input is the same error on every surface (a trust boundary)."""
+    def bad(where, why):
+        raise Fail("invalid", f"입력이 맞지 않아요: {where or '인자'} {why}")
+    props = schema.get("properties", {})
+    for k in schema.get("required", []):
+        if k not in args:
+            bad(k, "가 필요해요")
+    for k, v in args.items():
+        p = props.get(k)
+        if p is None:
+            if schema.get("additionalProperties") is False:
+                bad(k, "는 없는 인자예요")
+            continue
+        types = p.get("type")
+        types = types if isinstance(types, list) else [types] if types else []
+        kinds = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "null": type(None),
+                 "object": dict, "array": list}
+        if types and not any(isinstance(v, kinds[t]) and not (t == "integer" and isinstance(v, bool)) for t in types):
+            bad(k, f"의 형식이 {'/'.join(types)}가 아니에요")
+        if v is None:
+            continue
+        if "enum" in p and v not in p["enum"]:
+            bad(k, f"는 {', '.join(map(str, p['enum']))} 중 하나여야 해요")
+        if isinstance(v, str) and ("maxLength" in p and len(v) > p["maxLength"]
+                                   or "pattern" in p and not re.search(p["pattern"], v)):
+            bad(k, "의 값이 맞지 않아요")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and ("minimum" in p and v < p["minimum"] or "maximum" in p and v > p["maximum"]):
+            bad(k, "가 범위를 벗어났어요")
 
 
 HTTP_CODES = {400: "invalid", 404: "not_found", 409: "conflict", 429: "limit", 503: "unavailable"}
@@ -498,6 +547,16 @@ def cancelled(done):
     return done[1], done[0]
 
 
+def iso(text):
+    try:
+        t = datetime.fromisoformat(str(text))
+    except ValueError:
+        raise Fail("invalid", "시각은 2026-11-23T18:00:00+09:00 같은 ISO 형식으로 주세요.")
+    if t.tzinfo is None:
+        raise Fail("invalid", "시각에 +09:00 같은 시간대가 필요해요.")
+    return t
+
+
 def rule_of(item):
     """An item's cron: its own, or its legacy repeat at its time of day; None for a one-off."""
     if item.get("cron"):
@@ -521,6 +580,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
              APPROVAL_STATUS)
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
+OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
 MCP_TOOLS = ALL_OWN  # claude -p already has the daemons, Cygnus and the claude.ai connectors as its own MCP servers
 # The external token (the user's own Claude Code, later claude.ai): ring, schedule and hand off work, nothing personal.
 SCOPES = {"full": {t["name"] for t in MCP_TOOLS},

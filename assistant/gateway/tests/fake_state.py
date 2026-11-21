@@ -195,7 +195,7 @@ def make():
         expect = body.pop("expect_status", None)
         if expect and item["status"] != expect:
             raise HTTPException(409)
-        item.update({k: v for k, v in body.items() if v is not None})
+        item.update({k: v for k, v in body.items() if v is not None or k in ("start_date", "end_date")})
         return item
 
     @app.delete("/v1/state/schedule/{sid}")

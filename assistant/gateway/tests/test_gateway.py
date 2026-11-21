@@ -23,6 +23,7 @@ def start(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("BISEO_CLAUDE", str(HERE / "fake_claude.py"))
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("BISEO_LLM_URL", "http://127.0.0.1:9/v1/chat/completions")  # never the real Qwen in tests
     monkeypatch.setenv("BISEO_WARM_CLAUDE", "0")  # the one-shot fake; test_warm_claude covers the warm path
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -758,7 +759,9 @@ def test_schedule_api_validates_and_confirms(gw):
     assert r.status_code == 201
     item = r.json()
     assert item == {"id": item["id"], "at": tomorrow10.isoformat(), "repeat": None, "kind": "wake", "note": "",
-                    "status": "pending", "attempts": 0, "created_by": "app", "persona_id": "azel"}
+                    "status": "pending", "attempts": 0, "created_by": "app", "persona_id": "azel",
+                    "next_at": tomorrow10.isoformat(), "cron": None, "rule_text": None, "start_date": None,
+                    "end_date": None, "notify": "call", "purpose": ""}
     iso = lambda t: datetime.fromtimestamp(t, g.KST).isoformat()  # noqa: E731
     for bad in [{"at": iso(now - 60)}, {"at": iso(now + 31 * 86400)}, {"at": "2026-12-01T10:00:00"},  # no offset
                 {"at": now + 3600}, {"at": iso(now + 3600), "repeat": "hourly"},
@@ -790,10 +793,10 @@ def test_spoken_times(gw):
         (kst(2026, 11, 22, 0, 5), None, "내일 밤 12시 5분"), (kst(2026, 11, 21, 12, 30), None, "오늘 낮 12시 30분")]:
         assert g.spoken_when(at.timestamp(), repeat, now) == want, want
     fri7 = kst(2026, 11, 27, 7, 0).timestamp()  # a Friday
-    assert g.next_at(fri7, "weekdays", fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
-    assert g.next_at(fri7, "daily", fri7) == kst(2026, 11, 28, 7, 0).timestamp()
-    assert g.next_at(fri7, "weekly:4", fri7) == kst(2026, 12, 4, 7, 0).timestamp()
-    assert g.next_at(fri7, "daily", fri7 + 3 * 86400) == kst(2026, 12, 1, 7, 0).timestamp()  # skips missed days
+    assert g.next_fire_of({"at": fri7, "repeat": "weekdays"}, fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
+    assert g.next_fire_of({"at": fri7, "repeat": "daily"}, fri7) == kst(2026, 11, 28, 7, 0).timestamp()
+    assert g.next_fire_of({"at": fri7, "repeat": "weekly:4"}, fri7) == kst(2026, 12, 4, 7, 0).timestamp()
+    assert g.next_fire_of({"at": fri7, "repeat": "daily"}, fri7 + 3 * 86400) == kst(2026, 12, 1, 7, 0).timestamp()  # skips missed days
 
 
 def test_schedule_over_the_link(gw):
@@ -817,7 +820,8 @@ def test_schedule_over_the_link(gw):
     assert by["r1"]["say"] == "내일 오전 7시 30분에 깨워 드릴게요." and by["r1"]["ok"]
     assert by["r1"]["item"]["at"] == at.isoformat() and by["r1"]["item"]["created_by"] == "voice"
     assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by",
-                                     "persona_id"}
+                                     "persona_id", "next_at", "cron", "rule_text", "start_date", "end_date", "notify",
+                                     "purpose"}
     assert by["r2"]["say"] == "예약된 전화는 내일 오전 7시 30분 기상이에요."
     assert by["r3"]["say"] == "내일 오전 7시 30분 예약을 취소했어요."
     assert by["r4"]["say"] == "취소할 예약이 없어요."
@@ -853,7 +857,9 @@ def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
     for dt, n in [(0, 1), (60, 1), (120, 2), (180, 2), (240, 3), (290, 3)]:
         asyncio.run(g.fire_scheduled(at + dt))
         assert len(placed) == n and item["attempts"] == n, (dt, n)
-    assert placed[0] == ("wake", "일어나실 시간이에요.") and item["status"] == "fired" and len(item["call_id"]) == 32
+    t = datetime.fromtimestamp(at, g.KST)  # the opening: composed from the time, never the request (openings.py)
+    assert placed[0] == ("wake", g.openings.template("wake", "", t.hour, t.minute)) and item["status"] == "fired" \
+        and len(item["call_id"]) == 32
     asyncio.run(g.fire_scheduled(at + 300))  # 60 s after the third attempt
     assert item["status"] == "missed" and len(placed) == 3
     assert alerts == ["오늘 오전 7시 기상 전화를 받지 않으셨어요."]
@@ -864,7 +870,10 @@ def test_answered_call_stops_retries_and_repeat_reschedules(gw, monkeypatch):
     at, placed, _ = fire_setup(g, monkeypatch, repeat="daily", kind="reminder", note="약 드실 시간이에요.")
     item = g.fake.db["schedule"]["s1"]
     asyncio.run(g.fire_scheduled(at))
-    assert placed == [("reminder", "말씀하신 시간이에요. 약 드실 시간이에요.")]
+    t = datetime.fromtimestamp(at, g.KST)
+    purpose = g.openings.purpose_rule("약 드실 시간이에요.")
+    assert placed == [("reminder", g.openings.template("reminder", "", t.hour, t.minute, purpose))]
+    assert "약 드실 시간이에요." not in placed[0][1]  # the note is not read back verbatim
     asyncio.run(g.handle_link(LinkWS([{"type": "call_answered", "call_id": item["call_id"]}])))
     assert item["status"] == "pending" and item["attempts"] == 0 and item["at"] > at  # tomorrow, same time
     assert datetime.fromtimestamp(item["at"], g.KST).strftime("%H:%M") == "07:00"
