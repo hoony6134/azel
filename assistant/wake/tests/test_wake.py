@@ -64,7 +64,8 @@ def make(tmp_path, handler=None, wall=None, open_url=None, **cfg):
     http = httpx.Client(transport=httpx.MockTransport(handler or default_handler),
                         headers={"Authorization": "Bearer t"})
     c = bw.DEFAULTS | {"log_path": str(tmp_path / "wake.jsonl"), "handoff": "headless",
-                       "in_call_path": str(tmp_path / "in-call")} | cfg
+                       "in_call_path": str(tmp_path / "in-call"), "enrolling_path": str(tmp_path / "enrolling"),
+                       "utterance_dir": str(tmp_path / "azel"), "mic_live_path": str(tmp_path / "mic-live")} | cfg
     extra = {k: v for k, v in {"wall": wall, "open_url": open_url}.items() if v}
     lis = Listener(c, FakeOww(), FakeVad(), http, play, ack=(np.zeros(8000, np.int16), 16000),
                    flush=lambda: flushed.append(1), clock=clock, **extra)
@@ -247,8 +248,8 @@ def test_wake_opens_the_app_with_the_primary_persona_and_stays_headless_free(tmp
     lis, clock, played, _, _ = make(tmp_path, handler=h, handoff="app",
                                     open_url=lambda u: opened.append(u) or True)
     lis.run(frames(clock, [(WAKE, 1), *utterance(), (SIL, 40)]))
-    assert opened == ["azel://wake?persona=sohee_x"]
-    assert played == [16000]  # the ack only; no /v1/turn, no reply audio
+    assert len(opened) == 1 and opened[0].startswith("azel://wake?persona=sohee_x&utterance=")
+    assert played == []  # no ack in one-breath mode, no /v1/turn, no reply audio
     assert [r.url.path for r in reqs] == ["/v1/personas"]
     assert log_lines(tmp_path)[0]["handoff"] == "app"
 
@@ -360,3 +361,108 @@ def test_app_running_matches_the_bundle_path(monkeypatch):
     monkeypatch.setattr(bw.subprocess, "run", lambda argv, **kw: seen.append(argv) or type("R", (), {"returncode": 0})())
     assert bw.app_running({"app_path": "/Applications/Azel.app"})
     assert seen[0][:2] == ["pgrep", "-f"] and seen[0][2] == "^/Applications/Azel\\.app/Contents/MacOS/"
+
+
+def uid_of(url):
+    return url.split("utterance=")[1]
+
+
+def test_one_breath_command_is_captured_after_the_wake_word_and_handed_over(tmp_path):
+    opened = []
+    lis, clock, played, flushed, requests = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(SIL, 3), (WAKE, 1), (SIL, 1), (SPEECH, 5), (SIL, 5), (SIL, 40)]))
+    f = tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm"
+    pcm = np.frombuffer(f.read_bytes(), dtype="<i2")
+    assert f.stat().st_mode & 0o777 == 0o600
+    assert (pcm == SPEECH).sum() == 5 * FRAME           # the command, not the wake word
+    assert (pcm == WAKE).sum() == 0
+    assert not played and not any(r.url.path == '/v1/turn' for r in requests)                  # no ack over the user's speech, no headless turn
+    assert log_lines(tmp_path)[0]["utterance"] == uid_of(opened[0])
+
+
+def test_preroll_keeps_the_frame_before_speech_starts(tmp_path):
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 40)]))
+    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
+    assert len(pcm) == 9 * FRAME and (pcm[:FRAME] == WAKE).all()  # wake frame + 4 speech + 4 silence
+
+
+def test_utterance_file_is_empty_when_nobody_speaks(tmp_path):
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SIL, 40)]))
+    assert (tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes() == b""
+
+
+def test_capture_ends_when_the_app_mic_is_live(tmp_path):
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+
+    def stream():
+        yield from frames(clock, [(WAKE, 1), (SPEECH, 3)])
+        (tmp_path / "mic-live").write_text("")  # the app's mic is live: it hears the rest itself
+        yield from frames(clock, [(SPEECH, 5), (SIL, 40)])
+
+    lis.run(stream())
+    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
+    assert len(pcm) == 5 * FRAME  # wake frame as pre-roll + 3 speech + the frame that showed mic-live
+
+
+def test_stale_utterance_files_are_swept(tmp_path):
+    lis, *_ = make(tmp_path, handoff="app")
+    d = tmp_path / "azel"
+    d.mkdir()
+    old = d / "wake-utterance-old.pcm"
+    old.write_bytes(b"x")
+    import os
+    os.utime(old, (1, 1))
+    lis.write_utterance("new", np.zeros(4, np.int16))
+    assert not old.exists() and (d / "wake-utterance-new.pcm").exists()
+
+
+def test_detections_are_ignored_while_the_app_enrolls_but_not_when_stale(tmp_path):
+    opened = []
+    wall = lambda: 1_000_000.0
+    lis, clock, *_ = make(tmp_path, handoff="app", wall=wall, open_url=lambda u: opened.append(u) or True)
+    flag = tmp_path / "enrolling"
+    flag.write_text("")
+    import os
+    os.utime(flag, (wall() - 60, wall() - 60))
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
+    assert opened == []
+    os.utime(flag, (wall() - 1801, wall() - 1801))
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
+    assert len(opened) == 1
+
+
+def test_utterance_off_keeps_the_ack_and_the_plain_url(tmp_path):
+    opened = []
+    lis, clock, played, *_ = make(tmp_path, handoff="app", utterance=False, open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
+    assert played == [16000] and opened == ["azel://wake?persona=azel"] and not (tmp_path / "azel").exists()
+
+
+def test_part_file_exists_while_capturing_and_is_renamed_when_done(tmp_path):
+    seen = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: True)
+
+    def stream():
+        yield from frames(clock, [(WAKE, 1), (SPEECH, 2)])
+        seen.append(sorted(p.name[-9:] for p in (tmp_path / "azel").iterdir()))
+        yield from frames(clock, [(SIL, 40)])
+
+    lis.run(stream())
+    assert seen == [[".pcm.part"]]
+    assert [p.suffix for p in (tmp_path / "azel").iterdir()] == [".pcm"]
+
+
+def test_unwritable_utterance_dir_hands_over_without_the_file(tmp_path, capsys):
+    blocker = tmp_path / "file"
+    blocker.write_text("")  # a file where the folder should be: mkdir fails
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", utterance_dir=str(blocker / "azel"),
+                          open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
+    assert opened == ["azel://wake?persona=azel"]  # no utterance= the app would wait for
+    assert "utterance file failed" in capsys.readouterr().out and "utterance" not in log_lines(tmp_path)[0]

@@ -18,6 +18,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -59,6 +60,14 @@ DEFAULTS = {
     "handoff_ignore_s": 3,  # deaf this long after the handoff, until the app creates the in-call file
     "in_call_stale_s": 7200,  # an in-call file older than this is a leftover
     "app_check_s": 2,  # how often the app-running check runs
+    "utterance": True,  # one-breath commands: capture what follows the wake word and hand it to the app
+    "mic_live_path": "~/Library/Application Support/Azel/mic-live",  # the app is capturing: the listener's capture ends
+    "utterance_dir": "~/Library/Application Support/Azel",  # wake-utterance-<id>.pcm goes here
+    "utterance_wait_s": 2,  # give up this long after the wake word if nobody speaks
+    "utterance_max_s": 10,
+    "utterance_preroll_ms": 160,  # audio kept from before the first voiced frame (the wake word's tail edge)
+    "enrolling_path": "~/Library/Application Support/Azel/enrolling",  # the app's wake-clip recording screen
+    "enrolling_stale_s": 1800,
 }
 
 
@@ -105,18 +114,24 @@ class Listener:
         self.muted_until = self.clock() + self.cfg["mute_after_ms"] / 1000
         self.oww.reset()
 
-    def in_call(self):
-        """The app is in a call: its lock file exists and is not a leftover (older than in_call_stale_s)."""
+    def fresh(self, path_key, stale_key):
+        """A lock file of the app exists and is not a leftover (older than its stale limit)."""
         try:
-            age = self.wall() - Path(self.cfg["in_call_path"]).expanduser().stat().st_mtime
+            age = self.wall() - Path(self.cfg[path_key]).expanduser().stat().st_mtime
         except OSError:
             return False
-        return age < self.cfg["in_call_stale_s"]
+        return age < self.cfg[stale_key]
+
+    def in_call(self):
+        return self.fresh("in_call_path", "in_call_stale_s")
+
+    def enrolling(self):
+        return self.fresh("enrolling_path", "enrolling_stale_s")
 
     def live(self, frames):
-        """Frames that arrive outside the mute window, the post-handoff deaf window and any app call."""
+        """Frames that arrive outside the mute window, the post-handoff deaf window, an app call and enrollment."""
         for f in frames:
-            busy = self.in_call()
+            busy = self.in_call() or self.enrolling()
             if self.was_in_call and not busy:
                 self.oww.reset()  # forget what the call put into the detector's buffer
             self.was_in_call = busy
@@ -151,16 +166,28 @@ class Listener:
                  "request": False, "transcript": None}
         if self.cfg["save_audio"]:
             entry["audio"] = str(self.save_clip(np.concatenate(self.ring)))
-        self.ring = []
+        ring, self.ring = self.ring, []
         session = f"wake-{int(time.time())}"
-        if self.ack:
+        one_breath = use_app(self.cfg) and self.cfg["utterance"]
+        if one_breath:  # no ack: it would play over, and flush away, the start of the command
+            pass
+        elif self.ack:
             self.play(*self.ack)
         else:
             self.beep()
         if use_app(self.cfg):
             persona = primary_persona(self.cfg, self.http)
             entry["handoff"], entry["persona"] = "app", persona
-            if self.open_url(f"azel://wake?persona={quote(persona)}"):
+            uid = f"{int(time.time())}-{secrets.token_hex(3)}" if one_breath else None
+            if uid and not self.begin_utterance(uid):  # the .part file tells the app a capture is under way
+                uid = None  # no file to hand over: the app just listens itself
+            url = f"azel://wake?persona={quote(persona)}" + (f"&utterance={uid}" if uid else "")
+            opened = self.open_url(url)
+            if uid:
+                pcm = self.capture_utterance(frames, ring)  # always written, empty when nobody spoke: the app waits for it
+                entry["utterance"], entry["utterance_s"] = uid, round(len(pcm) / SR, 2)
+                self.write_utterance(uid, pcm)
+            if opened:
                 self.deaf_until = self.clock() + self.cfg["handoff_ignore_s"]
             else:  # no headless fallback in app mode: the app answers, or nobody does
                 entry["error"] = "open azel://wake failed"
@@ -180,6 +207,67 @@ class Listener:
         finally:
             self.log(entry)
             self.oww.reset()
+
+    def capture_utterance(self, frames, ring) -> np.ndarray:
+        """What is said right after the wake word, from the raw frames (the app's call-file ends it, so no live()).
+
+        Ends on the app's in-call file (its mic is live), end of speech, the cap, or no speech within
+        utterance_wait_s. Returns int16 samples; empty when nobody spoke."""
+        c = self.cfg
+        keep = max(1, -(-c["utterance_preroll_ms"] * SR // 1000 // FRAME))
+        wait, cap = int(c["utterance_wait_s"] / FRAME_S), int(c["utterance_max_s"] / FRAME_S)
+        end = int(c["silence_ms"] / 1000 / FRAME_S + 0.999)
+        pre, speech, silent = list(ring[-keep:]), [], 0
+        self.vad.reset()
+        for n, frame in enumerate(frames, 1):
+            live = Path(c["mic_live_path"]).expanduser().exists()  # the app hears the rest itself; keep this frame, then stop
+            voiced = any(self.vad(frame[i:i + VAD_CHUNK].tobytes()) >= c["vad_threshold"]
+                         for i in range(0, FRAME, VAD_CHUNK))
+            if speech:
+                speech.append(frame)
+                silent = 0 if voiced else silent + 1
+                if silent >= end or len(speech) >= cap:
+                    break
+            elif voiced:
+                speech = pre + [frame]
+            elif n >= wait:
+                break
+            else:
+                pre = (pre + [frame])[-keep:]
+            if live:
+                break
+        return np.concatenate(speech) if speech else np.zeros(0, dtype=np.int16)
+
+    def utterance_paths(self, uid):
+        d = Path(self.cfg["utterance_dir"]).expanduser()
+        return d, d / f"wake-utterance-{uid}.pcm.part", d / f"wake-utterance-{uid}.pcm"
+
+    def begin_utterance(self, uid) -> bool:
+        """Create wake-utterance-<uid>.pcm.part; False (logged) if the folder or file can't be made."""
+        d, part, _ = self.utterance_paths(uid)
+        try:
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.close(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            return True
+        except OSError as e:
+            print(f"utterance file failed ({type(e).__name__}: {e}); handing over without it", flush=True)
+            return False
+
+    def write_utterance(self, uid, pcm) -> Path:
+        """wake-utterance-<uid>.pcm (16 kHz mono int16 LE, 0600), renamed from .pcm.part so an existing .pcm is complete."""
+        d, tmp, final = self.utterance_paths(uid)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for old in d.glob("wake-utterance-*"):  # the app deletes what it read; this is for a crashed app
+            try:
+                if self.wall() - old.stat().st_mtime > 3600:
+                    old.unlink()
+            except OSError:
+                pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pcm.astype("<i2").tobytes())
+        os.replace(tmp, final)
+        return final
 
     def record(self, frames):
         """One utterance via Silero VAD, or None if nobody starts talking within followup_s."""
