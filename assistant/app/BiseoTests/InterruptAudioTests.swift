@@ -136,26 +136,26 @@ final class HangupAudioTests: XCTestCase {
 final class PlayedReportTests: XCTestCase {
     func testReportsEachReplyOnceItsLastSamplePlayed() {
         var t = PlayedTracker()
-        t.start(1); t.audio(samples: 1000); t.audio(samples: 500)
-        XCTAssertEqual(t.due(played: 1500), [], "still streaming: not done even though playback caught up")
+        t.start(1); t.audio(samples: 1000, now: 10); t.audio(samples: 500, now: 10.1)
+        XCTAssertEqual(t.due(played: 1500, now: 10.2), [], "dry for 0.1 s: maybe a streaming stall")
         t.start(2)                                   // the next reply closes #1 and queues after it
-        t.audio(samples: 800)
-        XCTAssertEqual(t.due(played: 1400), [])
-        XCTAssertEqual(t.due(played: 1500), [1])
-        XCTAssertEqual(t.due(played: 1600), [], "once only")
-        t.close()                                    // turn_done
-        XCTAssertEqual(t.due(played: 2299), [])
-        XCTAssertEqual(t.due(played: 2300), [2])
+        t.audio(samples: 800, now: 10.3)
+        XCTAssertEqual(t.due(played: 1400, now: 10.4), [])
+        XCTAssertEqual(t.due(played: 1500, now: 10.4), [1], "a closed reply: as soon as it played")
+        XCTAssertEqual(t.due(played: 1600, now: 10.5), [], "once only")
+        XCTAssertEqual(t.due(played: 2300, now: 10.5), [], "the queue just ran dry")
+        XCTAssertEqual(t.due(played: 2300, now: 10.6), [2], "dry for 0.25 s: reported without waiting for turn_done")
+        XCTAssertEqual(t.due(played: 2300, now: 11), [])
     }
 
     func testInterruptedAndSilentRepliesAreNotReported() {
         var t = PlayedTracker()
-        t.start(1); t.audio(samples: 1000)
+        t.start(1); t.audio(samples: 1000, now: 0)
         t.flush()                                    // interrupt
-        XCTAssertEqual(t.due(played: 5000), [])
+        XCTAssertEqual(t.due(played: 5000, now: 9), [])
         t.start(2); t.close()                        // text-only reply, no audio
-        t.start(3); t.audio(samples: 100); t.close()
-        XCTAssertEqual(t.due(played: 100), [3])
+        t.start(3); t.audio(samples: 100, now: 1); t.close()
+        XCTAssertEqual(t.due(played: 100, now: 1), [3])
     }
 
     func testANewReplyStartQueuesAfterTheTail() {

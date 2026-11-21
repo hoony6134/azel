@@ -471,6 +471,11 @@ struct PlayedTracker: Equatable {
     private struct Reply: Equatable { var id: Int; var begin: Int; var end: Int; var closed = false }
     private var replies: [Reply] = []
     private var scheduled = 0
+    private var lastAudio = 0.0
+    /// The server sends `turn_done` only after `played` (gateway 9e2ecc8), so the latest reply is
+    /// reported once everything queued has played and no audio came for this long (a short
+    /// streaming stall must not end the turn).
+    static let settle = 0.25
 
     /// `reply_start`: closes the reply before it (no more audio comes for it).
     mutating func start(_ id: Int) {
@@ -478,8 +483,9 @@ struct PlayedTracker: Equatable {
         replies.append(Reply(id: id, begin: scheduled, end: scheduled))
     }
 
-    mutating func audio(samples: Int) {
+    mutating func audio(samples: Int, now: Double = ProcessInfo.processInfo.systemUptime) {
         scheduled += samples
+        lastAudio = now
         if let i = replies.indices.last, !replies[i].closed { replies[i].end = scheduled }
     }
 
@@ -489,10 +495,15 @@ struct PlayedTracker: Equatable {
     /// Interrupt or hangup: the clock restarts and nothing cut is reported.
     mutating func flush() { replies = []; scheduled = 0 }
 
-    /// Replies that are complete, had audio, and whose last sample has played, oldest first. A reply
-    /// still streaming is never due, even if playback caught up with it for a moment.
-    mutating func due(played: Int) -> [Int] {
+    /// Replies whose last sample has played, oldest first: closed ones (a later reply started or
+    /// turn_done) as soon as they played; the open one once the queue ran dry and stayed dry
+    /// `settle` seconds.
+    mutating func due(played: Int, now: Double = ProcessInfo.processInfo.systemUptime) -> [Int] {
         var out: [Int] = []
+        if let i = replies.indices.last, !replies[i].closed, replies[i].end > replies[i].begin,
+           played >= replies[i].end, played >= scheduled, now - lastAudio >= Self.settle {
+            replies[i].closed = true
+        }
         while let r = replies.first, r.closed {
             if r.end > r.begin {
                 guard played >= r.end else { break }
