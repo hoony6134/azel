@@ -67,8 +67,9 @@ def test_enroll_validates_stores_and_trains(api):
 
 def test_clip_cap(api):
     m, c, *_ = api
-    r = c.post("/v1/wake/enroll", files=files(*[wav() for _ in range(m.MAX_CLIPS + 2)])).json()
-    assert r["accepted"] == m.MAX_CLIPS and r["rejected"][0]["reason"] == "too many clips"
+    assert c.post("/v1/wake/enroll", files=files(*[wav() for _ in range(m.MAX_CLIPS)])).json()["accepted"] == m.MAX_CLIPS
+    r = c.post("/v1/wake/enroll", files=files(wav(), wav())).json()
+    assert r["accepted"] == 0 and r["rejected"][0]["reason"] == "too many clips"
 
 
 def test_oversize_upload_and_request_caps(api):
