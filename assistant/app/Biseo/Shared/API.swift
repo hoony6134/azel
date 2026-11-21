@@ -13,6 +13,7 @@ struct CallEvent: Decodable, Equatable {
     var label: String?        // activity, server wording
     var tool: String?         // activity
     var kind: String?         // activity: calendar | mail | memory | … (DESIGN §13.2)
+    var reply_id: Int?        // reply_start
 }
 
 struct AppSettings: Codable, Equatable {
@@ -93,6 +94,19 @@ struct AppSettings: Codable, Equatable {
     var reply_length: String?
     /// Days the server keeps call history (0 = forever). Optional for older gateways.
     var history_days: Int?
+    /// How the assistant addresses the user ("" = no 호칭). Optional for older gateways.
+    var user_title: String?
+    /// Whether the gateway knows `user_title` (its GET included the key). Today's gateway doesn't, and
+    /// rejects unknown keys on PUT, so the 호칭 rows stay hidden and the field is never sent until it does.
+    @MainActor static var supportsUserTitle = false
+
+    /// The GET /v1/settings JSON has a `user_title` key (any value, "" or null included).
+    static func reportsUserTitle(_ data: Data) -> Bool {
+        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?.keys.contains("user_title") ?? false
+    }
+    /// claude_api | claude_code | nim | qwen: the default engine for tasks. nil on older gateways,
+    /// which then never get it back (synthesized encoding omits nil).
+    var task_backend: String?
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 
@@ -161,6 +175,7 @@ enum GatewayError: LocalizedError {
             }
             if !parts.isEmpty { return parts.joined(separator: ", ") }
         }
+        if let e = obj["error"] as? [String: Any], let m = e["message"] as? String { return m }   // action result
         return ["detail", "message", "error"].lazy.compactMap { obj[$0] as? String }.first
     }
 
@@ -168,6 +183,9 @@ enum GatewayError: LocalizedError {
     /// endpoint, 409 = busy, 401/403 = token, 5xx = unreachable).
     static func from(status code: Int, body: Data) -> GatewayError {
         if code == 400 || code == 422, let m = message(in: body) { return .rejected(m) }
+        // Action errors (ACTIONS.md §2: 404/409/429/503 with {detail, …result}) carry a Korean message too.
+        if (400..<600).contains(code), ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["error"] is [String: Any],
+           let m = message(in: body) { return .rejected(m) }
         return .http(code)
     }
 }
@@ -208,6 +226,8 @@ enum Gateway {
     }
 
     static func saveSettings(_ s: AppSettings) async throws {
+        var s = s
+        if await !AppSettings.supportsUserTitle { s.user_title = nil }   // an old gateway 400s on unknown keys
         _ = try await send("PUT", "/v1/settings", json: try JSONEncoder().encode(s))
     }
 
@@ -243,5 +263,35 @@ enum NIMAPI {
     /// Write-only: the key goes to the gateway once and is never kept on this device.
     static func putKey(_ value: String) async throws {
         _ = try await Gateway.send("PUT", "/v1/providers/nim/key", json: ["value": value])
+    }
+}
+
+/// The unified action result (ACTIONS.md §2): `{ok, spoken, data, needs, error}`. Older routes
+/// answer with their own JSON; that counts as ok with nothing to ask.
+struct ActionResult: Equatable {
+    struct Option: Equatable { var id: String; var spoken: String }
+    struct Needs: Equatable {
+        var kind: String          // confirm | clarify | choose
+        var question: String
+        var options: [Option] = []
+    }
+
+    var ok = true
+    var spoken: String?
+    var needs: Needs?
+
+    init(ok: Bool = true, spoken: String? = nil, needs: Needs? = nil) { self.ok = ok; self.spoken = spoken; self.needs = needs }
+
+    init(_ data: Data) {
+        guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        ok = (o["ok"] as? Bool) ?? true
+        spoken = (o["spoken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        if let n = o["needs"] as? [String: Any], let kind = n["kind"] as? String {
+            let options = (n["options"] as? [[String: Any]] ?? []).compactMap { d -> Option? in
+                guard let id = d["id"].map(describe), let s = d["spoken"] as? String else { return nil }
+                return Option(id: id, spoken: s)
+            }
+            needs = Needs(kind: kind, question: (n["question"] as? String) ?? spoken ?? "", options: options)
+        }
     }
 }

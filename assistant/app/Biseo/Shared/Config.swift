@@ -3,6 +3,8 @@ import Security
 
 /// Server addresses live in UserDefaults; the token only ever lives in the Keychain.
 enum Config {
+    /// Running as the unit-test host: no real gateway polling, no windows popping up, no sound.
+    static let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     /// TLS reverse proxy on deneb: `/v1/call` goes to the voice server, the rest to the gateway.
     static let publicVoiceURL = "wss://azel.scian.xyz", publicGatewayURL = "https://azel.scian.xyz"
     // HTTPS only (PM, 2026-11-21): azel.scian.xyz works with or without Tailscale, and ATS blocks

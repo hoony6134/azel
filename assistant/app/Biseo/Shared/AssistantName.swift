@@ -24,6 +24,17 @@ enum AssistantName {
 
     static let personalityLimit = 600
 
+    /// 호칭: 0–12 Hangul, Latin letters or spaces, trimmed; "" is allowed (no 호칭). nil = invalid.
+    static func validatedTitle(_ raw: String) -> String? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count <= 12 else { return nil }
+        let ok = t.unicodeScalars.allSatisfy { u in
+            (0xAC00...0xD7A3).contains(u.value) || (0x3131...0x318E).contains(u.value)
+                || ("a"..."z").contains(u) || ("A"..."Z").contains(u) || u == " "
+        }
+        return ok ? t : nil
+    }
+
     /// What gets saved for `personality`: trimmed and cut to the limit; "" means the server default.
     static func personality(_ raw: String) -> String {
         String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(personalityLimit))

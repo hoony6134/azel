@@ -8,19 +8,21 @@ struct BiseoMacApp: App {
     @StateObject private var history = HistoryModel()
     @StateObject private var schedule = ScheduleModel()
     @ObservedObject private var call = MacCall.shared
+    @ObservedObject private var approvals = ApprovalCenter.shared
 
     init() {
         Recordings.cleanup()
         Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
         HotKey.register()
+        ApprovalWindow.install()
     }
 
     var body: some Scene {
         MenuBarExtra {
             Popover(model: model, wake: wake, history: history)
         } label: {
-            Image(nsImage: JarIcon.make(filled: call.inCall, dot: !model.approvals.isEmpty))
+            Image(nsImage: JarIcon.make(filled: call.inCall, dot: !model.approvals.isEmpty || !approvals.pending.isEmpty))
                 .accessibilityLabel("Azel")
         }
         .menuBarExtraStyle(.window)
@@ -40,6 +42,49 @@ struct BiseoMacApp: App {
                 Button("새 대화") { model.newConversation() }.keyboardShortcut("n")
             }
         }
+    }
+}
+
+/// A new pending approval opens in a small floating window, above other apps, while Azel runs.
+@MainActor
+enum ApprovalWindow {
+    private static var window: NSPanel?
+    private static let closer = Closer()
+
+    /// The title-bar close button ends the presentation too, so the next approval can show.
+    private final class Closer: NSObject, NSWindowDelegate {
+        func windowWillClose(_ notification: Notification) { MainActor.assumeIsolated { ApprovalCenter.shared.presented = nil } }
+    }
+
+    private static func done(_ w: NSWindow) {
+        w.orderOut(nil)
+        ApprovalCenter.shared.presented = nil
+    }
+
+    static func install() {
+        guard !Config.isTestHost else { return }   // a test run must not poll the real gateway or pop windows
+        ApprovalCenter.shared.present = { show($0) }
+        ApprovalCenter.shared.start()
+    }
+
+    static func show(_ a: ApprovalRequest) {
+        let w = window ?? {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 420), styleMask: [.titled, .closable, .fullSizeContentView],
+                            backing: .buffered, defer: false)
+            p.title = "승인 요청"
+            p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)   // above the call panel
+            p.isReleasedWhenClosed = false
+            p.hidesOnDeactivate = false
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.delegate = closer
+            window = p
+            return p
+        }()
+        w.contentView = NSHostingView(rootView: ApprovalSheet(request: a) { done(w) }.frame(width: 440))
+        w.setContentSize(w.contentView?.fittingSize ?? NSSize(width: 440, height: 420))
+        w.center()
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
     }
 }
 

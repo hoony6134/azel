@@ -20,6 +20,16 @@ enum AudioDevices {
         }
     }
 
+    /// The system default input or output device.
+    static func defaultID(input: Bool) -> AudioDeviceID? {
+        var addr = AudioObjectPropertyAddress(mSelector: input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id) == noErr, id != 0 else { return nil }
+        return id
+    }
+
     static func id(forUID uid: String?, input: Bool) -> AudioDeviceID? {
         guard let uid else { return nil }
         return list(input: input).first { $0.uid == uid }?.id

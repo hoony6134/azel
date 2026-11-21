@@ -28,6 +28,7 @@ struct CallScreen: View {
                 Button("녹음") { recordingNoticeShown = true; call.toggleRecording() }
                 Button("취소", role: .cancel) {}
             }
+            .approvalSheet(active: call.inCall)
     }
 
     private var withFeedback: some View {

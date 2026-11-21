@@ -30,10 +30,13 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
     var device: String?
     var persona: String?
     var created_at: Date?
+    /// The engine that actually ran it, and why it fell back if it did. Absent on older gateways.
+    var backend: String?
+    var fallback_reason: String?
 
     var isActive: Bool { ["queued", "running", "waiting_approval"].contains(status) }
 
-    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, device, persona, persona_id, created_at }
+    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, device, persona, persona_id, created_at, backend, fallback_reason }
 
     init(id: String, goal: String, status: String, steps: [Step] = [], result: String? = nil, cost: Double? = nil, device: String? = nil) {
         self.id = id; self.goal = goal; self.status = status; self.steps = steps; self.result = result; self.cost = cost; self.device = device
@@ -52,6 +55,8 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
         device = try c.decodeIfPresent(String.self, forKey: .device)
         persona = (try? c.decodeIfPresent(String.self, forKey: .persona)) ?? (try? c.decodeIfPresent(String.self, forKey: .persona_id))
         created_at = TaskTime.decode(c, .created_at)
+        backend = try? c.decodeIfPresent(String.self, forKey: .backend)
+        fallback_reason = try? c.decodeIfPresent(String.self, forKey: .fallback_reason)
     }
 
     static func == (a: AgentTask, b: AgentTask) -> Bool { a.id == b.id && a.status == b.status && a.steps == b.steps && a.result == b.result }
@@ -93,6 +98,38 @@ enum TaskBadge {
         default: return Theme.text3
         }
     }
+}
+
+/// The default task engine (`task_backend`).
+enum TaskBackend: String, CaseIterable, Identifiable {
+    case claude_api, claude_code, nim, qwen
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .claude_api: return "Claude API"
+        case .claude_code: return "Claude Code"
+        case .nim: return "NIM"
+        case .qwen: return "로컬 Qwen"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .claude_api: return "빠름, 예산에서 차감"
+        case .claude_code: return "구독 사용"
+        case .nim: return "실험적"
+        case .qwen: return "무료, 조회 위주"
+        }
+    }
+
+    /// NIM only when it's switched on (or already the chosen one, so the picker still shows it).
+    static func options(nimEnabled: Bool, current: String?) -> [TaskBackend] {
+        allCases.filter { $0 != .nim || nimEnabled || current == TaskBackend.nim.rawValue }
+    }
+
+    /// A task's `backend` for display; unknown values as-is.
+    static func label(_ raw: String) -> String { TaskBackend(rawValue: raw)?.label ?? raw }
 }
 
 enum TaskNotify: String, CaseIterable, Identifiable {

@@ -680,7 +680,7 @@ async def ask_claude_code(text, model, session):
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
     servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
-    resume = await resume_id(session)
+    resume = await resume_id(session, settings)
     cfg, proc = None, None
     if WARM and not session.startswith(COLD_SESSIONS):
         source = (await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, resume, run_settings,
@@ -728,7 +728,7 @@ async def ask_claude_code(text, model, session):
                              result=str(e.get("result") or "")[:300])
                 if e.get("session_id"):
                     try:
-                        await state.call("PUT", f"/v1/state/sessions/{quote(session, safe='')}",
+                        await state.call("PUT", f"/v1/state/sessions/{quote(session_key(session, settings), safe='')}",
                                          {"claude_session": e["session_id"], "device": DEVICE})
                     except StateDown:
                         pass  # the next turn just starts a fresh Claude session
@@ -762,8 +762,17 @@ def run_args(settings, devices, requester=""):
     return servers, allowed, run_settings, env
 
 
-async def resume_id(session):
-    prev = await state.get(f"/v1/state/sessions/{quote(session, safe='')}")
+def session_key(session, settings):
+    """The voice session plus who is speaking to whom: the app reuses one session id all day, so a renamed persona or
+    a new user title starts a fresh Claude conversation instead of resuming one that keeps using the old title."""
+    p = active_persona(settings)
+    sig = hashlib.sha1(f"{p.get('name')}|{user_title(settings, p)}".encode()).hexdigest()[:8]
+    return f"{session}~{sig}"
+
+
+async def resume_id(session, settings):
+    key = session_key(session, settings)
+    prev = await state.get(f"/v1/state/sessions/{quote(key, safe='')}")
     return prev["claude_session"] if prev and prev["device"] == DEVICE else None  # sessions live on their host
 
 
@@ -783,7 +792,7 @@ async def prewarm(session, persona_id=None):
             return
         style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
         servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
-        await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session),
+        await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session, settings),
                             run_settings, run_env)
     except Exception as e:
         print("prewarm failed:", type(e).__name__, flush=True)
@@ -1825,17 +1834,26 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
-    for run in list(task_runs.values()):  # a stopping gateway kills its task processes
+    for run in [r for r in task_runs.values() if r]:  # a stopping gateway kills its task processes
         run.cancel()
-    await asyncio.gather(*task_runs.values(), return_exceptions=True)
+    await asyncio.gather(*[r for r in task_runs.values() if r], return_exceptions=True)
     await warm_pool.close_all()
 
 
+TASK_WATCH_S = 60
+
+
 async def fail_orphan_tasks_safe():
-    try:
-        await fail_orphan_tasks()
-    except StateDown:
-        pass
+    startup = True
+    while True:  # ruchba may be down at start (a redeploy): keep trying, and keep catching stray queued tasks
+        try:
+            await fail_orphan_tasks(startup)
+            startup = False
+        except StateDown:
+            pass
+        except Exception as e:
+            print("task watch failed:", type(e).__name__, e, flush=True)
+        await asyncio.sleep(TASK_WATCH_S)
 
 
 async def reap_warm():
@@ -2773,9 +2791,14 @@ async def task_create(body, source="api"):
     t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
          "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
          "cost_usd": 0.0, "cancel_requested": False}
-    await task_save(t)
-    await task_index_add(t)
-    task_runs[t["id"]] = asyncio.create_task(run_task(t))
+    task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
+    try:
+        await task_save(t)
+        await task_index_add(t)
+    except BaseException:
+        task_runs.pop(t["id"], None)
+        raise
+    start_task(t)
     return t
 
 
@@ -2908,12 +2931,27 @@ async def wait_approval(t, aid):
 TASK_APPROVAL_POLL_S = 3
 
 
+def start_task(t):
+    run = task_runs[t["id"]] = asyncio.create_task(run_task(t))
+    run.add_done_callback(_task_settled)
+    return run
+
+
+def _task_settled(run):
+    """run_task records its own failures; anything that still escapes it is logged, never lost silently."""
+    if not run.cancelled() and run.exception():
+        print("task runner crashed:", type(run.exception()).__name__, run.exception(), flush=True)
+
+
 async def run_task(t):
     try:
+        if task_slots.locked():  # both slots busy: say so instead of looking stuck
+            t["note"] = f"다른 작업 {TASK_SLOTS}개가 끝나길 기다리는 중"
+            await task_save(t)
         async with task_slots:
             if t["cancel_requested"]:
                 raise asyncio.CancelledError
-            t.update(status="running", started=time.time())
+            t.update(status="running", started=time.time(), note=None)
             await task_save(t)
             deadline = time.monotonic() + t["max_minutes"] * 60
             if t.get("backend", "claude_code") != "claude_code":
@@ -3003,19 +3041,26 @@ async def task_notify(t, approval=False):
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 
 
-async def fail_orphan_tasks():
-    """At start: this gateway's tasks that were running when it stopped can never finish."""
+async def fail_orphan_tasks(startup=True):
+    """This gateway's unfinished tasks with no runner here: queued ones (never started) are picked up again; ones that
+    were running when the gateway stopped cannot resume and fail. At start and then every TASK_WATCH_S."""
     for tid in await state.call("GET", "/v1/state/kv/tasks-index") or []:
+        if tid in task_runs:
+            continue
         t = await state.call("GET", task_key(tid))
-        if t and t.get("owner") == DEVICE and t["status"] in ("queued", "running", "waiting_approval"):
+        if not t or t.get("owner") != DEVICE:
+            continue
+        if t["status"] == "queued" and not t.get("cancel_requested"):
+            print("picking up queued task:", tid, flush=True)
+            start_task(t)
+        elif startup and t["status"] in ("running", "waiting_approval"):
             t.update(status="failed", finished=time.time(), error="게이트웨이가 다시 시작돼서 멈췄어요.")
             await task_save(t)
 
 
 def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
-            "max_minutes", "created", "started",
-            "finished", "result", "error", "cost_usd", "owner")
+            "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
@@ -3139,7 +3184,7 @@ bridge = tools_bridge.Bridge(
     schedule_cancel=lambda sid, at, occurrence=None: schedule_cancel(sid=sid, at=at, occurrence=occurrence),
     schedule_update=lambda sid, changes, occ: schedule_update(sid, changes, occ),
     task_get=lambda tid: state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else none(),
-    task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t, steps=full),
+    task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t) if full else {**task_view(t, steps=False), "steps": t["steps"][-30:]},
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
     llm=lambda system, user: llm_json(system, user),

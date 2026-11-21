@@ -234,3 +234,19 @@ def test_requester_does_not_outlive_its_ask(agw):
             pass
         return g.requester_ctx.get()  # same task, after the ask: nothing left over
     assert asyncio.run(two()) == ""
+
+
+@pytest.mark.parametrize("key,ok", [("approval-" + "0123456789ab", True), ("approval-rules", True), ("tasks-index", True),
+                                    ("task-0123456789ab", True), ("alerts_recent", True), ("approval rules", False),
+                                    ("Approval-Rules", False), ("a" * 65, False)])
+def test_kv_keys_fit_the_memory_service(agw, key, ok):
+    """fake_state uses memory_service.py's own KV_KEY, so the keys every flow here writes are known to be accepted."""
+    g, c, _ = agw
+    try:
+        asyncio.run(g.state.call("PUT", f"/v1/state/kv/{key}", []))
+        accepted = True
+    except g.HTTPException as e:
+        accepted, code = False, e.status_code
+    assert accepted is ok, key
+    if not ok:
+        assert code == 422, (key, code)

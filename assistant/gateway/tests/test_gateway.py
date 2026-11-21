@@ -1140,10 +1140,11 @@ def test_outbox_survives_concurrent_puts(gw):
 
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
-    g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}
+    key = g.session_key("s9", asyncio.run(g.load_settings()))  # session + persona/title signature
+    g.fake.db["sessions"][key] = {"claude_session": "other", "device": "albireo"}
     c.post("/v1/ask", json={"text": "a", "session": "s9"})
     assert "--resume" not in json.loads((tmp / "args.json").read_text())
-    assert g.fake.db["sessions"]["s9"] == {"claude_session": "sess-1", "device": "macbook"}
+    assert g.fake.db["sessions"][key] == {"claude_session": "sess-1", "device": "macbook"}
     c.post("/v1/ask", json={"text": "b", "session": "s9"})
     args = json.loads((tmp / "args.json").read_text())
     assert args[args.index("--resume") + 1] == "sess-1"
@@ -1437,7 +1438,7 @@ def test_warm_claude_keeps_one_process_per_session(tmp_path, monkeypatch):
     assert g.resolve(g.DEFAULTS, None, None, "chat", "이번 주 계획 짜 줘")[0] == "sonnet"
     assert g.resolve(g.DEFAULTS, "opus", None, "chat", "서버 상태 괜찮아?")[0] == "opus"  # a forced model wins
     assert g.resolve(g.DEFAULTS, None, None, "schedule", "오늘 일정 뭐 있어?")[0] == "sonnet"  # task_defaults win
-    assert g.fake.db["sessions"]["call-1"]["claude_session"] == "warm-1"
+    assert g.fake.db["sessions"][g.session_key("call-1", asyncio.run(g.load_settings()))]["claude_session"] == "warm-1"
 
 
 def run_settings(tmp):
@@ -1582,3 +1583,34 @@ def test_user_title_shared_and_per_persona(gw, monkeypatch):
     g.current_persona.set(None)
     stored = g.fake.db["settings"]
     assert stored["user_title"] == "선생님" and next(p for p in stored["personas"] if p["id"] == "luna")["user_title"] == ""
+
+
+def test_persona_change_reaches_the_voice_server_and_restarts_the_conversation(gw, monkeypatch, tmp_path):
+    g, c, tmp = gw
+    persona_gw(g, monkeypatch)
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+    monkeypatch.setattr(g, "link_send", capture)
+    c.post("/v1/personas", json={"id": "mia", "name": "미아", "voice": "sohee", "user_title": "정훈님"})
+    assert c.put("/v1/personas/mia", json={"user_title": "오빠"}).status_code == 200
+    pushed = [m for m in sent if m.get("type") == "settings"][-1]["value"]
+    assert next(p for p in pushed["personas"] if p["id"] == "mia")["user_title"] == "오빠"  # at once, over the link
+    # Same voice session all day: a new title starts a fresh Claude conversation, an unchanged one resumes.
+    s = asyncio.run(g.load_settings())
+    g.current_persona.set("mia")
+    k1 = g.session_key("mia:iphone-2026-11-22", s)
+    s["personas"][[p["id"] for p in s["personas"]].index("mia")]["user_title"] = "정훈님"
+    assert g.session_key("mia:iphone-2026-11-22", s) != k1
+    g.current_persona.set(None)
+
+    def ask(text):
+        events(c.post("/v1/ask", json={"text": text, "session": "mia:iphone-2026-11-22"}))
+        return json.loads((tmp / "args.json").read_text())
+    asyncio.run(g.state.call("PUT", "/v1/state/settings", {**asyncio.run(g.load_settings())}))
+    ask("안녕")
+    assert "--resume" in ask("또")  # nothing changed: resumed
+    c.put("/v1/settings", json={"user_title": "대표님"})  # the shared title (azel has none of its own)
+    assert "--resume" not in ask("다시")  # title changed: a fresh conversation

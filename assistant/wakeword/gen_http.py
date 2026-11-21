@@ -4,7 +4,7 @@ Loading another TTS model on the Spark (next to the 125B Qwen) ran the GPU out o
 memory and rebooted it twice on 2026-11-21, so this uses only the live TTS server
 (9 speakers + style instructions) and the voice server's Whisper, one request at a time.
 
-usage: uv run --project ../client gen_http.py --out clips/kim_biseo --n-train 2500 --n-test 400
+usage: uv run --project ../client gen_http.py --out clips/azel --n-train 2500 --n-test 400
 Resumable: each split tops up to its target. Writes 16 kHz mono PCM16 WAVs.
 """
 import argparse
@@ -18,7 +18,7 @@ import httpx
 import numpy as np
 import soundfile as sf
 
-from gen_clips import ADVERSARIAL, EVERYDAY, negative_text, positive_text
+from gen_clips import leaked, negative_text, positive_text
 from filter_clips import close_to
 
 TTS = "http://100.64.0.11:8890/v1/audio/speech"
@@ -50,11 +50,11 @@ def fill(c, token, out: Path, target, make_text, positive, wake, rng):
             time.sleep(15)
 
 
-def one_clip(c, token, out, rejected, make_text, positive, wake, rng):
+def one_clip(c, token, out, rejected, make_text, positive, wake, rng, voices=SPEAKERS):
     """Generate one clip; return 1 if it was kept, 0 if rejected or unusable."""
     if True:
         text = make_text(rng)
-        body = {"input": text, "voice": rng.choice(SPEAKERS), "response_format": "wav", "language": "Korean"}
+        body = {"input": text, "voice": rng.choice(voices), "response_format": "wav", "language": "Korean"}
         if style := rng.choice(STYLES):
             body["instructions"] = style
         r = c.post(TTS, json=body)
@@ -78,12 +78,11 @@ def one_clip(c, token, out, rejected, make_text, positive, wake, rng):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--wake", default="김비서")
+    ap.add_argument("--wake", default="아젤")
     ap.add_argument("--n-train", type=int, default=2500)
     ap.add_argument("--n-test", type=int, default=400)
     args = ap.parse_args()
-    leaked = [t for t in ADVERSARIAL + EVERYDAY if args.wake.replace(" ", "") in t.replace(" ", "")]
-    assert not leaked, leaked
+    assert not leaked(args.wake), leaked(args.wake)
     token = (Path.home() / ".config/biseo/token").read_text().strip()
     rng, root = random.Random(1), Path(args.out)
     pos = lambda r: positive_text(args.wake, r)  # noqa: E731

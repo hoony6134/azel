@@ -256,7 +256,11 @@ device that created them.
   `user_title`: how the assistant addresses the user, 0–12 Hangul/Latin letters or spaces (whitespace collapsed,
   null → `""`); `""` = no fixed title, address the user naturally. A persona's own `user_title` overrides it. The
   title in effect goes into Claude's persona block and Qwen's prompt as "사용자를 '<title>'(이)라고 부른다." (left out
-  when empty).
+  when empty). Persona and settings changes reach the voice server at once over the link (every change pushes the
+  whole settings), and each call takes its persona snapshot when it starts. Because the app reuses one session id per
+  day, a change of the persona's name or title also starts that conversation fresh: the voice server drops the
+  persona+session history it built under the old name/title, and the gateway keys the resumed Claude session by
+  session + a hash of name and title.
   `personality` (text up to 600 chars, else 400) is Azel's character: one persona block (`assistant_name` +
   personality) goes into Qwen's system prompt, Claude's voice style, briefings and autonomous-call openings,
   so both models sound like the same person. `""`, whitespace, `null` or a missing key mean the built-in
@@ -346,8 +350,10 @@ device that created them.
     cost (token usage × list price, replaced by the CLI's own figure at each result) reaches `budget_usd` (≤ 50) or
     after `max_minutes` (≤ 240; time spent waiting for an approval does not count). At most 2 run at once per gateway,
     in their own `claude -p` process (never the 4-process warm voice pool); later ones stay `queued`.
-  - `GET /v1/tasks?limit=20` → newest first, without steps. `GET /v1/tasks/{id}` → `{"id","goal","status","device",
+  - `GET /v1/tasks?limit=20` → newest first, each with its last 30 steps (the app's task sheet renders the list
+    item). `GET /v1/tasks/{id}` → `{"id","goal","status","device",
     "persona","notify","budget_usd","max_minutes","created","started","finished","result","error","cost_usd","owner",
+    "note",
     "steps":[{"at","kind":"tool","tool","label"} | {"kind":"approval"|"approval_approved"|"approval_rejected",
     "approval_id"} | {"kind":"killed","reason":"time"|"budget"|"error"}]}`. Steps never carry tool arguments or results.
     `status`: `queued|running|waiting_approval|done|failed|cancelled`.
@@ -362,7 +368,9 @@ device that created them.
     (never model output), with `"type":"task","task_id":"<id>"` at the payload's top level next to `aps` (the app
     opens `azel://task/<id>`); `"none"` sends nothing. A cancelled task sends nothing. A task resumes only on approvals
     its own run created (never on an id that merely appears in tool output). Usage: path `claude_code`, `task:"task"`. Stored in ruchba's kv (`task-<id>`, index `tasks-index`, newest 200); a gateway restarting marks its own
-    unfinished tasks `failed`.
+    unfinished running tasks `failed`, and picks up its own `queued` tasks that have no runner (at start, then every
+    minute). `note`: why a queued task has not started ("다른 작업 2개가 끝나길 기다리는 중"), else null. A runner
+    failure is logged and marks the task `failed` ("작업이 실패했어요.").
   - Voice: "…해 줘, 끝나면 알려 줘" (push when it says 알림/푸시) or a job on a named device ("맥북 다운로드 폴더 정리해
     줘") becomes a task over the gateway link (`{"type":"task","goal","notify","persona","device"?}` →
     `{"type":"task_result","ok","task_id","say"}`), and the assistant says e.g. "맥북에서 시작할게요. 끝나면 전화드릴게요."

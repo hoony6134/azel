@@ -8,6 +8,8 @@ final class FakeServer: URLProtocol {
     /// Every request seen: method, path and body.
     /// Binary bodies (wav) keyed like `routes`; checked first.
     nonisolated(unsafe) static var rawRoutes: [String: Data] = [:]
+    /// Responses served once each, in order, before falling back to `routes`.
+    nonisolated(unsafe) static var queued: [String: [(Int, String)]] = [:]
     nonisolated(unsafe) static var seen: [(method: String, path: String, body: Data)] = []
 
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "fake.test" }
@@ -24,7 +26,9 @@ final class FakeServer: URLProtocol {
         Self.seen.append((request.httpMethod ?? "GET", url.path, sent))
         let key = "\(request.httpMethod ?? "GET") \(url.path)"
         let raw = Self.rawRoutes[key]
-        let (code, body) = raw.map { _ in (200, "") } ?? Self.routes[key] ?? Self.routes[url.path] ?? (404, #"{"detail":"Not Found"}"#)
+        var next: (Int, String)?
+        if var q = Self.queued[key], !q.isEmpty { next = q.removeFirst(); Self.queued[key] = q }
+        let (code, body) = raw.map { _ in (200, "") } ?? next ?? Self.routes[key] ?? Self.routes[url.path] ?? (404, #"{"detail":"Not Found"}"#)
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.delay) { [self] in
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: code, httpVersion: nil, headerFields: nil)!,
                                 cacheStoragePolicy: .notAllowed)

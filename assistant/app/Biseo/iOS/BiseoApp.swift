@@ -14,6 +14,11 @@ struct BiseoApp: App {
         Recordings.cleanup()
         Config.migrateAddresses()
         UNUserNotificationCenter.current().delegate = TaskNotificationHandler.shared
+        UNUserNotificationCenter.current().setNotificationCategories(PushAction.categories)
+        LiveActivities.shared.start()
+        #if DEBUG
+        if CommandLine.arguments.contains("-liveActivityPreview") { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { LiveActivities.shared.debugPreview() } }
+        #endif
     }
 
     var body: some Scene {
@@ -40,6 +45,7 @@ struct BiseoApp: App {
             .onOpenURL { url in if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } } }
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
+                if scenePhase == .active { ApprovalCenter.shared.start() } else { ApprovalCenter.shared.stop() }
             }
         }
     }
@@ -52,6 +58,7 @@ struct RootView: View {
     @ObservedObject var history: HistoryModel
     @ObservedObject var schedule: ScheduleModel
     @ObservedObject private var call = CallManager.shared
+    @ObservedObject private var approvals = ApprovalCenter.shared
     @State private var tab = 0
 
     var body: some View {
@@ -66,21 +73,32 @@ struct RootView: View {
             .tabItem { Label("기록", systemImage: "clock") }.tag(1)
             NavigationStack { ApprovalsScreen(model: model) }
                 .tabItem { Label("승인", systemImage: "checkmark.shield") }.tag(2)
-                .badge(model.approvals.count)
+                .badge(approvals.pending.count)
             NavigationStack { SettingsScreen(model: model, history: history) }
                 .tabItem { Label("설정", systemImage: "gearshape") }.tag(3)
         }
         .fullScreenCover(isPresented: Binding(get: { call.inCall }, set: { if !$0 { call.hangUp() } })) {
             CallScreen()
         }
+        .approvalSheet(active: !call.inCall)
     }
 }
 
-/// Tapping a "task finished" notification opens that task (payload `task_id` or `task`).
+/// Tapping a "task finished" notification opens that task (payload `task_id` or `task`); an
+/// approval push (`type: "approval"`) opens the approval sheet.
 final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate {
     static let shared = TaskNotificationHandler()
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let action = response.actionIdentifier
+        if action != UNNotificationDefaultActionIdentifier && action != UNNotificationDismissActionIdentifier {
+            await PushAction.perform(action: action, userInfo: response.notification.request.content.userInfo)
+            return
+        }
+        if let id = ApprovalCenter.approvalID(from: response.notification.request.content.userInfo) {
+            await ApprovalCenter.shared.open(id: id)
+            return
+        }
         guard let id = TaskModel.taskID(from: response.notification.request.content.userInfo) else { return }
         await TaskModel.shared.openTask(id: id)
     }

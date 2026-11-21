@@ -137,7 +137,8 @@ def system_prompt(name, length="normal", context="", persona="", title=""):
     or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
     endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
     body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
-    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona, title) if persona else "") + body + " " \
+    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona, title) if persona else
+                                                   f"사용자를 '{title}'(이)라고 부른다. " if title else "") + body + " " \
         + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
@@ -211,6 +212,9 @@ if not CHECK_ONLY:
     HASHES = load_hashes(open(HASH_FILE).read())
 asr_lock = asyncio.Lock()
 history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
+# Who each history was built as (persona name, user title). The app reuses one session id all day, so without this a
+# renamed persona or a new title would keep being contradicted by the earlier turns Qwen sees and imitates.
+history_sig: dict[str, tuple] = {}
 client = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5))
 
 
@@ -1275,6 +1279,11 @@ async def respond(text, session, t0, timings, on_event=None):
     hkey = f"{persona['id']}:{session}"  # history and the Claude session map are per persona
     hist = history[hkey]
     name = persona["name"]
+    sig = (name, user_title(settings, persona))
+    if history_sig.get(hkey, sig) != sig:
+        hist.clear()  # the name or title changed since these turns: start this conversation fresh
+    history_sig[hkey] = sig
+    prior = list(hist)  # earlier turns only: this utterance is added to history below and sent once, as the last turn
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
     job = None if sched else task_intent(bare)
@@ -1318,7 +1327,7 @@ async def respond(text, session, t0, timings, on_event=None):
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
             thinking.append(Unthink())  # Claude/NIM output gets the same filter as Qwen's
-            async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(hist),
+            async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(prior),
                                                      on_event=watch), thinking[-1]):
                 got_text.set()
                 buf += delta
@@ -1350,7 +1359,7 @@ async def respond(text, session, t0, timings, on_event=None):
             gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
             system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) \
                 + gateway_tools_text(gw_defs) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
-            messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
+            messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
@@ -2303,6 +2312,27 @@ if __name__ == "__main__":
         assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        async def title_turns():  # same session all day: a new title must not be fought by the old turns
+            seen = []
+
+            async def echo_llm(messages, max_tokens=600):
+                seen.append(messages)
+                yield "네, 알겠어요 정훈님."
+            globals().update(llm_stream=echo_llm, tts=lambda s: asyncio.sleep(0, (b"", 24000)))
+            links.settings = {"user_title": "정훈님", "personas": [{"id": "mia", "name": "미아", "primary": True,
+                                                                  "voice": "sohee", "personality": "", "user_title": ""}]}
+            history.pop("mia:day", None)
+            history_sig.pop("mia:day", None)
+            for q in ("안녕", "오늘 어때"):
+                [x async for x in respond(q, "day", time.perf_counter(), {})]
+            assert len(seen[-1]) > 2  # same title: the earlier turns are kept
+            links.settings["personas"][0]["user_title"] = "오빠"  # changed in the app, pushed over the link
+            [x async for x in respond("나야", "day", time.perf_counter(), {})]
+            msgs = seen[-1]
+            assert [m["role"] for m in msgs] == ["system", "user"] and "'오빠'(이)라고 부른다" in msgs[0]["content"], msgs
+            links.settings = {}
+        asyncio.run(title_turns())
+        globals().update(llm_stream=real_llm, tts=real[1])
         said, _ = asyncio.run(ack_check(["<think>The user asks the boiling point. Answer briefly.</think>물은 100도에서 끓어요."]))
         assert said == ["물은 100도에서 끓어요."], said  # the reasoning is never spoken
         assert history["azel:ack"][-1] == {"role": "assistant", "content": "물은 100도에서 끓어요."}  # nor stored

@@ -29,13 +29,16 @@ final class AppModel: ObservableObject {
         guard configured else { return }
         // Independent and parallel; a cancelled refresh changes nothing, other failures keep the old data.
         async let statusResult = attempt { try await Gateway.get("/v1/status") as ServerStatus }
-        async let settingsResult = attempt { try await Gateway.get("/v1/settings") as AppSettings }
+        async let settingsResult = attempt { try await Gateway.send("GET", "/v1/settings") }
         async let approvalsResult = attempt { try await Gateway.send("GET", "/v1/approvals") }
         switch await statusResult {
         case .success(let s): status = s; statusError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { statusError = e }
         }
-        if case .success(let s) = await settingsResult, let name = s.assistant_name { AssistantName.current = name }
+        if case .success(let data) = await settingsResult, let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
+            if let name = s.assistant_name { AssistantName.current = name }
+            AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)
+        }
         switch await approvalsResult {
         case .success(let data):
             if let items = try? Gateway.parseApprovals(data) { approvals = items }
@@ -49,7 +52,7 @@ final class AppModel: ObservableObject {
     func decide(_ item: [String: Any], _ approve: Bool) async throws {
         let id = describe(item["id"] ?? "")
         let path = "/v1/approvals/" + (id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id)
-        _ = try await Gateway.send("POST", path, json: ["approve": approve])
+        _ = try await Gateway.send("POST", path, json: ApprovalAPI.body(approve ? .once : .deny))
         await refresh()
     }
 }
