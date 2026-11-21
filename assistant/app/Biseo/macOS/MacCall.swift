@@ -202,6 +202,9 @@ final class MacCall: ObservableObject {
             ActivityAnnouncer.toolStarted(event.label ?? "", thinking: state == "thinking")
         case "activity" where event.phase == "tool_end":
             pulseAt = Date()
+        case "hangup", "end":
+            end(error: nil, keepPanel: false)
+            return
         case "error": error = event.message
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)

@@ -110,3 +110,23 @@ final class HoldTests: XCTestCase {
         XCTAssertFalse(client.isConnected)
     }
 }
+
+final class HangUpTests: XCTestCase {
+    /// What CXEndCallAction relies on: stop() always closes the socket, stops audio and finishes
+    /// a running recording, and is safe to call twice.
+    func testStopEndsEverything() throws {
+        let client = CallClient()
+        try client.startRecording(session: "hangup-test")
+        XCTAssertTrue(client.isRecording)
+        client.stop()
+        XCTAssertFalse(client.isRecording)
+        XCTAssertFalse(client.isConnected)
+        XCTAssertFalse(client.audio.isRunning)
+        client.stop()
+        Recordings.list().filter { $0.lastPathComponent.hasPrefix("hangup-test") }.forEach(Recordings.delete)
+    }
+
+    func testServerHangupDecodes() throws {
+        XCTAssertEqual(try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"hangup"}"#.utf8)).type, "hangup")
+    }
+}
