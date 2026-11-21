@@ -45,6 +45,12 @@ answering a call the assistant placed; the server then speaks that call's openin
     (`PLAY_TAIL_MS`), not just until generation ends; only then come `turn_done` and `listening`. Speech in
     that window is a barge-in (`pause`/check), never a new turn.
   - `{"type":"transcript","text":"…"}` — what the user said
+  - `{"type":"reply_start","reply_id":N}` — sent right before the first audio frame of each reply (an answer, a
+    briefing, a placed call's opening); `N` increases per reply. Binary frames carry no id, so the app treats every
+    binary frame after a `reply_start` as belonging to that reply: on a `reply_start` (or an `interrupt`) it drops
+    whatever is still queued from an older reply. The server guarantees no frame of an interrupted or superseded
+    reply is sent after its `interrupt` (each reply has a generation; an interrupt bumps it and cancels and awaits
+    the old reply's TTS, Qwen and Claude work before sending `interrupt`).
   - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — text of the audio chunk that follows: one or
     more whole sentences (or a clause ending in ", "), never under 5 syllables unless it is the whole reply,
     never cut mid-word. Chinese characters, kana, Cyrillic and Thai are dropped from it (and from the audio

@@ -1437,10 +1437,25 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
     # faster than real time, so "still talking" is judged by this, not by the task.
-    current: dict = {"task": None, "play_end": 0.0, "paused_at": None}
+    # gen: the reply generation. Every reply claims a new one and an interrupt bumps it, so audio (and captions) a
+    # superseded reply produces afterwards is dropped here: binary frames carry no id the app could check.
+    current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set()}
 
-    async def send(obj=None, audio=None):
+    def spawn(coro):
+        """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
+        t = asyncio.create_task(coro)
+        current["replies"].add(t)
+        t.add_done_callback(current["replies"].discard)
+        return t
+
+    def new_reply():
+        current["gen"] += 1
+        return current["gen"]
+
+    async def send(obj=None, audio=None, gen=None):
         async with send_lock:
+            if gen is not None and gen != current["gen"]:
+                return  # from a reply that was interrupted or superseded: never reaches the phone
             if audio is not None:
                 now = time.monotonic()
                 current["play_end"] = max(now, current["play_end"]) + len(audio) / 2 / 24000
@@ -1458,11 +1473,13 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
             except Exception:
                 pcms = None
+            gen = new_reply()
             await send({"type": "state", "value": "speaking"})
+            await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             for i, s in enumerate(op["parts"]):
                 pcm = pcms[i] if pcms else (await tts(s))[0]
-                await send({"type": "reply", "text": s, "route": "opening"})
-                await send(audio=pcm)
+                await send({"type": "reply", "text": s, "route": "opening"}, gen=gen)
+                await send(audio=pcm, gen=gen)
                 if i == 0:
                     guard.first_end = current["play_end"]
                 guard.play_end = current["play_end"]
@@ -1514,10 +1531,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if act == "ignore":
             return
         if act == "replace":
-            if prev and not prev.done():
-                prev.cancel()
-            await asyncio.gather(prev, return_exceptions=True) if prev else None
-            await send({"type": "interrupt"})
+            await interrupt()  # cancels the answer being worked on (and anything else speaking)
         else:
             await asyncio.gather(prev, return_exceptions=True) if prev else None
         await answer(audio, text)
@@ -1526,9 +1540,13 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         # Let the opening's first sentence finish playing; re-read, since its end is known only once sent.
         while protected and (wait := guard.wait(time.monotonic())) > 0:
             await asyncio.sleep(min(wait, 0.05))
-        task = current["task"]
-        if task and not task.done() and task is not asyncio.current_task():
-            task.cancel()
+        current["gen"] += 1  # first: nothing the old reply still produces reaches the phone
+        me = asyncio.current_task()
+        olds = [t for t in {*current["replies"], current["task"]} if t and not t.done() and t is not me]
+        for t in olds:
+            t.cancel()
+        if olds:  # its TTS, Qwen and Claude work stop before the app is told (a Claude run gets a link cancel)
+            await asyncio.wait(olds, timeout=3)
         current["play_end"] = guard.play_end = 0.0
         await send({"type": "interrupt"})  # barge-in: the client drops its queue
         if current["paused_at"] is not None:  # it was paused: un-pause the (now empty) queue, or it stays stuck
@@ -1536,15 +1554,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "resume"})
 
     async def speak_briefing():
-        spoken, cut = [], False
+        spoken, cut, gen = [], False, new_reply()
         try:
             await send({"type": "state", "value": "speaking"})
+            await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             st = await gateway_settings()
             p = current_persona(st)
             async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st)):
                 pcm, _ = await tts(s)
-                await send({"type": "reply", "text": s, "route": "briefing"})
-                await send(audio=pcm)
+                await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
+                await send(audio=pcm, gen=gen)
                 if s not in (FILLER, FILLER_LONG):
                     spoken.append(s)
         except asyncio.CancelledError:
@@ -1575,7 +1594,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await interrupt_then_answer(audio, text)
 
     async def answer(audio, text=None, timings=None):
-        t0, timings = time.perf_counter(), timings or {}
+        t0, timings, gen = time.perf_counter(), timings or {}, new_reply()
         turn = {"assistant": [], "activity": [], "route": "", "interrupted": False}
 
         async def on_event(ev):
@@ -1592,14 +1611,17 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "transcript", "text": text})
             started = False
             async for s, route, pcm, sr in respond(text, session, t0, timings, on_event=on_event):
+                if gen != current["gen"]:
+                    raise asyncio.CancelledError  # superseded while synthesizing: stop, say nothing more
                 if not started:
                     await send({"type": "state", "value": "speaking"})
+                    await send({"type": "reply_start", "reply_id": gen}, gen=gen)  # new audio starts here
                     started = True
                 turn["route"] = route
                 if s not in (FILLER, FILLER_LONG):
                     turn["assistant"].append(s)
-                await send({"type": "reply", "text": s, "route": route})
-                await send(audio=pcm)
+                await send({"type": "reply", "text": s, "route": route}, gen=gen)
+                await send(audio=pcm, gen=gen)
             timings["total_ms"] = ms(t0)
             queued = max(0, round((current["play_end"] - time.monotonic()) * 1000))  # still to play when generation ended
             await until_played()
@@ -1634,12 +1656,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                          reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
         await links.log(start_log)
         if briefing:  # the app's "오늘 브리핑": speak a briefing first, interruptible like any reply
-            current["task"] = asyncio.create_task(speak_briefing())
+            current["task"] = spawn(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
                 history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
-                current["task"] = asyncio.create_task(speak_opening(op))
+                current["task"] = spawn(speak_opening(op))
         await send({"type": "state", "value": "listening"})
         while True:
             msg = await ws.receive()
@@ -1669,17 +1691,17 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     if guard.speech_at is not None:
                         act = guard.end(now, len(audio) / 16000)
                         if act == "check":
-                            asyncio.create_task(check_greeting(audio))
+                            spawn(check_greeting(audio))
                         else:
-                            asyncio.create_task(interrupt_then_answer(audio))
+                            spawn(interrupt_then_answer(audio))
                     elif current["paused_at"] is not None:
-                        asyncio.create_task(barge_check(audio, vad_turn.last_voiced_s))
+                        spawn(barge_check(audio, vad_turn.last_voiced_s))
                     elif playing and not vad_turn.barge:
                         pass  # noisy mode: speech over the reply is not a turn
                     elif busy:  # thinking: never cancel on raw voice, decide on the transcript
-                        current["task"] = asyncio.create_task(followup(audio, task))
+                        current["task"] = spawn(followup(audio, task))
                     else:
-                        current["task"] = asyncio.create_task(answer(audio))
+                        current["task"] = spawn(answer(audio))
             if guard.tick(time.monotonic()) == "interrupt":
                 await interrupt()
     except WebSocketDisconnect:
@@ -2572,6 +2594,64 @@ if __name__ == "__main__":
         assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.05, broken_tts=True)  # TTS failed: the protection is dropped, not held an hour
         assert at < 0.5 and after == {"type": "state", "value": "listening"}, (at, after)
+
+        def stale_audio_check(queued):
+            """A reply streams with slow TTS; the user taps interrupt mid-stream (queued=True: after a follow-up was
+            queued behind it while it was thinking). Returns (frames after the server's interrupt, all frames)."""
+            said = iter(["광합성 설명해 줘", "그리고 예시도 같이 부탁해"])
+
+            async def stt(audio):
+                return next(said)
+
+            async def slow_llm(messages, max_tokens=600):
+                await asyncio.sleep(0.8)  # still thinking when the follow-up arrives
+                for i in range(8):
+                    yield f"{i + 1}번째 문장을 천천히 말하고 있어요. "
+                    await asyncio.sleep(0.02)
+
+            async def slow_tts(sentence):
+                await asyncio.sleep(0.15)
+                return b"\1\0" * 12000, 24000  # 0.5 s of audio, synthesized in 0.15 s: several chunks in flight
+            from fastapi.testclient import TestClient
+            globals().update(tts=slow_tts, llm_stream=slow_llm, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            history.clear()
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            frames = []
+            with tc.websocket_connect("/v1/call?session=stale", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(speech)
+                if queued:
+                    time.sleep(0.2)
+                    w.send_bytes(speech)  # "그리고 예시도…": queued behind the answer being thought out
+                got_audio = 0
+                while got_audio < 2:  # mid-stream: two chunks played, more synthesizing
+                    m = w.receive()
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    got_audio += bool(m.get("bytes"))
+                w.send_text(json.dumps({"type": "interrupt"}))
+                end = time.monotonic() + 2.5
+                while time.monotonic() < end:
+                    try:
+                        m = w.receive()
+                    except Exception:
+                        break
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    if len([f for f in frames if f == "audio"]) > 40:
+                        break
+                    if frames[-1] == {"type": "state", "value": "listening"} and {"type": "interrupt"} in frames:
+                        time.sleep(1.0)  # anything still coming from the old reply arrives now
+                        w.send_text(json.dumps({"type": "hangup"}))
+                        break
+            time.sleep(0.1)
+            cut = frames.index({"type": "interrupt"})
+            return frames[cut + 1:], frames
+        globals()["speech"] = np.zeros(8000, np.int16).tobytes() + (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+        for queued in (False, True):
+            after, frames = stale_audio_check(queued)
+            assert "audio" not in after, (queued, frames)  # no old audio once the interrupt is out
+            starts = [f for f in frames if isinstance(f, dict) and f.get("type") == "reply_start"]
+            assert starts and frames.index(starts[0]) < frames.index("audio"), frames  # reply_start precedes the audio
+        globals().update(tts=real[1], llm_stream=real_llm)
         # no token ever reaches a log: the container disables access logs and INFO, and query strings are redacted
         cmd = json.loads(re.search(r"^CMD\s+(\[.*\])\s*$", open(os.path.join(os.path.dirname(os.path.abspath(
             __file__)), "Dockerfile")).read(), re.M).group(1))
