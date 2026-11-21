@@ -117,7 +117,8 @@ styles so Dynamic Type works; the sizes below are the default (Large) sizes.
   on iOS 17; `.navigationTransition(.zoom)` may replace it on iOS 18+).
 - `interrupt` event: playback is flushed, the caption being spoken gets a dimmed
   "…" tail and fades to `text3` over 220 ms, the jar snaps to listening with a single 120 ms
-  ring ripple. This tells the user "I stopped, go ahead".
+  ring ripple. This tells the user "I stopped, go ahead". The same visual plays for a
+  tap-to-interrupt (§7.3), immediately on tap, without waiting for the server.
 - Haptics (iOS): `.sensoryFeedback(.impact(weight: .light), trigger: state)` on
   listening→thinking only; `.success` on approval sent; `.warning` on error. Nothing else.
 - **Reduce Motion** (`accessibilityReduceMotion`): the jar keeps its silhouette but stops
@@ -241,10 +242,11 @@ Top to bottom, on `bg` with a faint celadon glaze top-center:
    "오늘 브리핑" (`sun.max`, `startCall(prefix: "briefing")`), "새 대화"
    (`square.and.pencil`, `Session.rotate()`, shows a toast "새 대화를 시작해요"),
    "승인 2건" (`checkmark.shield`, only when > 0, switches to the 승인 tab).
-6. **최근 대화**: up to 3 cards (`card`, radius 22). Each: time ("오전 9:12"), route chip of the
-   last reply, the user's first line (body, text2, 1 line) and the assistant's last reply
-   (body, text, 2 lines). Tap → read-only transcript sheet for that session. Source:
-   local store (§12 Q1). Empty: "아직 대화가 없어요" + "첫 전화를 걸어 보세요" (text3).
+6. **최근 대화**: up to 3 cards (`card`, radius 22). Each: title = the user's first
+   utterance (body, text, 1 line); meta row = time and duration ("오전 9:12 · 4분", footnote
+   text3) and the route mix as chips (로컬 and/or Claude, each shown once if used); the
+   assistant's last reply below (subheadline, text2, 2 lines). Tap → read-only transcript
+   sheet for that session. Source: local store of the last 20 calls (§12.1). Empty: "아직 대화가 없어요" + "첫 전화를 걸어 보세요" (text3).
 
 ### 7.3 Call screen (listening / thinking / speaking)
 
@@ -276,7 +278,10 @@ Full-bleed, no navigation bar, status bar light content.
   | Hold | `pause` / `play.fill` | 대기 | `CXSetHeldCallAction`, §7.4 |
 - **Hang up**: 72 pt circle, `hangup` fill, `phone.down.fill` white, centered under the
   dock, 16 pt gap. Long-press not required; single tap hangs up.
-- **Interrupt**: see §5. No button needed: talking over 아젤 interrupts it (server VAD).
+- **Interrupt**: talking over 아젤 interrupts it (server VAD). While speaking, tapping the
+  jar also interrupts: send `{"type":"interrupt"}` on `/v1/call`, flush the local playback
+  queue at once, play the §5 interrupt visual. The jar's VoiceOver hint while speaking is
+  "두 번 탭하면 말을 끊습니다"; also exposed as `accessibilityAction(named: "말 끊기")`.
 - **Error during call** (`error` event): a small banner slides under the top bar,
   danger color, 4 s auto-dismiss, VoiceOver announcement.
 
@@ -300,8 +305,8 @@ Card header: headline + optional trailing text button.
    text field (max 12 characters, trimmed, empty → back to "아젤"). Footer helper (footnote,
    text3): "호출어는 다시 학습하기 전까지 '아젤'로 유지돼요." Saved like the other settings; the
    new name shows on the call screen, CallKit and menus from the next call.
-2. **사용량 card**: month ("11월"), big cost `$123.40` (title, monospacedDigit) with
-   "/ $500" (text2), a 6 pt capsule progress bar (celadon; amber past `budget_warn_pct`;
+2. **사용량 card**: month ("11월") and `calls` ("통화 42회") in the header, big cost
+   `cost_usd` `$123.40` (title, monospacedDigit) with "/ $500" from `budget_usd` (text2), a 6 pt capsule progress bar (celadon; amber past `budget_warn_pct`;
    danger past 100%) with a tick at the warn %. Below, `by_model` rows as thin bars
    (label · value). `by_path` collapsed under "경로별 보기".
 3. **상태 card**: rows "스파크", "게이트웨이", then devices; each with a 8 pt dot (celadon ok /
@@ -326,7 +331,7 @@ Saving: auto-save 600 ms after the last change (debounced `PUT /v1/settings`) wi
 ### 7.6 Approvals (승인 tab)
 
 One card per pending approval (newest first):
-- Header row: device name (headline) + tool chip (`run_command`) + relative time (text3).
+- Header row: device name (headline) + tool chip (`run_command`) + relative time from `created` (Unix seconds; "2분 전", text3).
 - **Command block**: `callout.monospaced`, text, on `bg` inset radius 12, horizontally
   scrollable, never truncated; `cwd` below in footnote text2 with `folder` symbol.
 - Buttons, full-width row: **거절** (bordered, danger text) and **승인** (filled celadon). Both
@@ -367,6 +372,8 @@ route chip and a small hang-up button (`xmark`, 28 pt).
 - Appears on hotkey down with `enter` motion (scale 0.96 → 1, opacity), listens while the
   key is held, shows thinking/speaking after release, fades out 4 s after `turn_done`
   unless the pointer is over it. Esc or the `xmark` ends the call.
+- On key-up the client sends ~700 ms of zero PCM so the server VAD closes the turn, then
+  stops sending until the next press (gaps never end a turn on their own).
 - Hotkey default ⌥Space, configurable in Settings. While held, the panel border is celadon.
 
 ### 8.3 Main window
@@ -401,7 +408,7 @@ title; the raw `localizedDescription` goes in a disclosure "자세히" (footnote
 | Server unreachable | URLError timeout/cannotConnect, or status `ok:false` | 아젤에게 닿지 않아요 | 스파크(또는 게이트웨이)에 연결할 수 없어요. Tailscale이 켜져 있는지 확인해 주세요. | 다시 시도 |
 | Wrong token | HTTP 401/403, WS close 4401/1008 | 토큰이 맞지 않아요 | 설정의 토큰을 다시 입력해 주세요. | 토큰 다시 입력 |
 | Mic denied | `AVAudioApplication.recordPermission == .denied` | 마이크 권한이 필요해요 | 아젤이 말을 들으려면 마이크를 허용해 주세요. | 설정 열기 (`UIApplication.openSettingsURLString` / x-apple.systempreferences privacy URL) |
-| Budget warn | `cost_usd ≥ budget × warn%` | (banner) 이번 달 예산의 85%를 썼어요 | — | 사용량 보기 |
+| Budget warn | `cost_usd ≥ budget_usd × warn%` | (banner) 이번 달 예산의 85%를 썼어요 | — | 사용량 보기 |
 | Call dropped | WS closed unexpectedly | 통화가 끊겼어요 | 네트워크가 잠깐 끊긴 것 같아요. | 다시 걸기 |
 | No approvals | empty list | 모두 처리했어요 | 승인이 필요하면 알려 드릴게요. | — |
 | No recents | empty store | 아직 대화가 없어요 | 첫 전화를 걸어 보세요. | — |
@@ -422,7 +429,7 @@ call fail.
 |---|---|---|
 | Call button | 아젤에게 전화 | hint: 통화를 시작합니다 |
 | Home jar | 아젤 | hint: 두 번 탭하면 전화를 겁니다 |
-| Call jar | 아젤 | value: 듣고 있어요 / 생각 중 / 말하는 중 / 대기 중 |
+| Call jar | 아젤 | value: 듣고 있어요 / 생각 중 / 말하는 중 / 대기 중; hint while speaking: 두 번 탭하면 말을 끊습니다 |
 | 오늘 브리핑 | 오늘 브리핑 듣기 | — |
 | 새 대화 | 새 대화 시작 | hint: 이전 대화 맥락을 비웁니다 |
 | Recent card | "오전 9시 12분, 나: …, 아젤: …" (combine children) | hint: 전체 대화 보기 |
@@ -451,26 +458,17 @@ call fail.
 - **Keyboard (Mac)**: every control reachable with Tab; ⌘N new conversation, ⌘, settings,
   Esc ends PTT call, Space toggles mute in the call view.
 
-## 12. Data and open questions
+## 12. Data decisions (PM, 2026-11-21)
 
-Everything above uses existing endpoints and local state, except:
-
-1. **Recent conversations on home**. No endpoint lists past calls. Proposal: the app keeps
-   its own last 20 calls (session id, start time, lines with route) in a local JSON file /
-   SwiftData; no server change. Alternative: `POST /v1/search` on the memory service with
-   `kinds:["transcript"]`, but the app doesn't talk to the memory service today and
-   transcripts may not be written per call. → **PM decision**: local store for now?
-2. **Tap-to-interrupt**. Today interrupt is voice only (server VAD). A "그만" tap on the
-   jar while speaking would need a client→server `{"type":"interrupt"}` text message. The
-   design works without it; nice to have.
-3. **Usage breakdown shape**. `by_model` / `by_path` values are open in PROTOCOL §3. The
-   cards assume each value is a number (USD) or an object with `cost_usd`; anything else is
-   shown as text.
-4. **Mac push-to-talk** with server-side VAD: while the key is up, the client sends
-   silence (or nothing) and the server keeps the socket. Confirm the server tolerates gaps
-   in the PCM stream (or send zeros).
-5. **Approval timestamps**. The card shows relative time if the item has `created`;
-   PROTOCOL doesn't define it. Hidden when absent.
-6. **Where `assistant_name` lives**. The spec assumes it is a field in `GET/PUT
-   /v1/settings` (so the voice server can use it in openings and every device agrees). If it
-   is app-local instead, the 비서 card just saves to `UserDefaults`; the UI is the same.
+1. **Recent conversations**: the app keeps its last 20 calls locally (session id, title =
+   first user utterance, start time, duration, route mix, lines with route) in a JSON file
+   or SwiftData. A memory-service history may replace it later.
+2. **`assistant_name`** is a field in `GET/PUT /v1/settings`; the gateway uses it for VoIP
+   caller names and openings. The app caches the last value locally as a fallback only.
+3. **Tap-to-interrupt**: client → server `{"type":"interrupt"}` on `/v1/call` (server
+   support in progress); the client also drops its own playback queue at once.
+4. **`/v1/usage`**: `{"month":"YYYY-MM","calls":N,"by_model":{"sonnet":12.34,…},
+   "by_path":{…},"cost_usd":…,"budget_usd":500}`; breakdown values are plain USD numbers.
+5. **Mac push-to-talk**: gaps don't end a turn; on key-up send ~700 ms of zero PCM, then
+   stop sending until the next press.
+6. **Approvals** carry `created` (Unix seconds, float) and `decided` once answered.
