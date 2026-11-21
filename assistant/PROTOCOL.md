@@ -144,8 +144,9 @@ get only the current utterance, never the call's earlier turns (which may be per
 For the phone without Tailscale. Exposed paths only; everything else is blocked at the proxy:
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
-  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|DELETE /v1/history`, `GET|DELETE
-  /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`, `GET /v1/proactive/log` (bearer header).
+  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
+  `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
+  `GET /v1/proactive/log` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -223,6 +224,28 @@ device that created them.
   name: the gateways use it for the VoIP push `caller` and Claude's prompts, and the voice server for
   Qwen's system prompt (built per turn from the settings pushed over the link), so a rename applies on
   the next turn or call everywhere.
+- Connectors: which MCP servers a full gateway's Claude runs load (warm or one-shot). Shared setting `connectors`
+  (also writable as part of `PUT /v1/settings`):
+  ```json
+  {"claude_ai": {"Gmail": true, "Notion": false},
+   "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "transport": "http", "enabled": true, "auth_ref": "wiki"}]}
+  ```
+  `claude_ai` keys are claude.ai connector display names without the `claude.ai ` prefix; a name not listed takes its
+  default (Cygnus MCP, Google Calendar, Gmail on; everything else off). `custom`: ≤ 20 servers, `name` a unique ASCII
+  slug (`[A-Za-z0-9_-]{1,40}`, also the tool prefix `mcp__<name>`), `url` http(s), `transport` `http`|`sse` (default
+  http), `enabled` (default true), optional `auth_ref` (slug) naming the secret. Secrets never go into settings. Each
+  run also loads the device daemons, no plugin MCP servers, and every tool up front (no ToolSearch). A custom server
+  whose secret file is missing or not 0600 is skipped. Full gateways only; limited → 403 on every route below.
+  - `GET /v1/connectors[?refresh=true]` → `{"claude_ai": [{"name","url","status":"connected"|"needs_auth"|"failed"|
+    "unknown","enabled"}], "custom": [{…the item…, "has_secret": bool}], "discovered_at": <epoch>|null}`. The
+    claude.ai list is this gateway's login as `claude mcp list` sees it (cached from startup; `refresh=true` re-reads,
+    ~15 s); `unknown` = switched in settings but not visible to this login.
+  - `PUT /v1/connectors` with the setting's shape → the same view as GET (400 with a reason on a bad shape). Replaces
+    both fields.
+  - `PUT /v1/connectors/secret/{name}` `{"value": "<token>"}` (a raw token is sent as `Authorization: Bearer <token>`)
+    or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → `{"ok": true}`. Write-only: stored in
+    `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
+    Claude processes. Each full gateway that should use the server needs its own copy.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
   haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.
