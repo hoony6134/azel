@@ -1,6 +1,7 @@
 """The tool executor through the gateway: /v1/tools, /v1/tools/call, /v1/mcp, the link, and API-backed tasks."""
 import asyncio
 import json
+import re
 
 from test_gateway import TestClient, private, start
 from test_tasks import tgw, wait_for  # noqa: F401  (fixture)
@@ -176,3 +177,20 @@ def test_external_token_sees_only_its_scope_on_mcp(tgw):  # noqa: F811
     path.unlink()  # revoked
     assert outside.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 5, "method": "ping"}).status_code == 401
     assert full.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 6, "method": "ping"}).status_code == 200
+
+
+def test_claude_code_tasks_get_their_origin_and_never_chain(tgw):  # noqa: F811
+    """claude -p reaches create_task over /v1/mcp: the ask's run tells it the call (X-Azel-Origin), so the finish
+    call continues that conversation; a task's own run cannot start another task."""
+    g, c, _ = tgw
+    s = asyncio.run(g.load_settings())
+    servers, _, rs, _ = g.run_args(s, [], g.requester_id("ask", "azel:iphone-2026-11-22"))
+    assert servers["azel"]["headers"]["X-Azel-Origin"] == "azel:iphone-2026-11-22"
+    servers, _, rs, _ = g.run_args(s, [], g.requester_id("task", "abcabcabcabc"))
+    assert "X-Azel-Origin" not in servers["azel"]["headers"] and "mcp__azel__create_task" in json.loads(rs)["permissions"]["deny"]
+    full = tailnet(g)
+    r = full.post("/v1/mcp", headers={"X-Azel-Origin": "azel:iphone-2026-11-22"},
+                  json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "create_task", "arguments": {"goal": "맥북 정리", "notify": "call"}}})
+    tid = re.search(r"[0-9a-f]{12}", json.dumps(r.json(), ensure_ascii=False)).group(0)
+    assert g.fake.db["kv"][f"task-{tid}"]["origin_session"] == "azel:iphone-2026-11-22"

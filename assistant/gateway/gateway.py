@@ -794,16 +794,24 @@ def run_args(settings, devices, requester=""):
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
                                                               {"X-Azel-Requester": requester} if requester else None)
+    deny = []
     if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
+        deny = [f"mcp__{d['id']}__delegate" for d in devices]
+    elif requester.startswith("task:"):  # a task never starts another task (no task chains)
+        deny = ["mcp__azel__create_task"]
+    if deny:
         rs = json.loads(run_settings)
         rs.setdefault("permissions", {}).setdefault("deny", [])
-        rs["permissions"]["deny"] = sorted({*rs["permissions"]["deny"], *(f"mcp__{d['id']}__delegate" for d in devices)})
+        rs["permissions"]["deny"] = sorted({*rs["permissions"]["deny"], *deny})
         run_settings = json.dumps(rs, sort_keys=True)
     if MODE == "full":  # live web lookups: never on limited gateways (Bash, Edit and Write stay disallowed)
         allowed = [*allowed, "WebSearch", "WebFetch"]
     if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
         url = f"http://{HOST}:{PORT}/v1/mcp"
-        servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {"Authorization": f"Bearer {TOKEN}"}}}
+        origin = requester[4:] if requester.startswith("ask:") and ORIGIN_RE.fullmatch(requester[4:]) else ""
+        servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {
+            "Authorization": f"Bearer {TOKEN}",
+            **({"X-Azel-Origin": origin} if origin else {})}}}  # its create_task / call_user continue this call
         allowed = [*allowed, "mcp__azel"]
         rs = json.loads(run_settings)
         if "allowedMcpServers" in rs:
@@ -3473,6 +3481,8 @@ async def mcp_server(request: Request):
                                  "error": {"code": -32000, "message": "한 시간에 60번까지만 쓸 수 있어요."}})
         _external_calls.append(now)
         print("external mcp:", str((msg.get("params") or {}).get("name"))[:40], flush=True)  # the name only
+    if scope == "full" and ORIGIN_RE.fullmatch(origin := request.headers.get("x-azel-origin", "")):
+        origin_ctx.set(origin)  # claude -p's create_task/call_user: the call it runs in (never from the external token)
     out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope)
     return Response(status_code=202) if out is None else JSONResponse(out)
 

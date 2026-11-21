@@ -37,6 +37,7 @@ async def run(backend, system, goal, bridge, cfg, budget_usd, max_minutes, cance
     deadline, spent, steps = time.monotonic() + max_minutes * 60, 0.0, 0
     caller = "qwen" if backend == "qwen" else "api"
     defs, where = await bridge.tools(caller)
+    defs = [d for d in defs if d["name"] != "create_task"]  # a task never starts another task
     try:
         if backend == "claude_api":
             loop = _claude(system, goal, defs, cfg)
