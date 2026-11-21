@@ -495,8 +495,7 @@ class Bridge:
             try:
                 out = await self.d["cygnus_write"]("memory_save", {"text": f"{fact}" + (f" ({about})" if about else ""),
                                                                    "kind": kind})
-                m = re.search(r"\b(m[_-]?[0-9a-z]{4,}|[0-9a-f]{8,}|\d{2,})\b", out)
-                cyg_id = m.group(1) if m else None
+                cyg_id, note = cygnus_saved(out)
             except Exception:  # noqa: BLE001  Azel still remembers; say Cygnus didn't take it
                 note = " (Cygnus에는 지금 못 남겼어요.)"
         rec = await self.d["memory_add"](fact, {"memory": True, "source": "explicit", "about": about or None,
@@ -699,6 +698,21 @@ def site_name(src):
         return title
     host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", str(src.get("url", ""))).split("/")[0])
     return host
+
+
+def cygnus_saved(out):
+    """(id, note) from memory_save's reply. Only a "saved" item is ours: a "similar" reply names someone else's
+    memory (forget must never archive it), and a held one is not a memory until the owner approves it."""
+    try:
+        item = (json.loads(out) or [{}])[0]
+    except (ValueError, TypeError, IndexError, KeyError):
+        return None, " (Cygnus 응답을 확인하지 못했어요.)"
+    status = item.get("status")
+    if status == "saved" and isinstance(item.get("id"), str):
+        return item["id"], ""
+    if status == "similar":
+        return None, " (Cygnus에는 비슷한 기억이 이미 있어요.)"
+    return None, " (Cygnus에서는 확인을 기다려요.)"
 
 
 async def none_true():

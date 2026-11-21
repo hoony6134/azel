@@ -13,6 +13,7 @@ class Mem(World):
     def __init__(self, can_write=True):
         super().__init__()
         self.recs, self.cyg_writes, self.can = {}, [], can_write
+        self.save_reply = '[{"status":"saved","id":"m_abc123"}]'
 
     async def search(self, q, n):
         words = q.split()
@@ -20,7 +21,7 @@ class Mem(World):
         return sorted([r for r in rows if r["score"] > 0], key=lambda r: -r["score"])[:n]
 
     async def add(self, text, meta):
-        rid = len(self.recs) + 1
+        rid = max(self.recs, default=0) + 1
         self.recs[rid] = {"id": rid, "text": text, "meta": {k: v for k, v in meta.items() if v is not None},
                           "created": "2026-11-23"}
         return {"id": rid}
@@ -40,7 +41,9 @@ class Mem(World):
 
     async def cyg_write(self, name, args):
         self.cyg_writes.append((name, args))
-        return "저장했어요: id m_abc123" if name == "memory_save" else "보관했어요."
+        if name == "memory_save":
+            return self.save_reply
+        return '{"ok":true,"message":"archived (restorable)"}'
 
     def bridge(self):
         b = super().bridge()
@@ -144,3 +147,16 @@ def test_post_call_facts_are_auto_local_and_filtered(monkeypatch):
         assert recs[0]["meta"] == {"memory": True, "source": "auto", "call": "log1", "persona": "azel"} and not writes
         asyncio.run(g.post_call_facts("log1", "azel"))
         assert len(g.fake.db["records"]) == 1  # the same fact twice: kept once
+
+
+def test_a_similar_cygnus_memory_is_never_claimed():
+    w = Mem()
+    w.save_reply = '[{"status":"similar","reason":"very similar memory exists","similar":[{"id":"m_users1","similarity":0.99}]}]'
+    b = w.bridge()
+    r = run(b.run("remember", {"fact": "좋아하는 커피는 라떼"}, "azel"))
+    assert r["ok"] and "비슷한 기억이 이미" in r["spoken"] and w.recs[1]["meta"].get("cygnus_id") is None
+    r = run(b.run("forget", {"id": "1", "confirmed": True}, "azel"))
+    assert r["ok"] and not any(n == "memory_edit" for n, _ in w.cyg_writes)  # the user's own memory stays
+    w.save_reply = '[{"status":"대기 중","id":"m_held","reason":"held for owner review"}]'
+    r = run(b.run("remember", {"fact": "주말엔 등산"}, "azel"))
+    assert "확인을 기다려요" in r["spoken"] and w.recs[2]["meta"].get("cygnus_id") is None
