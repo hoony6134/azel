@@ -316,6 +316,49 @@ HISTORY_PATHS = {"start": "start", "turn": "turns", "end": "end"}
 history_outbox = Outbox("pending_history.json", "history_rejected.jsonl",
                         lambda b: f"/v1/state/history/{quote(b['log_id'], safe='')}/{HISTORY_PATHS[b['event']]}")
 local_devices: dict[str, dict] = {}  # daemons that registered here, so this device works offline
+# Team devices (vd-spark, vd-core) cannot dial a jh gateway (ACL), so their daemons never register: full gateways
+# list them in HOME/static_devices.json (or BISEO_STATIC_DEVICES) and probe them directly. Rows live only in this
+# process (the shared devices table has no `limited` column); each needs its daemon's own bearer token in
+# HOME/device_tokens/<id> (0600): the shared token never goes to a team device.
+STATIC_PATH = HOME / "static_devices.json"
+static_devices: dict[str, dict] = {}
+device_tokens: dict[str, str] = {}  # daemon url -> its bearer token, when not the shared one
+limited_urls: set[str] = set()  # daemons that may never be handed a `delegate`
+STATIC_PROBE_S = 60
+
+
+def load_static_devices(raw):
+    for e in json.loads(raw or "[]"):
+        did, url = str(e.get("id", "")), e.get("url")
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", did) or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            raise ValueError(f"static_devices: bad entry {did!r}")
+        if e.get("mode") != "limited":
+            raise ValueError(f"static_devices: {did} must be mode limited")
+        tok = secret(f"device_tokens/{did}")
+        if not tok:
+            print(f"static device {did} skipped: no {HOME}/device_tokens/{did}", flush=True)
+            continue
+        static_devices[did] = {"id": did, "name": str(e.get("name") or did)[:40], "url": url, "harness": [],
+                               "gateway": DEVICE, "writer": "full", "limited": True, "static": True, "last_seen": 0.0}
+        device_tokens[url] = tok
+        limited_urls.add(url)
+
+
+if MODE == "full":
+    load_static_devices(os.environ.get("BISEO_STATIC_DEVICES") or (STATIC_PATH.read_text() if STATIC_PATH.exists() else ""))
+
+
+def with_static(rows):
+    """Shared device rows plus this gateway's static ones (a static row wins over a row with the same id)."""
+    return [d for d in rows if d["id"] not in static_devices] + list(static_devices.values())
+
+
+async def static_prober():
+    while True:
+        for d in list(static_devices.values()):
+            if (await probe(d["url"], token=True))["ok"]:
+                d["last_seen"] = time.time()
+        await asyncio.sleep(STATIC_PROBE_S)
 
 
 HM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
@@ -447,7 +490,7 @@ async def fresh_devices():
     rows = await state.get("/v1/state/devices")
     if rows is None:  # ruchba down and nothing cached yet
         rows = list(local_devices.values())
-    return [d for d in rows if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
+    return [d for d in with_static(rows) if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
 
 
 # A short status or lookup question: Haiku answers it about 1 s sooner. Anything with several steps stays Sonnet.
@@ -601,7 +644,7 @@ discovery = connectors.Discovery(CLAUDE)
 def run_args(settings, devices):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
     custom servers the user switched on, plus the device daemons."""
-    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME)
+    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME, device_tokens)
 
 
 async def resume_id(session):
@@ -635,7 +678,8 @@ async def mcp(url, method, params):
     """One JSON-RPC call to a daemon's stateless streamable-HTTP MCP endpoint (JSON or SSE answer)."""
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                         headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/json, text/event-stream"})
+                         headers={"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}",
+                                  "Accept": "application/json, text/event-stream"})
     r.raise_for_status()
     if r.headers.get("content-type", "").startswith("text/event-stream"):
         msgs = [json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")]
@@ -657,6 +701,8 @@ async def device_tools(devices):
             print("tools/list failed:", d["id"], type(e).__name__, flush=True)
             continue
         for t in listed:
+            if t["name"] == "delegate" and d.get("limited"):
+                continue  # a team device only reads and diagnoses: never hand it work
             name = f"{d['id']}__{t['name']}"[:64]
             where[name] = (d["url"], t["name"])
             tools.append({"name": name, "description": f"[{d['name']}] {t.get('description') or ''}"[:1024],
@@ -667,6 +713,8 @@ async def device_tools(devices):
 async def run_tool(block, where):
     try:
         url, name = where[block["name"]]
+        if name == "delegate" and url in limited_urls:
+            raise RuntimeError("delegate is not allowed on a limited device")
         res = await mcp(url, "tools/call", {"name": name, "arguments": block["input"]})
         text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
         return {"type": "tool_result", "tool_use_id": block["id"], "content": text[:20000] or "(empty)",
@@ -1426,6 +1474,8 @@ async def lifespan(app):
     tasks = [asyncio.create_task(voice_link()), asyncio.create_task(reap_warm())]
     if MODE == "full":  # scheduled jobs need personal data
         tasks.append(asyncio.create_task(scheduler()))
+        if static_devices:
+            tasks.append(asyncio.create_task(static_prober()))
         if CLAUDE_OK:
             tasks.append(asyncio.create_task(discovery.refresh()))
         if OLD_DB.exists() and not MIGRATED.exists():
@@ -1549,7 +1599,7 @@ async def usage():
 async def probe(url, token=False):
     """Reachability only. The token goes along only when asked (a trusted daemon); health routes need none."""
     t = time.perf_counter()
-    headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {TOKEN}"} if token else {})
+    headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}"} if token else {})
     try:
         # Headers only: an MCP endpoint may answer GET with a stream that never ends.
         async with httpx.AsyncClient(timeout=3) as c, c.stream("GET", url, headers=headers) as r:
@@ -1561,12 +1611,12 @@ async def probe(url, token=False):
 
 @app.get("/v1/status")
 async def status():
-    devs = await state.get("/v1/state/devices", list(local_devices.values()))
+    devs = with_static(await state.get("/v1/state/devices", list(local_devices.values())))
     probes = await asyncio.gather(probe(f"{VOICE_URL}/health"), probe(f"{TTS_URL}/health"),
                                   probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
-            "devices": [{"id": d["id"], "name": d["name"], **p,
+            "devices": [{"id": d["id"], "name": d["name"], "limited": bool(d.get("limited")), **p,
                          "fresh": time.time() - d["last_seen"] < DEVICE_FRESH_S} for d, p in zip(devs, probes[3:])]}
 
 
@@ -1588,7 +1638,7 @@ async def register(body: dict):
 
 @app.get("/v1/devices")
 async def devices():
-    return await state.get("/v1/state/devices", list(local_devices.values()))
+    return with_static(await state.get("/v1/state/devices", list(local_devices.values())))
 
 
 def full_only():

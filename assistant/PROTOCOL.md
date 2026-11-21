@@ -308,6 +308,15 @@ device that created them.
   "devices":[{"name","ok","ms"}]}`
 - `POST /v1/devices/register` `{"name","url","harness":["claude_code",…]}` — daemons call
   this on start and every 60 s. `GET /v1/devices` lists them with `last_seen`.
+- Static devices (full gateways only): team devices (`tag:vujade`: vd-spark, vd-core) cannot dial a jh gateway, so
+  their daemons never register. Each full gateway lists them in `~/.config/biseo/static_devices.json` (or env
+  `BISEO_STATIC_DEVICES`): `[{"id":"spark","name":"vd-spark","url":"http://100.64.0.11:8893/mcp","mode":"limited"}]`
+  (`mode` must be `limited`; anything else refuses to start). Each needs that daemon's own bearer token in
+  `~/.config/biseo/device_tokens/<id>` (0600); without it the entry is skipped (the shared token never goes to a team
+  device). The gateway probes them every 60 s and lists them in `GET /v1/devices` / `GET /v1/status` with
+  `"writer":"full","limited":true,"static":true` (only in that gateway's memory, not in the shared devices table).
+  A limited device is never given `delegate`: dropped from the API/NIM tool list, refused by the tool runner, and
+  denied (`permissions.deny`) in `claude -p` runs. Its daemon config must also allow only read/diagnostic tools.
 - `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production","alert_token"?}` —
   the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
