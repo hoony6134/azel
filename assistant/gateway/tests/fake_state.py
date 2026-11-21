@@ -33,6 +33,10 @@ def make():
 
     @app.post("/v1/state/usage")
     def add_usage(body: dict):
+        if body.get("model") == "bad":
+            raise HTTPException(422, "bad row")
+        if body.get("import_key") and any(u.get("import_key") == body["import_key"] for u in db["usage"]):
+            return {"ok": True}
         db["usage"].append({"ts": time.time(), **body})
         return {"ok": True}
 

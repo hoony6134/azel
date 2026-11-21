@@ -307,6 +307,33 @@ def test_ruchba_down_read_only(gw):
     assert len(g.fake.db["usage"]) == 2 and g.pending_usage == []  # the queued row was flushed
 
 
+def test_outage_survives_a_restart(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch)
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        c.post("/v1/push/register", json={"voip_token": "tok1", "bundle_id": "xyz.scian.azel"})
+        g.fake.state.down = True
+        c.post("/v1/ask", json={"text": "a"})
+    assert len(g.pending_usage) == 1 and os.stat(tmp_path / "pending_usage.json").st_mode & 0o077 == 0
+    g2 = start(tmp_path, monkeypatch)  # restarted while ruchba is still down
+    g2.fake.state.down = True
+    assert [t["token"] for t in asyncio.run(g2.push_tokens())] == ["tok1"]  # calls still reach the phone
+    assert len(g2.pending_usage) == 1
+    g2.fake.state.down = False
+    with TestClient(g2.app, headers={"Authorization": "Bearer t0k"}) as c:
+        c.post("/v1/ask", json={"text": "b"})
+    assert len(g2.fake.db["usage"]) == 2 and g2.pending_usage == []
+    assert json.loads((tmp_path / "pending_usage.json").read_text()) == []
+
+
+def test_rejected_usage_row_does_not_block_the_queue(gw):
+    g, c, tmp = gw
+    asyncio.run(g.record_usage({"model": "bad", "path": "api", "cost_usd": 1}))
+    asyncio.run(g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.1}))
+    assert [u["model"] for u in g.fake.db["usage"]] == ["haiku"] and g.pending_usage == []
+    dead = [json.loads(line) for line in (tmp / "usage_rejected.jsonl").read_text().splitlines()]
+    assert dead[0]["status"] == 422 and dead[0]["row"]["model"] == "bad"
+
+
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
     g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}
@@ -390,6 +417,23 @@ def test_tokens_per_mode(tmp_path, monkeypatch):
     os.chmod(tmp_path / "link_token", 0o644)
     with pytest.raises(AssertionError, match="chmod 600"):
         start(tmp_path, monkeypatch)
+
+
+def test_limited_never_seeds_settings(tmp_path, monkeypatch):
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    private(tmp_path / "state_token_limited", "l1m\n")
+    (tmp_path / "settings.json").write_text(json.dumps({"monthly_budget_usd": 1}))
+    g = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
+    puts = []
+    real = g.state.call
+
+    async def spy(method, path, body=None, **params):
+        puts.append((method, path))
+        return await real(method, path, body, **params)
+    g.state.call = spy
+    s = asyncio.run(g.load_settings())
+    assert ("PUT", "/v1/state/settings") not in puts and g.fake.db["settings"] == {}
+    assert s["monthly_budget_usd"] == 500  # the shared (empty) settings, not this host's old copy
 
 
 def test_limited_refuses_personal_data(limited, monkeypatch):

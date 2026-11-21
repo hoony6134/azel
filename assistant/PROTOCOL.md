@@ -119,8 +119,11 @@ out), and in limited mode `state_token_limited` (required).
 All state below (settings, usage, devices, push tokens, calls, approvals, voice→Claude session map)
 lives in the shared state API (section 5), so every gateway answers the same. If ruchba is
 unreachable a gateway keeps answering from its cache: settings read-only (`PUT` → 503, last copy in
-`~/.config/biseo/settings.json`), usage queued in memory and flushed later, daemons that registered
-through this gateway stay usable, new approvals → 503. `claude -p` sessions resume only on the
+`~/.config/biseo/settings.json`), usage queued in `pending_usage.json` and flushed later (a row ruchba
+refuses with 4xx goes to `usage_rejected.jsonl` instead of blocking the queue), push tokens served from
+`push_tokens.json`, daemons that registered through this gateway stay usable, new approvals → 503. All
+these files are 0600 and survive a restart. Only full gateways seed empty shared settings from a local
+`settings.json`. `claude -p` sessions resume only on the
 device that created them.
 
 - `POST /v1/ask` `{"text","session","model"?,"path"?,"task"?}` → NDJSON stream of

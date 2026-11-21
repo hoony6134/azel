@@ -140,18 +140,33 @@ class State:
             raise HTTPException(r.status_code, r.json().get("detail", "state error"))
         return r.json()
 
-    async def get(self, path, default=None, **params):
-        """GET with a last-good cache, so reads keep working while ruchba is down."""
+    async def get(self, path, default=None, persist=None, **params):
+        """GET with a last-good cache, so reads keep working while ruchba is down. `persist`: also keep the
+        last good answer in that file under HOME, so it survives a restart during an outage."""
         key = (path, tuple(sorted(params.items())))
         try:
             self.cache[key] = await self.call("GET", path, **params)
+            if persist:
+                write_private(HOME / persist, json.dumps(self.cache[key], ensure_ascii=False))
         except StateDown as e:
             print("state down, using cache:", path, e, flush=True)
+            if key not in self.cache and persist and (HOME / persist).exists():
+                self.cache[key] = json.loads((HOME / persist).read_text())
         return self.cache.get(key, default)
 
 
+def write_private(path, text):
+    """Atomic 0600 write (concurrent writers each use their own temp file)."""
+    tmp = path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(text)
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
 state = State(STATE_URL)
-pending_usage: list[dict] = []  # usage rows written while ruchba was down; flushed on the next write
+PENDING_USAGE = HOME / "pending_usage.json"  # usage rows written while ruchba was down; flushed on the next write
+REJECTED_USAGE = HOME / "usage_rejected.jsonl"  # rows ruchba refused (4xx): kept for a look, never retried
+pending_usage: list[dict] = json.loads(PENDING_USAGE.read_text()) if PENDING_USAGE.exists() else []
 local_devices: dict[str, dict] = {}  # daemons that registered here, so this device works offline
 
 
@@ -160,7 +175,7 @@ async def load_settings():
     try:
         doc = await state.call("GET", "/v1/state/settings") or {}
         local = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
-        if not doc and local:  # first start against an empty ruchba: seed it from this host's old settings
+        if not doc and local and MODE == "full":  # first start against an empty ruchba: seed it from old settings
             doc = await state.call("PUT", "/v1/state/settings", local)
         if local != doc:
             write_settings_copy(doc)
@@ -171,9 +186,7 @@ async def load_settings():
 
 
 def write_settings_copy(doc):
-    tmp = SETTINGS_PATH.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")  # concurrent asks may write at once
-    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
-    tmp.replace(SETTINGS_PATH)
+    write_private(SETTINGS_PATH, json.dumps(doc, ensure_ascii=False, indent=2))
 
 
 async def save_settings(s):
@@ -197,10 +210,20 @@ async def record_usage(row):
     pending_usage.append({"ts": time.time(), "device": DEVICE, **row})
     try:
         while pending_usage:
-            await state.call("POST", "/v1/state/usage", pending_usage[0])
+            try:
+                await state.call("POST", "/v1/state/usage", pending_usage[0])
+            except HTTPException as e:  # refused, not unreachable: retrying would block the queue forever
+                with REJECTED_USAGE.open("a") as f:
+                    f.write(json.dumps({"status": e.status_code, "row": pending_usage[0]}, ensure_ascii=False) + "\n")
             pending_usage.pop(0)
     except StateDown:
-        pass  # shortcut: kept in memory only, lost if the gateway restarts before ruchba is back
+        pass  # kept in PENDING_USAGE until ruchba is back
+    if pending_usage or PENDING_USAGE.exists():
+        write_private(PENDING_USAGE, json.dumps(pending_usage))
+
+
+async def push_tokens():
+    return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
 
 
 async def take_lease(name, ttl_s):
@@ -483,7 +506,7 @@ def apns_config():
 
 async def send_voip_push(payload):
     cfg = apns_config()
-    tokens = await state.get("/v1/state/push_tokens", [])
+    tokens = await push_tokens()
     if not cfg or not tokens:
         return {"sent": 0, "reason": "APNs key or device token not configured"}
     if time.time() - _apns_jwt["ts"] > 50 * 60:  # APNs wants a fresh JWT at most hourly
@@ -749,6 +772,7 @@ async def push_register(body: dict):
         raise HTTPException(400, "voip_token and bundle_id required")
     await state.call("PUT", f"/v1/state/push_tokens/{quote(body['voip_token'], safe='')}",
                      {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox")})
+    await push_tokens()  # refresh the restart-proof copy
     return {"ok": True}
 
 
