@@ -163,13 +163,77 @@ class GatewayLinks:
             self.settings = msg.get("value") or {}
         elif t == "call":
             if len(self.openings) > 100:
-                self.openings.pop(next(iter(self.openings)))
-            self.openings[msg["call_id"]] = msg.get("opening", "")
+                old = self.openings.pop(next(iter(self.openings)))
+                if old["audio"]:
+                    old["audio"].cancel()
+            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""))
         elif msg.get("id") in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
 
 links = GatewayLinks()
+
+
+def prepare_opening(text):
+    """Split a placed call's opening and start synthesizing it now, so the phone hears it the moment it
+    connects (the push arrives seconds before the callee answers)."""
+    parts = split_ready(text, final=True)[0] if text else []
+    op = {"text": text, "parts": parts, "audio": None}
+    if parts:
+        try:
+            op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts))
+        except RuntimeError:
+            pass  # no event loop (self-checks): synthesize on connect instead
+    return op
+
+
+async def _synth_all(parts):
+    return [(await tts(p))[0] for p in parts]
+
+
+GREETING = re.compile(r"(여보세요|여보세용|여보|네+|예|응+|어+|안녕(하세요)?|네네)[\s.!?~,]*")
+GREETING_MAX_S = 1.5
+
+
+def is_greeting(text, seconds):
+    return seconds < GREETING_MAX_S and bool(GREETING.fullmatch(text.strip()))
+
+
+class OpeningGuard:
+    """Keeps a placed call's opening from being cut off by the callee's "여보세요".
+
+    While the opening plays, speech is held instead of interrupting: the first sentence always finishes;
+    a short greeting (< GREETING_MAX_S) is let go; longer speech interrupts once the first sentence is
+    over. Times are time.monotonic() seconds; the call handler acts on the returned verbs."""
+
+    def __init__(self):
+        self.first_end = self.play_end = 0.0
+        self.speech_at = None
+
+    def active(self, now):
+        return now < self.play_end
+
+    def start(self, now):
+        """Speech began while the assistant is talking: 'interrupt' now, or 'hold'."""
+        if not self.active(now):
+            return "interrupt"
+        self.speech_at = now
+        return "hold"
+
+    def tick(self, now):
+        """Held speech still going: 'interrupt' once it is too long for a greeting and sentence one is done."""
+        if (self.speech_at is not None and self.active(now) and now >= self.first_end
+                and now - self.speech_at >= GREETING_MAX_S):
+            self.speech_at = None
+            return "interrupt"
+        return None
+
+    def end(self, now, seconds):
+        """An utterance ended: 'answer' (normal turn), 'check' (maybe a greeting) or 'interrupt' then answer."""
+        held, self.speech_at = self.speech_at is not None, None
+        if not held:
+            return "answer"
+        return "check" if seconds < GREETING_MAX_S else "interrupt"
 
 _SENT_END = re.compile(r"(?<=[.!?。…~])\s+|\n+")
 
@@ -558,18 +622,47 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             else:
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
-    async def speak(sentences, route):
-        await send({"type": "state", "value": "speaking"})
-        for s in sentences:
-            pcm, _ = await tts(s)
-            await send({"type": "reply", "text": s, "route": route})
-            await send(audio=pcm)
+    guard = OpeningGuard()
 
-    async def answer(audio):
+    async def speak_opening(op):
+        guard.first_end = guard.play_end = time.monotonic() + 3600  # protected until its audio is out
+        try:
+            pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
+        except Exception:
+            pcms = None
+        await send({"type": "state", "value": "speaking"})
+        for i, s in enumerate(op["parts"]):
+            pcm = pcms[i] if pcms else (await tts(s))[0]
+            await send({"type": "reply", "text": s, "route": "opening"})
+            await send(audio=pcm)
+            if i == 0:
+                guard.first_end = current["play_end"]
+            guard.play_end = current["play_end"]
+
+    async def interrupt(delay=0.0):
+        if delay > 0:
+            await asyncio.sleep(delay)  # let the opening's first sentence finish playing
+        task = current["task"]
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        current["play_end"] = guard.play_end = 0.0
+        await send({"type": "interrupt"})  # barge-in: the client drops its queue
+
+    async def interrupt_then_answer(audio, delay, text=None):
+        await interrupt(delay)
+        current["task"] = asyncio.current_task()
+        await answer(audio, text)
+
+    async def check_greeting(audio, delay):
+        text = await transcribe(audio)
+        if text and not is_greeting(text, len(audio) / 16000):
+            await interrupt_then_answer(audio, delay, text)
+
+    async def answer(audio, text=None):
         t0, timings = time.perf_counter(), {}
         try:
             await send({"type": "state", "value": "thinking"})
-            text = await transcribe(audio)
+            text = text if text is not None else await transcribe(audio)
             timings["stt_ms"] = ms(t0)
             if not text:
                 return
@@ -592,11 +685,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
-            opening = links.openings.pop(call_id, "")
-            if opening:
-                parts = split_ready(opening, final=True)[0]
-                history[session].append({"role": "assistant", "content": opening})
-                current["task"] = asyncio.create_task(speak(parts, "opening"))
+            op = links.openings.pop(call_id, None)
+            if op and op["parts"]:
+                history[session].append({"role": "assistant", "content": op["text"]})
+                current["task"] = asyncio.create_task(speak_opening(op))
         await send({"type": "state", "value": "listening"})
         while True:
             msg = await ws.receive()
@@ -607,15 +699,22 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     break
                 continue
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
+                now = time.monotonic()
                 task = current["task"]
                 busy = task and not task.done()
-                if kind == "start" and (busy or time.monotonic() < current["play_end"]):
-                    if busy:
-                        task.cancel()
-                    current["play_end"] = 0.0
-                    await send({"type": "interrupt"})  # barge-in: the client drops its queue
+                if kind == "start" and (busy or now < current["play_end"]):
+                    if guard.start(now) == "interrupt":
+                        await interrupt()
                 elif kind == "end":
-                    current["task"] = asyncio.create_task(answer(audio))
+                    act, wait = guard.end(now, len(audio) / 16000), max(0.0, guard.first_end - now)
+                    if act == "answer":
+                        current["task"] = asyncio.create_task(answer(audio))
+                    elif act == "check":
+                        asyncio.create_task(check_greeting(audio, wait))
+                    else:
+                        asyncio.create_task(interrupt_then_answer(audio, wait))
+            if guard.tick(time.monotonic()) == "interrupt":
+                await interrupt()
     except WebSocketDisconnect:
         pass
     finally:
@@ -663,7 +762,7 @@ if __name__ == "__main__":
         gl.receive(spark, {"type": "hello", "device": "spark", "mode": "limited", "priority": 90})
         gl.receive(alb, {"type": "settings", "value": {"default_model": "opus"}})  # settings from any link
         gl.receive(spark, {"type": "call", "call_id": "c1", "opening": "좋은 아침이에요."})  # openings too
-        assert gl.settings["default_model"] == "opus" and gl.openings["c1"] == "좋은 아침이에요."
+        assert gl.settings["default_model"] == "opus" and gl.openings["c1"]["text"] == "좋은 아침이에요."
         assert gl.pick(True) is mac and gl.pick(False) is mac
         mac.fails = 3  # unhealthy: the next full link by priority takes over
         assert gl.pick(True) is alb
@@ -763,6 +862,34 @@ if __name__ == "__main__":
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
         assert [tag_state(h) for h in ("", "[CLA", "[CLAUDE]", "네")] == ["maybe", "maybe", "tag", "no"]
+        async def prefetch_check():  # the opening is synthesized when the call message arrives, not on connect
+            spoken = []
+
+            async def fake_tts(sentence):
+                spoken.append(sentence)
+                return sentence.encode(), 24000
+            globals()["tts"] = fake_tts
+            gl2 = GatewayLinks()
+            gl2.receive(gl2.add(FakeWS()), {"type": "call", "call_id": "c9",
+                                            "opening": "좋은 아침이에요. 오늘 수업은 두 개예요."})
+            op = gl2.openings["c9"]
+            assert await op["audio"] == ["좋은 아침이에요.".encode(), "오늘 수업은 두 개예요.".encode()]
+            assert spoken == op["parts"] == ["좋은 아침이에요.", "오늘 수업은 두 개예요."]
+        asyncio.run(prefetch_check())
+        globals()["tts"] = real[1]
+        assert prepare_opening("")["parts"] == [] and prepare_opening("네.")["audio"] is None  # no loop here
+        for text, sec, want in [("여보세요?", 0.8, True), ("네", 0.3, True), ("응응", 0.4, True), ("안녕하세요!", 1.0, True),
+                                ("여보세요", 1.6, False), ("잠깐만요", 0.6, False), ("네 그런데 그거 말고요", 1.2, False)]:
+            assert is_greeting(text, sec) is want, (text, sec)
+        g = OpeningGuard()
+        assert g.start(0.0) == "interrupt" and g.end(0.5, 0.5) == "answer"  # no opening playing: normal turns
+        g.first_end, g.play_end = 2.0, 8.0  # first sentence plays until t=2, the whole opening until t=8
+        assert g.start(0.5) == "hold" and g.tick(1.9) is None  # during sentence one nothing interrupts
+        assert g.end(1.2, 0.7) == "check"  # "여보세요": transcribe, and let it go if it is a greeting
+        assert g.start(1.0) == "hold" and g.tick(1.9) is None and g.tick(2.6) == "interrupt"  # long talk, after s1
+        assert g.end(3.0, 2.0) == "answer"  # that utterance is then answered normally
+        assert g.start(0.2) == "hold" and g.end(1.9, 1.7) == "interrupt"  # long but over before s1 ends: deferred
+        assert g.start(9.0) == "interrupt"  # opening finished: ordinary barge-in again
         h = {k: hashlib.sha256(k.encode()).hexdigest() for k in ("app-tok", "link-tok", "lim-tok")}
         HASHES = load_hashes(f"# generated on the Mac\nclient {h['app-tok']}\nlink {h['link-tok']}\n"
                              f"link_limited {h['lim-tok']}\n")
