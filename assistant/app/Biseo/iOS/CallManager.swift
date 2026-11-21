@@ -223,6 +223,7 @@ final class CallManager: NSObject, ObservableObject {
 
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
+        if let c = CallContext.from(event: event) { callContext = c; return }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         switch event.type {
         case "state": state = event.value ?? ""

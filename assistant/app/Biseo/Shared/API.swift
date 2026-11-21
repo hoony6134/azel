@@ -15,6 +15,9 @@ struct CallEvent: Decodable, Equatable {
     var kind: String?         // activity: calendar | mail | memory | … (DESIGN §13.2)
     var reply_id: Int?        // reply_start
     var mode: String?         // the active brain mode (state / mode events)
+    var context: Context?     // `context`: the first frame of a call placed for a task or a reminder
+
+    struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
 }
 
 struct AppSettings: Codable, Equatable {

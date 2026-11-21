@@ -134,3 +134,22 @@ final class Batch5AppTests: XCTestCase {
         XCTAssertNil(CallContext.from(nil))
     }
 }
+
+final class CallContextFrameTests: XCTestCase {
+    func testFirstFrameAndPatchBody() throws {
+        let e = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"context","context":{"kind":"task","label":"역사 특강 과제","id":"abc123def456"}}"#.utf8))
+        XCTAssertEqual(CallContext.from(event: e)?.chip, "맡긴 작업: 역사 특강 과제")
+        XCTAssertNil(CallContext.from(event: try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening"}"#.utf8))))
+    }
+
+    func testNotifyPatchHitsTheTaskRoute() async throws {
+        URLProtocol.registerClass(FakeServer.self)
+        Config.testOverride = (gateway: "https://fake.test", token: "test-token")
+        defer { URLProtocol.unregisterClass(FakeServer.self); Config.testOverride = nil; FakeServer.routes = [:] }
+        FakeServer.seen = []
+        FakeServer.routes = ["PATCH /v1/tasks/abc123def456": (200, #"{"id":"abc123def456","goal":"x","status":"running","notify":"call"}"#)]
+        try await TaskAPI.setNotify("abc123def456", "call")
+        let sent = try JSONSerialization.jsonObject(with: FakeServer.seen.last!.body) as! [String: String]
+        XCTAssertEqual(sent, ["notify": "call"])
+    }
+}
