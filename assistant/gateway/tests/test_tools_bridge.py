@@ -527,7 +527,7 @@ def test_music_and_home_errors_become_spoken_failures():
     w.reply = {"status": "not_found", "result": "not found"}
     assert "못 찾았어요" in run(b.call("music_play", {"query": "없는 곡"}))["content"]
     w.reply = {"status": "refused", "reason": "unknown scene; allowed: azel-movie"}
-    r = run(b.call("home_scene", {"name": "front door lock"}))
+    r = run(b.call("home_scene", {"name": "no-such-scene"}))
     assert r["is_error"] and "allowed: azel-movie" in r["content"]
     assert run(b.call("music_control", {"action": "explode"}))["is_error"]  # schema: not in the enum
     w2 = World()  # no daemon with music: say so

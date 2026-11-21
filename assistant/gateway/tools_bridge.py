@@ -869,7 +869,7 @@ HOME_SCENE = {
 MAC_ACTIONS = {"music_play": "music", "music_control": "music", "home_scene": "home"}
 MAC_TOOL_NAMES = set(MAC_ACTIONS.values())
 # A scene that sounds like a lock, a door, the garage or security always needs the user's spoken yes, read or no read.
-RISKY_SCENE = re.compile(r"lock|unlock|door|garage|alarm|security|arm|disarm|잠금|잠궈|도어락|문|현관|차고|경보|보안|방범", re.I)
+RISKY_SCENE = re.compile(r"lock|unlock|door|garage|alarm|security|잠금|잠궈|도어락|문|현관|차고|경보|보안|방범", re.I)
 WEB_NAMES = {"web_search", "web_fetch"}  # the Claude API path has native server tools by these names
 # schedule_create: call_user that must have a time (the app's "new schedule" form); same handler, same checks.
 SCHEDULE_CREATE = {"name": "schedule_create",
