@@ -40,12 +40,12 @@ figcaption { color:var(--text2); font-size:13px; font-weight:600; letter-spacing
 .screen { position:relative; width:100%; height:100%; border-radius:44px; overflow:hidden; background:var(--bg); display:flex; flex-direction:column; }
 .statusbar { height:50px; flex:none; display:flex; justify-content:space-between; align-items:center; padding:6px 30px 0; font-size:15px; font-weight:600; position:relative; z-index:2; }
 .island { position:absolute; left:50%; top:11px; transform:translateX(-50%); width:120px; height:34px; background:#000; border-radius:20px; }
-.tabbar { flex:none; height:84px; display:flex; justify-content:space-around; padding-top:10px; border-top:1px solid var(--stroke); background:var(--bgRaised); }
+.tabbar { flex:none; height:84px; display:flex; justify-content:space-around; padding:10px 0 20px; border-top:1px solid var(--stroke); background:var(--bgRaised); }
 .tab { display:flex; flex-direction:column; align-items:center; gap:4px; font-size:11px; color:var(--text3); position:relative; }
 .tab.on { color:var(--celadon); }
 .tab svg { width:26px; height:26px; }
 .badge { position:absolute; top:-4px; right:-10px; background:var(--danger); color:var(--onAccent); font-size:11px; font-weight:700; border-radius:9px; padding:2px 7px; }
-.body { flex:1; overflow:hidden; padding:0 20px; display:flex; flex-direction:column; position:relative; }
+.body { flex:1; overflow:hidden; padding:0 20px 16px; display:flex; flex-direction:column; position:relative; }
 .body > * { flex-shrink:0; }
 .body > .captions, .body > .stack, .body > .recent { flex-shrink:1; min-height:0; }
 .call .jar { flex-shrink:1; }
@@ -132,7 +132,7 @@ canvas.jar { display:block; }
 .earcons .btnrow { display:flex; flex-wrap:wrap; gap:10px; }
 .earcons button { font:inherit; font-size:15px; color:var(--text); background:var(--card); border:1px solid var(--stroke); border-radius:999px; padding:10px 16px; cursor:pointer; min-height:44px; }
 .earcons button:focus-visible, .toggle:focus-visible { outline:2px solid var(--celadon); outline-offset:2px; }
-.pttdesk { width:min(560px,100%); height:170px; border-radius:14px; display:grid; place-items:center; position:relative;
+.pttdesk { width:min(560px,100%); height:170px; display:grid; place-items:center; position:relative;
   background:linear-gradient(160deg, var(--desk), color-mix(in srgb, var(--desk) 60%, #000)); box-shadow:0 0 0 1px #2b3338; }
 .pttdesk .ptt { position:static; transform:none; }
 .ptt .act { display:flex; align-items:center; gap:5px; font-size:13px; font-weight:600; }
@@ -151,6 +151,7 @@ canvas.jar { display:block; }
 .hrow .hm { font-size:13px; color:var(--text3); grid-column:2; font-variant-numeric:tabular-nums; }
 .hrow .hc { grid-row:1 / span 2; grid-column:3; display:flex; gap:4px; align-items:center; color:var(--text3); }
 .hrow .hc svg { width:15px; height:15px; }
+.hrow.deleting .ht, .hrow.deleting > svg { color:var(--text3); }
 .hrow.swiped { transform:translateX(-88px); background:var(--card); }
 .swipe-del { position:absolute; right:0; top:0; bottom:0; width:88px; background:var(--hangup); color:#fff; display:grid; place-items:center; font-size:15px; font-weight:600; }
 .hwrap { position:relative; }
@@ -208,9 +209,9 @@ canvas.jar { display:block; }
 .btns .yes { background:var(--celadon); color:var(--onAccent); }
 
 /* Mac */
-.mac { width:min(1000px, 100%); aspect-ratio:16/10; border-radius:14px; overflow:hidden; position:relative; box-shadow:0 0 0 1px #2b3338, 0 30px 60px rgba(0,0,0,.35);
+.mac { width:min(1000px, 100%); aspect-ratio:16/10; overflow:hidden; position:relative; box-shadow:0 0 0 1px #2b3338, 0 30px 60px rgba(0,0,0,.35);
   background:linear-gradient(160deg, var(--desk), color-mix(in srgb, var(--desk) 60%, #000)); }
-.menubar { height:26px; display:flex; align-items:center; justify-content:flex-end; gap:16px; padding:0 14px; font-size:13px; background:color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter:blur(20px); }
+.menubar { height:26px; display:flex; align-items:center; justify-content:flex-end; gap:16px; padding:4px 14px; font-size:13px; background:color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter:blur(20px); }
 .menubar .left { margin-right:auto; display:flex; gap:18px; font-weight:600; }
 .menubar .mine { position:relative; color:var(--celadon); display:flex; }
 .menubar .mine::after { content:""; position:absolute; right:-3px; top:0; width:6px; height:6px; border-radius:50%; background:var(--danger); }
@@ -227,7 +228,7 @@ canvas.jar { display:block; }
 .popover .rec div span:last-child { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .popover .ft { display:flex; justify-content:space-between; margin-top:10px; padding-top:10px; border-top:1px solid var(--stroke); color:var(--text2); }
 .ptt { position:absolute; left:50%; bottom:9%; transform:translateX(-50%); width:460px; max-width:92%; height:112px; border-radius:30px; background:var(--material); backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px);
-  border:1px solid var(--stroke); display:flex; align-items:center; gap:14px; padding:0 18px 0 14px; box-shadow:0 20px 40px rgba(0,0,0,.3); }
+  border:1px solid var(--stroke); display:flex; align-items:center; gap:14px; padding:12px 18px 12px 14px; box-shadow:0 20px 40px rgba(0,0,0,.3); }
 .ptt .cap { flex:1; min-width:0; }
 .ptt .cap .me { font-size:13px; color:var(--text2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .ptt .cap .ai { font-size:17px; font-weight:500; line-height:1.4; margin-top:3px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
@@ -436,7 +437,7 @@ canvas.jar { display:block; }
         <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">잘 자, 내일 7시에 깨워 줘</span><span class="hc"><span class="chip qwen">로컬</span></span><span class="hm">오후 11:40 · 1분 · 2턴</span></div>
         <div style="position:relative;overflow:hidden;border-top:1px solid var(--stroke)"><span class="swipe-del">삭제</span>
           <div class="hrow swiped"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">스파크 GPU 메모리 얼마나 써?</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm">오후 4:18 · 2분 · 3턴</span></div></div>
-        <div class="hrow" style="opacity:.5" aria-label="지우는 중"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">이 PR 리뷰 코멘트 몇 개 남았어?</span><span class="hc foot">지우는 중…</span><span class="hm">오후 2:05 · 5분 · 7턴</span></div>
+        <div class="hrow deleting" aria-label="지우는 중"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">이 PR 리뷰 코멘트 몇 개 남았어?</span><span class="hc foot">지우는 중…</span><span class="hm">오후 2:05 · 5분 · 7턴</span></div>
       </div>
       <h2 class="day">11월 19일 수요일</h2>
       <div class="hlist">
@@ -531,7 +532,7 @@ canvas.jar { display:block; }
   <div class="tb"><i></i><i></i><i></i>&nbsp; 기록 <div class="search s" role="search" aria-label="기록 검색"><svg aria-hidden="true"><use href="#i-search"/></svg>검색</div></div>
   <aside>
     <h2 class="day">오늘</h2>
-    <div class="hrow sel"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">오늘 일정 뭐 있어?</span><span class="hc"><span class="chip claude" style="font-size:11px">Claude</span></span><span class="hm">오전 8:02 · 4분 · 6턴</span></div>
+    <div class="hrow sel"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">오늘 일정 뭐 있어?</span><span class="hc"></span><span class="hm">오전 8:02 · 4분 · 6턴</span></div>
     <div class="hrow"><svg class="in" aria-hidden="true"><use href="#i-in"/></svg><span class="ht">아침 브리핑</span><span class="hc"></span><span class="hm">오전 7:00 · 3분 · 4턴</span></div>
     <h2 class="day">어제</h2>
     <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">잘 자, 내일 7시에 깨워 줘</span><span class="hc"></span><span class="hm">오후 11:40 · 1분 · 2턴</span></div>

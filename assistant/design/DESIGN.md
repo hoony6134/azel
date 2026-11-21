@@ -684,8 +684,9 @@ activity event carries `"route":"claude"` and a `kind` (§13.2).
   If it fails, the row comes back in place with a danger inline note "지우지 못했어요 · 다시
   시도". Plain delete keeps any local recording; rows with one also get a long-press
   menu item "기록과 녹음 지우기".
-- **Deleting state** (when the request is in flight because the user left the tab): row at
-  50% opacity, a small `ProgressView` replaces the chips, not tappable.
+- **Deleting state** (when the request is in flight because the user left the tab): title and
+  glyph drop to text3 (still ≥ 4.5:1; no opacity fade), a small `ProgressView` + "지우는 중…"
+  replaces the chips, not tappable.
 - **Pull to refresh**; the tab badge stays empty (history is not a to-do).
 
 ### 15.3 Detail (iPhone)
@@ -739,7 +740,7 @@ Opened from the popover's "기록 모두 보기…" (⌘Y) or the main window's 
 a `Window("기록", id: "history")`, default 820 × 560, min 640 × 420.
 
 - `NavigationSplitView`: sidebar list (width 300) with the same day sections and rows
-  (title + meta, route chips trailing), a search field in the toolbar (`.searchable`,
+  (title + meta; no route chips in the narrow sidebar, the detail header shows them), a search field in the toolbar (`.searchable`,
   placement `.toolbar`; the selected row's meta text switches from text3 to text2 so it keeps
   4.5:1 on the celadon selection); detail pane = §15.3 header, player and transcript, content max
   width 640, centered.
