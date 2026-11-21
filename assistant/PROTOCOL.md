@@ -54,7 +54,10 @@ answering a call the assistant placed; the server then speaks that call's openin
   - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — text of the audio chunk that follows: one or
     more whole sentences (or a clause ending in ", "), never under 5 syllables unless it is the whole reply,
     never cut mid-word. Chinese characters, kana, Cyrillic and Thai are dropped from it (and from the audio
-    and history).
+    and history). Model reasoning (`<think>…</think>`, a stray `</think>` with everything before it, an unclosed
+    `<think>`, any `reasoning_content` field) is never spoken, captioned or stored, from Qwen, Claude or NIM alike;
+    thinking stays on, and the call stays in `thinking` meanwhile. A reply that was only reasoning is answered with a
+    short "생각이 길어져서 답을 못 정했어요. 한 번만 더 말씀해 주시겠어요?".
   - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
   - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued

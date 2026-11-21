@@ -761,6 +761,67 @@ async def llm_stream(messages, max_tokens=600):
                 yield delta
 
 
+# Reasoning models (Qwen with thinking on, some NIM models) may stream <think>…</think> before the answer, or only
+# the closing tag (the chat template opened it). It must never be spoken, captioned or stored. Thinking stays on (it
+# helps the answers); the "thinking" state simply lasts while nothing speakable has arrived.
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+THINK_FALLBACK = "생각이 길어져서 답을 못 정했어요. 한 번만 더 말씀해 주시겠어요?"
+_HANGUL = re.compile(r"[가-힣]")
+
+
+class Unthink:
+    """Streamed text with reasoning removed: `feed(delta)` returns what may be spoken now, `close()` the rest.
+
+    Before the first tag or Hangul, text is held (a stray `</think>` means all of it was reasoning). Inside a think
+    block nothing comes out. A trailing partial tag ("<thi") is held until the next delta decides. `thought` tells
+    whether any reasoning was dropped."""
+
+    def __init__(self):
+        self.buf, self.inside, self.decided, self.thought = "", False, False, False
+
+    def feed(self, delta: str) -> str:
+        self.buf += delta
+        out = ""
+        while True:
+            if self.inside:
+                i = self.buf.find(THINK_CLOSE)
+                if i < 0:
+                    self.buf = self.buf[-(len(THINK_CLOSE) - 1):]  # may be the start of a split closing tag
+                    return out
+                self.buf, self.inside, self.decided, self.thought = self.buf[i + len(THINK_CLOSE):], False, True, True
+                continue
+            o, c = self.buf.find(THINK_OPEN), self.buf.find(THINK_CLOSE)
+            if c >= 0 and (o < 0 or c < o):  # a closing tag without its opening: everything held before it was reasoning
+                self.buf, self.decided, self.thought = self.buf[c + len(THINK_CLOSE):], True, True
+                continue
+            if o >= 0:
+                out += self.buf[:o] if self.decided else ""
+                self.buf, self.inside, self.thought = self.buf[o + len(THINK_OPEN):], True, True
+                continue
+            if not self.decided:
+                if not _HANGUL.search(self.buf):
+                    return out  # still possibly untagged reasoning: hold
+                self.decided = True
+            keep = next((k for k in range(min(len(THINK_CLOSE) - 1, len(self.buf)), 0, -1)
+                         if THINK_OPEN.startswith(self.buf[-k:]) or THINK_CLOSE.startswith(self.buf[-k:])), 0)
+            out, self.buf = out + self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+            return out
+
+    def close(self) -> str:
+        rest, self.buf = ("" if self.inside else self.buf), ""
+        if self.inside:
+            self.thought = True
+        return rest
+
+
+async def unthink(stream, f: Unthink):
+    async for d in stream:
+        if t := f.feed(d):
+            yield t
+    if t := f.close():
+        yield t
+
+
 async def gateway_settings():
     return links.settings  # pushed by the gateways on connect and on every change
 
@@ -851,7 +912,7 @@ async def briefing_sentences(session, name, on_event, persona="", title=""):
         stream = claude_stream(BRIEFING_CLAUDE, session, None, "schedule", personal=True, on_event=on_event)
     buf, first, said, failed = "", True, [], False
     try:
-        async for delta in stream:
+        async for delta in unthink(stream, Unthink()):
             buf += delta
             done, buf = split_ready(buf, final=False, first=first)
             for s in done:
@@ -990,7 +1051,7 @@ async def qwen_schedule(text, now):
               f"지금은 {now.isoformat(timespec='minutes')} (KST)야.")
     out = ""
     try:
-        async for delta in llm_stream([{"role": "system", "content": prompt}, {"role": "user", "content": text}]):
+        async for delta in unthink(llm_stream([{"role": "system", "content": prompt}, {"role": "user", "content": text}]), Unthink()):
             out += delta
             if len(out) > 400:
                 break
@@ -1127,6 +1188,7 @@ async def respond(text, session, t0, timings, on_event=None):
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
     to_claude, model = (False, None) if sched or job else pre_route(bare, settings, local=bool(ctx), tools=links.brain_tools() if ctx else ())
     sentences: asyncio.Queue = asyncio.Queue()
+    thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
     route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
 
     async def via_claude():
@@ -1146,8 +1208,9 @@ async def respond(text, session, t0, timings, on_event=None):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            async for delta in claude_stream(text, hkey, model, task, personal, recent_context(hist),
-                                             on_event=on_event):
+            thinking.append(Unthink())  # Claude/NIM output gets the same filter as Qwen's
+            async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(hist),
+                                                     on_event=on_event), thinking[-1]):
                 got_text.set()
                 buf += delta
                 done, buf = split_ready(buf, final=False)
@@ -1197,7 +1260,8 @@ async def respond(text, session, t0, timings, on_event=None):
             try:
                 for rounds in range(4):  # at most two tool calls and one nudge, then an answer
                     buf, state, said_round = "", "maybe", []
-                    async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
+                    thinking.append(Unthink())
+                    async for delta in unthink(llm_stream(messages, LENGTH_TOKENS[length]), thinking[-1]):
                         timings.setdefault("llm_first_token_ms", ms(t0))
                         buf += delta
                         if state not in ("tool", "no"):
@@ -1275,6 +1339,10 @@ async def respond(text, session, t0, timings, on_event=None):
                 spoken.append(s)
             yield s, route["value"], pcm, sr
         await producer  # surfaces LLM errors
+        if not spoken and any(f.thought for f in thinking):  # the model only reasoned: a short line, not silence
+            pcm, sr = await tts(THINK_FALLBACK)
+            spoken.append(THINK_FALLBACK)
+            yield THINK_FALLBACK, route["value"], pcm, sr
     finally:
         producer.cancel()
         # Only what was actually spoken goes into history (a barge-in cuts it short). Nothing spoken: no assistant
@@ -1773,6 +1841,24 @@ if __name__ == "__main__":
     if CHECK_ONLY:
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
+
+        def unthought(chunks):
+            f = Unthink()
+            out = [f.feed(c) for c in chunks]
+            return out, f.close(), f.thought
+        out, rest, th = unthought(["<thi", "nk>Okay, the user asks about wa", "ter.</th", "ink>네, 물은 백 도", "에서 끓어요."])
+        assert "".join(out) + rest == "네, 물은 백 도에서 끓어요." and th  # split tags across chunks
+        assert out[3] == "네, 물은 백 도"  # once past the reasoning, Korean streams out at once
+        out, rest, th = unthought(["<think>Let me consider", " the schedule first"])
+        assert "".join(out) + rest == "" and th  # unclosed: nothing at all
+        out, rest, th = unthought(["Okay so the user wants", " a time.\n</think>\n\n지금은 오후 세 시예요."])
+        assert "".join(out) + rest == "\n\n지금은 오후 세 시예요." and th  # stray </think>: all before it dropped
+        out, rest, th = unthought(["안녕하세요, ", "무엇을 도와", "드릴까요?"])
+        assert out == ["안녕하세요, ", "무엇을 도와", "드릴까요?"] and rest == "" and not th  # normal text untouched
+        out, rest, th = unthought(["Sure", ", 3 PM."])
+        assert out == ["", ""] and rest == "Sure, 3 PM." and not th  # English with no tags: held, then said whole
+        out, rest, th = unthought(["답이에요 <thi", "nk>속으로</think> 끝."])
+        assert "".join(out) + rest == "답이에요  끝." and th  # a think block mid-answer
         assert split_ready("好的. 내일 봬요.", True)[0] == ["내일 봬요."] and korean_only("API 서버") == "API 서버"
         assert split_ready("네! 알겠어요? 그럼", False) == (["네! 알겠어요?"], "그럼")  # "네!" alone is too short
         assert split_ready("네. 말씀하세요", False) == ([], "네. 말씀하세요") and split_ready("네. 그럼요.", True)[0] == ["네. 그럼요."]
@@ -2087,6 +2173,11 @@ if __name__ == "__main__":
         assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        said, _ = asyncio.run(ack_check(["<think>The user asks the boiling point. Answer briefly.</think>물은 100도에서 끓어요."]))
+        assert said == ["물은 100도에서 끓어요."], said  # the reasoning is never spoken
+        assert history["azel:ack"][-1] == {"role": "assistant", "content": "물은 100도에서 끓어요."}  # nor stored
+        said, _ = asyncio.run(ack_check(["<think>Hmm, I am not sure what they"], user="고마워"))
+        assert said == [THINK_FALLBACK] and history["azel:ack"][-1]["content"] == THINK_FALLBACK  # only reasoning
         # 2026-11-21 23:35 call: "내일 내가 해야 될 일도 정리해줘" reached Qwen, which made up two plans
         for ask in ("내일 내가 해야 될 일도 정리해줘", "알았어 고마워. 그리고 내일 내가 해야 될 일들도 좀 정리해줘.",
                     "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘", "토요일에 뭐 있어?"):
