@@ -131,7 +131,7 @@ class Bridge:
     async def tools(self, caller="api"):
         """Messages-API definitions of everything this caller may use, and where device tools run."""
         dev_defs, where = await self.d["device_tools"](await self.d["fresh_devices"]())
-        if caller == "qwen":
+        if caller in ("qwen", "voice"):  # a voice turn of any model never delegates; tasks do
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
         cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
@@ -254,7 +254,7 @@ class Bridge:
 
     async def device(self, name, args, where, caller, on_progress):
         url, tool = where[name]
-        if caller == "qwen" and tool == "delegate":
+        if caller in ("qwen", "voice") and tool == "delegate":
             raise Fail("invalid", "여러 단계 작업은 create_task로 맡겨 주세요.")
         if caller == "qwen" and tool not in READ_TOOLS and not args.get("approval_id"):
             # the local model never executes on its own: ask the user first, every time
@@ -495,8 +495,7 @@ class Bridge:
             try:
                 out = await self.d["cygnus_write"]("memory_save", {"text": f"{fact}" + (f" ({about})" if about else ""),
                                                                    "kind": kind})
-                m = re.search(r"\b(m[_-]?[0-9a-z]{4,}|[0-9a-f]{8,}|\d{2,})\b", out)
-                cyg_id = m.group(1) if m else None
+                cyg_id, note = cygnus_saved(out)
             except Exception:  # noqa: BLE001  Azel still remembers; say Cygnus didn't take it
                 note = " (Cygnus에는 지금 못 남겼어요.)"
         rec = await self.d["memory_add"](fact, {"memory": True, "source": "explicit", "about": about or None,
@@ -699,6 +698,21 @@ def site_name(src):
         return title
     host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", str(src.get("url", ""))).split("/")[0])
     return host
+
+
+def cygnus_saved(out):
+    """(id, note) from memory_save's reply. Only a "saved" item is ours: a "similar" reply names someone else's
+    memory (forget must never archive it), and a held one is not a memory until the owner approves it."""
+    try:
+        item = (json.loads(out) or [{}])[0]
+    except (ValueError, TypeError, IndexError, KeyError):
+        return None, " (Cygnus 응답을 확인하지 못했어요.)"
+    status = item.get("status")
+    if status == "saved" and isinstance(item.get("id"), str):
+        return item["id"], ""
+    if status == "similar":
+        return None, " (Cygnus에는 비슷한 기억이 이미 있어요.)"
+    return None, " (Cygnus에서는 확인을 기다려요.)"
 
 
 async def none_true():

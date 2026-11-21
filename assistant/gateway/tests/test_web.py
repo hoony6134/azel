@@ -84,3 +84,21 @@ def test_limited_gateway_has_no_web_on_claude_code(tmp_path, monkeypatch):
     private(tmp_path / "state_token_limited", "l1m\n")
     g = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
     assert "WebSearch" not in g.run_args({"connectors": {}}, [])[1]
+
+
+def test_voice_turns_never_delegate_tasks_still_can(tmp_path, monkeypatch):
+    from test_gateway import start
+    from test_tools_bridge import World
+    b = World().bridge()
+    for caller in ("voice", "qwen"):
+        names = [t["name"] for t in asyncio.run(b.tools(caller))[0]]
+        assert "macbook__delegate" not in names, caller
+        r = asyncio.run(b.run("macbook__delegate", {"task": "x"}, caller=caller))
+        assert r["error"]["code"] == "invalid" and "create_task" in r["spoken"], caller
+    assert "macbook__delegate" in [t["name"] for t in asyncio.run(b.tools("api"))[0]]  # the task loop keeps it
+    g = start(tmp_path, monkeypatch)
+    devices = [{"id": "macbook", "url": "http://mac/mcp"}]
+    ask = json.loads(g.run_args({"connectors": {}}, devices, "ask:s1")[2])
+    task = json.loads(g.run_args({"connectors": {}}, devices, "task:t1")[2])
+    assert "mcp__macbook__delegate" in ask["permissions"]["deny"]  # claude -p answering a call or the app
+    assert "mcp__macbook__delegate" not in task.get("permissions", {}).get("deny", [])
