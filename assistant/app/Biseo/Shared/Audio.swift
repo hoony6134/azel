@@ -113,6 +113,8 @@ final class AudioIO {
     private lazy var cueBuffers: [Cue: AVAudioPCMBuffer] = Dictionary(uniqueKeysWithValues: Cue.allCases.map { ($0, Earcon.buffer($0)) })
     private let speechLock = NSLock()
     private var speechEnd = 0.0      // monotonic time the queued speech runs out
+    private var scheduledSamples = 0 // reply samples scheduled since the last flush (24 kHz)
+    private var pausedAt: Double?    // playback paused: the clock stands still
     let levels = Levels()
     var onMic: ((Data) -> Void)?
     #if os(macOS)
@@ -131,14 +133,14 @@ final class AudioIO {
     func playCue(_ cue: Cue) {
         guard engine.isRunning, let buf = cueBuffers[cue] else { return }
         cuePlayer.volume = speechPlaying ? 0.4 : 1
-        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick ? [] : .interrupts)
+        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick || cue == .pulse ? [] : .interrupts) // a pulse never cuts another cue
         if !cuePlayer.isPlaying { cuePlayer.play() }
     }
 
     /// Reply audio is still queued or playing.
     var speechPlaying: Bool {
         speechLock.lock(); defer { speechLock.unlock() }
-        return ProcessInfo.processInfo.systemUptime < speechEnd
+        return (pausedAt ?? ProcessInfo.processInfo.systemUptime) < speechEnd
     }
 
     /// iOS: call after CallKit activated the audio session.
@@ -185,20 +187,43 @@ final class AudioIO {
         guard engine.isRunning, let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
         player.scheduleBuffer(buf)
         let now = ProcessInfo.processInfo.systemUptime
-        speechLock.lock(); speechEnd = max(speechEnd, now) + Double(buf.frameLength) / buf.format.sampleRate; speechLock.unlock()
+        speechLock.lock()
+        speechEnd = max(speechEnd, pausedAt ?? now) + Double(buf.frameLength) / buf.format.sampleRate
+        scheduledSamples += Int(buf.frameLength)
+        speechLock.unlock()
     }
 
     /// `interrupt`: stop() drops every scheduled buffer; play() makes the node ready for the next reply.
     func flush() {
         player.stop()
         cuePlayer.stop() // interrupt silences cues too
-        speechLock.lock(); speechEnd = 0; speechLock.unlock()
+        speechLock.lock(); speechEnd = 0; scheduledSamples = 0; if pausedAt != nil { pausedAt = ProcessInfo.processInfo.systemUptime }; speechLock.unlock()
         if engine.isRunning { player.play() }
     }
 
     /// Hold: playback pauses where it is (queued replies wait); resume() continues them.
-    func pause() { player.pause() }
-    func resume() { if engine.isRunning { player.play() } }
+    func pause() {
+        player.pause()
+        speechLock.lock(); if pausedAt == nil { pausedAt = ProcessInfo.processInfo.systemUptime }; speechLock.unlock()
+    }
+
+    func resume() {
+        if engine.isRunning { player.play() }
+        speechLock.lock()
+        if let p = pausedAt { speechEnd += ProcessInfo.processInfo.systemUptime - p; pausedAt = nil }
+        speechLock.unlock()
+    }
+
+    /// Reply samples actually heard since the last flush: scheduled minus what is still queued.
+    /// Stands still while paused; gaps between replies don't count.
+    var playedSamples: Int {
+        speechLock.lock(); defer { speechLock.unlock() }
+        return Self.played(scheduled: scheduledSamples, speechEnd: speechEnd, now: pausedAt ?? ProcessInfo.processInfo.systemUptime, rate: 24_000)
+    }
+
+    static func played(scheduled: Int, speechEnd: Double, now: Double, rate: Double) -> Int {
+        max(0, scheduled - Int((max(0, speechEnd - now) * rate).rounded()))
+    }
 
     /// True while the engine (and so the mic and voice processing) is running.
     var isRunning: Bool { engine.isRunning }
@@ -207,6 +232,7 @@ final class AudioIO {
     func stop() {
         player.stop()
         cuePlayer.stop()
+        speechLock.lock(); speechEnd = 0; scheduledSamples = 0; pausedAt = nil; speechLock.unlock()
         engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()

@@ -200,7 +200,7 @@ struct SetupFlow: View {
 
 // MARK: - Settings (DESIGN §7.5): usage + status + settings as cards, auto-saved
 
-private let models = [("qwen", "로컬 Qwen"), ("haiku", "Haiku"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("auto", "자동")]
+private let models = [("qwen", "로컬 Qwen"), ("haiku", "Haiku"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("nim", "NIM"), ("auto", "자동")]
 private let paths = [("api", "API"), ("claude_code", "Claude Code"), ("auto", "자동")]
 private let tasks = [("chat", "잡담"), ("schedule", "일정"), ("code", "코드"), ("mac", "macbook 작업")]
 
@@ -503,6 +503,13 @@ struct SettingsScreen<Extra: View>: View {
             }
             row("기본 모델") { picker(models, s.default_model) }
             row("Claude 경로") { picker(paths, s.claude_path) }
+            Divider()
+            NIMRow(nim: Binding(get: { s.wrappedValue.providers?.nim ?? .init() },
+                                set: { n in
+                                    var p = s.wrappedValue.providers ?? .init()
+                                    p.nim = n
+                                    s.wrappedValue.providers = p
+                                }))
         }
     }
 
@@ -918,5 +925,58 @@ extension View {
         #else
         self
         #endif
+    }
+}
+
+/// NVIDIA NIM provider: enable, model (server list or free text), and a write-only API key.
+struct NIMRow: View {
+    @Binding var nim: AppSettings.Providers.NIM
+    @State private var models: [String] = []
+    @State private var key = ""                 // cleared as soon as it is sent; never stored
+    @State private var keySaved = false
+    @State private var sending = false
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s) {
+            Toggle("NVIDIA NIM", isOn: $nim.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
+            if nim.enabled {
+                HStack {
+                    TextField("모델 (예: meta/llama-3.1-70b-instruct)", text: Binding(get: { nim.model ?? "" },
+                                                                             set: { nim.model = $0.isEmpty ? nil : $0 }))
+                        .textFieldStyle(.roundedBorder).urlInput()
+                    if !models.isEmpty {
+                        Menu {
+                            ForEach(models, id: \.self) { m in Button(m) { nim.model = m } }
+                        } label: { Image(systemName: "chevron.down.circle") }
+                        .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("모델 목록")
+                    }
+                }
+                HStack {
+                    SecureField(nim.has_key == true || keySaved ? "키 등록됨 (바꿀 때만 입력)" : "API 키", text: $key)
+                        .textFieldStyle(.roundedBorder)
+                    Button(sending ? "등록 중…" : "등록") { Task { await sendKey() } }
+                        .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending)
+                        .tint(Theme.celadon)
+                }
+                if nim.has_key == true || keySaved { Label("키 등록됨", systemImage: "checkmark.seal").font(.footnote).foregroundStyle(Theme.celadon) }
+                Text("키는 게이트웨이로 한 번만 보내고 이 기기에는 남기지 않아요.").font(.footnote).foregroundStyle(Theme.text3)
+                if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
+            }
+        }
+        .task(id: nim.enabled) {
+            guard nim.enabled else { return }
+            if case .success(let m) = await attempt({ try await NIMAPI.models() }) { models = m }
+        }
+        .onDisappear { key = "" }
+    }
+
+    private func sendKey() async {
+        let value = Config.cleanToken(key)
+        key = ""
+        sending = true
+        defer { sending = false }
+        do { try await NIMAPI.putKey(value); keySaved = true; message = nil }
+        catch { message = "키를 등록하지 못했어요: " + FriendlyError.describe(error).title }
     }
 }

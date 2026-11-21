@@ -13,6 +13,11 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var playing = false
     /// The state the UI shows: 말하는 중 while reply audio is still playing.
     var displayState: String { CallClient.displayState(server: state, playing: playing) }
+    /// The reply paragraph being heard (sentences, characters heard, sentence being spoken).
+    func karaoke(stepped: Bool) -> (texts: [String], spoken: Double, current: Int?) {
+        let k = client.karaokeState()
+        return (k.texts, stepped ? k.stepped : k.spoken, k.current)
+    }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }
@@ -26,6 +31,8 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var activity = ActivityLog()
     @Published private(set) var surgeAt: Date?
     @Published private(set) var pulseAt: Date?
+    /// The thinking pulse's visual twin: a shimmer across the orb.
+    @Published private(set) var shimmerAt: Date?
     /// Last interrupt (server or tap), drives the jar's ripple.
     @Published private(set) var interruptedAt: Date?
     /// Incoming calls show the push's `caller`; outgoing ones the cached assistant name.
@@ -36,6 +43,7 @@ final class CallManager: NSObject, ObservableObject {
     private let pushRegistry = PKPushRegistry(queue: .main)
     private let client = CallClient()
     private var voipToken: Data?
+    private var alertToken: Data?
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
@@ -54,6 +62,7 @@ final class CallManager: NSObject, ObservableObject {
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
         client.onPlayback = { [weak self] in self?.playing = $0 }
+        client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date() } }
         client.onClose = { [weak self] in self?.fail($0) }
         client.onWarning = { [weak self] in self?.error = $0 }
         pushRegistry.delegate = self
@@ -132,11 +141,21 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// Sends the PushKit token to the gateway once both it and the server token exist.
+    /// Sends both tokens in one register call; runs again whenever either changes (the gateway
+    /// requires the VoIP token, so an alert token alone waits for it).
     func registerPush() {
         guard let token = voipToken, Config.token != nil else { return }
+        let alert = alertToken
         Task { @MainActor in
-            do { try await Gateway.registerPush(token: token) } catch { self.error = "푸시 등록 실패: \(error.localizedDescription)" }
+            do { try await Gateway.registerPush(token: token, alertToken: alert) } catch { self.error = "푸시 등록 실패: \(error.localizedDescription)" }
         }
+    }
+
+    /// APNs alert token from `didRegisterForRemoteNotificationsWithDeviceToken`.
+    func setAlertToken(_ token: Data) {
+        guard token != alertToken else { return }
+        alertToken = token
+        registerPush()
     }
 
     // MARK: Call lifecycle

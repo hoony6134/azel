@@ -133,11 +133,24 @@ struct EmptyState: View {
 }
 
 /// §10: map a raw error to the user-facing title/body.
+/// Error text for the UI. Only network trouble and 5xx mean "unreachable"; a 4xx means the server
+/// answered and said no (user bug, 2026-11-21: a 400 on persona save read "닿지 않아요").
+/// `title` is short: callers prefix it ("저장하지 못했어요: …").
 enum FriendlyError {
     static func describe(_ error: Error) -> (title: String, message: String) {
-        if case GatewayError.http(let code) = error, code == 401 || code == 403 {
+        switch error {
+        case GatewayError.rejected(let detail):
+            return (detail, "서버가 요청을 받지 않았어요.")
+        case GatewayError.http(let code) where code == 401 || code == 403:
             return ("토큰이 맞지 않아요", "설정의 토큰을 다시 입력해 주세요.")
+        case GatewayError.http(404):
+            return ("이 기능은 서버 업데이트 후 사용할 수 있어요", "서버가 아직 이 기능을 모르는 것 같아요.")
+        case GatewayError.http(409):
+            return ("지금은 처리할 수 없어요. 잠시 후 다시 시도해 주세요", "서버가 다른 작업 중이에요.")
+        case GatewayError.http(let code) where (400..<500).contains(code):
+            return ("요청을 처리하지 못했어요 (HTTP \(code))", "서버가 요청을 받지 않았어요.")
+        default:
+            return ("\(AssistantName.current)에게 닿지 않아요", "서버에 연결할 수 없어요. 네트워크와 서버 주소를 확인해 주세요.")
         }
-        return ("\(AssistantName.current)에게 닿지 않아요", "서버에 연결할 수 없어요. 네트워크와 서버 주소를 확인해 주세요.")
     }
 }
