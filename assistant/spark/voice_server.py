@@ -1139,13 +1139,16 @@ async def qwen_schedule(text, now):
 
 
 async def schedule_reply(text, action, session, now=None):
-    """What to say for a schedule utterance, after a full gateway stored, listed or cancelled it."""
+    """What to say for a schedule utterance. The parser here is only a fast path: what it parses becomes the same
+    call_user / schedule_list / schedule_cancel tool call every model path uses (gateway tools_bridge), and the
+    tool's own result is spoken. No other code path writes schedules."""
     now = now or datetime.now(KST)
     if action == "list":
-        msg = {"type": "schedule", "action": "list"}
+        msg, tool = {"type": "schedule", "action": "list"}, ("schedule_list", {})
     elif action == "cancel":
         at, _ = parse_when(text, now)
         msg = {"type": "schedule", "action": "cancel", **({"at": at.timestamp()} if at else {})}
+        tool = ("schedule_cancel", {"at": at.isoformat()} if at else {})
     else:
         prior = pending_schedule.pop(session, (0, {}))[1]
         kind = "wake" if SCHED_WAKE.search(text) else prior.get("kind", "reminder")
@@ -1165,7 +1168,13 @@ async def schedule_reply(text, action, session, now=None):
         note = "" if kind == "wake" else text[:100]
         msg = {"type": "schedule", "action": "create", "at": at.isoformat(), "repeat": repeat, "kind": kind,
                "note": note, "persona_id": (CALL_PERSONA.get() or {}).get("id")}
-    try:
+        tool = ("call_user", {"when": at.isoformat(), "reason": note or "깨우는 전화", "kind": kind, "repeat": repeat})
+    if tool[0] in {t["name"] for t in gw_tools["defs"]}:
+        try:
+            return await gateway_tool(*tool)
+        except (RuntimeError, asyncio.TimeoutError):
+            return "지금은 예약을 받을 수 없어요."
+    try:  # shortcut: an older gateway without the tool registry; drop once every gateway serves tool_call
         reply = await links.request(msg)
     except (RuntimeError, asyncio.TimeoutError):
         return "지금은 예약을 받을 수 없어요."
@@ -3158,6 +3167,28 @@ if __name__ == "__main__":
         assert unconfirmed_check("끝나면 전화해줄 수 있어", ["맥북 작업이 끝나면 바로 전화드릴게요."]) == ["클로드가 답해요."] \
             or task_intent("끝나면 전화해줄 수 있어")  # or the task route takes it
         assert unconfirmed_check("물은 몇 도에서 끓어?", ["물은 100도에서 끓어요."]) == ["물은 100도에서 끓어요."]
+        def schedule_tool_check():
+            class ToolGatewayWS(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "tool_call":
+                        links.receive(self.lk, {"id": m["id"], "type": "tool_result",
+                                                "result": "내일 오전 10시에 깨워 드릴게요.", "is_error": False})
+            ws = ToolGatewayWS()
+            gw = ws.lk = links.add(ws)
+            links.receive(gw, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            gw_tools.update(at=time.time(), defs=[{"name": "call_user"}, {"name": "schedule_list"}])
+            sat8 = datetime(2026, 11, 21, 8, 0, tzinfo=KST)
+            said = asyncio.run(schedule_reply("내일 10시에 깨워 줘", "create", "st", sat8))
+            sent = [m for m in ws.sent if m.get("type") in ("tool_call", "schedule")]
+            links.remove(gw)
+            gw_tools.update(at=0.0, defs=[])
+            return said, sent
+        said, sent = schedule_tool_check()
+        assert said == "내일 오전 10시에 깨워 드릴게요." and len(sent) == 1 and sent[0]["type"] == "tool_call"
+        assert sent[0]["name"] == "call_user" and sent[0]["args"] == {"when": "2026-11-22T10:00:00+09:00",
+                                                                     "reason": "깨우는 전화", "kind": "wake", "repeat": None}
         said, sent, prompts = gateway_tools_check()
         assert said == ["앱에서 허용해 주세요.", "크롬을 열었어요."], said
         assert sent[0]["name"] == "macbook__run_command" and sent[0]["args"] == {"command": "open -a Chrome"}
