@@ -518,8 +518,9 @@ def split_ready(buf: str, final: bool, first: bool = False):
         m = re.match(r"\s*([^,.!?\n]{1,20},)\s", buf)
         if m and syllables(korean_only(m.group(1))) >= MIN_SYL:
             return [korean_only(m.group(1).strip())], buf[m.end():]
-    parts = [p.strip() for p in _SENT_END.split(buf)]
-    rest = "" if final else parts.pop()
+    parts = _SENT_END.split(buf)
+    rest = "" if final else parts.pop()  # unstripped: "에너지를 " + "이용" must keep its space
+    parts = [p.strip() for p in parts]
     out, cur = [], ""
     for p in parts:
         p = korean_only(p)
@@ -950,8 +951,9 @@ SYNTH_S_PER_SYL = float(os.environ.get("SYNTH_MS_PER_SYL", "150")) / 1000
 async def tts(sentence: str) -> tuple[bytes, int]:
     p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
-    # Fillers repeat constantly: synthesize them once (per voice). Nothing short is ever sent alone now.
-    cacheable = sentence in (FILLER, FILLER_LONG)
+    # Fillers and short openers ("네, 알겠습니다.") repeat constantly: synthesize them once (per voice). Under
+    # MIN_SYL is never cached (such a chunk is only ever a whole reply, and garbles more often).
+    cacheable = sentence in (FILLER, FILLER_LONG) or MIN_SYL <= syllables(sentence) <= 8
     key = (voice, style, sentence)
     if cacheable and key in _tts_cache:
         return _tts_cache[key]
@@ -1591,6 +1593,11 @@ if __name__ == "__main__":
         assert split_ready("오늘은 맑아요. 네.", True)[0] == ["오늘은 맑아요. 네."]
         assert split_ready("모두 " + "3,000원이고 " * 12, False)[0] == []  # never cut inside a number
         assert split_ready("마지막 문장", True) == (["마지막 문장"], "")
+        buf, out = "", []  # streamed two characters at a time, words keep their spaces
+        for i in range(0, len(text := "광합성은 식물이 빛 에너지를 이용해요. 그래서 산소가 나와요."), 2):
+            done, buf = split_ready(buf + text[i:i + 2], False)
+            out += done
+        assert out + split_ready(buf, True)[0] == ["광합성은 식물이 빛 에너지를 이용해요.", "그래서 산소가 나와요."], out
         assert split_ready("네, 알겠습니다. 오늘", False, first=True) == (["네, 알겠습니다."], "오늘")
         assert split_ready("오늘 날씨는요, 맑아요", False, first=True) == (["오늘 날씨는요,"], "맑아요")
         assert split_ready("네,", False, first=True) == ([], "네,")
