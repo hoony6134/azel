@@ -57,6 +57,8 @@ SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
     "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해. "
     "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
+    "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
+    "없으니, 도구가 없으면 할 수 없다고 하고 다시 물어봐. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
@@ -696,6 +698,20 @@ KO_HOURS = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "�
 _HOUR_RE = re.compile(r"(\d{1,2})\s*(?:시(?!간)|:\d{2})|(열한|열두|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*시(?!간)")
 
 
+# "오 분 뒤에 전화드릴게요" with nothing scheduled: a sentence saying the assistant did or will do an action is spoken only
+# when a tool in this turn confirmed one. Otherwise a scheduling request is asked back ("몇 분 뒤에…?"), anything else
+# goes to Claude.
+ACTION_CLAIM = re.compile(r"전화(를)? ?(드릴게요|드릴께요|드렸|걸게요|걸어 ?드릴게요|해 ?드릴게요)|예약(을)? ?(했|해 ?드렸|해 ?둘게요|"
+                          r"해 ?드릴게요|할게요|잡았|해 ?놨)|깨워 ?드릴게요|알람(을)? ?(맞췄|맞춰 ?(둘|드릴)게요)|맡겼|맡겨 ?(둘|드릴)게요|"
+                          r"실행했|열었(어요|습니다)|보냈(어요|습니다)|취소했")
+TOOL_REFUSED = re.compile(r"이미 통화 중|다 걸었어요|없는 도구|쓸 수 없어요|틀렸어요|실패|거절|만료|허용되지 않아|할 수 없어요|없어요\.?$")
+ASK_WHEN = "몇 분 뒤에 걸어 드릴까요?"
+
+
+class Unconfirmed(Exception):
+    """Qwen claimed an action no tool confirmed this turn."""
+
+
 class Ungrounded(Exception):
     """Qwen stated the user's plans without a source: the turn goes to Claude instead."""
 
@@ -1304,6 +1320,7 @@ async def respond(text, session, t0, timings, on_event=None):
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
+            confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
 
             async def say(s):
                 nonlocal flushed
@@ -1311,6 +1328,9 @@ async def respond(text, session, t0, timings, on_event=None):
                 if not grounded(s, sources):
                     timings["ungrounded"] = s[:80]
                     raise Ungrounded
+                if ACTION_CLAIM.search(s) and not confirmed["ok"]:
+                    timings["unconfirmed"] = s[:80]
+                    raise Unconfirmed
                 if guard and not flushed and content_free(" ".join(ack_held + [s])):
                     ack_held.append(s)  # "네," alone: keep it back until real content follows
                     return
@@ -1352,7 +1372,12 @@ async def respond(text, session, t0, timings, on_event=None):
                         async def tool_say(text):  # "앱에서 허용해 주세요" while an approval is pending
                             said_round.append(text)
                             await sentences.put(text)
-                        result = await run_tool(buf.strip().split("\n")[0], session, tool_say)
+                        line = buf.strip().split("\n")[0]
+                        result = await run_tool(line, session, tool_say)
+                        tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
+                        if (tool_name in ("call_user", "create_task", "schedule_cancel", "add_todo", "done_todo")
+                                or "__" in tool_name) and not TOOL_REFUSED.search(result.strip()):
+                            confirmed["ok"] = True
                         timings.setdefault("tools", []).append(ms(t_tool))
                         messages += [{"role": "assistant", "content": buf.strip()},
                                      {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
@@ -1373,6 +1398,12 @@ async def respond(text, session, t0, timings, on_event=None):
                     break
             except Ungrounded:
                 return await via_claude()  # never speak made-up plans
+            except Unconfirmed:  # never say an action happened when nothing did it
+                if SCHED_CALL.search(bare) or SCHED_WAKE.search(bare):
+                    pending_schedule[session] = (time.time(), {"kind": "wake" if SCHED_WAKE.search(bare) else "reminder"})
+                    await sentences.put(ASK_WHEN)
+                    return
+                return await via_claude()
         finally:
             await sentences.put(None)
 
@@ -3103,6 +3134,30 @@ if __name__ == "__main__":
             gw_tools.update(at=0.0, defs=[])
             globals().update(llm_stream=real_llm, tts=real[1])
             return said, sent, prompts
+        def unconfirmed_check(utterance, replies):
+            """Qwen claims an action no tool did: never spoken."""
+            async def lying_llm(messages, max_tokens=600):
+                yield replies.pop(0) if replies else "모르겠어요."
+
+            async def answer_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                yield "클로드가 답해요."
+
+            async def fake_tts(sentence, *a, **k):
+                return b"", 24000
+            globals().update(llm_stream=lying_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
+            pending_schedule.pop("unc", None)
+            out = asyncio.run(_collect(respond(utterance, "unc", time.perf_counter(), {})))
+            globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
+            return out
+
+        async def _collect(gen):
+            return [x async for x, *_ in gen]
+        # 2026-11-22 transcripts: nothing was scheduled, the assistant said it would call
+        assert unconfirmed_check("오분 있다가 호출어 확인이라고 전화해줘", ["오 분 뒤에 호출어 확인이라고 전화드릴게요."]) == [ASK_WHEN]
+        assert "unc" in pending_schedule  # the answer ("5분 뒤") completes the schedule
+        assert unconfirmed_check("끝나면 전화해줄 수 있어", ["맥북 작업이 끝나면 바로 전화드릴게요."]) == ["클로드가 답해요."] \
+            or task_intent("끝나면 전화해줄 수 있어")  # or the task route takes it
+        assert unconfirmed_check("물은 몇 도에서 끓어?", ["물은 100도에서 끓어요."]) == ["물은 100도에서 끓어요."]
         said, sent, prompts = gateway_tools_check()
         assert said == ["앱에서 허용해 주세요.", "크롬을 열었어요."], said
         assert sent[0]["name"] == "macbook__run_command" and sent[0]["args"] == {"command": "open -a Chrome"}
