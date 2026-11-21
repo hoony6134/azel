@@ -943,6 +943,7 @@ async def schedule_reply(text, action, session, now=None):
 _tts_cache: dict[str, tuple[bytes, int]] = {}
 # Measured 2026-11-21 against the shared TTS server (sohee): ~0.15 s of synthesis per syllable (about 0.7x real
 # time), one request at a time behind a GPU lock: two concurrent requests took longer than the same two in a row.
+PLAY_TAIL_S = float(os.environ.get("PLAY_TAIL_MS", "300")) / 1000  # after the phone's playback ends, then listen
 SYNTH_S_PER_SYL = float(os.environ.get("SYNTH_MS_PER_SYL", "150")) / 1000
 
 
@@ -1356,6 +1357,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
                 guard.first_end = guard.play_end = current["play_end"]
 
+    async def until_played():
+        """Stay 'speaking' until the phone has played everything sent, plus a short tail: only then is it the
+        user's turn. Speech meanwhile is a barge-in (pause/check), never a new turn. A pause stretches the wait."""
+        while current["paused_at"] is not None or (left := current["play_end"] + PLAY_TAIL_S - time.monotonic()) > 0:
+            await asyncio.sleep(0.05 if current["paused_at"] is not None else min(left, 0.2))
+
     async def pause():
         """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
         current["paused_at"] = time.monotonic()
@@ -1415,7 +1422,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "resume"})
 
     async def speak_briefing():
-        spoken = []
+        spoken, cut = [], False
         try:
             await send({"type": "state", "value": "speaking"})
             st = await gateway_settings()
@@ -1426,11 +1433,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 await send(audio=pcm)
                 if s not in (FILLER, FILLER_LONG):
                     spoken.append(s)
+        except asyncio.CancelledError:
+            cut = True
+            raise
         finally:  # what was actually said becomes the call's opening in history (the start event is an upsert)
             if spoken:
                 history[f"{current_persona(await gateway_settings())['id']}:{session}"].append(
                     {"role": "assistant", "content": " ".join(spoken)})
                 await links.log({**start_log, "opening": " ".join(spoken)})
+            if not cut:
+                await until_played()
             await send({"type": "state", "value": "listening"})
 
     async def tap_interrupt():
@@ -1475,7 +1487,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 await send({"type": "reply", "text": s, "route": route})
                 await send(audio=pcm)
             timings["total_ms"] = ms(t0)
-            await send({"type": "turn_done", "timings": timings})
+            queued = max(0, round((current["play_end"] - time.monotonic()) * 1000))  # still to play when generation ended
+            await until_played()
+            await send({"type": "turn_done", "timings": timings, "audio_ends_in_ms": queued})
         except asyncio.CancelledError:
             turn["interrupted"] = True
             raise
@@ -1485,6 +1499,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if text:  # turns with an empty transcript are not history
                 await links.log({"event": "turn", "log_id": log_id, "user": text, **turn,
                                  "timings": timings, "at": time.time()})
+            if not turn["interrupted"]:  # a failed turn's partial reply still plays out first
+                await until_played()
             await send({"type": "state", "value": "listening"})
 
     try:
@@ -2240,10 +2256,20 @@ if __name__ == "__main__":
             def one_turn(path):
                 with tc.websocket_connect(path, headers={"Authorization": "Bearer app-tok"}) as w:
                     w.send_bytes(speech)
+                    first_audio, states = None, []
                     while True:
                         m = w.receive()
-                        if m.get("text") and json.loads(m["text"])["type"] in ("turn_done", "error"):
+                        if m.get("bytes") and first_audio is None:
+                            first_audio = time.monotonic()
+                        ev = json.loads(m["text"]) if m.get("text") else {}
+                        if ev.get("type") == "state":
+                            states.append(ev["value"])
+                        if ev.get("type") in ("turn_done", "error"):
                             break
+                    # the reply is 0.5 s of audio: still "speaking" until it has played, plus the tail
+                    assert time.monotonic() - first_audio >= 0.5 + PLAY_TAIL_S - 0.05 and states[-1] == "speaking", states
+                    assert ev["type"] == "turn_done" and ev["audio_ends_in_ms"] > 300, ev
+                    assert json.loads(w.receive_text()) == {"type": "state", "value": "listening"}
                     w.send_text(json.dumps({"type": "hangup"}))
                 time.sleep(0.05)
             one_turn("/v1/call?session=ps&persona=luna")
