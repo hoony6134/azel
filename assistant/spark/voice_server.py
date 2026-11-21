@@ -8,6 +8,7 @@ Contract: ../PROTOCOL.md sections 1-2.
 """
 import asyncio
 import base64
+import contextlib
 import contextvars
 import hashlib
 import hmac
@@ -152,6 +153,54 @@ FILLER_AFTER_S = float(os.environ.get("FILLER_AFTER_MS", "1200")) / 1000  # say 
 NUDGE_AFTER_S = 9.0  # then FILLER_LONG once, counted from the start of the Claude turn
 # Whisper's classic outputs on silence or noise; never treat them as the user speaking.
 HALLUCINATIONS = {"시청해 주셔서 감사합니다", "시청해주셔서 감사합니다", "구독과 좋아요 부탁드립니다", "감사합니다", "MBC 뉴스 이덕영입니다"}
+# Whisper's sign-offs from its subtitle/news training data, heard in noise. Only a WHOLE utterance like this is dropped.
+HALLUCINATION_RE = re.compile(
+    r"((MBC|KBS|SBS|YTN|JTBC|TV조선|채널A|MBN|연합)\s*)?뉴스\s*\S{2,4}\s*(입니다|이었습니다|기자입니다)"
+    r"|시청\s*해\s*주셔서\s*(정말\s*)?감사(합니다|드립니다)|구독\s*(과|와|,)?\s*좋아요(\s*(부탁\S*|눌러\s*\S*|알림\S*))*"
+    r"|(구독|좋아요|알림\s*설정)\s*(부탁\S*|해\s*주세요)|다음\s*(영상|시간)에\s*(서\s*)?(만나요|뵙겠습니다)"
+    r"|(한국어\s*)?자막\s*(제공|제작)\S*(\s*\S+)?|영상\s*편집\s*\S*", re.I)
+STT_KWARGS = {"language": "korean", "task": "transcribe"}
+# Whisper's own guards (transformers 4.57): no conditioning on earlier text, and a segment that is too repetitive
+# (compression), too unsure (log-prob) or silent (no-speech) is re-decoded or dropped.
+STT_QUALITY = {**STT_KWARGS, "condition_on_prev_tokens": False, "compression_ratio_threshold": 2.4,
+               "logprob_threshold": -1.0, "no_speech_threshold": 0.6, "temperature": (0.0, 0.2, 0.4)}
+stt_quality = [True]  # turned off once if this transformers build refuses the kwargs (STT must keep working)
+MIN_STT_S = 0.3  # shorter audio is a click, not a word
+
+
+def collapse_repeats(text: str) -> str:
+    """'아니 아니 아니 아니' -> '아니'; '매우 매우 매우 좋아' -> '매우 좋아'; a word or a two-word phrase said 3+ times in a
+    row counts once. Whisper loops like this on noise; people rarely say a word three times on purpose."""
+    words = text.split()
+    for n in (1, 2):
+        out, i = [], 0
+        while i < len(words):
+            k = 1
+            while words[i + k * n:i + (k + 1) * n] == words[i:i + n]:
+                k += 1
+            if k >= 3:
+                out += words[i:i + n]
+                i += k * n
+            else:
+                out.append(words[i])
+                i += 1
+        words = out
+    return re.sub(r"(\S{1,4}?)\1{3,}", r"\1", " ".join(words))  # "아니아니아니아니" inside one token
+
+
+def clean_transcript(text: str) -> str:
+    """'' for noise: a subtitle/news sign-off as the whole utterance, or an utterance that is mostly a repeat loop."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return ""
+    collapsed = collapse_repeats(text)
+    before, after = len(text.split()), len(collapsed.split())
+    if before >= 6 and after <= before * 0.4:  # "아니 아니 아니 아니 아니 아니 …": a loop, not speech
+        return ""
+    bare = collapsed.strip(" .!?~,")
+    if bare in HALLUCINATIONS or HALLUCINATION_RE.fullmatch(bare):
+        return ""
+    return collapsed
 # A model name counts only as a request to use it ("오퍼스로", "소넷한테"), not as a topic ("하이쿠가 뭐야").
 _USE = r"\s*(으?로|한테|에게|모델)"
 MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){_USE}", "haiku": rf"(하이쿠|haiku){_USE}",
@@ -631,8 +680,29 @@ foreign_dropped = [0]  # sentences cleaned since start (route_eval reports it)
 URL = re.compile(r"\s*[(（]?\s*(?:https?://|www\.)[^\s)）]+[)）]?")
 
 
+CUT_MARK = " (여기서 끊김)"  # history only: the user heard the reply up to here (hung up or cut in)
+
+
+def heard_part(sent, cut_at, finished):
+    """(the sentences the phone had started playing by cut_at, whether the reply was cut short). `sent`: (sentence,
+    start, end) in phone playback time; audio is sent ahead of playback, so "sent" is not "heard"."""
+    heard = [s for s, start, _ in sent if start < cut_at]
+    return heard, not finished or len(heard) < len(sent) or bool(sent and sent[-1][2] > cut_at)
+
+
+def keep_heard(hist, entry, heard, cut):
+    """Rewrite a reply's history turn to what was actually heard, marked when cut off; nothing heard: no turn."""
+    for i in range(len(hist) - 1, -1, -1):
+        if hist[i] is entry:
+            if heard:
+                hist[i] = {"role": "assistant", "content": " ".join(heard) + (CUT_MARK if cut else "")}
+            else:
+                del hist[i]
+            return
+
+
 def korean_only(s: str) -> str:
-    s = URL.sub("", s)  # sources are said by name ("기상청 기준으로"), never read out as addresses
+    s = URL.sub("", s).replace(CUT_MARK.strip(), "")  # a model echoing the history marker never says it  # sources are said by name ("기상청 기준으로"), never read out as addresses
     t = FOREIGN.sub("", s)
     if t == s:
         return s
@@ -877,11 +947,19 @@ def decode_wav(data: bytes) -> np.ndarray:
 
 
 async def transcribe(wav: np.ndarray) -> str:
+    if len(wav) < MIN_STT_S * 16000:
+        return ""
     async with asr_lock:  # one GPU decode at a time
-        out = await asyncio.to_thread(asr, {"raw": wav, "sampling_rate": 16000},
-                                      generate_kwargs={"language": "korean", "task": "transcribe"})
-    text = out["text"].strip()
-    return "" if text.rstrip(".!") in HALLUCINATIONS else text
+        try:
+            out = await asyncio.to_thread(asr, {"raw": wav, "sampling_rate": 16000},
+                                          generate_kwargs=STT_QUALITY if stt_quality[0] else STT_KWARGS)
+        except (TypeError, ValueError) as e:
+            if not stt_quality[0]:
+                raise
+            print("whisper quality settings refused, using the plain ones:", type(e).__name__, e, flush=True)
+            stt_quality[0] = False
+            out = await asyncio.to_thread(asr, {"raw": wav, "sampling_rate": 16000}, generate_kwargs=STT_KWARGS)
+    return clean_transcript(out["text"])
 
 
 async def llm_stream(messages, max_tokens=600):
@@ -1367,8 +1445,9 @@ class Address:
         title_gap[self.hkey] = 0 if self.named else title_gap.get(self.hkey, 0) + 1
 
 
-async def respond(text, session, t0, timings, on_event=None):
-    """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
+async def respond(text, session, t0, timings, on_event=None, kept=None):
+    """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes. `kept` (a dict) gets
+    the history and the assistant turn added, so the call can cut it down to what the phone actually played."""
     settings = await gateway_settings()
     persona = current_persona(settings)
     hkey = f"{persona['id']}:{session}"  # history and the Claude session map are per persona
@@ -1612,6 +1691,8 @@ async def respond(text, session, t0, timings, on_event=None):
         if spoken:
             hist.append({"role": "assistant", "content": " ".join(spoken)})
             address.done()
+            if kept is not None:
+                kept.update(hist=hist, entry=hist[-1])
 
 
 app = FastAPI(title="assistant-voice")
@@ -1864,6 +1945,15 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
                 guard.first_end = guard.play_end = current["play_end"]
 
+    def cut_at():
+        """Now in phone playback time: playback stands still while paused."""
+        return current["paused_at"] if current["paused_at"] is not None else time.monotonic()
+
+    def queue_audio(sent, s, pcm, sr):
+        """Note when this sentence will play on the phone (before it is sent: send() moves play_end)."""
+        start = max(time.monotonic(), current["play_end"])
+        sent.append((s, start, start + len(pcm) / 2 / sr))
+
     async def until_played():
         """Stay 'speaking' until the phone has played everything sent, plus a short tail: only then is it the
         user's turn. Speech meanwhile is a barge-in (pause/check), never a new turn. A pause stretches the wait."""
@@ -1937,7 +2027,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "resume"}, gen=g)
 
     async def speak_briefing():
-        spoken, cut, gen = [], False, new_reply()
+        spoken, cut, gen, sent = [], False, new_reply(), []
         try:
             await send({"type": "state", "value": "speaking"})
             await send({"type": "reply_start", "reply_id": gen}, gen=gen)
@@ -1947,18 +2037,21 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st), title):
                 if s not in (FILLER, FILLER_LONG) and not spoken:
                     s = with_title(s, title)  # the briefing's first words always use the title
-                pcm, _ = await tts(s)
+                pcm, sr = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
+                if s not in (FILLER, FILLER_LONG):
+                    queue_audio(sent, s, pcm, sr)
                 await send(audio=pcm, gen=gen)
                 if s not in (FILLER, FILLER_LONG):
                     spoken.append(s)
         except asyncio.CancelledError:
             cut = True
+            spoken, short = heard_part(sent, cut_at(), False)
             raise
-        finally:  # what was actually said becomes the call's opening in history (the start event is an upsert)
+        finally:  # what was actually heard becomes the call's opening in history (the start event is an upsert)
             if spoken:
                 history[f"{current_persona(await gateway_settings())['id']}:{session}"].append(
-                    {"role": "assistant", "content": " ".join(spoken)})
+                    {"role": "assistant", "content": " ".join(spoken) + (CUT_MARK if cut and short else "")})
                 await links.log({**start_log, "opening": " ".join(spoken)})
             if not cut:
                 await until_played()
@@ -1981,6 +2074,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     async def answer(audio, text=None, timings=None):
         t0, timings, gen = time.perf_counter(), timings or {}, new_reply()
         turn = {"assistant": [], "activity": [], "route": "", "interrupted": False}
+        sent, kept, finished = [], {}, False
 
         async def on_event(ev):
             if ev.get("phase") in ("tool_start", "thinking"):
@@ -1995,24 +2089,34 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 return
             await send({"type": "transcript", "text": text})
             started = False
-            async for s, route, pcm, sr in respond(text, session, t0, timings, on_event=on_event):
-                if gen != current["gen"]:
-                    raise asyncio.CancelledError  # superseded while synthesizing: stop, say nothing more
-                if not started:
-                    await send({"type": "state", "value": "speaking"})
-                    await send({"type": "reply_start", "reply_id": gen}, gen=gen)  # new audio starts here
-                    started = True
-                turn["route"] = route
-                if s not in (FILLER, FILLER_LONG):
-                    turn["assistant"].append(s)
-                await send({"type": "reply", "text": s, "route": route}, gen=gen)
-                await send(audio=pcm, gen=gen)
+            # aclosing: the reply's history turn exists before a cut below rewrites it (no GC-time finally)
+            async with contextlib.aclosing(respond(text, session, t0, timings, on_event=on_event, kept=kept)) as replies:
+                async for s, route, pcm, sr in replies:
+                    if gen != current["gen"]:
+                        raise asyncio.CancelledError  # superseded while synthesizing: stop, say nothing more
+                    if not started:
+                        await send({"type": "state", "value": "speaking"})
+                        await send({"type": "reply_start", "reply_id": gen}, gen=gen)  # new audio starts here
+                        started = True
+                    turn["route"] = route
+                    if s not in (FILLER, FILLER_LONG):
+                        turn["assistant"].append(s)
+                        queue_audio(sent, s, pcm, sr)
+                    await send({"type": "reply", "text": s, "route": route}, gen=gen)
+                    await send(audio=pcm, gen=gen)
+            finished = True
             timings["total_ms"] = ms(t0)
             queued = max(0, round((current["play_end"] - time.monotonic()) * 1000))  # still to play when generation ended
             await until_played()
             await send({"type": "turn_done", "timings": timings, "audio_ends_in_ms": queued})
         except asyncio.CancelledError:
             turn["interrupted"] = True
+            # Hung up or cut in: history and the call log keep only what the phone played, marked as cut off, so
+            # the next turn (or the next call on this session) never treats the unheard rest as said.
+            heard, short = heard_part(sent, cut_at(), finished)
+            turn["assistant"] = heard
+            if kept:
+                keep_heard(kept["hist"], kept["entry"], heard, short)
             raise
         except Exception as e:  # keep the call alive on a failed turn
             await send({"type": "error", "message": f"{type(e).__name__}: {e}"})
@@ -2111,6 +2215,15 @@ if __name__ == "__main__":
     if CHECK_ONLY:
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
+        for noise in ["MBC 뉴스 김철수입니다.", "MBC 뉴스 이덕영입니다", "시청해 주셔서 감사합니다", "시청해주셔서 감사합니다!",
+                      "구독과 좋아요 부탁드립니다", "구독, 좋아요 알림설정", "자막 제공 배달의민족", "감사합니다.",
+                      "아니 아니 아니 아니 아니 아니 아니 아니", "네 네 네 네 네 네 네"]:
+            assert clean_transcript(noise) == "", noise  # Whisper's noise/subtitle outputs are not the user
+        for real in ["아니", "아니 그게 아니라", "매우 좋아", "네 네", "뉴스 좀 틀어줘", "정말 감사합니다 덕분에 살았어요"]:
+            assert clean_transcript(real) == real, real  # short real speech passes untouched
+        assert clean_transcript("매우 매우 매우 좋아") == "매우 좋아" and clean_transcript("아니아니아니아니") == "아니"
+        assert clean_transcript("그게 아니라 그게 아니라 그게 아니라 진짜로") == "그게 아니라 진짜로"
+        assert not STT_QUALITY["condition_on_prev_tokens"] and STT_QUALITY["compression_ratio_threshold"] == 2.4
 
         def unthought(chunks):
             f = Unthink()
@@ -2711,6 +2824,46 @@ if __name__ == "__main__":
             links.remove(lim)
             assert not [m for m in lim.ws.sent if m.get("type") == "call_log"]  # never to a limited gateway
             return logs
+        def hangup_leak_check():
+            """Hang up while the reply is still playing (its audio was all sent ahead), then call again on the same
+            session (the app reuses one id all day): only the part the phone played is history, marked as cut off,
+            and the unheard rest never reaches the next call's prompt or the call log."""
+            from fastapi.testclient import TestClient
+            prompts = []
+
+            async def fake_transcribe(audio):
+                return "안녕" if not prompts else "응 그래"
+
+            async def fake_llm(messages, max_tokens=600):
+                prompts.append(messages)
+                for d in (["물은 백 도에서 끓어요. ", "얼음은 영 도에서 녹아요. ", "소금물은 더 늦게 얼어요."]
+                          if len(prompts) == 1 else ["네, 말씀하세요."]):
+                    yield d
+
+            async def fake_tts(sentence):
+                return b"\0" * 96000, 24000  # two seconds each: the phone is still on the first when we hang up
+            globals().update(transcribe=fake_transcribe, llm_stream=fake_llm, tts=fake_tts,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            speech = (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+            for n in (1, 2):
+                with tc.websocket_connect("/v1/call?client=iphone&session=leak",
+                                          headers={"Authorization": "Bearer app-tok"}) as w:
+                    w.send_bytes(speech)
+                    texts = []
+                    while True:
+                        m = w.receive()
+                        f = json.loads(m["text"]) if m.get("text") else {}
+                        texts += [f["text"]] if f.get("type") == "reply" else []
+                        if (n == 1 and len(texts) >= 1 and m.get("bytes")) or f.get("type") in ("turn_done", "error"):
+                            break
+                    w.send_text(json.dumps({"type": "hangup"}))
+                time.sleep(0.2)
+            logs = [m for m in full.ws.sent if m.get("type") == "call_log" and m.get("event") == "turn"]
+            links.remove(full)
+            return list(history["azel:leak"]), prompts, logs
         def briefing_check(situation):
             """/v1/call?intent=briefing against a fake full gateway; returns (reply texts, frame types, call logs)."""
             from fastapi.testclient import TestClient
@@ -2947,6 +3100,15 @@ if __name__ == "__main__":
             globals().update(tts=real[1], llm_stream=real_llm)
         persona_check()
         logs = history_check()
+        hist, prompts, turn_logs = hangup_leak_check()
+        assert hist[:2] == [{"role": "user", "content": "안녕"},
+                            {"role": "assistant", "content": "물은 백 도에서 끓어요." + CUT_MARK}], hist
+        assert len(prompts) == 2 and not any("얼음" in m["content"] or "소금" in m["content"] for m in prompts[1]), prompts
+        assert turn_logs[0]["assistant"] == ["물은 백 도에서 끓어요."] and turn_logs[0]["interrupted"] is True
+        assert hist[-1] == {"role": "assistant", "content": "네, 말씀하세요."}  # a reply that finished: unmarked
+        assert heard_part([("a", 0, 2), ("b", 2, 4)], 3, True) == (["a", "b"], True)  # mid-"b": heard, but cut
+        assert heard_part([("a", 0, 2), ("b", 2, 4)], 5, True) == (["a", "b"], False)
+        assert korean_only("네, 세 시예요. (여기서 끊김)").strip() == "네, 세 시예요."
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs
         assert start["direction"] == "outgoing" and start["client"] == "iphone" and start["session"] == "h"  # user called
