@@ -135,7 +135,8 @@ final class AudioIO {
         if !cuePlayer.isPlaying { cuePlayer.play() }
     }
 
-    private var speechPlaying: Bool {
+    /// Reply audio is still queued or playing.
+    var speechPlaying: Bool {
         speechLock.lock(); defer { speechLock.unlock() }
         return ProcessInfo.processInfo.systemUptime < speechEnd
     }
@@ -152,6 +153,8 @@ final class AudioIO {
         try? input.setVoiceProcessingEnabled(true)
         input.isVoiceProcessingBypassed = false
         input.isVoiceProcessingAGCEnabled = true
+        // Duck other apps' audio as little as possible during the call (user bug, 2026-11-21).
+        input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
         let format = input.outputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0,
               let mono = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),
@@ -197,12 +200,18 @@ final class AudioIO {
     func pause() { player.pause() }
     func resume() { if engine.isRunning { player.play() } }
 
+    /// True while the engine (and so the mic and voice processing) is running.
+    var isRunning: Bool { engine.isRunning }
+    var voiceProcessingOn: Bool { engine.inputNode.isVoiceProcessingEnabled }
+
     func stop() {
         player.stop()
         cuePlayer.stop()
         engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()
+        // Voice processing left on keeps ducking other audio after the call; it only runs in calls.
+        if engine.inputNode.isVoiceProcessingEnabled { try? engine.inputNode.setVoiceProcessingEnabled(false) }
         levels.reset()
     }
 }

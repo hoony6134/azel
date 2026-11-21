@@ -6,6 +6,8 @@ final class FakeServer: URLProtocol {
     nonisolated(unsafe) static var routes: [String: (Int, String)] = [:]
     nonisolated(unsafe) static var delay: TimeInterval = 0
     /// Every request seen: method, path and body.
+    /// Binary bodies (wav) keyed like `routes`; checked first.
+    nonisolated(unsafe) static var rawRoutes: [String: Data] = [:]
     nonisolated(unsafe) static var seen: [(method: String, path: String, body: Data)] = []
 
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "fake.test" }
@@ -20,11 +22,13 @@ final class FakeServer: URLProtocol {
             while stream.hasBytesAvailable { let n = stream.read(&buf, maxLength: buf.count); if n <= 0 { break }; sent.append(buf, count: n) }
         }
         Self.seen.append((request.httpMethod ?? "GET", url.path, sent))
-        let (code, body) = Self.routes["\(request.httpMethod ?? "GET") \(url.path)"] ?? Self.routes[url.path] ?? (404, #"{"detail":"Not Found"}"#)
+        let key = "\(request.httpMethod ?? "GET") \(url.path)"
+        let raw = Self.rawRoutes[key]
+        let (code, body) = raw.map { _ in (200, "") } ?? Self.routes[key] ?? Self.routes[url.path] ?? (404, #"{"detail":"Not Found"}"#)
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.delay) { [self] in
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: code, httpVersion: nil, headerFields: nil)!,
                                 cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data(body.utf8))
+            client?.urlProtocol(self, didLoad: raw ?? Data(body.utf8))
             client?.urlProtocolDidFinishLoading(self)
         }
     }
@@ -53,6 +57,7 @@ final class LoadingTests: XCTestCase {
     override func tearDown() async throws {
         URLProtocol.unregisterClass(FakeServer.self)
         Config.testOverride = nil
+        FakeServer.rawRoutes = [:]
         try? FileManager.default.removeItem(at: dir)
     }
 

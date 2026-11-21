@@ -35,3 +35,13 @@ final class PlaybackGateTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from: Data((base + #","noise_mode":"noisy"}"#).utf8)).noise_mode, "noisy")
     }
 }
+
+final class DisplayStateTests: XCTestCase {
+    func testSpeakingLastsUntilPlaybackDrains() {
+        XCTAssertEqual(CallClient.displayState(server: "listening", playing: true), "speaking", "server moved on, audio still playing")
+        XCTAssertEqual(CallClient.displayState(server: "", playing: true), "speaking")
+        XCTAssertEqual(CallClient.displayState(server: "listening", playing: false), "listening", "drained: back to listening")
+        XCTAssertEqual(CallClient.displayState(server: "thinking", playing: true), "thinking", "a new turn's thinking still shows")
+        XCTAssertEqual(CallClient.displayState(server: "speaking", playing: false), "speaking")
+    }
+}

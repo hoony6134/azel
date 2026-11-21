@@ -115,6 +115,14 @@ final class CallClient {
             throw StartError.audio
         }
         receive(task)
+        pulseTimer?.invalidate()
+        wasPlaying = false
+        pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let playing = audio.speechPlaying
+            if playing != wasPlaying { wasPlaying = playing; onPlayback?(playing) }
+            if let cue = thinking.tick(now: ProcessInfo.processInfo.systemUptime) { self.cue(cue, listening: false) }
+        }
         // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
         let check = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -134,6 +142,7 @@ final class CallClient {
             switch result {
             case .success(.data(let pcm)):
                 audio.play(pcm)
+                DispatchQueue.main.async { self.thinking.audioArrived() }
                 statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
                 recorder?.assistant(pcm)
             case .success(.string(let text)):
@@ -153,7 +162,12 @@ final class CallClient {
                 default: break
                 }
                 recorder?.note(event)
-                DispatchQueue.main.async { self.onEvent?(event) }
+                DispatchQueue.main.async {
+                    if let cue = self.thinking.event(event.type, value: event.value, now: ProcessInfo.processInfo.systemUptime) {
+                        self.cue(cue, listening: false)
+                    }
+                    self.onEvent?(event)
+                }
             case .failure:
                 let status = (task.response as? HTTPURLResponse)?.statusCode
                 let message = Self.closeMessage(status: status, receivedAny: receivedAny)
@@ -168,6 +182,18 @@ final class CallClient {
     }
 
     private var gate = EarconGate()
+    /// Main thread only.
+    private var thinking = ThinkingCues()
+    private var pulseTimer: Timer?
+    /// Playback started or drained (main queue): the UI keeps 말하는 중 until the queue is empty.
+    var onPlayback: ((Bool) -> Void)?
+    private var wasPlaying = false
+
+    /// What the call UI shows: the server may report listening/turn_done before the reply's last
+    /// audio has played, so playing audio wins over those.
+    static func displayState(server: String, playing: Bool) -> String {
+        playing && (server == "listening" || server.isEmpty) ? "speaking" : server
+    }
 
     /// Plays a work sound if the gate allows; cues that would land on the user's voice wait up to
     /// 300 ms, then drop. Main thread.
@@ -221,6 +247,10 @@ final class CallClient {
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
         silenceCheck?.cancel()
+        pulseTimer?.invalidate()
+        pulseTimer = nil
+        thinking = ThinkingCues()
+        if wasPlaying { wasPlaying = false; onPlayback?(false) }
         if socket != nil {
             statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()
             Log.call.info("call stop: sent \(bytes, privacy: .public) B, received audio \(got, privacy: .public) B")

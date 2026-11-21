@@ -240,7 +240,12 @@ struct SettingsScreen<Extra: View>: View {
                     EmptyState(title: f.title, message: f.message, detail: loadError.localizedDescription, action: ("다시 시도", { Task { await load() } }))
                 }
                 if let s = Binding($settings) { assistantCard(s) }
+                // The wake listener runs only on the Mac, so enrollment lives there.
+                #if os(macOS)
                 Card("호출어") { WakeEnrollRow() }
+                #else
+                Card("호출어") { Text("호출어는 Mac에서 등록해요").foregroundStyle(Theme.text2) }
+                #endif
                 Card("커넥터") {
                     Button { showConnectors = true } label: {
                         HStack {

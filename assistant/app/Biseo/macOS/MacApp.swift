@@ -113,7 +113,7 @@ struct Popover: View {
                 Button("연결 설정…") { show() }.buttonStyle(.borderedProminent).tint(Theme.celadon)
             } else {
                 HStack(spacing: Theme.m) {
-                    MoonJar(state: call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
+                    MoonJar(state: call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
                             levels: call.levels, sway: true, tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon)
                         .frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: Theme.s) {
@@ -277,7 +277,7 @@ struct MacHome: View {
     @State private var openItem: HistoryItem?
 
     private var jarState: JarState {
-        call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline)
+        call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline)
     }
 
     var body: some View {

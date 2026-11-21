@@ -1,5 +1,6 @@
 import AVFoundation
 import CallKit
+import UIKit
 import PushKit
 
 /// CallKit + PushKit + `WS /v1/call`. Provider and push callbacks run on the main queue.
@@ -8,6 +9,10 @@ final class CallManager: NSObject, ObservableObject {
 
     @Published private(set) var inCall = false
     @Published private(set) var state = ""          // listening | thinking | speaking
+    /// Reply audio still playing (the server can move on before the last of it is heard).
+    @Published private(set) var playing = false
+    /// The state the UI shows: 말하는 중 while reply audio is still playing.
+    var displayState: String { CallClient.displayState(server: state, playing: playing) }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }
@@ -48,6 +53,7 @@ final class CallManager: NSObject, ObservableObject {
         super.init()
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
+        client.onPlayback = { [weak self] in self?.playing = $0 }
         client.onClose = { [weak self] in self?.fail($0) }
         client.onWarning = { [weak self] in self?.error = $0 }
         pushRegistry.delegate = self
@@ -98,7 +104,7 @@ final class CallManager: NSObject, ObservableObject {
 
     /// Tap on the jar while it speaks.
     func interrupt() {
-        guard inCall, state == "speaking" else { return }
+        guard inCall, displayState == "speaking" else { return }
         client.interrupt()
         log.apply(CallEvent(type: "interrupt"))
         state = "listening"
@@ -185,6 +191,10 @@ final class CallManager: NSObject, ObservableObject {
             MainActor.assumeIsolated { ActivityAnnouncer.toolStarted(label, thinking: thinking) } // handle() runs on main
         case "activity" where event.phase == "tool_end":
             pulseAt = Date()
+        case "hangup", "end":
+            // The server ended the call: tell CallKit so the system UI goes away.
+            fail(nil)
+            return
         case "error": error = event.message
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
@@ -242,10 +252,22 @@ extension CallManager: CXProviderDelegate {
         action.fulfill()
     }
 
+    /// X on the Dynamic Island, the Lock Screen or the app (user bug, 2026-11-21). There is only
+    /// ever one call, so end whatever is up even if the UUID doesn't match, and finish the hangup
+    /// inside a background task so it reaches the server while the app is backgrounded.
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
         incoming[action.callUUID] = nil
-        if action.callUUID == callUUID { teardown() }
+        Log.call.info("callkit end (matches current: \(action.callUUID == self.callUUID, privacy: .public))")
+        if inCall || callUUID != nil { Self.inBackgroundTask { self.teardown() } }
         action.fulfill()
+    }
+
+    /// Keeps the app alive for the few hundred ms the hangup frame and socket close need.
+    static func inBackgroundTask(_ work: () -> Void) {
+        var task = UIBackgroundTaskIdentifier.invalid
+        task = UIApplication.shared.beginBackgroundTask(withName: "hangup") { UIApplication.shared.endBackgroundTask(task) }
+        work()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
