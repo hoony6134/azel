@@ -395,8 +395,13 @@ def test_schedule_cancel_one_occurrence():
     assert w.cancels[-1] == ("rule", None, "2026-11-23T14:00:00+09:00")
     run(b.call("schedule_cancel", {"id": "one", "scope": "occurrence"}))
     assert w.cancels[-1] == ("one", None, None)  # a one-off: cancelled outright
-    run(b.call("schedule_cancel", {"id": "rule"}))
-    assert w.cancels[-1] == ("rule", None, None)  # default: the whole rule
+    n = len(w.cancels)
+    r = run(b.run("schedule_cancel", {"id": "rule"}))  # a rule with no scope: ask, cancel nothing
+    assert r["needs"]["kind"] == "clarify" and "매번" in r["needs"]["question"] and len(w.cancels) == n
+    run(b.call("schedule_cancel", {"id": "rule", "scope": "rule"}))
+    assert w.cancels[-1] == ("rule", None, None)  # said "매번": the whole rule
+    r = run(b.run("schedule_cancel", {}))  # nothing named and several items: ask which, never "the soonest"
+    assert r["needs"]["kind"] == "choose" and len(w.cancels) == n + 1
 
 
 def test_mcp_scopes():

@@ -2485,8 +2485,9 @@ async def schedule_put(request: Request, sid: str, body: dict, occurrence: str |
 
 @app.delete("/v1/schedule/{sid}")
 async def schedule_delete(request: Request, sid: str, occurrence: str | None = None):
-    return await act("schedule_cancel", {"id": sid, **({"scope": "occurrence", "at": occurrence} if occurrence else {})},
-                     request=request)
+    # the app deletes the item it shows: the whole rule unless one occurrence is named
+    return await act("schedule_cancel", {"id": sid, **({"scope": "occurrence", "at": occurrence} if occurrence else
+                                                       {"scope": "rule"})}, request=request)
 
 
 @app.get("/v1/history")

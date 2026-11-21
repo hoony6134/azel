@@ -65,8 +65,9 @@ SCHEDULE_LIST = {"name": "schedule_list", "description": "예약된 전화 목�
 SCHEDULE_CANCEL = {
     "name": "schedule_cancel",
     "description": "예약된 전화 하나를 취소한다. id, 시각(at), 또는 설명(description: 메모나 '내일 7시' 같은 말)으로 고른다. "
-                   "여러 개가 맞으면 아무것도 취소하지 않고 어느 것인지 돌려준다. 아무것도 안 주면 가장 가까운 예약. "
-                   "반복 예약은 scope: occurrence(at의 그 회차, 없으면 다음 회차 하나만) 또는 rule(반복 전체, 기본).",
+                   "여러 개가 맞으면 아무것도 취소하지 않고 어느 것인지 돌려준다. 아무것도 안 주면 예약이 하나일 때만 그것. "
+                   "반복 예약은 scope가 필요하다: occurrence(at의 그 회차, 없으면 다음 회차 하나만) 또는 rule(반복 전체). "
+                   "없으면 사용자에게 물어본다.",
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
         **PICK, "scope": {"type": "string", "enum": ["occurrence", "rule"]}}}}
 SCHEDULE_UPDATE = {
@@ -548,29 +549,33 @@ class Bridge:
         await self.d["state"]("PUT", f"/v1/state/kv/user-calls-{today}", rows[-100:])
 
     async def schedule_cancel(self, args):
-        """By id or time through the gateway's schedule_cancel; by description only when exactly one item matches.
-        scope="occurrence" on a recurring item skips one fire (the one at `at`, else the next) and keeps the rule."""
-        if args.get("scope") == "occurrence":
-            if args.get("at"):
-                iso(args["at"])
-            item, _ = await self.pick(args, soonest=True)
-            if not rule_of(item):
-                args = {**args, "id": item["id"]}  # a one-off item: cancelling its only occurrence is cancelling it
-            else:
+        """One item, always through pick(): by id, time or description. Nothing given: the only item, else ask which.
+        A recurring item needs a scope: occurrence skips one fire (the one at `at`, else the next) and keeps the
+        rule; rule cancels it all. Without one, ask: "내일 7시 알람 취소" must not end a daily 7 am rule."""
+        if args.get("at"):
+            iso(args["at"])
+        if args.get("id") or args.get("at") or str(args.get("description") or "").strip():
+            item, _ = await self.pick(args, soonest=False)
+        else:
+            items = await self.d["schedule_items"]()
+            if not items:
+                raise Fail("not_found", "취소할 예약이 없어요.")
+            if len(items) > 1:
+                raise Need("choose", "어느 예약을 취소할까요?",
+                           "아직 취소하지 않았어요. 어느 것인지 골라 주세요: " +
+                           "; ".join(f"{i['spoken']}(id {i['id']})" for i in items[:5]),
+                           [{"id": i["id"], "spoken": i["spoken"]} for i in items[:5]])
+            item = items[0]
+        if rule_of(item):
+            if args.get("scope") == "occurrence":
                 done = await self.d["schedule_cancel"](item["id"], None, occurrence=args.get("at") or item["at"])
                 return cancelled(done)
-        if args.get("id") or args.get("at"):
-            at = datetime.fromisoformat(args["at"]).timestamp() if args.get("at") else None
-            done = await self.d["schedule_cancel"](args.get("id"), at)
-            return cancelled(done)
-        if str(args.get("description") or "").strip():
-            item, _ = await self.pick(args, soonest=True)
-            done = await self.d["schedule_cancel"](item["id"], None)
-            return cancelled(done)
-        done = await self.d["schedule_cancel"](None, None)  # the soonest, as the voice path always did
-        if not done:
-            raise Fail("not_found", "취소할 예약이 없어요.")
-        return done[1], done[0]
+            if args.get("scope") != "rule":
+                raise Need("clarify", "이번 한 번만 취소할까요, 매번 취소할까요?",
+                           "아직 취소하지 않았어요. 반복 예약이라 scope가 필요해요: 이번 한 번이면 occurrence(그 날짜의 at과 함께), "
+                           "매번이면 rule로 다시 보내.", resend={**args, "id": item["id"]})
+        done = await self.d["schedule_cancel"](item["id"], None)
+        return cancelled(done)
 
     async def task_status(self, args):
         ts = [t for t in [await self.d["task_get"](args["id"])] if t] if args.get("id") else \
