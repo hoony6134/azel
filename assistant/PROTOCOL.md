@@ -9,7 +9,7 @@ now, kept in a 0600 file (`~/.config/biseo/token` on the Mac), never in code or 
 |---|---|---|---|
 | Voice server (STT, router, Qwen, TTS, calls) | vd-spark | `http://100.64.0.11:8891` | `spark/` |
 | Qwen3-TTS | vd-spark | `http://100.64.0.11:8890` | `spark/tts/` |
-| Claude gateway (Claude, settings, usage, devices, push, scheduler) | Mac now, deneb later | `http://100.64.0.8:8892` | `gateway/` |
+| Claude gateway (Claude, settings, usage, devices, push, scheduler) | every device: Mac, albireo, gienah, deneb (full); vd-spark, vd-core (limited) | `http://<host tailnet IP>:8892` (Mac `100.64.0.8`) | `gateway/` |
 | Agent daemon | Mac (later every host) | `http://100.64.0.8:8893/mcp` | `daemon/` |
 | iPhone app | iPhone | — | `ios/` |
 
@@ -37,20 +37,52 @@ answering a call the assistant placed; the server then speaks that call's openin
 The **gateway dials the voice server**, never the reverse: under the Headscale ACL the
 Spark (`tag:vujade`) may not open connections to jh hosts, and the Spark is shared team
 hardware that must not hold personal Claude credentials. Auth: `Authorization: Bearer`
-header (not query). One link at a time; a new one replaces the old. JSON text frames:
+header (not query). **Every gateway keeps its own link**; the voice server holds all of them at once.
+JSON text frames:
 
-- gateway → voice: `{"type":"settings","value":{…}}` (on connect and every change),
-  `{"type":"call","call_id","opening"}` (sent before the VoIP push),
+- gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority"}` first on every
+  connect (`priority`: lower is preferred; a link that never says hello counts as full, priority 50;
+  a new hello from the same `device` replaces that device's older link),
+  `{"type":"settings","value":{…}}` (on connect and every change; from any link, the last one wins,
+  since all gateways read the same shared settings),
+  `{"type":"call","call_id","opening"}` (sent before the VoIP push; may arrive on any link),
   `{"id","type":"text"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
-  `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run).
+  `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
+  that got the ask).
+
+Routing, per ask: the full-mode link with the lowest `priority` among healthy links (3+ consecutive
+failed asks — timeouts or errors without a `code` — make a link unhealthy until it answers again; it
+is then tried last). With no full link, limited links take the ask only when the utterance is not
+personal (calendar, mail, memory, contacts, GISTRA courses/assignments, Planit, briefings; task
+`schedule`); a personal ask is answered "개인 비서 기능은 지금 쓸 수 없어요." With no link at all:
+"지금 Claude 게이트웨이에 연결이 안 돼요." A dropped link fails only its own pending asks.
+`GET /health` lists the connected gateways.
 
 ## 2. One-shot turn — `POST /v1/turn` on the voice server (testing, benchmark)
 
 Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm16`,
 `done`). Kept for the benchmark; apps use `/v1/call`.
 
-## 3. Gateway API (`http://100.64.0.8:8892`)
+## 3. Gateway API (`http://<host>:8892`, every device)
+
+Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BISEO_DEVICE` (ASCII
+slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
+`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`.
+
+- **full** (jh-only devices): Claude via `claude -p` with the user's login and claude.ai connectors
+  (Cygnus MCP, Calendar, Gmail) plus every fresh device daemon. Runs the scheduler.
+- **limited** (team devices): Messages API only, key from `~/.config/biseo/anthropic_api_key`
+  (0600, else the gateway refuses to start); tools = MCP tools of the daemons registered *through
+  this gateway* only; personal asks get `{"type":"error","code":"personal","message":"개인 비서
+  기능은 지금 쓸 수 없어요."}`. No scheduler; `POST /v1/calls` → 403.
+
+All state below (settings, usage, devices, push tokens, calls, approvals, voice→Claude session map)
+lives in the shared state API (section 5), so every gateway answers the same. If ruchba is
+unreachable a gateway keeps answering from its cache: settings read-only (`PUT` → 503, last copy in
+`~/.config/biseo/settings.json`), usage queued in memory and flushed later, daemons that registered
+through this gateway stay usable, new approvals → 503. `claude -p` sessions resume only on the
+device that created them.
 
 - `POST /v1/ask` `{"text","session","model"?,"path"?,"task"?}` → NDJSON stream of
   `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}`.
@@ -66,15 +98,22 @@ Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm1
                 "triggers":{"deadline":true,"server_down":true}},
    "default_device":"맥북","device_fallback":["알비레오","스파크"]}
   ```
-- `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"cost_usd":…}`
-- `GET /v1/status` → `{"spark":{"ok","ms"},"gateway":{…},"devices":[{"name","ok","ms"}]}`
+- `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
+  (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
+  haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.
+- `GET /v1/status` → `{"spark":{"ok","ms"},"tts":…,"state":…,"gateway":{"device","mode","link"},
+  "devices":[{"name","ok","ms"}]}`
 - `POST /v1/devices/register` `{"name","url","harness":["claude_code",…]}` — daemons call
   this on start and every 60 s. `GET /v1/devices` lists them with `last_seen`.
 - `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production"}` —
   the app sends its PushKit token.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
-- `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call.
+- `POST /v1/alerts` — Alertmanager webhook; critical + firing → a call. One call per alert set per
+  10 min across gateways (lease `alert:<names>`); if ruchba is down, the gateway calls anyway.
+- Scheduled jobs (morning briefing, deadline check) run on every full gateway's clock; the one that
+  takes lease `job:<name>:<date>` (24 h) fires it. Lease holder = `<device>-<random per process>`,
+  so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
 - `GET /v1/approvals` / `POST /v1/approvals/{id}` `{"approve":true|false}` — risky
   daemon actions waiting for the user (the app shows them).
 
@@ -98,7 +137,7 @@ Config `~/.config/biseo/daemon.toml`: `name`, `allowed_roots`, `allowed_commands
 calls return `{"status":"pending_approval","approval_id"}` and are posted to the
 gateway's `/v1/approvals`. Every call is logged as a JSON line.
 
-## 5. Memory service (`http://100.64.0.10:8894`, ruchba, `memory/`)
+## 5. Memory service and shared state (`http://100.64.0.10:8894`, ruchba, `memory/`)
 
 Shared by every device. Long-term facts (preferences, people, projects, decisions) stay in
 Cygnus MCP memory; this service holds task context, raw records and contacts, in Postgres
@@ -120,3 +159,27 @@ Runs in Docker (`memory/compose.yaml`, container `biseo-memory`, restart unless-
 - Contacts `{"id","name","phone","email","notes","updated"}`: `POST /v1/contacts`
   `{"name","phone"?,"email"?,"notes"?}`, `GET /v1/contacts?q=…` (substring over all
   fields), `GET|PUT|DELETE /v1/contacts/{id}` (PUT replaces every field; 404 if missing).
+
+### State (gateways' shared state)
+
+Tables in their own schema (`state`, env `BISEO_STATE_SCHEMA`), created on start. Timestamps are
+epoch seconds. Gateways reach them only through these routes, never the DB, so DB credentials stay
+on ruchba. `BISEO_LIMITED_IPS` (comma list, e.g. vd-spark and vd-core) restricts requests from those
+tailnet IPs to the routes marked *limited* below whatever token they send (the shared token also sits
+on team machines); every other route answers them 403.
+
+- `GET /v1/state/settings` *limited* → the settings document (`{}` if none); `PUT` replaces it.
+- `POST /v1/state/usage` *limited* `{"device","model","path","task","input_tokens","output_tokens",
+  "cost_usd","ts"?}`; `GET /v1/state/usage?since=<epoch>` *limited* → rows, oldest first.
+- `PUT /v1/state/devices/{id}` *limited* `{"name","url","harness","gateway"}` (upsert, sets
+  `last_seen`); `GET /v1/state/devices` *limited* → `[{"id","name","url","harness","gateway","last_seen"}]`.
+- `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env"}`; `GET /v1/state/push_tokens`.
+- `POST /v1/state/calls` `{"id","reason","opening"}`; `POST /v1/state/calls/{id}/answer` → the row,
+  marked answered (404 if missing).
+- `POST /v1/state/approvals` *limited* `{"device","tool","command","cwd"}` → `{"approval_id"}`;
+  `GET /v1/state/approvals?status=pending`; `GET /v1/state/approvals/{id}` *limited*;
+  `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending.
+- `GET|PUT /v1/state/sessions/{voice_session}` `{"claude_session","device"}` (404 if unknown).
+- `POST /v1/state/leases/{name}` `{"holder","ttl_s"}` (0 < ttl ≤ 7 days) → `{"held","holder","expires"}`.
+  Atomic: taken if free or expired, renewed if `holder` already holds it, else `held:false` with the
+  current holder. `DELETE /v1/state/leases/{name}?holder=` → `{"released":bool}`.

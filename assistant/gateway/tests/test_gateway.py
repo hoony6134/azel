@@ -1,29 +1,44 @@
+import asyncio
 import importlib
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import fake_state  # noqa: E402
 
 
-@pytest.fixture
-def gw(tmp_path, monkeypatch):
+def start(tmp_path, monkeypatch, **env):
+    """Load a fresh gateway module wired to an in-memory fake of ruchba's state API."""
     (tmp_path / "token").write_text("t0k\n")
     monkeypatch.setenv("BISEO_HOME", str(tmp_path))
     monkeypatch.setenv("BISEO_CLAUDE", str(HERE / "fake_claude.py"))
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
     sys.path.insert(0, str(HERE.parent))
     import gateway
     g = importlib.reload(gateway)
+    g.fake = fake_state.make()
+    g.state.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=g.fake), base_url="http://state")
 
     async def no_link():  # tests drive the link by hand
         return None
     g.voice_link = no_link
+    return g
+
+
+@pytest.fixture
+def gw(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         yield g, c, tmp_path
 
@@ -107,7 +122,7 @@ def test_quiet_hours(gw):
 
 def test_device_prompt_fallback(gw):
     g, _, _ = gw
-    s = g.load_settings()
+    s = asyncio.run(g.load_settings())
     devs = [{"name": "알비레오", "id": "albireo"}, {"name": "스파크", "id": "spark"}]
     p = g.device_prompt(s, devs)
     assert p.index("알비레오") < p.index("스파크") and "기본 기기 맥북는 꺼져" in p
@@ -118,7 +133,6 @@ def test_device_prompt_fallback(gw):
 
 def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
-    import asyncio
     placed = []
 
     async def fake_place(reason, opening=None):
@@ -136,7 +150,6 @@ def test_deadline_call_only_when_due(gw, monkeypatch):
 
 def test_link_serves_ask_and_cancel(gw):
     g, _, _ = gw
-    import asyncio
     sent = []
 
     class FakeWS:
@@ -165,3 +178,174 @@ def test_link_serves_ask_and_cancel(gw):
     a1 = [m for m in sent if m.get("id") == "a1"]
     assert "".join(m["delta"] for m in a1 if m["type"] == "text") == "네, 확인했어요." and a1[-1]["type"] == "done"
     assert not any(m.get("id") == "a2" and m["type"] == "done" for m in sent)  # cancelled before finishing
+
+
+# ---------- shared state ----------
+def test_state_is_shared_not_local(gw):
+    g, c, tmp = gw
+    c.put("/v1/settings", json={"default_model": "opus"})
+    assert g.fake.db["settings"]["default_model"] == "opus"
+    g.fake.db["settings"]["monthly_budget_usd"] = 7  # another gateway changed it
+    assert c.get("/v1/settings").json()["monthly_budget_usd"] == 7
+    c.post("/v1/ask", json={"text": "a"})
+    assert g.fake.db["usage"][0]["device"] == "macbook" and g.fake.db["usage"][0]["cost_usd"] == 0.5
+    assert c.get("/v1/usage").json()["by_device"] == {"macbook": 0.5}
+    c.post("/v1/devices/register", json={"id": "albireo", "name": "알비레오", "url": "http://a/mcp"})
+    assert g.fake.db["devices"]["albireo"]["gateway"] == "macbook"
+    c.post("/v1/push/register", json={"voip_token": "tok", "bundle_id": "xyz.scian.biseo"})
+    assert g.fake.db["push"]["tok"]["env"] == "sandbox"
+    assert not (tmp / "gateway.db").exists()
+
+
+def test_first_start_seeds_ruchba_from_old_settings(tmp_path, monkeypatch):
+    (tmp_path / "settings.json").write_text(json.dumps({"default_model": "opus", "monthly_budget_usd": 300}))
+    g = start(tmp_path, monkeypatch)
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        assert c.get("/v1/settings").json()["monthly_budget_usd"] == 300
+    assert g.fake.db["settings"] == {"default_model": "opus", "monthly_budget_usd": 300}
+
+
+def test_ruchba_down_read_only(gw):
+    g, c, tmp = gw
+    c.put("/v1/settings", json={"default_model": "opus"})
+    c.post("/v1/devices/register", json={"id": "macbook", "name": "맥북", "url": "http://x/mcp"})
+    g.state.cache.clear()  # nothing cached in memory: the settings file copy and local devices must do
+    g.fake.state.down = True
+    assert c.get("/v1/settings").json()["default_model"] == "opus"
+    assert c.put("/v1/settings", json={"default_model": "haiku"}).status_code == 503
+    assert c.post("/v1/approvals", json={"device": "macbook", "command": "rm x"}).status_code == 503
+    ev = events(c.post("/v1/ask", json={"text": "a", "session": "s1"}))
+    assert ev[-1]["type"] == "done"  # Claude still answers
+    args = json.loads((tmp / "args.json").read_text())
+    assert "mcp__macbook" in args  # this device's own daemon still works
+    assert len(g.pending_usage) == 1 and g.fake.db["usage"] == []
+    g.fake.state.down = False
+    c.post("/v1/ask", json={"text": "b"})
+    assert len(g.fake.db["usage"]) == 2 and g.pending_usage == []  # the queued row was flushed
+
+
+def test_resume_only_on_the_device_that_made_the_session(gw):
+    g, c, tmp = gw
+    g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}
+    c.post("/v1/ask", json={"text": "a", "session": "s9"})
+    assert "--resume" not in json.loads((tmp / "args.json").read_text())
+    assert g.fake.db["sessions"]["s9"] == {"claude_session": "sess-1", "device": "macbook"}
+    c.post("/v1/ask", json={"text": "b", "session": "s9"})
+    args = json.loads((tmp / "args.json").read_text())
+    assert args[args.index("--resume") + 1] == "sess-1"
+
+
+def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
+    g, _, _ = gw
+    ran = []
+
+    async def fake_place(reason, opening=None):
+        ran.append(g.INSTANCE)
+        return {"call_id": "x"}
+    monkeypatch.setattr(g, "place_call", fake_place)
+    g.in_quiet_hours = lambda s, now=None: False
+    g.fake.db["settings"] = {"proactive": {**g.DEFAULTS["proactive"], "triggers": {"deadline": False}}}
+    now = datetime(2026, 11, 21, 8, 0, tzinfo=g.KST)
+    for inst in ["macbook-aaa", "albireo-bbb", "gienah-ccc"]:  # three gateways tick in the same minute
+        monkeypatch.setattr(g, "INSTANCE", inst)
+        asyncio.run(g.scheduler_tick(now, {}))
+    assert ran == ["macbook-aaa"]
+    monkeypatch.setattr(g, "INSTANCE", "macbook-new")  # the winner restarts: still no second call
+    asyncio.run(g.scheduler_tick(now, {}))
+    assert ran == ["macbook-aaa"]
+    g.fake.state.down = True  # no lease service: skip rather than risk several calls
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 22, 8, 0, tzinfo=g.KST), {}))
+    assert ran == ["macbook-aaa"]
+
+
+def test_alert_calls_once_across_gateways(gw, monkeypatch):
+    g, c, _ = gw
+    g.in_quiet_hours = lambda s, now=None: False
+    body = {"alerts": [{"status": "firing", "labels": {"severity": "critical", "alertname": "NodeDown"}}]}
+    assert c.post("/v1/alerts", json=body).json()["called"]
+    monkeypatch.setattr(g, "INSTANCE", "albireo-x")
+    assert not c.post("/v1/alerts", json=body).json()["called"]
+
+
+# ---------- limited mode (team devices) ----------
+@pytest.fixture
+def limited(tmp_path, monkeypatch):
+    (tmp_path / "anthropic_api_key").write_text("sk-test\n")
+    os.chmod(tmp_path / "anthropic_api_key", 0o600)
+    g = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        yield g, c, tmp_path
+
+
+def test_limited_key_file_must_be_private(tmp_path, monkeypatch):
+    (tmp_path / "anthropic_api_key").write_text("sk-test\n")
+    os.chmod(tmp_path / "anthropic_api_key", 0o644)
+    with pytest.raises(AssertionError, match="chmod 600"):
+        start(tmp_path, monkeypatch, BISEO_MODE="limited")
+    os.unlink(tmp_path / "anthropic_api_key")
+    with pytest.raises(AssertionError, match="limited mode needs"):
+        start(tmp_path, monkeypatch, BISEO_MODE="limited")
+
+
+def test_limited_refuses_personal_data(limited, monkeypatch):
+    g, c, tmp = limited
+
+    async def fake_anthropic(body):
+        return {"content": [{"type": "text", "text": "1400원이에요."}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+    monkeypatch.setattr(g, "anthropic", fake_anthropic)
+    for text, task in [("내일 일정 알려줘", None), ("메일 왔어?", None), ("뭐든", "schedule"), ("GISTRA 과제", None)]:
+        ev = events(c.post("/v1/ask", json={"text": text, "task": task}))
+        assert ev == [{"type": "error", "code": "personal", "message": "개인 비서 기능은 지금 쓸 수 없어요."}]
+    ok = events(c.post("/v1/ask", json={"text": "최근 통화 내용:\n사용자: 내일 일정 알려줘\n\n고마워, 근데 환율은?"}))
+    assert ok[0] == {"type": "text", "delta": "1400원이에요.\n"}  # personal words in history alone do not refuse
+    assert c.post("/v1/calls", json={"reason": "manual"}).status_code == 403
+    assert not (tmp / "args.json").exists()  # `claude -p` never ran
+
+
+def test_limited_uses_api_with_own_daemon_only(limited, monkeypatch):
+    g, c, tmp = limited
+    c.post("/v1/devices/register", json={"id": "spark", "name": "스파크", "url": "http://spark/mcp"})
+    g.fake.db["devices"]["macbook"] = {"id": "macbook", "name": "맥북", "url": "http://mac/mcp", "harness": [],
+                                       "gateway": "macbook", "last_seen": 9e12}
+    rpc, bodies = [], []
+
+    async def fake_mcp(url, method, params):
+        rpc.append((url, method, params))
+        if method == "tools/list":
+            return {"tools": [{"name": "list_dir", "description": "ls", "inputSchema": {"type": "object"}}]}
+        return {"content": [{"type": "text", "text": "a.txt b.txt"}], "isError": False}
+
+    async def fake_anthropic(body):
+        bodies.append(json.loads(json.dumps(body)))
+        if len(bodies) == 1:
+            return {"content": [{"type": "text", "text": "볼게요."}, {"type": "tool_use", "id": "t1",
+                    "name": "spark__list_dir", "input": {"path": "~"}}], "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 1000, "output_tokens": 100}}
+        return {"content": [{"type": "text", "text": "파일이 두 개 있어요."}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1000, "output_tokens": 100}}
+    monkeypatch.setattr(g, "mcp", fake_mcp)
+    monkeypatch.setattr(g, "anthropic", fake_anthropic)
+    ev = events(c.post("/v1/ask", json={"text": "스파크 홈 폴더에 뭐 있어?", "model": "sonnet", "path": "claude_code"}))
+    assert "".join(e["delta"] for e in ev if e["type"] == "text") == "볼게요.\n파일이 두 개 있어요.\n"
+    assert ev[-1]["path"] == "api" and ev[-1]["cost_usd"] == pytest.approx((2000 * 2 + 200 * 10) / 1e6)
+    assert {u for u, _, _ in rpc} == {"http://spark/mcp"}  # never the Mac's daemon
+    assert ("http://spark/mcp", "tools/call", {"name": "list_dir", "arguments": {"path": "~"}}) in rpc
+    assert [t["name"] for t in bodies[0]["tools"]] == ["spark__list_dir"]
+    assert bodies[0]["model"] == "claude-sonnet-5-5" and "개인 데이터" in bodies[0]["system"]
+    assert bodies[1]["messages"][-1]["content"][0] == {"type": "tool_result", "tool_use_id": "t1",
+                                                       "content": "a.txt b.txt", "is_error": False}
+    assert not (tmp / "args.json").exists()
+
+
+def test_mcp_client_parses_sse_and_json(gw, monkeypatch):
+    g, _, _ = gw
+    answers = iter([
+        httpx.Response(200, headers={"content-type": "text/event-stream"},
+                       text='event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n\n'),
+        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"message": "nope"}})])
+    real = httpx.AsyncClient
+    monkeypatch.setattr(g.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(lambda r: next(answers))))
+    assert asyncio.run(g.mcp("http://d/mcp", "tools/list", {})) == {"tools": []}
+    with pytest.raises(RuntimeError, match="nope"):
+        asyncio.run(g.mcp("http://d/mcp", "tools/list", {}))

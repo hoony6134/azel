@@ -4,7 +4,9 @@
   <key>Label</key><string>xyz.scian.biseo-gateway</string>
   <key>ProgramArguments</key><array><string>/Users/jh/.local/bin/uv</string><string>run</string><string>gateway.py</string></array>
   <key>WorkingDirectory</key><string>__GATEWAY_DIR__</string>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/jh/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/jh/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>BISEO_DEVICE</key><string>macbook</string><key>BISEO_MODE</key><string>full</string>
+    <key>BISEO_PRIORITY</key><string>10</string></dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/Users/jh/Library/Logs/biseo-gateway.log</string>
   <key>StandardErrorPath</key><string>/Users/jh/Library/Logs/biseo-gateway.log</string>

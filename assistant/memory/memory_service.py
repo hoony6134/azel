@@ -1,9 +1,11 @@
-"""박비서 memory: raw records (hybrid search), task context, contacts. Long-term facts stay in Cygnus MCP.
+"""박비서 memory: raw records (hybrid search), task context, contacts, and the gateways' shared state.
+Long-term facts stay in Cygnus MCP.
 
 Contract: ../PROTOCOL.md section 5. Runs on ruchba in Docker (compose.yaml), Tailscale IP only.
 """
 import hmac
 import os
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,11 @@ PORT = int(os.environ.get("BISEO_PORT", "8894"))
 MODEL_REPO, MODEL_FILE = "Xenova/multilingual-e5-small", "onnx/model_quantized.onnx"
 KINDS = ("transcript", "task_log", "daemon_result", "note")
 W_VEC, W_LEX, W_FRESH, FRESH_DAYS = 0.6, 0.3, 0.1, 30
+STATE = os.environ.get("BISEO_STATE_SCHEMA", "state")
+assert STATE.replace("_", "").isalnum(), "BISEO_STATE_SCHEMA must be a plain identifier"
+# Team machines (vd-spark, vd-core) run limited gateways: from these tailnet IPs only the routes marked
+# `lim` answer, whatever token is sent, because the shared token also sits on those machines.
+LIMITED_IPS = {ip.strip() for ip in os.environ.get("BISEO_LIMITED_IPS", "").split(",") if ip.strip()}
 
 SCHEMA = """
 create extension if not exists pg_trgm;
@@ -40,6 +47,29 @@ create table if not exists context(
 create table if not exists contacts(
     id bigserial primary key, name text not null, phone text, email text, notes text,
     updated timestamptz not null default now());
+"""
+# Gateways' shared state (PROTOCOL.md section 5, "State"). Timestamps go out as epoch seconds.
+STATE_SCHEMA = f"""
+create schema if not exists {STATE};
+create table if not exists {STATE}.kv(key text primary key, value jsonb not null, updated timestamptz not null default now());
+create table if not exists {STATE}.usage(
+    id bigserial primary key, ts timestamptz not null default now(), device text, model text, path text, task text,
+    input_tokens int not null default 0, output_tokens int not null default 0, cost_usd double precision not null default 0);
+create index if not exists usage_ts on {STATE}.usage (ts);
+create table if not exists {STATE}.devices(
+    id text primary key, name text not null, url text not null, harness jsonb not null default '[]',
+    gateway text, last_seen timestamptz not null default now());
+create table if not exists {STATE}.push_tokens(
+    token text primary key, bundle_id text not null, env text not null, ts timestamptz not null default now());
+create table if not exists {STATE}.calls(
+    id text primary key, reason text, opening text, status text, created timestamptz not null default now());
+create table if not exists {STATE}.approvals(
+    id text primary key, device text, tool text, command text, cwd text, status text not null default 'pending',
+    created timestamptz not null default now(), decided timestamptz);
+create table if not exists {STATE}.sessions(
+    voice_session text primary key, claude_session text not null, device text not null,
+    updated timestamptz not null default now());
+create table if not exists {STATE}.leases(name text primary key, holder text not null, expires timestamptz not null);
 """
 
 
@@ -67,10 +97,16 @@ def db(sql, args=None):
         return cur.fetchall() if cur.description else []
 
 
-def auth(request: Request):
+def token_only(request: Request):
     got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     if not hmac.compare_digest(got.encode(), TOKEN.encode()):
         raise HTTPException(401, "bad token")
+
+
+def auth(request: Request):
+    token_only(request)
+    if request.client and request.client.host in LIMITED_IPS:
+        raise HTTPException(403, "not allowed from a limited host")
 
 
 @asynccontextmanager
@@ -79,6 +115,7 @@ async def lifespan(app):
     from psycopg.rows import dict_row
     pool = ConnectionPool(DB_URL, min_size=1, max_size=4, open=True, kwargs={"autocommit": True, "row_factory": dict_row})
     db(SCHEMA)
+    db(STATE_SCHEMA)
     embed = Embedder()
     yield
     pool.close()
@@ -86,6 +123,7 @@ async def lifespan(app):
 
 app = FastAPI(title="biseo-memory", lifespan=lifespan)
 v1 = Depends(auth)
+lim = Depends(token_only)  # also open to limited hosts
 
 
 @app.get("/health")
@@ -205,6 +243,194 @@ def put_contact(cid: int, c: Contact):
 @app.delete("/v1/contacts/{cid}", dependencies=[v1])
 def delete_contact(cid: int):
     return {"deleted": one_contact(db("delete from contacts where id=%s returning id", (cid,)))["id"]}
+
+
+# ---------- gateways' shared state ----------
+EPOCH = "extract(epoch from {0})::float8 as {0}"
+
+
+@app.get("/v1/state/settings", dependencies=[lim])
+def get_state_settings():
+    rows = db(f"select value from {STATE}.kv where key='settings'")
+    return rows[0]["value"] if rows else {}
+
+
+@app.put("/v1/state/settings", dependencies=[v1])
+def put_state_settings(body: dict):
+    return db(f"insert into {STATE}.kv values('settings', %s, now()) on conflict(key) do update"
+              " set value=excluded.value, updated=now() returning value", (Jsonb(body),))[0]["value"]
+
+
+class Usage(BaseModel):
+    device: str | None = None
+    model: str
+    path: str
+    task: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0
+    ts: float | None = None  # epoch seconds; set only when replaying old rows (gateway --migrate)
+
+
+@app.post("/v1/state/usage", dependencies=[lim])
+def add_usage(u: Usage):
+    db(f"insert into {STATE}.usage(ts, device, model, path, task, input_tokens, output_tokens, cost_usd)"
+       " values(coalesce(to_timestamp(%s), now()),%s,%s,%s,%s,%s,%s,%s)",
+       (u.ts, u.device, u.model, u.path, u.task, u.input_tokens, u.output_tokens, u.cost_usd))
+    return {"ok": True}
+
+
+@app.get("/v1/state/usage", dependencies=[lim])
+def list_usage(since: float = 0):
+    return db(f"select {EPOCH.format('ts')}, device, model, path, task, input_tokens, output_tokens, cost_usd"
+              f" from {STATE}.usage where ts >= to_timestamp(%s) order by ts", (since,))
+
+
+class Device(BaseModel):
+    name: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    harness: list[str] = []
+    gateway: str | None = None
+
+
+@app.put("/v1/state/devices/{did}", dependencies=[lim])
+def put_device(did: str, d: Device):
+    db(f"insert into {STATE}.devices values(%s,%s,%s,%s,%s,now()) on conflict(id) do update set name=excluded.name,"
+       " url=excluded.url, harness=excluded.harness, gateway=excluded.gateway, last_seen=now()",
+       (did, d.name, d.url, Jsonb(d.harness), d.gateway))
+    return {"ok": True}
+
+
+@app.get("/v1/state/devices", dependencies=[lim])
+def list_devices():
+    return db(f"select id, name, url, harness, gateway, {EPOCH.format('last_seen')} from {STATE}.devices order by id")
+
+
+class PushToken(BaseModel):
+    bundle_id: str = Field(min_length=1)
+    env: str = "sandbox"
+
+
+@app.put("/v1/state/push_tokens/{token}", dependencies=[v1])
+def put_push_token(token: str, p: PushToken):
+    db(f"insert into {STATE}.push_tokens values(%s,%s,%s,now()) on conflict(token) do update"
+       " set bundle_id=excluded.bundle_id, env=excluded.env, ts=now()", (token, p.bundle_id, p.env))
+    return {"ok": True}
+
+
+@app.get("/v1/state/push_tokens", dependencies=[v1])
+def list_push_tokens():
+    return db(f"select token, bundle_id, env from {STATE}.push_tokens")
+
+
+class Call(BaseModel):
+    id: str = Field(min_length=1)
+    reason: str = ""
+    opening: str = ""
+
+
+@app.post("/v1/state/calls", dependencies=[v1])
+def add_call(c: Call):
+    db(f"insert into {STATE}.calls values(%s,%s,%s,'ringing',now())", (c.id, c.reason, c.opening))
+    return {"ok": True}
+
+
+@app.post("/v1/state/calls/{cid}/answer", dependencies=[v1])
+def answer_call(cid: str):
+    rows = db(f"update {STATE}.calls set status='answered' where id=%s"
+              f" returning id, reason, opening, status, {EPOCH.format('created')}", (cid,))
+    if not rows:
+        raise HTTPException(404, "no such call")
+    return rows[0]
+
+
+class Approval(BaseModel):
+    device: str = ""
+    tool: str = ""
+    command: str = ""
+    cwd: str = ""
+
+
+APPROVAL_COLS = f"id, device, tool, command, cwd, status, {EPOCH.format('created')}, {EPOCH.format('decided')}"
+
+
+@app.post("/v1/state/approvals", dependencies=[lim])
+def add_approval(a: Approval):
+    aid = uuid.uuid4().hex[:12]
+    db(f"insert into {STATE}.approvals(id, device, tool, command, cwd) values(%s,%s,%s,%s,%s)",
+       (aid, a.device, a.tool, a.command, a.cwd))
+    return {"approval_id": aid}
+
+
+@app.get("/v1/state/approvals", dependencies=[v1])
+def list_approvals(status: str = "pending"):
+    return db(f"select {APPROVAL_COLS} from {STATE}.approvals where status=%s order by created desc", (status,))
+
+
+@app.get("/v1/state/approvals/{aid}", dependencies=[lim])
+def get_approval(aid: str):
+    rows = db(f"select {APPROVAL_COLS} from {STATE}.approvals where id=%s", (aid,))
+    if not rows:
+        raise HTTPException(404, "no such approval")
+    return rows[0]
+
+
+class Decision(BaseModel):
+    approve: bool
+
+
+@app.post("/v1/state/approvals/{aid}", dependencies=[v1])
+def decide_approval(aid: str, d: Decision):
+    status = "approved" if d.approve else "rejected"
+    if not db(f"update {STATE}.approvals set status=%s, decided=now() where id=%s and status='pending' returning id",
+              (status, aid)):
+        raise HTTPException(409, "not pending")
+    return {"id": aid, "status": status}
+
+
+class Session(BaseModel):
+    claude_session: str = Field(min_length=1)
+    device: str = Field(min_length=1)
+
+
+@app.get("/v1/state/sessions/{voice_session}", dependencies=[v1])
+def get_session(voice_session: str):
+    rows = db(f"select claude_session, device from {STATE}.sessions where voice_session=%s", (voice_session,))
+    if not rows:
+        raise HTTPException(404, "no such session")
+    return rows[0]
+
+
+@app.put("/v1/state/sessions/{voice_session}", dependencies=[v1])
+def put_session(voice_session: str, s: Session):
+    db(f"insert into {STATE}.sessions values(%s,%s,%s,now()) on conflict(voice_session) do update"
+       " set claude_session=excluded.claude_session, device=excluded.device, updated=now()",
+       (voice_session, s.claude_session, s.device))
+    return {"ok": True}
+
+
+class Lease(BaseModel):
+    holder: str = Field(min_length=1)
+    ttl_s: float = Field(gt=0, le=7 * 86400)
+
+
+@app.post("/v1/state/leases/{name}", dependencies=[v1])
+def take_lease(name: str, lease: Lease):
+    """Take or renew a lease. Atomic: only one holder wins while it is unexpired."""
+    rows = db(f"insert into {STATE}.leases values(%s,%s,now() + make_interval(secs => %s))"
+              " on conflict(name) do update set holder=excluded.holder, expires=excluded.expires"
+              f" where {STATE}.leases.expires < now() or {STATE}.leases.holder = excluded.holder"
+              f" returning holder, {EPOCH.format('expires')}", (name, lease.holder, lease.ttl_s))
+    if rows:
+        return {"held": True, **rows[0]}
+    cur = db(f"select holder, {EPOCH.format('expires')} from {STATE}.leases where name=%s", (name,))
+    return {"held": False, **(cur[0] if cur else {})}
+
+
+@app.delete("/v1/state/leases/{name}", dependencies=[v1])
+def release_lease(name: str, holder: str):
+    return {"released": bool(db(f"delete from {STATE}.leases where name=%s and holder=%s returning name",
+                                (name, holder)))}
 
 
 if __name__ == "__main__":

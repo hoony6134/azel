@@ -31,7 +31,7 @@ TTS_URL = os.environ.get("TTS_URL", "http://100.64.0.11:8890/v1/audio/speech")
 TTS_VOICE = os.environ.get("TTS_VOICE", "sohee")
 STT_MODEL = os.environ.get("STT_MODEL", "openai/whisper-large-v3-turbo")
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "/run/secrets/biseo_token")
-NAME = os.environ.get("ASSISTANT_NAME", "김비서")
+NAME = os.environ.get("ASSISTANT_NAME", "박비서")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "12"))
 END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
 KST = timezone(timedelta(hours=9))
@@ -52,6 +52,11 @@ FILLER_LONG = "조금만 더 기다려 주세요."
 # Whisper's classic outputs on silence or noise; never treat them as the user speaking.
 HALLUCINATIONS = {"시청해 주셔서 감사합니다", "시청해주셔서 감사합니다", "구독과 좋아요 부탁드립니다", "감사합니다", "MBC 뉴스 이덕영입니다"}
 MODEL_WORDS = {"opus": r"오퍼스|opus", "sonnet": r"소넷|sonnet", "haiku": r"하이쿠|haiku"}
+# Personal data only full-mode gateways may touch (same list as the gateway's PERSONAL).
+PERSONAL = re.compile(r"일정|캘린더|스케줄|회의|약속|메일|이메일|편지함|기억|메모리|연락처|과제|수업|시험|성적|마감|할 ?일"
+                      r"|브리핑|지스트라|GISTRA|플래닛|Planit", re.I)
+NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
+NO_GATEWAY = "지금 Claude 게이트웨이에 연결이 안 돼요."
 TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트|에러", "mac": r"맥북|파일|폴더|터미널",
               "schedule": r"일정|할 일|과제|캘린더|회의|수업|마감|알람|브리핑"}
 
@@ -67,42 +72,74 @@ history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
 client = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5))
 
 
-class GatewayLink:
-    """The gateway dials in here (Spark may not open connections to jh hosts, and personal
-    Claude credentials stay off this shared team machine). Asks go out, answers come back."""
+class Link:
+    """One gateway connection. Gateways dial in here (Spark may not open connections to jh hosts, and
+    personal Claude credentials stay off this shared team machine)."""
+
+    def __init__(self, ws):
+        self.ws, self.lock = ws, asyncio.Lock()
+        self.device, self.mode, self.priority = "?", "full", 50  # until hello (older gateways never send one)
+        self.fails = 0  # consecutive failed asks; 3 or more = unhealthy, tried last
+
+    async def send(self, obj):
+        async with self.lock:
+            await self.ws.send_text(json.dumps(obj, ensure_ascii=False))
+
+
+class GatewayLinks:
+    """Every connected gateway at once. Asks go to the healthiest full-mode link by priority (lower first);
+    with no full link, limited links take only non-personal asks. Settings and call openings may come
+    from any link (the gateways share state)."""
 
     def __init__(self):
-        self.ws = None
-        self.send_lock = asyncio.Lock()
-        self.queues: dict[str, asyncio.Queue] = {}
+        self.links: list[Link] = []
+        self.queues: dict[str, tuple[asyncio.Queue, Link]] = {}
         self.settings: dict = {}
         self.openings: dict[str, str] = {}
 
-    async def send(self, obj):
-        ws = self.ws
-        if ws is None:
-            raise RuntimeError("지금 Claude 게이트웨이에 연결이 안 돼요.")
-        async with self.send_lock:
-            await ws.send_text(json.dumps(obj, ensure_ascii=False))
+    def add(self, ws):
+        lk = Link(ws)
+        self.links.append(lk)
+        return lk
 
-    def receive(self, msg):
+    def remove(self, lk):
+        if lk in self.links:
+            self.links.remove(lk)
+        for q, owner in self.queues.values():
+            if owner is lk:
+                q.put_nowait({"type": "error", "message": "게이트웨이 연결이 끊겼어요."})
+
+    def pick(self, personal: bool) -> Link:
+        """The link for one ask; RuntimeError carries a speakable reason when none may take it."""
+        ranked = sorted(self.links, key=lambda lk: (lk.fails >= 3, lk.priority))
+        full = [lk for lk in ranked if lk.mode == "full"]
+        if full:
+            return full[0]
+        if personal:
+            raise RuntimeError(NO_PERSONAL)
+        limited = [lk for lk in ranked if lk.mode == "limited"]
+        if limited:
+            return limited[0]
+        raise RuntimeError(NO_GATEWAY)
+
+    def receive(self, lk, msg):
         t = msg.get("type")
-        if t == "settings":
+        if t == "hello":
+            lk.device, lk.mode = str(msg.get("device", "?")), msg.get("mode", "full")
+            lk.priority = int(msg.get("priority", 50))
+            for old in [o for o in self.links if o is not lk and o.device == lk.device]:
+                self.remove(old)  # that gateway reconnected; its old socket is dead
+        elif t == "settings":
             self.settings = msg.get("value") or {}
         elif t == "call":
             if len(self.openings) > 100:
                 self.openings.pop(next(iter(self.openings)))
             self.openings[msg["call_id"]] = msg.get("opening", "")
         elif msg.get("id") in self.queues:
-            self.queues[msg["id"]].put_nowait(msg)
-
-    def drop(self):
-        self.ws = None
-        for q in self.queues.values():
-            q.put_nowait({"type": "error", "message": "게이트웨이 연결이 끊겼어요."})
+            self.queues[msg["id"]][0].put_nowait(msg)
 
 
-link = GatewayLink()
+links = GatewayLinks()
 
 _SENT_END = re.compile(r"(?<=[.!?。…~])\s+|\n+")
 
@@ -175,33 +212,37 @@ async def llm_stream(messages):
 
 
 async def gateway_settings():
-    return link.settings  # pushed by the gateway on connect and on every change
+    return links.settings  # pushed by the gateways on connect and on every change
 
 
-async def claude_stream(text, session, model, task, timeout=180):
-    """Text deltas from the gateway over the link; RuntimeError carries a speakable message."""
+async def claude_stream(text, session, model, task, personal=False, timeout=180):
+    """Text deltas from a gateway over its link; RuntimeError carries a speakable message."""
+    lk = links.pick(personal)
     rid, q, finished = uuid.uuid4().hex, asyncio.Queue(), False
-    link.queues[rid] = q
+    links.queues[rid] = (q, lk)
     try:
-        await link.send({"type": "ask", "id": rid, "text": text, "session": session, "model": model, "task": task})
+        await lk.send({"type": "ask", "id": rid, "text": text, "session": session, "model": model, "task": task})
         while True:
             try:
                 ev = await asyncio.wait_for(q.get(), timeout)
             except asyncio.TimeoutError:
+                lk.fails += 1
                 raise RuntimeError("Claude 답이 너무 늦어서 끊었어요.")
             if ev["type"] == "text":
                 yield ev["delta"]
             elif ev["type"] == "error":
                 finished = True
+                if not ev.get("code"):  # budget/personal refusals are answers, not a sick gateway
+                    lk.fails += 1
                 raise RuntimeError(ev.get("message", "Claude를 쓸 수 없어요."))
             elif ev["type"] == "done":
-                finished = True
+                finished, lk.fails = True, 0
                 return
     finally:
-        link.queues.pop(rid, None)
-        if not finished and link.ws is not None:  # barge-in or timeout: stop the Claude run too
+        links.queues.pop(rid, None)
+        if not finished and lk in links.links:  # barge-in or timeout: stop the Claude run too
             try:
-                await link.send({"type": "cancel", "id": rid})
+                await lk.send({"type": "cancel", "id": rid})
             except Exception:
                 pass
 
@@ -261,7 +302,8 @@ async def respond(text, session, t0, timings):
                 await sentences.put(FILLER_LONG)
         nudger = asyncio.create_task(nudge())
         try:
-            async for delta in claude_stream(recent_context(hist) + text, session, model, task):
+            personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
+            async for delta in claude_stream(recent_context(hist) + text, session, model, task, personal):
                 got_text.set()
                 buf += delta
                 done, buf = split_ready(buf, final=False)
@@ -270,7 +312,7 @@ async def respond(text, session, t0, timings):
         except RuntimeError as e:
             buf = str(e)
         except httpx.HTTPError:
-            buf = "지금 Claude 게이트웨이에 연결이 안 돼요."
+            buf = NO_GATEWAY
         finally:
             nudger.cancel()
         for s in split_ready(buf, final=True)[0]:
@@ -321,7 +363,9 @@ app = FastAPI(title="assistant-voice")
 
 @app.get("/health")
 def health():
-    return {"ok": True, "stt": STT_MODEL, "llm": LLM_MODEL, "voice": TTS_VOICE}
+    return {"ok": True, "stt": STT_MODEL, "llm": LLM_MODEL, "voice": TTS_VOICE,
+            "gateways": [{"device": lk.device, "mode": lk.mode, "priority": lk.priority, "fails": lk.fails}
+                         for lk in links.links]}
 
 
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(auth)])
@@ -394,17 +438,14 @@ async def gateway_link(ws: WebSocket):
         await ws.close(code=4401)
         return
     await ws.accept()
-    if link.ws is not None:
-        link.drop()  # a newer gateway connection replaces the old one
-    link.ws = ws
+    lk = links.add(ws)  # every gateway stays connected; routing picks one per ask
     try:
         while True:
-            link.receive(json.loads(await ws.receive_text()))
+            links.receive(lk, json.loads(await ws.receive_text()))
     except (WebSocketDisconnect, ValueError):
         pass
     finally:
-        if link.ws is ws:
-            link.drop()
+        links.remove(lk)
 
 
 @app.websocket("/v1/call")
@@ -466,7 +507,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
-            opening = link.openings.pop(call_id, "")
+            opening = links.openings.pop(call_id, "")
             if opening:
                 parts = split_ready(opening, final=True)[0]
                 history[session].append({"role": "assistant", "content": opening})
@@ -523,15 +564,85 @@ if __name__ == "__main__":
         assert list(t.feed(quiet)) == []
         short = (np.ones(3000, np.int16) * 3000).tobytes()   # 0.19 s blip: no turn
         assert [k for k, _ in t.feed(short + quiet)] == ["start"]
-        lk = GatewayLink()
+        class FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def send_text(self, raw):
+                self.sent.append(json.loads(raw))
+
+        gl = GatewayLinks()
+        mac, alb, spark = (gl.add(FakeWS()) for _ in range(3))
+        gl.receive(mac, {"type": "hello", "device": "macbook", "mode": "full", "priority": 10})
+        gl.receive(alb, {"type": "hello", "device": "albireo", "mode": "full", "priority": 20})
+        gl.receive(spark, {"type": "hello", "device": "spark", "mode": "limited", "priority": 90})
+        gl.receive(alb, {"type": "settings", "value": {"default_model": "opus"}})  # settings from any link
+        gl.receive(spark, {"type": "call", "call_id": "c1", "opening": "좋은 아침이에요."})  # openings too
+        assert gl.settings["default_model"] == "opus" and gl.openings["c1"] == "좋은 아침이에요."
+        assert gl.pick(True) is mac and gl.pick(False) is mac
+        mac.fails = 3  # unhealthy: the next full link by priority takes over
+        assert gl.pick(True) is alb
+        mac.fails = 0
         q = asyncio.Queue()
-        lk.queues["r1"] = q
-        lk.receive({"type": "settings", "value": {"default_model": "opus"}})
-        lk.receive({"type": "call", "call_id": "c1", "opening": "좋은 아침이에요."})
-        lk.receive({"id": "r1", "type": "text", "delta": "네"})
-        lk.receive({"id": "zz", "type": "text", "delta": "lost"})  # unknown ids are ignored
-        assert lk.settings["default_model"] == "opus" and lk.openings["c1"] == "좋은 아침이에요."
+        gl.queues["r1"] = (q, mac)
+        gl.receive(mac, {"id": "r1", "type": "text", "delta": "네"})
+        gl.receive(mac, {"id": "zz", "type": "text", "delta": "lost"})  # unknown ids are ignored
         assert q.get_nowait()["delta"] == "네" and q.empty()
-        lk.drop()
-        assert q.get_nowait()["type"] == "error" and lk.ws is None
+        q2 = asyncio.Queue()
+        gl.queues["r2"] = (q2, alb)
+        gl.remove(mac)  # only the dropped link's asks fail
+        assert q.get_nowait()["type"] == "error" and q2.empty() and mac not in gl.links
+        gl.remove(alb)
+        assert gl.pick(False) is spark  # no full link: limited takes non-personal asks only
+        try:
+            gl.pick(True)
+            raise AssertionError("personal ask reached a limited gateway")
+        except RuntimeError as e:
+            assert str(e) == NO_PERSONAL
+        again = gl.add(FakeWS())
+        gl.receive(again, {"type": "hello", "device": "spark", "mode": "limited", "priority": 90})
+        assert gl.links == [again]  # a reconnect replaces that device's old link
+        gl.remove(again)
+        try:
+            gl.pick(False)
+            raise AssertionError("picked a link with none connected")
+        except RuntimeError as e:
+            assert str(e) == NO_GATEWAY
+        old = gl.add(FakeWS())  # a gateway that predates hello counts as full
+        assert gl.pick(True) is old
+        gl.remove(old)
+        assert PERSONAL.search("내일 일정 알려줘") and PERSONAL.search("메일 왔어?") and not PERSONAL.search("환율 알려줘")
+
+        async def stream_check():  # end to end over the module-level links, incl. barge-in cancel
+            a, b = links.add(FakeWS()), links.add(FakeWS())
+            links.receive(a, {"type": "hello", "device": "macbook", "mode": "full", "priority": 10})
+            links.receive(b, {"type": "hello", "device": "spark", "mode": "limited", "priority": 90})
+            gen = claude_stream("서버 괜찮아?", "s", None, "chat")
+            first = asyncio.ensure_future(gen.__anext__())
+            await asyncio.sleep(0)
+            ask = a.ws.sent[-1]
+            assert ask["type"] == "ask" and not b.ws.sent
+            links.receive(a, {"id": ask["id"], "type": "text", "delta": "네"})
+            assert await first == "네"
+            await gen.aclose()  # barge-in
+            assert a.ws.sent[-1] == {"type": "cancel", "id": ask["id"]} and not links.queues
+            links.remove(a)
+            got = []
+            gen = claude_stream("환율 알려줘", "s", None, "chat")
+            task = asyncio.ensure_future(gen.__anext__())
+            await asyncio.sleep(0)
+            ask = b.ws.sent[-1]
+            links.receive(b, {"id": ask["id"], "type": "text", "delta": "1400원이에요."})
+            got.append(await task)
+            links.receive(b, {"id": ask["id"], "type": "done"})
+            got += [d async for d in gen]
+            assert got == ["1400원이에요."] and b.ws.sent[-1]["type"] == "ask"  # finished: no cancel
+            try:
+                async for _ in claude_stream("오늘 일정", "s", None, "schedule", personal=True):
+                    pass
+                raise AssertionError("personal ask went to the limited link")
+            except RuntimeError as e:
+                assert str(e) == NO_PERSONAL
+            links.remove(b)
+        asyncio.run(stream_check())
         print("voice_server checks ok")
