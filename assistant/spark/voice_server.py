@@ -945,7 +945,10 @@ _tts_cache: dict[str, tuple[bytes, int]] = {}
 # Measured 2026-11-21 against the shared TTS server (sohee): ~0.15 s of synthesis per syllable (about 0.7x real
 # time), one request at a time behind a GPU lock: two concurrent requests took longer than the same two in a row.
 PLAY_TAIL_S = float(os.environ.get("PLAY_TAIL_MS", "300")) / 1000  # after the phone's playback ends, then listen
+# The server slows down when the shared GPU is busy, so the rate is tracked from real calls (the slowest of the
+# default and a moving average), and merging leaves a 1.5x margin.
 SYNTH_S_PER_SYL = float(os.environ.get("SYNTH_MS_PER_SYL", "150")) / 1000
+synth_rate = [SYNTH_S_PER_SYL]
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
@@ -958,8 +961,11 @@ async def tts(sentence: str) -> tuple[bytes, int]:
     if cacheable and key in _tts_cache:
         return _tts_cache[key]
     body = {"input": sentence, "voice": voice, "response_format": "wav", **({"instructions": style} if style else {})}
+    t = time.perf_counter()
     r = await client.post(TTS_URL, json=body)
     r.raise_for_status()
+    if (n := syllables(sentence)) >= MIN_SYL:
+        synth_rate[0] = 0.7 * synth_rate[0] + 0.3 * (time.perf_counter() - t) / n
     wav, sr = sf.read(io.BytesIO(r.content), dtype="int16")
     if cacheable and len(_tts_cache) < 500:
         _tts_cache[key] = (wav.tobytes(), sr)
@@ -1112,7 +1118,7 @@ async def respond(text, session, t0, timings, on_event=None):
         s = back.pop() if back else await sentences.get()
         if s is None or s in (FILLER, FILLER_LONG):
             return s
-        room = max(0.0, play_end - time.monotonic()) / SYNTH_S_PER_SYL
+        room = max(0.0, play_end - time.monotonic()) / (1.5 * max(SYNTH_S_PER_SYL, synth_rate[0]))
         while not back and not sentences.empty():
             nxt = sentences.get_nowait()
             if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
