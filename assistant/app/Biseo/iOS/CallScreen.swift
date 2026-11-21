@@ -16,7 +16,7 @@ struct CallScreen: View {
     /// The persona's glaze (§17.6); incoming calls come from the primary.
     private var tint: Color { (call.activePersona ?? PersonaModel.shared.primary)?.glaze ?? Theme.glazeCeladon }
 
-    private var jarState: JarState { JarState(callState: call.state, inCall: call.inCall, held: call.held) }
+    private var jarState: JarState { JarState(callState: call.displayState, inCall: call.inCall, held: call.held) }
 
     var body: some View {
         withFeedback

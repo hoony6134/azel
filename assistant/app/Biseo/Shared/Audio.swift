@@ -135,7 +135,8 @@ final class AudioIO {
         if !cuePlayer.isPlaying { cuePlayer.play() }
     }
 
-    private var speechPlaying: Bool {
+    /// Reply audio is still queued or playing.
+    var speechPlaying: Bool {
         speechLock.lock(); defer { speechLock.unlock() }
         return ProcessInfo.processInfo.systemUptime < speechEnd
     }

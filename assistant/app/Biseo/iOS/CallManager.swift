@@ -9,6 +9,10 @@ final class CallManager: NSObject, ObservableObject {
 
     @Published private(set) var inCall = false
     @Published private(set) var state = ""          // listening | thinking | speaking
+    /// Reply audio still playing (the server can move on before the last of it is heard).
+    @Published private(set) var playing = false
+    /// The state the UI shows: 말하는 중 while reply audio is still playing.
+    var displayState: String { CallClient.displayState(server: state, playing: playing) }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }
@@ -49,6 +53,7 @@ final class CallManager: NSObject, ObservableObject {
         super.init()
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
+        client.onPlayback = { [weak self] in self?.playing = $0 }
         client.onClose = { [weak self] in self?.fail($0) }
         client.onWarning = { [weak self] in self?.error = $0 }
         pushRegistry.delegate = self
@@ -99,7 +104,7 @@ final class CallManager: NSObject, ObservableObject {
 
     /// Tap on the jar while it speaks.
     func interrupt() {
-        guard inCall, state == "speaking" else { return }
+        guard inCall, displayState == "speaking" else { return }
         client.interrupt()
         log.apply(CallEvent(type: "interrupt"))
         state = "listening"

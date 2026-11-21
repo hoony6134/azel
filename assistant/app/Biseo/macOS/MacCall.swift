@@ -10,6 +10,10 @@ final class MacCall: ObservableObject {
 
     @Published private(set) var inCall = false
     @Published private(set) var state = ""          // listening | thinking | speaking
+    /// Reply audio still playing (the server can move on before the last of it is heard).
+    @Published private(set) var playing = false
+    /// The state the UI shows: 말하는 중 while reply audio is still playing.
+    var displayState: String { CallClient.displayState(server: state, playing: playing) }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }
@@ -37,6 +41,7 @@ final class MacCall: ObservableObject {
 
     private init() {
         client.onEvent = { [weak self] in self?.handle($0) }
+        client.onPlayback = { [weak self] in self?.playing = $0 }
         client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
         client.onWarning = { [weak self] in self?.error = $0 }
     }
@@ -142,7 +147,7 @@ final class MacCall: ObservableObject {
 
     /// Tap on the jar while it speaks.
     func interrupt() {
-        guard inCall, state == "speaking" else { return }
+        guard inCall, displayState == "speaking" else { return }
         client.interrupt()
         log.apply(CallEvent(type: "interrupt"))
         state = "listening"
@@ -271,7 +276,7 @@ struct CallPanelView: View {
     @ObservedObject var call: MacCall
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    private var jarState: JarState { call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : .offline }
+    private var jarState: JarState { call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : .offline }
 
     var body: some View {
         HStack(spacing: Theme.m) {

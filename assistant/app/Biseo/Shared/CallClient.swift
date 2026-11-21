@@ -116,9 +116,12 @@ final class CallClient {
         }
         receive(task)
         pulseTimer?.invalidate()
-        pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self, let cue = thinking.tick(now: ProcessInfo.processInfo.systemUptime) else { return }
-            self.cue(cue, listening: false)
+        wasPlaying = false
+        pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let playing = audio.speechPlaying
+            if playing != wasPlaying { wasPlaying = playing; onPlayback?(playing) }
+            if let cue = thinking.tick(now: ProcessInfo.processInfo.systemUptime) { self.cue(cue, listening: false) }
         }
         // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
         let check = DispatchWorkItem { [weak self] in
@@ -182,6 +185,15 @@ final class CallClient {
     /// Main thread only.
     private var thinking = ThinkingCues()
     private var pulseTimer: Timer?
+    /// Playback started or drained (main queue): the UI keeps 말하는 중 until the queue is empty.
+    var onPlayback: ((Bool) -> Void)?
+    private var wasPlaying = false
+
+    /// What the call UI shows: the server may report listening/turn_done before the reply's last
+    /// audio has played, so playing audio wins over those.
+    static func displayState(server: String, playing: Bool) -> String {
+        playing && (server == "listening" || server.isEmpty) ? "speaking" : server
+    }
 
     /// Plays a work sound if the gate allows; cues that would land on the user's voice wait up to
     /// 300 ms, then drop. Main thread.
@@ -238,6 +250,7 @@ final class CallClient {
         pulseTimer?.invalidate()
         pulseTimer = nil
         thinking = ThinkingCues()
+        if wasPlaying { wasPlaying = false; onPlayback?(false) }
         if socket != nil {
             statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()
             Log.call.info("call stop: sent \(bytes, privacy: .public) B, received audio \(got, privacy: .public) B")
