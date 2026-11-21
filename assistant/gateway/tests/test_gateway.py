@@ -607,7 +607,7 @@ def test_ruchba_down_read_only(gw):
 def test_outage_survives_a_restart(tmp_path, monkeypatch):
     g = start(tmp_path, monkeypatch)
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
-        c.post("/v1/push/register", json={"voip_token": "tok1", "bundle_id": "xyz.scian.azel"})
+        c.post("/v1/push/register", json={"voip_token": "tok1", "bundle_id": "xyz.scian.biseo"})
         g.fake.state.down = True
         c.post("/v1/ask", json={"text": "a"})
     assert len(g.pending_usage) == 1 and os.stat(tmp_path / "pending_usage.json").st_mode & 0o077 == 0

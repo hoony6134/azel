@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -116,53 +117,116 @@ def check_args(tokens: list[str], wd: Path) -> None:
                 raise Refused(f"argument outside allowed_roots: {v}")
 
 
-# Never runnable, approval or not: privilege escalation, secrets, wiping, and shell or AppleScript one-liners
-# (argv only, no shell: `sh -c` would smuggle a whole script past the exact-command approval).
+# Never runnable, approval or not: privilege escalation, secrets, wiping, and inline code (argv only, no shell:
+# `sh -c`, `python -c`, `osascript` would smuggle a whole script past the exact-command approval). Names are
+# compared case-insensitively (APFS: SUDO is sudo), and every argv position counts, so wrappers (env, xargs,
+# find -exec, nice, nohup, time, timeout, caffeinate, command) cannot hide a command.
 ESCALATE = {"sudo", "su", "doas", "pkexec", "runas"}
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
+INLINE = {"perl": "eE", "ruby": "e", "node": "ep", "nodejs": "ep", "php": "r", "lua": "e"}  # + python* : c
+INLINE_LONG = {"--eval", "--print", "--command"}
+TERMINALS = {"terminal", "terminal.app", "iterm", "iterm.app", "iterm2", "iterm2.app", "com.apple.terminal",
+             "com.googlecode.iterm2"}
+SCRIPT_EXT = (".command", ".tool", ".sh", ".scpt", ".scptd", ".applescript", ".workflow")
 SECRET_DIRS = ("~/.config/biseo", "~/.ssh", "~/.claude", "~/Library/Keychains")
-SECRET_WORDS = (".config/biseo", ".ssh/", "/.ssh", "Keychains", ".keychain")  # also inside --flag=… values
+SECRET_WORDS = (".config/biseo", ".ssh/", "/.ssh", ".claude", "Keychains", ".keychain")  # also inside flag values
+
+
+def _expand(tokens: list[str]) -> list[str]:
+    """argv with `env -S "…"` / `--split-string=…` values split into their own tokens (env runs them)."""
+    out, i = [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("-S", "--split-string") and i + 1 < len(tokens):
+            out += [t] + _split(tokens[i + 1])
+            i += 2
+            continue
+        if t.startswith("--split-string="):
+            out += _split(t.split("=", 1)[1])
+        elif t.startswith("-S") and len(t) > 2 and not t.startswith("--"):
+            out += _split(t[2:])
+        else:
+            out.append(t)
+        i += 1
+    return out
+
+
+def _split(v: str) -> list[str]:
+    try:
+        return _expand(shlex.split(v))
+    except ValueError:
+        raise Refused("unparseable env -S string")
+
+
+def _short_flags(t: str) -> str:
+    return t[1:] if t.startswith("-") and not t.startswith("--") else ""
+
+
+def _path_values(t: str) -> list[str]:
+    """The path-like values a token may carry: itself, `--opt=/p`, and attached short options (`-C/p`, `-T~/p`)."""
+    vals = [t]
+    if t.startswith("-") and "=" in t:
+        vals.append(t.split("=", 1)[1])
+    if t.startswith("-") and not t.startswith("--") and len(t) > 2 and t[2] in "/~.":
+        vals.append(t[2:])
+    return vals
 
 
 def hard_deny(tokens: list[str], wd: Path) -> None:
-    """Refuse (before any approval exists) what no approval may unlock."""
-    names = [os.path.basename(t) for t in tokens]
+    """Refuse (before any approval exists, and for approved runs) what no approval may unlock."""
+    tokens = _expand(tokens)
+    names = [os.path.basename(t).lower() for t in tokens]
+    home = Path.home().resolve()
+    secrets = [Path(d).expanduser().resolve() for d in SECRET_DIRS]
     if ESCALATE & set(names):
         raise Refused("privilege escalation is never allowed")
     for i, n in enumerate(names):
-        rest = tokens[i + 1:]
-        if n in SHELLS and any(t == "-c" or (t.startswith("-") and not t.startswith("--") and "c" in t) for t in rest):
+        rest, low = tokens[i + 1:], [r.lower() for r in tokens[i + 1:]]
+        if n in SHELLS and any(r == "-c" or "c" in _short_flags(r) or r == "--command" for r in rest):
             raise Refused("shell -c is never allowed (run the command itself)")
-        if n == "osascript" and any(t == "-e" or t.startswith("-e") for t in rest):
-            raise Refused("osascript -e is never allowed")
-        if n == "security":
-            raise Refused("keychain access is never allowed")
-    home = Path.home().resolve()
-    secrets = [Path(d).expanduser().resolve() for d in SECRET_DIRS]
+        if n == "osascript" or n == "security":
+            raise Refused(f"{n} is never allowed")
+        letters = "c" if re.fullmatch(r"python[\d.]*", n) else INLINE.get(n)
+        if letters and any(set(_short_flags(r)) & set(letters) or r.split("=")[0] in INLINE_LONG for r in rest):
+            raise Refused(f"inline code ({n} {'/'.join('-' + c for c in letters)}) is never allowed")
+        if n == "open":
+            app = [low[k + 1] for k, r in enumerate(low[:-1]) if r in ("-a", "-b")]
+            if any(os.path.basename(a.rstrip("/")) in TERMINALS for a in app) or any(r.endswith(SCRIPT_EXT) for r in low):
+                raise Refused("opening a terminal or a script is never allowed")
+        if n == "rm" and any(r == "--recursive" or set(_short_flags(r)) & {"r", "R"} for r in rest):
+            for r in rest:
+                if not r.startswith("-"):
+                    p = (wd / Path(r.replace("$HOME", "~")).expanduser()).resolve()
+                    if p == Path("/") or home.is_relative_to(p):
+                        raise Refused("rm -r on / or the home directory is never allowed")
+        if n == "find" and "-delete" in rest:
+            for r in rest:
+                if r.startswith(("-", "(", "!")):
+                    break
+                p = (wd / Path(r.replace("$HOME", "~")).expanduser()).resolve()
+                if p == Path("/") or home.is_relative_to(p):
+                    raise Refused("find -delete on / or the home directory is never allowed")
+        if n == "diskutil" and rest:
+            sub = low[0]
+            if sub.startswith(("erase", "zerodisk", "secureerase", "reformat", "partitiondisk")) or (
+                    sub == "apfs" and len(low) > 1 and low[1].startswith(("delete", "erase"))):
+                raise Refused("erasing disks is never allowed")
+        if n.startswith(("mkfs", "newfs")):
+            raise Refused("formatting is never allowed")
+        if n == "dd" and any(r.startswith("of=/dev/") for r in low):
+            raise Refused("dd to a device is never allowed")
     if any(wd == s or wd.is_relative_to(s) for s in secrets):
         raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
-    for t in tokens[1:]:
-        v = t.split("=", 1)[1] if t.startswith("-") and "=" in t else t
-        if any(w in t for w in SECRET_WORDS) or t.rstrip("/").endswith(".ssh"):
-            raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
-        if v and not v.startswith("-"):
-            p = (wd / Path(v).expanduser()).resolve()
-            if any(p == s or p.is_relative_to(s) for s in secrets):
+    for t in tokens:
+        for v in _path_values(t):
+            if any(w.lower() in v.lower() for w in SECRET_WORDS) or v.rstrip("/").lower().endswith(".ssh"):
                 raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
-    if names[0] == "rm" and any(t in ("--recursive",) or (t.startswith("-") and not t.startswith("--") and set(t[1:]) & {"r", "R"})
-                                for t in tokens[1:]):
-        for t in tokens[1:]:
-            if t.startswith("-"):
+            if not v or (v.startswith("-") and v == t):
                 continue
-            p = (wd / Path(t.replace("$HOME", "~")).expanduser()).resolve()
-            if p == Path("/") or home.is_relative_to(p):  # / or the home directory (or anything above it)
-                raise Refused("rm -r on / or the home directory is never allowed")
-    if names[0] == "diskutil" and len(tokens) > 1 and tokens[1].lower().startswith(("erase", "zerodisk", "secureerase", "reformat")):
-        raise Refused("erasing disks is never allowed")
-    if names[0].startswith(("mkfs", "newfs")):
-        raise Refused("formatting is never allowed")
-    if names[0] == "dd" and any(t.startswith("of=/dev/") for t in tokens):
-        raise Refused("dd to a device is never allowed")
+            p = (wd / Path(v.replace("$HOME", "~")).expanduser()).resolve()
+            # the secret dirs themselves, anything inside them, and their ancestors (~, ~/.config, /Users, /)
+            if any(p == s or p.is_relative_to(s) or s.is_relative_to(p) for s in secrets):
+                raise Refused(f"path covers the assistant's, SSH, Claude or keychain files: {v}")
 
 
 def run_dir(cwd: str | None, approved: bool) -> Path:
@@ -316,8 +380,12 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
             return {"status": "pending_approval", "approval_id": approval_id}
         if a.get("status") != "approved":
             raise Refused(f"approval not granted (status={a.get('status')})")
-        if a.get("command") != command or a.get("cwd") != str(wd):
-            raise Refused("approval does not match this command/cwd")
+        if a.get("device") != CFG["id"] or a.get("command") != command or a.get("cwd") != str(wd):
+            raise Refused("approval does not match this device/command/cwd")
+        try:  # spend it centrally, atomically and once (also stale after 10 min), then locally
+            gateway("POST", f"/v1/approvals/{approval_id}/use", {"device": CFG["id"], "command": command, "cwd": str(wd)})
+        except httpx.HTTPStatusError:
+            raise Refused("approval already used, stale or not for this device")
         _claim_approval(approval_id)
     else:
         check_args(tokens, wd)

@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import tempfile
 import time
 import uuid
@@ -2141,16 +2142,28 @@ async def history_prune(older_than_days: float):
     return await state.call("DELETE", "/v1/state/history", older_than_days=older_than_days)
 
 
+APP_BUNDLE = "xyz.scian.biseo"
+MAX_PUSH_TOKENS = 10
+
+
 @app.post("/v1/push/register")
 async def push_register(body: dict):
-    if not body.get("bundle_id") or not (body.get("voip_token") or body.get("alert_token")):
-        raise HTTPException(400, "bundle_id and voip_token and/or alert_token required")  # macOS: alert only
-    if body.get("voip_token"):
-        await state.call("PUT", f"/v1/state/push_tokens/{quote(body['voip_token'], safe='')}",
-                         {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox")})
-    if body.get("alert_token"):  # ordinary notifications (missed scheduled calls)
-        await state.call("PUT", f"/v1/state/push_tokens/{quote(body['alert_token'], safe='')}",
-                         {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox"), "kind": "alert"})
+    if body.get("bundle_id") != APP_BUNDLE:
+        raise HTTPException(400, f"bundle_id must be {APP_BUNDLE}")
+    if not (body.get("voip_token") or body.get("alert_token")):
+        raise HTTPException(400, "voip_token and/or alert_token required")  # macOS: alert only
+    for kind, tok in (("voip", body.get("voip_token")), ("alert", body.get("alert_token"))):
+        if not tok:
+            continue
+        if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Za-z_-]{3,200}", tok)):
+            raise HTTPException(400, f"{kind}_token: a device token")
+        await state.call("PUT", f"/v1/state/push_tokens/{quote(tok, safe='')}",
+                         {"bundle_id": APP_BUNDLE, "env": body.get("env", "sandbox"),
+                          **({"kind": "alert"} if kind == "alert" else {})})
+    rows = await state.call("GET", "/v1/state/push_tokens") or []  # newest first
+    for kind in ("voip", "alert"):  # at most MAX_PUSH_TOKENS per kind: the oldest go
+        for old in [r for r in rows if r.get("kind", "voip") == kind][MAX_PUSH_TOKENS:]:
+            await state.call("DELETE", f"/v1/state/push_tokens/{quote(old['token'], safe='')}")
     await push_tokens()  # refresh the restart-proof copy
     return {"ok": True}
 
@@ -2220,7 +2233,22 @@ async def alerts_to_ring(names, now):
 # column for sits in kv: `approval-<id>` (expiry, requester, decision), `approval-rules` ("always" rules) and
 # `approval-audit` (approved runs). A pending approval expires after APPROVAL_TTL_S.
 APPROVAL_TTL_S = 300
+APPROVED_RUN_S = 600  # an approved command must run within this long of the tap, once (state's atomic "use")
 DECISIONS = ("once", "always", "deny")
+# Never made into an "always" rule (forced to once): commands that run other code (wrappers, interpreters).
+RULE_UNSAFE = {"env", "xargs", "find", "nice", "nohup", "time", "command", "caffeinate", "timeout", "sh", "bash",
+               "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node", "php", "lua", "osascript",
+               "open", "make", "npm", "npx", "yarn", "pnpm", "uv", "pip", "pip3", "brew", "launchctl", "defaults",
+               "crontab", "ssh", "scp", "rsync", "git"}
+task_approvals: dict[str, set] = {}  # task id -> approval ids created while it ran (only those resume it)
+
+
+def rule_unsafe(command):
+    try:
+        names = [os.path.basename(t).lower() for t in shlex.split(command)]
+    except ValueError:
+        return True
+    return any(n in RULE_UNSAFE or re.fullmatch(r"python\d[\d.]*", n) for n in names)
 last_ask: dict = {}  # the most recent ask or task on this gateway: who an approval created meanwhile belongs to
 
 
@@ -2230,13 +2258,19 @@ def note_requester(**who):
 
 
 async def approval_meta(aid):
+    if MODE == "limited":  # kv needs the full token: team-device approvals are plain state rows
+        return {}
     return await state.call("GET", f"/v1/state/kv/approval-{aid}") or {}
 
 
 def approval_view(row, meta, now=None):
     now = now or time.time()
     expires = meta.get("expires_at") or (row.get("created") or now) + APPROVAL_TTL_S
-    status = "expired" if row["status"] == "pending" and now >= expires else row["status"]
+    status = row["status"]
+    if status == "pending" and now >= expires:
+        status = "expired"
+    elif status == "approved" and row.get("decided") and now >= row["decided"] + APPROVED_RUN_S:
+        status = "expired"  # approved but never run in time: no longer usable
     return {**row, "status": status, "expires_at": expires, "decision": meta.get("decision"),
             "requester": meta.get("requester"), "rule_id": meta.get("rule_id")}
 
@@ -2247,11 +2281,16 @@ async def create_approval(body: dict):
     if not row["device"] or not row["command"]:
         raise HTTPException(400, "device and command required")
     now = time.time()
-    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-    rule = next((r for r in rules if r["device"] == row["device"] and r["command"] == row["command"]), None)
     created = await state.call("POST", "/v1/state/approvals", row)
     aid = created["approval_id"]
+    if MODE == "limited":  # no kv, rules or pushes with the limited token: the row alone, as before
+        return {"approval_id": aid, "status": "pending"}
     requester = {k: v for k, v in last_ask.items() if k != "at"} if now - last_ask.get("at", 0) < 600 else None
+    if requester and requester.get("task_id"):
+        task_approvals.setdefault(requester["task_id"], set()).add(aid)
+    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    rule = None if requester and requester.get("task_id") else next(  # a task's commands always need a tap
+        (r for r in rules if (r["device"], r["command"], r.get("cwd")) == (row["device"], row["command"], row["cwd"])), None)
     meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None}
     if rule:  # an "always" rule: approved on the spot, still audited when it runs
         await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
@@ -2260,7 +2299,8 @@ async def create_approval(body: dict):
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     try:  # the app shows it; the command text only (never output), shortened
-        await send_alert_push("승인 요청", f"{row['device']}: {row['command'][:80]}", type="approval", approval_id=aid)
+        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", type="approval",
+                              approval_id=aid)  # the command itself only in the app, never on the lock screen
     except Exception as e:
         print("approval push failed:", type(e).__name__, flush=True)
     return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
@@ -2307,6 +2347,7 @@ async def get_approval(aid: str):
 @app.post("/v1/approvals/{aid}")
 async def decide(aid: str, body: dict):
     """`{"decision": "once"|"always"|"deny"}` (older apps: `{"approve": bool}` = once / deny)."""
+    full_only()
     decision = body.get("decision") or ("once" if body.get("approve") else "deny")
     if decision not in DECISIONS:
         raise HTTPException(400, f"decision: one of {list(DECISIONS)}")
@@ -2317,22 +2358,38 @@ async def decide(aid: str, body: dict):
     view = approval_view(row, meta)
     if view["status"] != "pending":
         raise HTTPException(409, f"approval is {view['status']}")
+    forced = decision == "always" and rule_unsafe(row["command"])
+    if forced:
+        decision = "once"  # a command that runs other code never becomes a standing rule
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
     if decision == "always":
         rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-        rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "created": time.time()}
+        rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "cwd": row["cwd"],
+                "created": time.time()}
         await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
         meta["rule_id"] = rule["id"]
     meta["decision"] = decision
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
-    return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {})}
+    return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
+            **({"forced_once": True} if forced else {})}
+
+
+@app.post("/v1/approvals/{aid}/use")
+async def approval_use(aid: str, body: dict):
+    """A daemon spends an approval right before running it: atomic and once, for its own device, the exact
+    command and cwd, within APPROVED_RUN_S of the tap (409 otherwise)."""
+    use = {k: body.get(k) for k in ("device", "command", "cwd")}
+    if not all(isinstance(v, str) and v for v in use.values()):
+        raise HTTPException(400, "device, command and cwd required")
+    return await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}/use", {**use, "window_s": APPROVED_RUN_S})
 
 
 @app.post("/v1/approvals/{aid}/ran")
 async def approval_ran(aid: str, body: dict):
     """A daemon ran an approved command: the audit log gets device, command, exit code, time and decision."""
+    full_only()  # the audit lives in kv (team devices' runs stay in their daemon logs)
     row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
-    if row is None or row["status"] != "approved":
+    if row is None or row["status"] not in ("approved", "used"):
         raise HTTPException(404, "no such approved approval")
     code = body.get("exit_code")
     entry = {"approval_id": aid, "device": row["device"], "command": row["command"], "cwd": row["cwd"],
@@ -2480,8 +2537,9 @@ async def task_round(t, prompt, resume, deadline):
                     raise TaskLimit("budget", f"예산 {t['budget_usd']:g}달러를 넘어 멈췄어요.")
             elif e.get("type") == "user":
                 for b in (e.get("message") or {}).get("content") or []:
-                    if b.get("type") == "tool_result" and (m := PENDING_RE.search(json.dumps(b.get("content"), ensure_ascii=False).replace('\\"', '"'))):
-                        pending = m.group(1)
+                    if b.get("type") == "tool_result":  # only an approval this task's own run created
+                        found = PENDING_RE.findall(json.dumps(b.get("content"), ensure_ascii=False).replace('\\"', '"'))
+                        pending = next((a for a in found if a in task_approvals.get(t["id"], ())), pending)
             elif e.get("type") == "result":
                 session = e.get("session_id") or session
                 if e.get("total_cost_usd"):  # the CLI's own figure replaces the estimate for this round
@@ -2585,7 +2643,9 @@ async def task_notify(t, approval=False):
             await place_call("task_approval" if approval else "task", opening=task_summary(t), persona_id=t["persona"])
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
-            await send_alert_push(title, task_summary(t)[:180], type="task", task_id=t["id"])
+            what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
+            goal = t["goal"] if len(t["goal"]) <= 40 else t["goal"][:39] + "…"
+            await send_alert_push(title, f"{what}: {goal}", type="task", task_id=t["id"])  # no model output
     except Exception as e:
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 

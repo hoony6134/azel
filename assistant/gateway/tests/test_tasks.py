@@ -8,10 +8,20 @@ import pytest
 from test_gateway import start, TestClient
 
 
+class _Tracked(dict):  # the fake claude reports approval "ap1": count it as created by whichever task asks
+    def get(self, key, default=None):
+        return {"ap1"}
+
+
+def tgw_track(g):
+    g.task_approvals = _Tracked()
+
+
 @pytest.fixture
 def tgw(tmp_path, monkeypatch):
     g = start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
     g.TASK_APPROVAL_POLL_S = 0.05
+    tgw_track(g)
     notes = []
 
     async def place_call(reason, opening=None, call_id=None, persona_id=None):
@@ -43,6 +53,9 @@ def test_task_runs_logs_steps_and_calls(tgw):
     assert t["status"] == "done" and t["result"] == "파일 세 개를 정리했어요." and t["cost_usd"] == pytest.approx(0.1)
     assert [(s["kind"], s.get("label")) for s in t["steps"]] == [("tool", "macbook 파일 보는 중")]
     assert "SECRET" not in json.dumps(t)  # tool arguments and results never reach the log
+    end = time.time() + 5
+    while not notes and time.time() < end:  # the status is saved a moment before the call goes out
+        time.sleep(0.02)
     assert notes == [("call", "task", "맡기신 작업 끝났어요. 파일 세 개를 정리했어요.", "azel")]
     assert [x["id"] for x in c.get("/v1/tasks").json()] == [t["id"]]
     row = g.fake.db["usage"][-1]  # a task runs on claude -p: counted as the subscription path, labelled as a task
@@ -64,8 +77,8 @@ def test_task_waits_for_approval_then_resumes(tgw):
     t = wait_for(c, tid, ("done", "failed"))
     assert t["status"] == "done" and t["result"] == "승인받고 정리했어요."
     assert [s["kind"] for s in t["steps"]] == ["tool", "approval", "approval_approved"]
-    assert notes == [("push", "승인 필요", "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요.", {"type": "task", "task_id": tid}),
-                     ("push", "작업 완료", "맡기신 작업 끝났어요. 승인받고 정리했어요.", {"type": "task", "task_id": tid})]
+    assert notes == [("push", "승인 필요", "승인이 필요해요: TASK-APPROVAL 임시 폴더 지워 줘", {"type": "task", "task_id": tid}),
+                     ("push", "작업 완료", "작업이 끝났어요: TASK-APPROVAL 임시 폴더 지워 줘", {"type": "task", "task_id": tid})]
 
 
 def test_budget_kill(tgw):
@@ -73,6 +86,9 @@ def test_budget_kill(tgw):
     tid = c.post("/v1/tasks", json={"goal": "TASK-SPEND 큰 작업", "budget_usd": 2}).json()["id"]
     t = wait_for(c, tid, ("done", "failed"))
     assert t["status"] == "failed" and "예산" in t["error"] and t["steps"][-1]["reason"] == "budget"
+    end = time.time() + 5
+    while not notes and time.time() < end:
+        time.sleep(0.02)
     assert notes and notes[0][1] == "작업 실패"
 
 
@@ -142,13 +158,22 @@ def test_alert_only_registration_and_task_push_payload(tmp_path, monkeypatch):
         return {"sent": 1}
     g.apns_send = apns_send
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
-        assert c.post("/v1/push/register", json={"bundle_id": "xyz.scian.azel"}).status_code == 400
-        assert c.post("/v1/push/register", json={"alert_token": "mac-alert", "bundle_id": "xyz.scian.azel"}).status_code == 200
-        assert g.fake.db["push"] == {"mac-alert": {"token": "mac-alert", "bundle_id": "xyz.scian.azel", "env": "sandbox",
-                                                   "kind": "alert"}}
-    asyncio.run(g.task_notify({"id": "abc123abc123", "notify": "push", "status": "done", "result": "끝", "persona": None}))
-    assert sent == [("alert", {"aps": {"alert": {"title": "작업 완료", "body": "맡기신 작업 끝났어요. 끝"}, "sound": "default"},
-                               "type": "task", "task_id": "abc123abc123"})]
+        assert c.post("/v1/push/register", json={"bundle_id": "xyz.scian.biseo"}).status_code == 400
+        assert c.post("/v1/push/register", json={"alert_token": "mac-alert", "bundle_id": "xyz.scian.other"}).status_code == 400
+        assert c.post("/v1/push/register", json={"alert_token": "mac-alert", "bundle_id": "xyz.scian.biseo"}).status_code == 200
+        row = g.fake.db["push"]["mac-alert"]
+        assert (row["bundle_id"], row["env"], row["kind"]) == ("xyz.scian.biseo", "sandbox", "alert") and len(g.fake.db["push"]) == 1
+        for i in range(12):  # at most 10 per kind: the oldest are evicted
+            c.post("/v1/push/register", json={"voip_token": f"voip-{i:02d}", "alert_token": f"alert-{i:02d}",
+                                              "bundle_id": "xyz.scian.biseo"})
+            time.sleep(0.002)
+        kinds = [r.get("kind", "voip") for r in g.fake.db["push"].values()]
+        assert kinds.count("voip") == 10 and kinds.count("alert") == 10 and "voip-00" not in g.fake.db["push"]
+    asyncio.run(g.task_notify({"id": "abc123abc123", "notify": "push", "status": "done", "result": "SECRET 모델 답",
+                               "goal": "맥북 다운로드 폴더를 아주 아주 꼼꼼하게 정리하고 중복 파일도 지워서 용량 확보해 줘", "persona": None}))
+    body = sent[-1][1]["aps"]["alert"]["body"]
+    assert body.startswith("작업이 끝났어요: 맥북 다운로드") and body.endswith("…") and len(body) <= 50 and "SECRET" not in body
+    assert sent[-1][1]["type"] == "task" and sent[-1][1]["task_id"] == "abc123abc123"
 
 
 def test_call_mode_rings_for_an_approval(tgw):

@@ -59,6 +59,12 @@ def gw(monkeypatch):
             return approvals.get("_create", {"approval_id": "ap1"})
         if method == "POST" and path.endswith("/ran"):
             return {"ok": True}
+        if method == "POST" and path.endswith("/use"):  # state's atomic spend: approved, same device/command/cwd, once
+            a = approvals.get(path.split("/")[-2], {})
+            if a.get("status") != "approved" or any(a.get(k) != body[k] for k in ("device", "command", "cwd")):
+                raise httpx.HTTPStatusError("409", request=httpx.Request("POST", path), response=httpx.Response(409))
+            a["status"] = "used"
+            return {"status": "used"}
         if method == "GET" and path.startswith("/v1/approvals/"):
             return approvals[path.rsplit("/", 1)[1]]
         raise AssertionError(path)
@@ -125,9 +131,9 @@ def test_approval_flow(cfg, gw, tmp_path):
     calls, approvals = gw
     proj = str(tmp_path / "root" / "proj")
     (tmp_path / "root" / "proj" / "b.txt").write_text("x")
-    approvals["pend"] = {"status": "pending", "command": "rm b.txt", "cwd": proj}
-    approvals["ok"] = {"status": "approved", "command": "rm b.txt", "cwd": proj}
-    approvals["other"] = {"status": "approved", "command": "rm a.txt", "cwd": proj}
+    approvals["pend"] = {"device": "testbox", "status": "pending", "command": "rm b.txt", "cwd": proj}
+    approvals["ok"] = {"device": "testbox", "status": "approved", "command": "rm b.txt", "cwd": proj}
+    approvals["other"] = {"device": "testbox", "status": "approved", "command": "rm a.txt", "cwd": proj}
 
     assert d.run_command(command="rm b.txt", cwd="proj", approval_id="pend")["status"] == "refused"
     assert d.run_command(command="rm b.txt", cwd="proj", approval_id="other")["status"] == "refused"  # mismatch
@@ -136,7 +142,7 @@ def test_approval_flow(cfg, gw, tmp_path):
     assert d.run_command(command="rm b.txt", cwd="proj", approval_id="ok")["status"] == "ok"
     assert not (tmp_path / "root" / "proj" / "b.txt").exists()
     reuse = d.run_command(command="rm b.txt", cwd="proj", approval_id="ok")
-    assert reuse == {"status": "refused", "reason": "approval already used"}
+    assert reuse["status"] == "refused"  # spent centrally: "used" now
 
 
 def test_delegate_mocked(cfg, monkeypatch):
@@ -309,7 +315,7 @@ def test_hard_deny_holds_for_approved_runs(cfg, gw, tmp_path):
     calls, approvals = gw
     d.CFG["approve_unlisted"] = True
     proj = str(tmp_path / "root" / "proj")
-    approvals["ok"] = {"status": "approved", "command": "sudo ls", "cwd": proj}
+    approvals["ok"] = {"device": "testbox", "status": "approved", "command": "sudo ls", "cwd": proj}
     try:
         assert d.run_command(command="sudo ls", cwd="proj", approval_id="ok")["status"] == "refused"
     finally:
@@ -319,7 +325,7 @@ def test_hard_deny_holds_for_approved_runs(cfg, gw, tmp_path):
 def test_unlisted_becomes_an_approval_only_where_enabled(cfg, gw, tmp_path):
     calls, approvals = gw
     assert d.run_command(command="echo bye", cwd="proj")["status"] == "refused"  # approve_unlisted off: as before
-    approvals["x"] = {"status": "approved", "command": "echo bye", "cwd": str(tmp_path / "root" / "proj")}
+    approvals["x"] = {"device": "testbox", "status": "approved", "command": "echo bye", "cwd": str(tmp_path / "root" / "proj")}
     assert d.run_command(command="echo bye", cwd="proj", approval_id="x")["status"] == "refused"  # id can't unlock it
     d.CFG["approve_unlisted"] = True
     try:
@@ -327,13 +333,13 @@ def test_unlisted_becomes_an_approval_only_where_enabled(cfg, gw, tmp_path):
         assert res == {"status": "pending_approval", "approval_id": "ap1"}
         assert calls[-1] == ("POST", "/v1/approvals", {"device": "testbox", "tool": "run_command", "command": "echo bye",
                                                        "cwd": str(tmp_path / "root" / "proj")})
-        approvals["ap1"] = {"status": "approved", "command": "echo bye", "cwd": str(tmp_path / "root" / "proj")}
+        approvals["ap1"] = {"device": "testbox", "status": "approved", "command": "echo bye", "cwd": str(tmp_path / "root" / "proj")}
         res = d.run_command(command="echo bye", cwd="proj", approval_id="ap1")
         assert res["status"] == "ok" and res["stdout"] == "bye\n"
         assert calls[-1] == ("POST", "/v1/approvals/ap1/ran", {"exit_code": 0, "status": "ok"})  # audited, no output
-        assert d.run_command(command="echo bye", cwd="proj", approval_id="ap1")["reason"] == "approval already used"
+        assert d.run_command(command="echo bye", cwd="proj", approval_id="ap1")["status"] == "refused"  # used
         home_dir = d.Path.home()  # approved runs may use any existing directory under $HOME
-        approvals["h"] = {"status": "approved", "command": "echo home", "cwd": str(home_dir.resolve())}
+        approvals["h"] = {"device": "testbox", "status": "approved", "command": "echo home", "cwd": str(home_dir.resolve())}
         assert d.run_command(command="echo home", cwd=str(home_dir), approval_id="h")["status"] == "ok"
         assert d.run_command(command="echo bye", cwd="/tmp")["status"] == "refused"  # not under $HOME
     finally:
@@ -345,7 +351,7 @@ def test_always_rule_runs_on_the_spot(cfg, gw, tmp_path):
     d.CFG["approve_unlisted"] = True
     proj = str(tmp_path / "root" / "proj")
     approvals["_create"] = {"approval_id": "r1", "status": "approved"}
-    approvals["r1"] = {"status": "approved", "command": "echo ruled", "cwd": proj}
+    approvals["r1"] = {"device": "testbox", "status": "approved", "command": "echo ruled", "cwd": proj}
     try:
         res = d.run_command(command="echo ruled", cwd="proj")
     finally:
@@ -358,7 +364,7 @@ def test_pending_approval_waits_for_the_tap(cfg, gw, tmp_path, monkeypatch):
     calls, approvals = gw
     d.CFG["approve_unlisted"], d.CFG["approval_wait_s"] = True, 5
     monkeypatch.setattr(d.time, "sleep", lambda s: approvals.__setitem__("w", {**approvals["w"], "status": "approved"}))
-    approvals["w"] = {"status": "pending", "command": "echo waited", "cwd": str(tmp_path / "root" / "proj")}
+    approvals["w"] = {"device": "testbox", "status": "pending", "command": "echo waited", "cwd": str(tmp_path / "root" / "proj")}
     try:
         res = d.run_command(command="echo waited", cwd="proj", approval_id="w")
     finally:
@@ -372,3 +378,62 @@ def test_allowlisted_args_still_checked(cfg, gw):
         assert d.run_command(command="head ../../secret.txt", cwd="proj")["status"] == "refused"
     finally:
         d.CFG["approve_unlisted"] = False
+
+
+def test_approval_for_another_device_or_replayed(cfg, gw, tmp_path):
+    calls, approvals = gw
+    proj = str(tmp_path / "root" / "proj")
+    approvals["x"] = {"device": "albireo", "status": "approved", "command": "rm b.txt", "cwd": proj}
+    (tmp_path / "root" / "proj" / "b.txt").write_text("x")
+    assert d.run_command(command="rm b.txt", cwd="proj", approval_id="x")["status"] == "refused"  # not ours
+    approvals["y"] = {"device": "testbox", "status": "approved", "command": "rm b.txt", "cwd": proj}
+    assert d.run_command(command="rm b.txt", cwd="proj", approval_id="y")["status"] == "ok"
+    (tmp_path / "root" / "proj" / "b.txt").write_text("x")
+    d._used_file().unlink()  # even with the local used-ids file gone, state refuses a second use
+    assert d.run_command(command="rm b.txt", cwd="proj", approval_id="y")["status"] == "refused"
+    assert (tmp_path / "root" / "proj" / "b.txt").exists()
+
+
+@pytest.mark.parametrize("cmd", [
+    "SUDO ls", "Sudo ls", "BASH -c ls", "Security dump-keychain", "env -S 'sudo ls'", "env --split-string='bash -c ls'",
+    "env -Sbash\\ -c\\ ls", "xargs sudo ls", "nice -n 5 bash -c ls", "nohup zsh -c ls", "time sh -c ls",
+    "timeout 5 bash -c ls", "caffeinate -i sh -c ls", "command bash -c ls", "find . -exec sh -c ls ;",
+    "find ~ -delete", "find / -name x -delete", "env rm -rf ~", "xargs rm -rf /", "nice dd if=/dev/zero of=/dev/disk3",
+    "env diskutil eraseDisk APFS X disk2", "diskutil apfs deleteContainer disk3", "diskutil APFS eraseVolume disk3s1",
+    "time mkfs.ext4 /dev/sdb", "python -c print(1)", "python3 -c x", "/usr/bin/python3.12 -c x", "Python3 -c x",
+    "perl -e 1", "perl -pe s/a/b/ f", "ruby -e 1", "node -e 1", "node --eval=1", "php -r 1", "lua -e 1",
+    "osascript script.scpt", "osascript", "open -a Terminal", "open -a iTerm", "open -a /Applications/Utilities/Terminal.app",
+    "open -b com.apple.Terminal", "open run.command", "open x.sh", "open a.scpt",
+    "ls ~/.claude", "cat x/.claude/settings.json", "git -C ~/.ssh log", "tar -C/Users -xf a", "rg --path=~/.ssh x",
+    "ls ~", "ls /Users", "ls /", "ls ~/.config", "rg x ~", "head -T~/.config/biseo/token"])
+def test_hard_deny_bypasses_closed(cfg, gw, cmd):
+    d.CFG["approve_unlisted"] = True
+    cfg["roots"].append(d.Path.home().resolve())
+    try:
+        res = d.run_command(command=cmd, cwd=str(cfg["roots"][0] / "proj"))
+    finally:
+        cfg["roots"].pop()
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", (cmd, res)
+    assert not [c for c in gw[0] if c[1] == "/v1/approvals"], cmd
+
+
+def test_hard_deny_symlink_into_secrets(cfg, gw, tmp_path):
+    link = cfg["roots"][0] / "proj" / "keys"
+    link.symlink_to(d.Path("~/.ssh").expanduser())
+    d.CFG["approve_unlisted"] = True
+    try:
+        assert d.run_command(command="ls keys", cwd="proj")["status"] == "refused"  # resolved before checking
+    finally:
+        d.CFG["approve_unlisted"] = False
+
+
+@pytest.mark.parametrize("cmd", ['open -a "Google Chrome"', "open https://example.com", "python3 tool.py",
+                                 "mkdir -p reports", "make build"])
+def test_ordinary_commands_still_reach_approval(cfg, gw, cmd):
+    d.CFG["approve_unlisted"] = True
+    try:
+        res = d.run_command(command=cmd, cwd="proj")
+    finally:
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "pending_approval", (cmd, res)
