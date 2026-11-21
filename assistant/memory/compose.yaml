@@ -1,4 +1,4 @@
-# 박비서 memory service. Tailnet only: host networking, uvicorn binds ruchba's Tailscale IP (BISEO_HOST default
+# Azel memory service. Tailnet only: host networking, uvicorn binds ruchba's Tailscale IP (BISEO_HOST default
 # 100.64.0.10). Host networking (not a published port) so the app sees real tailnet client IPs, which the
 # BISEO_LIMITED_IPS gate needs; Docker's userland proxy would show every peer as a bridge address.
 services:

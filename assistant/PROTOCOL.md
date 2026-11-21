@@ -1,4 +1,4 @@
-# 박비서 — component contracts
+# Azel — component contracts
 
 Every service listens only on its host's Tailscale address. Every request carries
 `Authorization: Bearer <token>` (WebSocket: `?token=<token>` query, since iOS
@@ -124,8 +124,12 @@ device that created them.
    "monthly_budget_usd":500,"budget_warn_pct":80,
    "proactive":{"morning_briefing":"08:00","quiet_hours":["23:30","07:30"],
                 "triggers":{"deadline":true,"server_down":true}},
-   "default_device":"macbook","device_fallback":["albireo","spark"]}
+   "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤"}
   ```
+  `assistant_name` (default "아젤"; 1–12 Hangul/Latin letters or spaces, else 400) is the assistant's spoken
+  name: the gateways use it for the VoIP push `caller` and Claude's prompts, and the voice server for
+  Qwen's system prompt (built per turn from the settings pushed over the link), so a rename applies on
+  the next turn or call everywhere.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
   haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.

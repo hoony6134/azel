@@ -75,6 +75,33 @@ def test_budget_blocks(gw):
     assert ev == [{"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}]
 
 
+def test_assistant_name(gw, monkeypatch):
+    g, c, tmp = gw
+    assert c.get("/v1/settings").json()["assistant_name"] == "아젤"
+    pushes = []
+
+    async def fake_push(payload):
+        pushes.append(payload)
+        return {"sent": 1}
+    monkeypatch.setattr(g, "send_voip_push", fake_push)
+    c.post("/v1/calls", json={"reason": "manual", "opening": "테스트예요."})
+    c.post("/v1/ask", json={"text": "a"})
+    args = json.loads((tmp / "args.json").read_text())
+    assert pushes[-1]["caller"] == "아젤" and "'아젤'" in args[args.index("--append-system-prompt") + 1]
+    assert c.put("/v1/settings", json={"assistant_name": " 루나  Luna "}).json()["assistant_name"] == "루나 Luna"
+    assert g.fake.db["settings"]["assistant_name"] == "루나 Luna"  # shared: every gateway and the voice server
+    c.post("/v1/calls", json={"reason": "manual", "opening": "테스트예요."})
+    c.post("/v1/ask", json={"text": "b"})
+    args = json.loads((tmp / "args.json").read_text())
+    prompt = args[args.index("--append-system-prompt") + 1]
+    assert pushes[-1]["caller"] == "루나 Luna" and "'루나 Luna'" in prompt and "아젤" not in prompt
+    for bad in ["", "   ", "가" * 13, "아젤2", "R2-D2", "<b>x</b>", "아젤😀", 7, ["x"]]:
+        assert c.put("/v1/settings", json={"assistant_name": bad}).status_code == 400, bad
+    assert c.get("/v1/settings").json()["assistant_name"] == "루나 Luna"
+    for name in ["가" * 12, "Azel", "아젤"]:
+        assert c.put("/v1/settings", json={"assistant_name": name}).status_code == 200
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400

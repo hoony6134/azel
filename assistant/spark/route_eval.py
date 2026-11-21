@@ -42,7 +42,7 @@ CASES = [
     ("지난번에 내가 뭐라고 했지?", C, None), ("저번에 얘기한 치과 예약 언제였어?", C, None),
     ("엄마 전화번호 알려줘", C, None), ("내가 좋아하는 커피 기억해?", C, None),
     # server status: Claude
-    ("박비서야 서버 괜찮아?", C, None), ("루크바 디스크 용량 확인해 줘", C, None), ("스파크 GPU 메모리 어때?", C, None),
+    (f"{vs.DEFAULT_NAME}야 서버 괜찮아?", C, None), (f"{vs.DEFAULT_NAME}, 지금 몇 시야?", Q, None), ("루크바 디스크 용량 확인해 줘", C, None), ("스파크 GPU 메모리 어때?", C, None),
     # Mac, files: Claude, mac
     ("맥북에 다운로드 폴더 정리해 줘", C, "mac"), ("바탕화면에 있는 파일 목록 보여줘", C, "mac"),
     ("터미널에서 깃 상태 확인해 줘", C, None),
@@ -80,7 +80,8 @@ assert PERSONAL_CASES <= {c[0] for c in CASES}
 
 async def qwen_route(text):
     """'claude' if Qwen emits the routing tag first, else 'qwen' (stream closed as soon as it is decided)."""
-    messages = [{"role": "system", "content": vs.SYSTEM + vs.now_kst()}, {"role": "user", "content": text}]
+    messages = [{"role": "system", "content": vs.system_prompt(vs.DEFAULT_NAME) + vs.now_kst()},
+                {"role": "user", "content": text}]
     buf, gen = "", vs.llm_stream(messages)
     try:
         async for delta in gen:
@@ -96,7 +97,7 @@ async def qwen_route(text):
 async def run(name, cases, personal_cases):
     rows, t0 = [], time.perf_counter()
     for text, want, want_task in cases:
-        forced, _ = vs.pre_route(text, {})
+        forced, _ = vs.pre_route(vs.strip_vocative(text, vs.DEFAULT_NAME), {})
         route, head = (C, "(keywords)") if forced else await qwen_route(text)
         task = vs.pick(vs.TASK_WORDS, text) or "chat"
         rows.append((text, want, route, want_task, task, head.strip()[:24]))

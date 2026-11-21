@@ -1,4 +1,4 @@
-"""박비서 gateway: Claude access, settings, usage, devices, approvals, calls, push, scheduler.
+"""Azel gateway (the assistant's spoken name is the `assistant_name` setting): Claude access, settings, usage, devices, approvals, calls, push, scheduler.
 
 One gateway runs on every device. Shared state lives behind the memory service's state API on ruchba
 (PROTOCOL.md section 5), never in a local database, so any gateway can answer for the others.
@@ -59,7 +59,13 @@ DEFAULTS = {
     "proactive": {"morning_briefing": "08:00", "deadline_check": "20:00", "quiet_hours": ["23:30", "07:30"],
                   "triggers": {"deadline": True, "server_down": True}},
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
+    "assistant_name": "아젤",
 }
+NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
+
+
+def name_prompt(settings):
+    return f"너의 이름은 '{settings['assistant_name']}'이야. "
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
@@ -253,7 +259,8 @@ async def ask_claude_code(text, model, session):
     """Yield text deltas, then a final dict with usage, from `claude -p` stream-json."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
     devices = await fresh_devices()
-    style = VOICE_STYLE + device_prompt(await load_settings(), devices)
+    settings = await load_settings()
+    style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
     cmd = [CLAUDE, "-p", text, "--model", MODELS[model], "--output-format", "stream-json", "--verbose",
            "--include-partial-messages", "--append-system-prompt", style,
            "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit",
@@ -365,7 +372,8 @@ async def ask_api(text, model, session):
     """
     devices = await fresh_devices()
     tools, where = await device_tools(devices)
-    system = API_STYLE + device_prompt(await load_settings(), devices)
+    settings = await load_settings()
+    system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
     messages = [{"role": "user", "content": text}]
     final = {"model": model, "path": "api", "input_tokens": 0, "output_tokens": 0}
     for _ in range(MAX_TOOL_TURNS):
@@ -470,7 +478,8 @@ async def place_call(reason, opening=None):
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
     await link_send({"type": "call", "call_id": call_id, "opening": opening or ""})
-    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": "박비서"})
+    caller = (await load_settings())["assistant_name"]
+    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": caller})
     return {"call_id": call_id, **push}
 
 
@@ -624,6 +633,11 @@ async def put_settings(body: dict):
     unknown = set(body) - set(DEFAULTS)
     if unknown:
         raise HTTPException(400, f"unknown keys: {sorted(unknown)}")
+    name = body.get("assistant_name")
+    if name is not None and not (isinstance(name, str) and NAME_RE.fullmatch(name) and name.strip()):
+        raise HTTPException(400, "assistant_name: 1-12 Hangul/Latin letters or spaces")
+    if name is not None:
+        body["assistant_name"] = " ".join(name.split())
     s = await load_settings() | body
     await save_settings(s)
     await link_send({"type": "settings", "value": s})

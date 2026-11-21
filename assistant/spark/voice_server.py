@@ -37,15 +37,15 @@ STT_MODEL = os.environ.get("STT_MODEL", "openai/whisper-large-v3-turbo")
 # link_limited (team-device gateways: always limited, whatever their hello says).
 HASH_FILE = os.environ.get("TOKEN_HASH_FILE", "/run/secrets/biseo_token_hashes")
 LABELS = ("client", "link", "link_limited")
-NAME = os.environ.get("ASSISTANT_NAME", "박비서")
+DEFAULT_NAME = os.environ.get("ASSISTANT_NAME", "아젤")  # until the gateways push settings with assistant_name
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "12"))
 END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
 KST = timezone(timedelta(hours=9))
 MAX_UPLOAD = 16000 * 2 * 60  # one minute of 16 kHz PCM16
 ROUTE_TAG = "[CLAUDE]"
 
-SYSTEM = (
-    f"너는 사용자의 개인 비서 '{NAME}'야. 지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
+SYSTEM_BODY = (
+    "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
     "한국어 존댓말로, 짧고 자연스럽게 말해. 첫 문장은 열 글자 안팎으로 짧게 시작해. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
     "길게 설명할 일은 요점만 두세 문장으로 줄여. "
@@ -53,6 +53,20 @@ SYSTEM = (
     f"파일, MacBook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 간단한 상식, 계산, 방금 대화 내용 정리는 네가 바로 답해."
 )
+
+
+def assistant_name(settings):
+    return settings.get("assistant_name") or DEFAULT_NAME
+
+
+def system_prompt(name):
+    """Qwen's system prompt for this turn: the name comes from the shared settings, so a rename applies at once."""
+    return f"너는 사용자의 개인 비서 '{name}'야. " + SYSTEM_BODY
+
+
+def strip_vocative(text, name):
+    """'아젤아, 서버 괜찮아?' -> '서버 괜찮아?': calling the assistant by name says nothing about the route."""
+    return re.sub(rf"^\s*{re.escape(name)}\s*(아|야|씨|님)?[\s,!.~]*", "", text) or text
 FILLER = "잠시만요, 확인해 볼게요."
 FILLER_LONG = "조금만 더 기다려 주세요."
 FILLER_AFTER_S = float(os.environ.get("FILLER_AFTER_MS", "1200")) / 1000  # say FILLER only if Claude is this slow
@@ -430,7 +444,9 @@ def recent_context(hist, n=6):
 async def respond(text, session, t0, timings):
     """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
     hist = history[session]
-    to_claude, model = pre_route(text, await gateway_settings())
+    settings = await gateway_settings()
+    name = assistant_name(settings)
+    to_claude, model = pre_route(strip_vocative(text, name), settings)
     sentences: asyncio.Queue = asyncio.Queue()
     route = {"value": "claude" if to_claude else "qwen"}
 
@@ -468,7 +484,8 @@ async def respond(text, session, t0, timings):
         try:
             if to_claude:
                 return await via_claude()
-            messages = [{"role": "system", "content": SYSTEM + now_kst()}, *hist, {"role": "user", "content": text}]
+            messages = [{"role": "system", "content": system_prompt(name) + now_kst()}, *hist,
+                        {"role": "user", "content": text}]
             buf = ""
             async for delta in llm_stream(messages):
                 timings.setdefault("llm_first_token_ms", ms(t0))
@@ -861,6 +878,14 @@ if __name__ == "__main__":
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
+        assert assistant_name({}) == "아젤" and "'아젤'" in system_prompt(assistant_name({}))
+        gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
+        assert "'루나'" in system_prompt(assistant_name(gl.settings)) and "아젤" not in system_prompt("루나")
+        for said, name, want in [("아젤아, 서버 괜찮아?", "아젤", "서버 괜찮아?"), ("아젤 지금 몇 시야", "아젤", "지금 몇 시야"),
+                                 ("루나야 일정 알려줘", "루나", "일정 알려줘"), ("아젤", "아젤", "아젤"),
+                                 ("서버 괜찮아?", "아젤", "서버 괜찮아?"), ("스파크야 안녕", "스파크", "안녕")]:
+            assert strip_vocative(said, name) == want, (said, name)
+        assert pre_route(strip_vocative("스파크야 안녕", "스파크"), {})[0] is False  # a name that is also a keyword
         assert [tag_state(h) for h in ("", "[CLA", "[CLAUDE]", "네")] == ["maybe", "maybe", "tag", "no"]
         async def prefetch_check():  # the opening is synthesized when the call message arrives, not on connect
             spoken = []

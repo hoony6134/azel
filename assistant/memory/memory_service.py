@@ -1,4 +1,4 @@
-"""박비서 memory: raw records (hybrid search), task context, contacts, and the gateways' shared state.
+"""Azel memory: raw records (hybrid search), task context, contacts, and the gateways' shared state.
 Long-term facts stay in Cygnus MCP.
 
 Contract: ../PROTOCOL.md section 5. Runs on ruchba in Docker (compose.yaml), Tailscale IP only.
