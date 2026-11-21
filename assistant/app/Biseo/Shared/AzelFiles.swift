@@ -46,7 +46,9 @@ enum AzelFiles {
         while !fm.fileExists(atPath: url.path) {
             let waited = Date().timeIntervalSince(start)
             if fm.fileExists(atPath: part.path) ? waited >= partLimit : waited >= appear { break }
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            // 20 ms: the live mic is held until the file is read, so this poll is the only audio gap
+            // (the listener's file already covers everything up to the frame where it saw mic-live).
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
         let data = try? Data(contentsOf: url)
         try? FileManager.default.removeItem(at: url)
