@@ -754,7 +754,7 @@ def run_args(settings, devices, requester=""):
     if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
         url = f"http://{HOST}:{PORT}/v1/mcp"
         servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {"Authorization": f"Bearer {TOKEN}"}}}
-        allowed = [*allowed, "mcp__azel"]
+        allowed = [*allowed, "mcp__azel", "WebSearch", "WebFetch"]  # live web answers (weather, prices, news), full only
         rs = json.loads(run_settings)
         if "allowedMcpServers" in rs:
             rs["allowedMcpServers"].append({"serverUrl": url})

@@ -1614,3 +1614,17 @@ def test_persona_change_reaches_the_voice_server_and_restarts_the_conversation(g
     assert "--resume" in ask("또")  # nothing changed: resumed
     c.put("/v1/settings", json={"user_title": "대표님"})  # the shared title (azel has none of its own)
     assert "--resume" not in ask("다시")  # title changed: a fresh conversation
+
+
+def test_web_tools_only_on_full_gateways(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
+    _, allowed, _, _ = g.run_args(asyncio.run(g.load_settings()), [])
+    assert {"WebSearch", "WebFetch"} <= set(allowed)
+    for name, text in (("anthropic_api_key", "sk-test\n"), ("state_token_limited", "l1m\n")):
+        (tmp_path / name).write_text(text)
+        (tmp_path / name).chmod(0o600)
+    lim = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
+    _, allowed, _, _ = lim.run_args(asyncio.run(lim.load_settings()), [])
+    assert not {"WebSearch", "WebFetch"} & set(allowed)
+    args = lim.base_cmd("m", "s", allowed)
+    assert "WebSearch" not in args[args.index("--allowedTools"):]
