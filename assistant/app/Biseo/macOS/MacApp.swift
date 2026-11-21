@@ -11,6 +11,7 @@ struct BiseoMacApp: App {
 
     init() {
         Recordings.cleanup()
+        Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
         HotKey.register()
     }

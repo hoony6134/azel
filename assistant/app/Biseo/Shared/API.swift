@@ -26,7 +26,7 @@ struct AppSettings: Codable, Equatable {
             var enabled: Bool
             var max_per_day: Int
             var min_gap_minutes: Int
-            var window: [String]          // ["09:00", "22:00"]
+            var window: [String]          // ["08:00", "23:00"]
         }
 
         var enabled: Bool
@@ -35,10 +35,12 @@ struct AppSettings: Codable, Equatable {
         var server_alerts: Bool
         var autonomous: Autonomous
 
-        static let defaultAutonomous = Autonomous(enabled: false, max_per_day: 2, min_gap_minutes: 120, window: ["09:00", "21:00"])
+        /// Fallbacks used only before the server's settings load (the server's values always win).
+        static let defaultAutonomous = Autonomous(enabled: false, max_per_day: 3, min_gap_minutes: 120, window: ["08:00", "23:00"])
+        static let defaultDeadline = Timed(enabled: true, time: "20:00")
 
         init(enabled: Bool = true, morning_briefing: Timed = Timed(enabled: true, time: "08:00"),
-             deadline_check: Timed = Timed(enabled: true, time: "18:00"), server_alerts: Bool = true,
+             deadline_check: Timed = defaultDeadline, server_alerts: Bool = true,
              autonomous: Autonomous = defaultAutonomous) {
             self.enabled = enabled; self.morning_briefing = morning_briefing; self.deadline_check = deadline_check
             self.server_alerts = server_alerts; self.autonomous = autonomous
@@ -51,7 +53,7 @@ struct AppSettings: Codable, Equatable {
             if let timed = try? c.decode(Timed.self, forKey: .morning_briefing) {
                 self.init(enabled: try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true,
                           morning_briefing: timed,
-                          deadline_check: try c.decodeIfPresent(Timed.self, forKey: .deadline_check) ?? Timed(enabled: true, time: "18:00"),
+                          deadline_check: try c.decodeIfPresent(Timed.self, forKey: .deadline_check) ?? Self.defaultDeadline,
                           server_alerts: try c.decodeIfPresent(Bool.self, forKey: .server_alerts) ?? true,
                           autonomous: try c.decodeIfPresent(Autonomous.self, forKey: .autonomous) ?? Self.defaultAutonomous)
             } else {
@@ -59,7 +61,7 @@ struct AppSettings: Codable, Equatable {
                 let time = try c.decodeIfPresent(String.self, forKey: .morning_briefing) ?? "08:00"
                 let triggers = try c.decodeIfPresent([String: Bool].self, forKey: .triggers) ?? [:]
                 self.init(morning_briefing: Timed(enabled: true, time: time),
-                          deadline_check: Timed(enabled: triggers["deadline"] ?? true, time: "18:00"),
+                          deadline_check: Timed(enabled: triggers["deadline"] ?? true, time: Self.defaultDeadline.time),
                           server_alerts: triggers["server_down"] ?? true)
             }
         }
@@ -83,6 +85,8 @@ struct AppSettings: Codable, Equatable {
     var device_fallback: [String]
     /// DESIGN §0: what the assistant is called (default 아젤). Optional so older gateways still decode.
     var assistant_name: String?
+    /// brief | normal | detailed (default normal). Optional for older gateways.
+    var reply_length: String?
     /// Days the server keeps call history (0 = forever). Optional for older gateways.
     var history_days: Int?
 }

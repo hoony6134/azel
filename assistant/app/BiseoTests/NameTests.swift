@@ -39,13 +39,19 @@ final class SetupTests: XCTestCase {
         XCTAssertEqual(Config.cleanToken("abc"), "abc")
     }
 
-    func testSavedPlainAddressesFallBackOnIOSOnly() {
-        XCTAssertNil(Config.usable("ws://100.64.0.11:8891", iOS: true))
-        XCTAssertNil(Config.usable("http://100.64.0.8:8892", iOS: true))
-        XCTAssertEqual(Config.usable("wss://azel.scian.xyz", iOS: true), "wss://azel.scian.xyz")
-        XCTAssertEqual(Config.usable("ws://100.64.0.11:8891", iOS: false), "ws://100.64.0.11:8891")
-        XCTAssertNil(Config.usable("  ", iOS: false))
-        XCTAssertNil(Config.usable(nil, iOS: false))
+    func testOnlyTLSAddressesAreUsedAndPlainOnesMigrate() {
+        XCTAssertNil(Config.usable("ws://100.64.0.11:8891"))
+        XCTAssertNil(Config.usable("http://100.64.0.8:8892"))
+        XCTAssertNil(Config.usable("  "))
+        XCTAssertNil(Config.usable(nil))
+        XCTAssertEqual(Config.usable("wss://azel.scian.xyz"), "wss://azel.scian.xyz")
+        let store = UserDefaults(suiteName: "MigrateTests")!
+        store.removePersistentDomain(forName: "MigrateTests")
+        store.set("ws://100.64.0.11:8891", forKey: "voiceURL")
+        store.set("https://other.example", forKey: "gatewayURL")
+        XCTAssertEqual(Config.migrateAddresses(store), ["voiceURL"])
+        XCTAssertNil(store.string(forKey: "voiceURL"))
+        XCTAssertEqual(store.string(forKey: "gatewayURL"), "https://other.example", "a custom TLS host stays")
     }
 
     func testCallSocketRejectionsAreExplained() {

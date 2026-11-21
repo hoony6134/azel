@@ -10,6 +10,7 @@ struct BiseoApp: App {
     init() {
         _ = CallManager.shared // PushKit must be registered on every launch, including background VoIP launches
         Recordings.cleanup()
+        Config.migrateAddresses()
     }
 
     var body: some Scene {

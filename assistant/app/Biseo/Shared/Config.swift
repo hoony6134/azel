@@ -5,9 +5,9 @@ import Security
 enum Config {
     /// TLS reverse proxy on deneb: `/v1/call` goes to the voice server, the rest to the gateway.
     static let publicVoiceURL = "wss://azel.scian.xyz", publicGatewayURL = "https://azel.scian.xyz"
-    // No tailnet shortcut: ATS blocks plain http/ws to the tailnet (checked 2026-11-21: iOS refuses
-    // 100.64.x.x; macOS lets only this Mac's own 100.64.0.8 through, not vd-spark's voice server).
-    static let addressNote = "기본은 공개 주소(TLS)예요. 암호화되지 않은 Tailnet 주소(http/ws)는 앱 보안 정책 때문에 쓸 수 없어요."
+    // HTTPS only (PM, 2026-11-21): azel.scian.xyz works with or without Tailscale, and ATS blocks
+    // plain http/ws to the tailnet anyway. The advanced fields exist only for another TLS host.
+    static let addressNote = "기본은 azel.scian.xyz예요. 다른 서버를 쓸 때만 바꾸세요 (wss://, https://만 돼요)."
 
     static var voiceURL: String {
         get { usable(UserDefaults.standard.string(forKey: "voiceURL")) ?? publicVoiceURL }
@@ -18,20 +18,24 @@ enum Config {
         set { UserDefaults.standard.set(newValue, forKey: "gatewayURL") }
     }
 
-    /// A saved address, unless it can't work here: blank, or (iOS) plain ws/http, which ATS
-    /// blocks. Older iPhone builds saved the tailnet addresses, so those fall back to the public ones.
-    /// macOS keeps them: a plain address to this Mac itself still passes ATS there.
-    static func usable(_ saved: String?, iOS: Bool = isIOS) -> String? {
-        guard let s = saved?.trimmingCharacters(in: .whitespaces), !s.isEmpty else { return nil }
-        if iOS, s.hasPrefix("ws://") || s.hasPrefix("http://") { return nil }
+    /// A saved address only if it is TLS (wss/https); anything else falls back to the defaults.
+    static func usable(_ saved: String?) -> String? {
+        guard let s = saved?.trimmingCharacters(in: .whitespaces), isTLS(s) else { return nil }
         return s
     }
 
-    #if os(iOS)
-    static let isIOS = true
-    #else
-    static let isIOS = false
-    #endif
+    static func isTLS(_ s: String) -> Bool { s.hasPrefix("wss://") || s.hasPrefix("https://") }
+
+    /// First launch after the update: older builds saved plain tailnet addresses; drop them
+    /// silently so the azel defaults apply. Returns the keys it removed.
+    @discardableResult
+    static func migrateAddresses(_ store: UserDefaults = .standard) -> [String] {
+        ["voiceURL", "gatewayURL"].filter { key in
+            guard let s = store.string(forKey: key), usable(s) == nil else { return false }
+            store.removeObject(forKey: key)
+            return true
+        }
+    }
 
     /// Tokens get pasted with stray spaces and line breaks; none belong in one.
     static func cleanToken(_ raw: String) -> String {

@@ -133,8 +133,13 @@ struct SetupFlow: View {
     private func check() async {
         checking = true
         defer { checking = false }
-        Config.voiceURL = voice.trimmingCharacters(in: .whitespaces)
-        Config.gatewayURL = gateway.trimmingCharacters(in: .whitespaces)
+        let v = voice.trimmingCharacters(in: .whitespaces), g = gateway.trimmingCharacters(in: .whitespaces)
+        guard Config.isTLS(v), Config.isTLS(g) else {
+            checks = [Check(id: "서버 주소", ok: false, reason: "wss://, https:// 주소만 쓸 수 있어요")]
+            return
+        }
+        Config.voiceURL = v
+        Config.gatewayURL = g
         if !token.isEmpty { Config.token = Config.cleanToken(token) }
         token = ""
         #if os(iOS)
@@ -282,6 +287,13 @@ struct SettingsScreen<Extra: View>: View {
                     .accessibilityHint("호출어는 바뀌지 않습니다")
             }
             if let nameError { Text(nameError).font(.footnote).foregroundStyle(Theme.danger) }
+            row("답변 길이") {
+                Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
+                                                   set: { s.wrappedValue.reply_length = $0 })) {
+                    Text("간결").tag("brief"); Text("보통").tag("normal"); Text("자세히").tag("detailed")
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 220)
+            }
             Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
             HStack {
                 Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
@@ -502,9 +514,9 @@ struct SettingsScreen<Extra: View>: View {
     }
 
     private func window(_ p: Binding<AppSettings.Proactive>, _ i: Int) -> Binding<String> {
-        Binding(get: { let w = p.wrappedValue.autonomous.window; return i < w.count ? w[i] : (i == 0 ? "09:00" : "21:00") },
+        Binding(get: { let w = p.wrappedValue.autonomous.window; return i < w.count ? w[i] : (i == 0 ? "08:00" : "23:00") },
                 set: { var w = p.wrappedValue.autonomous.window
-                       while w.count < 2 { w.append(w.isEmpty ? "09:00" : "21:00") }
+                       while w.count < 2 { w.append(w.isEmpty ? "08:00" : "23:00") }
                        w[i] = $0
                        p.wrappedValue.autonomous.window = w })
     }
