@@ -130,7 +130,7 @@ MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){
                "nim": rf"(엔비디아|nvidia|\bnim){_USE}"}  # NVIDIA NIM on a full gateway (gateway/nim.py)
 USE_CLAUDE = re.compile(rf"(클로드|claude){_USE}|(클로드|claude)(가|이)\s*(해|답|풀|찾|봐|알아)", re.I)
 # Needs live data or a device: straight to Claude without asking Qwen (Qwen would guess).
-NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
+NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
                           r"|spark|ruchba|albireo|gienah|deneb|macbook"
                           r"|스파크|루크바|알비레오|기에나|데네브", re.I)  # Korean: how Whisper spells the spoken names
 # Personal data only full-mode gateways may touch (same list as the gateway's PERSONAL).
@@ -317,7 +317,7 @@ MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|�
 BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")  # a brain without a tool list
 TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
 # With the brain's read-only server tools, a status question stays local; doing something on a server does not.
-WEB_LIVE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|검색|찾아(서|줘|봐)|맛집")
+WEB_LIVE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집")
 STATUS_Q = re.compile(r"괜찮|상태|살아 ?있|켜져|꺼졌|다운|죽었|문제|경보|알림|이상|느려|디스크|용량|온도|메모리")
 DEVICE_Q = re.compile(r"(맥북|macbook|기기|노트북|컴퓨터).{0,6}(켜져|꺼져|꺼졌|연결|살아|온라인|오프라인)", re.I)
 SERVER_ACTION = re.compile(r"재시작|재부팅|리부트|고쳐|켜 ?줘|꺼 ?줘|지워|삭제|정리해|로그|배포|실행|돌려|설치")
@@ -1895,6 +1895,9 @@ if __name__ == "__main__":
         assert client_activity({"phase": "tool_start", "kind": "mail"})["kind"] == "mail"
         assert client_activity({"phase": "tool_start", "kind": "<script>"})["kind"] == "generic"
         assert "SECRET" not in json.dumps(seen) and said == ["내일은 수업이 없어요."]
+        for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
+            assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
+        assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
         assert task_intent("맥북 다운로드 폴더 정리해 줘") == "call" and task_intent("논문 찾아서 요약하고 끝나면 알려 줘") == "call"
         assert task_intent("빌드 돌리고 다 되면 알림으로 알려 줘") == "push" and task_intent("맥북 켜져 있어?") is None
