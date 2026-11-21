@@ -60,8 +60,8 @@ figcaption { color:var(--text2); font-size:13px; font-weight:600; letter-spacing
 .chip.tool { color:var(--text2); border-color:var(--stroke); font-family:ui-monospace, "SF Mono", Menlo, monospace; font-weight:500; }
 .card { background:var(--card); border:1px solid var(--stroke); border-radius:22px; padding:16px; }
 [data-theme="light"] .card { box-shadow:0 4px 12px rgba(0,0,0,.05); }
-.card h3 { font-size:17px; font-weight:600; display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
-.card h3 small { font-size:13px; font-weight:600; color:var(--celadon); }
+.card h2 { font-size:17px; font-weight:600; display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+.card h2 small { font-size:13px; font-weight:600; color:var(--celadon); }
 .row { display:flex; justify-content:space-between; align-items:center; font-size:17px; padding:9px 0; border-top:1px solid var(--stroke); gap:12px; }
 .row:first-of-type { border-top:none; }
 .row .v { color:var(--text2); font-variant-numeric:tabular-nums; }
@@ -75,7 +75,7 @@ canvas.jar { display:block; }
 .quick { display:flex; gap:8px; margin-top:12px; }
 .quick span { flex:1; display:flex; justify-content:center; align-items:center; gap:6px; height:44px; border:1px solid var(--stroke); border-radius:999px; font-size:15px; color:var(--text); white-space:nowrap; }
 .recent { margin-top:22px; }
-.recent h4 { font-size:15px; font-weight:600; color:var(--text2); margin-bottom:10px; }
+.recent h2 { font-size:15px; font-weight:600; color:var(--text2); margin-bottom:10px; }
 .recent .card { padding:14px 16px; margin-bottom:10px; border-radius:18px; }
 .recent .meta { display:flex; justify-content:space-between; margin-bottom:6px; }
 .recent .me { color:var(--text2); font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -196,7 +196,7 @@ canvas.jar { display:block; }
       <span style="color:var(--amber)"><svg width="17" height="17"><use href="#i-shield"/></svg>승인 2건</span>
     </div>
     <div class="recent">
-      <h4>최근 대화</h4>
+      <h2>최근 대화</h2>
       <div class="card"><div class="meta"><span class="foot">오전 8:02</span><span class="chip claude">Claude</span></div>
         <div class="me">오늘 일정 뭐 있어?</div>
         <div class="ai">10시 랩 미팅, 오후 2시에 알고리즘 과제 마감이 있어요. 과제는 어제 70%까지 하셨어요.</div></div>
@@ -247,12 +247,12 @@ canvas.jar { display:block; }
     <div class="title">설정</div>
     <div class="stack">
       <div class="card">
-        <h3>비서</h3>
+        <h2>비서</h2>
         <div class="row"><span>이름</span><span class="v" style="color:var(--text)" aria-label="비서 이름, 아젤">아젤</span></div>
         <div class="foot" style="margin-top:6px;line-height:1.4">호출어는 다시 학습하기 전까지 ‘아젤’로 유지돼요.</div>
       </div>
       <div class="card">
-        <h3>사용량 <span class="foot">11월</span></h3>
+        <h2>사용량 <span class="foot">11월</span></h2>
         <div><span class="big">$123.40</span> <span class="sub num">/ $500</span></div>
         <div class="bar" role="img" aria-label="이번 달 사용량, 500달러 중 123달러, 25퍼센트"><b style="width:25%"></b><span class="tick" style="left:80%"></span></div>
         <div class="foot">경고 기준 80%</div>
@@ -261,14 +261,14 @@ canvas.jar { display:block; }
         <div class="mini"><span>Haiku</span><span class="b" style="width:8%"></span><span>$7.30</span></div>
       </div>
       <div class="card">
-        <h3>상태</h3>
+        <h2>상태</h2>
         <div class="row"><span><span class="dot"></span>&nbsp; 스파크</span><span class="v">42 ms</span></div>
         <div class="row"><span><span class="dot"></span>&nbsp; 게이트웨이</span><span class="v">8 ms</span></div>
         <div class="row"><span><span class="dot"></span>&nbsp; 맥북</span><span class="v">11 ms</span></div>
         <div class="row"><span><span class="dot down"></span>&nbsp; 알비레오</span><span class="v" style="color:var(--danger)">응답 없음</span></div>
       </div>
       <div class="card">
-        <h3>모델 <small>✓ 저장됨</small></h3>
+        <h2>모델 <small>✓ 저장됨</small></h2>
         <div class="row"><span>기본 모델</span><span class="menu">자동 ⌄</span></div>
         <div class="row"><span>Claude 경로</span><span class="menu">자동 ⌄</span></div>
       </div>
@@ -291,14 +291,14 @@ canvas.jar { display:block; }
     <div class="title">승인</div>
     <div class="stack">
       <div class="card" aria-label="맥북, run_command, 명령: git push origin main">
-        <h3>맥북 <span class="foot">2분 전</span></h3>
+        <h2>맥북 <span class="foot">2분 전</span></h2>
         <span class="chip tool">run_command</span>
         <div class="code">git push origin main</div>
         <div class="foot" style="display:flex;gap:6px;align-items:center;color:var(--text2)"><svg width="14" height="14"><use href="#i-folder"/></svg>~/dev/biseo</div>
         <div class="btns"><span class="no">거절</span><span class="yes">승인</span></div>
       </div>
       <div class="card">
-        <h3>알비레오 <span class="foot">14분 전</span></h3>
+        <h2>알비레오 <span class="foot">14분 전</span></h2>
         <span class="chip tool">run_command</span>
         <div class="code">rm -rf ~/tmp/old-build</div>
         <div class="foot" style="display:flex;gap:6px;align-items:center;color:var(--text2)"><svg width="14" height="14"><use href="#i-folder"/></svg>~/tmp</div>
