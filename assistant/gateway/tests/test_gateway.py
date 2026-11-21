@@ -23,6 +23,7 @@ def start(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("BISEO_CLAUDE", str(HERE / "fake_claude.py"))
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("BISEO_WARM_CLAUDE", "0")  # the one-shot fake; test_warm_claude covers the warm path
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     sys.path.insert(0, str(HERE.parent))
@@ -34,6 +35,15 @@ def start(tmp_path, monkeypatch, **env):
     async def no_link():  # tests drive the link by hand
         return None
     g.voice_link = no_link
+
+    async def discovered():  # what `claude mcp list` / `claude plugin list` would report
+        g.discovery.connectors = [{"name": "Cygnus MCP", "url": "https://mcp.example/cygnus", "status": "connected"},
+                                  {"name": "Gmail", "url": "https://gmail.example/mcp", "status": "connected"},
+                                  {"name": "Google Calendar", "url": "https://cal.example/mcp", "status": "connected"},
+                                  {"name": "Notion", "url": "https://notion.example/mcp", "status": "connected"},
+                                  {"name": "Slack", "url": "https://slack.example/mcp", "status": "needs_auth"}]
+        g.discovery.plugins, g.discovery.at = ["figma@official", "legal@x"], 1.0
+    g.discovery.refresh = discovered
     return g
 
 
@@ -168,7 +178,7 @@ def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypa
     c.put("/v1/settings", json={"proactive": {"enabled": False}})
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append(reason)
         return {"call_id": f"c{len(placed)}"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -192,6 +202,175 @@ def test_reply_length_setting(gw):
     c.post("/v1/ask", json={"text": "b"})
     assert g.LENGTH_STYLE["detailed"] in prompt()
     assert c.put("/v1/settings", json={"reply_length": "long"}).status_code == 400
+    assert c.get("/v1/settings").json()["noise_mode"] == "normal"
+    assert c.put("/v1/settings", json={"noise_mode": "noisy"}).json()["noise_mode"] == "noisy"
+    assert c.put("/v1/settings", json={"noise_mode": "loud"}).status_code == 400
+
+
+def test_personality(gw):
+    g, c, tmp = gw
+    s = c.get("/v1/settings").json()
+    assert s["personality"] == "" and s["personality_default"] == g.PERSONALITY_DEFAULT
+    c.post("/v1/ask", json={"text": "a"})
+    prompt = lambda: (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]  # noqa: E731
+    assert f"성격: {g.PERSONALITY_DEFAULT}" in prompt()  # empty = the default, for Claude too
+    s = c.put("/v1/settings", json={**s, "personality": "느긋하고 다정함"}).json()  # whole document back: fine
+    assert s["personality"] == "느긋하고 다정함" and "personality_default" not in g.fake.db["settings"]
+    c.post("/v1/ask", json={"text": "b"})
+    assert "성격: 느긋하고 다정함" in prompt() and g.PERSONALITY_DEFAULT not in prompt()
+    for reset in ["", "   ", None]:  # "기본값으로 되돌리기"
+        s = c.put("/v1/settings", json={"personality": reset}).json()
+        assert s["personality"] == ("" if reset is None else reset) and g.personality(s) == g.PERSONALITY_DEFAULT
+    assert c.put("/v1/settings", json={"personality": "가" * 601}).status_code == 400
+    assert c.put("/v1/settings", json={"personality": 3}).status_code == 400
+
+
+# ---------- personas ----------
+def persona_gw(g, monkeypatch):
+    async def voices():
+        return ["sohee", "ryan", "vivian"]
+    monkeypatch.setattr(g, "tts_voices", voices)
+
+
+def test_personas_migrate_from_one_assistant(gw):
+    g, c, _ = gw
+    g.fake.db["settings"] = {"assistant_name": "루나", "personality": "다정함"}  # stored before personas
+    [p] = c.get("/v1/personas").json()
+    assert p["id"] == "azel" and p["primary"] and p["name"] == "루나" and p["personality"] == "다정함"
+    s = c.get("/v1/settings").json()
+    assert s["assistant_name"] == "루나" and s["personality"] == "다정함"  # older clients still read these
+    c.put("/v1/settings", json={"assistant_name": "아젤"})  # and write the primary through them
+    assert c.get("/v1/personas/azel").json()["name"] == "아젤"
+
+
+def test_personas_crud_and_limits(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "Vivian", "personality": "느긋함",
+                                     "color": "#22aa88", "share_memory": True})
+    assert r.status_code == 201 and r.json()["voice"] == "vivian" and not r.json()["primary"]
+    for bad in [{"name": "루나", "voice": "sohee"},  # name taken
+                {"name": "새비서", "voice": "nova"},  # not a TTS speaker
+                {"name": "a" * 13, "voice": "sohee"}, {"name": "새비서"}, {"name": "새비서", "voice": "sohee", "color": "red"},
+                {"name": "새비서", "voice": "sohee", "default_model": "gpt"}, {"name": "새비서", "voice": "sohee", "id": "Bad!"},
+                {"name": "새비서", "voice": "sohee", "id": "luna"}, {"name": "새비서", "voice": "sohee", "evil": 1},
+                {"name": "새비서", "voice": "sohee", "personality": "가" * 601}]:
+        assert c.post("/v1/personas", json=bad).status_code == 400, bad
+    assert c.put("/v1/personas/luna", json={"personality": "꼼꼼함", "voice": "ryan"}).json()["voice"] == "ryan"
+    assert c.put("/v1/personas/luna", json={"primary": True}).status_code == 400  # only via /primary
+    for i in range(6):
+        assert c.post("/v1/personas", json={"name": f"비서{'가나다라마바'[i]}", "voice": "sohee"}).status_code == 201
+    assert c.post("/v1/personas", json={"name": "아홉째", "voice": "sohee"}).status_code == 400  # max 8
+    assert c.delete("/v1/personas/azel").status_code == 400  # the primary stays
+    assert c.post("/v1/personas/luna/primary").json()["primary"]
+    assert [p["id"] for p in c.get("/v1/personas").json() if p["primary"]] == ["luna"]
+    assert c.get("/v1/settings").json()["assistant_name"] == "루나"
+    gone = c.delete("/v1/personas/azel").json()  # no longer primary: marked deleted, not removed
+    assert gone["deleted_at"] and "azel" not in [p["id"] for p in c.get("/v1/personas").json()]
+    assert c.get("/v1/personas/azel").json()["name"] == "아젤"  # still resolvable for its old calls
+    assert "azel" in [p["id"] for p in c.get("/v1/personas?include=deleted").json()]
+    assert c.post("/v1/personas", json={"name": "아젤", "voice": "sohee"}).status_code == 201  # name free again
+    assert c.get("/v1/personas/nope").status_code == 404
+
+
+def test_persona_calls_schedule_and_asks(gw, monkeypatch):
+    g, c, tmp = gw
+    persona_gw(g, monkeypatch)
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋하고 다정함"})
+    sent, pushes = [], []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+
+    async def fake_push(payload):
+        pushes.append(payload)
+        return {"sent": 1}
+    g.link_send, g.send_voip_push = capture, fake_push
+    asyncio.run(g.place_call("manual", "안녕하세요.", persona_id="luna"))
+    assert pushes[-1]["caller"] == "루나" and sent[-1]["persona"] == "luna"
+    asyncio.run(g.place_call("deadline", "마감이에요."))  # proactive calls: the primary
+    assert pushes[-1]["caller"] == "아젤" and sent[-1]["persona"] == "azel"
+    at = (datetime.now(g.KST) + timedelta(hours=2)).replace(second=0, microsecond=0).isoformat()
+    item = c.post("/v1/schedule", json={"at": at, "persona_id": "luna"}).json()
+    assert item["persona_id"] == "luna"
+    assert c.post("/v1/schedule", json={"at": at, "persona_id": "ghost"}).status_code == 400
+    assert c.get("/v1/schedule?persona=luna").status_code == 200
+    asyncio.run(g.serve_ask({"type": "ask", "id": "a1", "text": "안녕", "session": "luna:s", "persona": "luna"}))
+    prompt = (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]
+    assert "'루나'" in prompt and "느긋하고 다정함" in prompt and "'아젤'" not in prompt
+    c.post("/v1/ask", json={"text": "b"})
+    prompt = (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]
+    assert "'아젤'" in prompt  # no persona: the primary
+
+
+def test_persona_delete_voices_and_samples(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian"})
+    c.post("/v1/personas", json={"id": "mira", "name": "미라", "voice": "ryan"})
+    assert c.delete("/v1/personas/luna").json()["deleted_at"] and g.fake.persona_data == ("luna", False)
+    c.delete("/v1/personas/mira?delete_history=true")
+    assert g.fake.persona_data == ("mira", True)
+    c.post("/v1/personas", json={"id": "nova", "name": "노바", "voice": "sohee"})
+    g.fake.state.down = True  # data cannot be deleted: the persona is not deleted either
+    assert c.delete("/v1/personas/nova").status_code == 503
+    g.fake.state.down = False
+    assert not c.get("/v1/personas/nova").json()["deleted_at"]
+    v = c.get("/v1/voices").json()
+    assert {"id": "sohee", "label": "소희", "desc": "따뜻한 한국어 여성", "lang": "ko"} in v and len(v) == 3
+    calls = []
+
+    async def fake_sample(text, voice, style):
+        calls.append((text, voice, style))
+        return b"RIFFfakewav"
+    monkeypatch.setattr(g, "tts_sample", fake_sample)
+    g._sample_at[0] = 0.0
+    r = c.post("/v1/personas/voice-sample", json={"voice": "Sohee", "voice_style": "밝게", "text": "안녕하세요, 루나예요."})
+    assert r.status_code == 200 and r.headers["content-type"] == "audio/wav" and r.content == b"RIFFfakewav"
+    assert calls == [("안녕하세요, 루나예요.", "sohee", "밝게")]
+    assert c.post("/v1/personas/voice-sample", json={"voice": "sohee", "text": "또"}).status_code == 429  # 1 per 2 s
+    g._sample_at[0] = 0.0
+    for bad in [{"voice": "sohee", "text": "가" * 61}, {"voice": "nova", "text": "안녕"}, {"voice": "sohee", "text": " "}]:
+        assert c.post("/v1/personas/voice-sample", json=bad).status_code == 400, bad
+
+
+def test_connectors_app_shape(gw, monkeypatch):
+    g, c, tmp = gw
+    g.discovery.connectors = [{"name": "Gmail", "url": "https://gmail.mcp.claude.com/mcp", "status": "connected"},
+                              {"name": "Notion", "url": "https://mcp.notion.com/mcp", "status": "failed"}]
+    g.discovery.at = time.time()
+    got = c.get("/v1/connectors").json()
+    assert got == {"claude_ai": [{"name": "Gmail", "enabled": True, "status": "connected"},
+                                 {"name": "Notion", "enabled": False, "status": "needs_auth"}], "custom": []}
+    put = {"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
+           "custom": [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True}]}
+    got = c.put("/v1/connectors", json=put).json()
+    assert [x["enabled"] for x in got["claude_ai"]] == [False, True]
+    assert got["custom"] == [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True,
+                              "has_secret": False}]
+    r = c.put("/v1/connectors/secret/linear", json={"value": "lin_secret"})
+    assert r.status_code == 204 and r.content == b""
+    assert c.get("/v1/connectors").json()["custom"][0]["has_secret"] is True
+    assert "lin_secret" not in json.dumps(c.get("/v1/connectors").json())
+    for bad in [{"claude_ai": {"Gmail": True}}, {"claude_ai": [{"name": "Gmail", "enabled": "yes"}]},
+                {"custom": [{"name": "Bad Name", "url": "https://x"}]}, {"extra": 1}]:
+        assert c.put("/v1/connectors", json=bad).status_code == 400, bad
+
+
+def test_wake_enrollment_mounted_on_full_gateways(gw):
+    g, c, _ = gw
+    assert c.get("/v1/wake/enroll").json()["status"] == "none"
+    assert c.get("/v1/wake/enroll", headers={"Authorization": "Bearer nope"}).status_code == 401  # bearer applies
+
+
+def test_claude_error_is_spoken_not_silent(gw):
+    g, c, _ = gw
+    ev = events(c.post("/v1/ask", json={"text": "한도 걸린 질문"}))
+    assert ev == [{"type": "error", "code": "limit", "message": "지금은 Claude 사용 한도에 걸려서 답할 수 없어요. 오후 10시쯤 풀려요."}]
+    assert g.claude_failure("something broke")["code"] == "claude_error"
+    assert g.claude_failure("rate limited (429)")["message"].endswith("다시 물어봐 주세요.")
+    assert events(c.post("/v1/ask", json={"text": "평범한 질문"}))[-1]["type"] == "done"  # unchanged otherwise
 
 
 def test_settings_reject_unknown(gw):
@@ -247,7 +426,7 @@ def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append((reason, opening))
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -511,7 +690,7 @@ def test_schedule_api_validates_and_confirms(gw):
     assert r.status_code == 201
     item = r.json()
     assert item == {"id": item["id"], "at": tomorrow10.isoformat(), "repeat": None, "kind": "wake", "note": "",
-                    "status": "pending", "attempts": 0, "created_by": "app"}
+                    "status": "pending", "attempts": 0, "created_by": "app", "persona_id": "azel"}
     iso = lambda t: datetime.fromtimestamp(t, g.KST).isoformat()  # noqa: E731
     for bad in [{"at": iso(now - 60)}, {"at": iso(now + 31 * 86400)}, {"at": "2026-12-01T10:00:00"},  # no offset
                 {"at": now + 3600}, {"at": iso(now + 3600), "repeat": "hourly"},
@@ -569,7 +748,8 @@ def test_schedule_over_the_link(gw):
     by = {m["id"]: m for m in sent}
     assert by["r1"]["say"] == "내일 오전 7시 30분에 깨워 드릴게요." and by["r1"]["ok"]
     assert by["r1"]["item"]["at"] == at.isoformat() and by["r1"]["item"]["created_by"] == "voice"
-    assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by"}
+    assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by",
+                                     "persona_id"}
     assert by["r2"]["say"] == "예약된 전화는 내일 오전 7시 30분 기상이에요."
     assert by["r3"]["say"] == "내일 오전 7시 30분 예약을 취소했어요."
     assert by["r4"]["say"] == "취소할 예약이 없어요."
@@ -580,7 +760,7 @@ def test_schedule_over_the_link(gw):
 def fire_setup(g, monkeypatch, **item):
     placed, alerts = [], []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append((reason, opening))
         assert g.fake.db["schedule"]["s1"]["call_id"] == call_id  # claimed with the attempt, before ringing
         return {"call_id": call_id}
@@ -669,7 +849,7 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
         assert ev == [{"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}]
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         ran.append(reason)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -703,7 +883,7 @@ def test_guardrails(gw):
 def auto_setup(g, monkeypatch, verdict):
     placed, asked = [], []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
@@ -896,7 +1076,7 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
     g, _, _ = gw
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         ran.append(g.INSTANCE)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -918,7 +1098,7 @@ def test_alert_limits(gw, monkeypatch):
     g, c, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
         placed.append(opening)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -990,9 +1170,11 @@ def test_tokens_per_mode(tmp_path, monkeypatch):
 
 def test_limited_has_no_call_history(limited):
     g, c, _ = limited
+    for method in ("get", "post", "delete"):  # wake-word enrollment is not mounted on a limited gateway
+        assert getattr(c, method)("/v1/wake/enroll").status_code in (404, 405), method
     for method, path in [("get", "/v1/history"), ("get", "/v1/history/L1"), ("delete", "/v1/history/L1"),
                          ("delete", "/v1/history?older_than_days=30"), ("get", "/v1/schedule"),
-                         ("get", "/v1/proactive/log"),
+                         ("get", "/v1/proactive/log"), ("get", "/v1/personas"), ("delete", "/v1/personas/azel"),
                          ("delete", "/v1/schedule/s1")]:
         assert getattr(c, method)(path).status_code == 403, path
     asyncio.run(g.handle_link(LinkWS(CALL_LOG)))
@@ -1079,3 +1261,176 @@ def test_mcp_client_parses_sse_and_json(gw, monkeypatch):
     assert asyncio.run(g.mcp("http://d/mcp", "tools/list", {})) == {"tools": []}
     with pytest.raises(RuntimeError, match="nope"):
         asyncio.run(g.mcp("http://d/mcp", "tools/list", {}))
+
+
+def test_warm_pool_race_cap_displace_and_call_end(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+    import claude_warm
+    monkeypatch.setattr(claude_warm, "MAX_PROCS", 2)
+
+    def spawned():
+        return len((tmp_path / "args.json").read_text().splitlines()) if (tmp_path / "args.json").exists() else 0
+
+    async def run():
+        await asyncio.gather(g.prewarm("azel:c1"), g.ask_text("안녕", "azel:c1"))  # prewarm races the first ask
+        n_race = spawned()
+        first = g.warm_pool.procs["azel:c1"]
+        await g.ask_text("둘", "azel:c2")
+        await g.ask_text("셋", "azel:c3")  # cap 2: the least recently used (c1) goes, closed
+        capped = (sorted(g.warm_pool.procs), first.proc.returncode is not None)
+        w = g.warm_pool.procs["azel:c3"]
+        cfg = w.cfg
+        settings = await g.load_settings()
+        settings["assistant_name"] = "새이름"  # a different prompt: a new process, the old one closed with its config
+        g.fake.db["settings"] = {**g.fake.db["settings"], "assistant_name": "새이름"}
+        await g.ask_text("넷", "azel:c3")
+        displaced = (w.proc.returncode is not None, cfg is None or not os.path.exists(cfg))
+        await g.handle_link(LinkWS([{"type": "call_log", "event": "start", "log_id": "L9", "session": "s9",
+                                     "persona_id": "azel"}]))
+        await asyncio.sleep(0.3)  # the prewarm task runs
+        warm9 = "azel:s9" in g.warm_pool.procs
+        await g.handle_link(LinkWS([{"type": "call_log", "event": "end", "log_id": "L9", "ended_at": 1.0}]))
+        await asyncio.sleep(0.1)
+        closed9 = "azel:s9" not in g.warm_pool.procs
+        await g.warm_pool.close_all()
+        return n_race, capped, displaced, warm9, closed9
+    n_race, capped, displaced, warm9, closed9 = asyncio.run(run())
+    assert n_race == 1  # one process, not two
+    assert capped == (["azel:c2", "azel:c3"], True)
+    assert displaced == (True, True)
+    assert warm9 and closed9  # prewarmed at the call's start under the asks' key, closed at its end
+
+
+def test_warm_turn_timeout_kills_a_hung_process(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+    import claude_warm
+    monkeypatch.setattr(claude_warm, "TURN_IDLE_S", 0.5)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="nothing for too long"):  # serve_ask turns it into an error event
+            [e async for e in g.ask_stream("멈춤", "azel:h1")]  # the fake never answers
+        w = g.warm_pool.procs.get("azel:h1")
+        dead = w is None or w.proc.returncode is not None
+        await g.warm_pool.close_all()
+        return dead
+    assert asyncio.run(run())
+
+
+def test_prewarm_uses_the_call_persona(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+    g.fake.db["settings"] = {"personas": [{"id": "azel", "name": "아젤", "voice": "sohee", "primary": True},
+                                          {"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋함"}]}
+
+    async def run():
+        await g.prewarm("luna:s1", "luna")
+        style = g.warm_pool.procs["luna:s1"].style
+        await g.warm_pool.close_all()
+        return style
+    style = asyncio.run(run())
+    assert "'루나'" in style and "느긋함" in style
+
+
+def test_warm_claude_keeps_one_process_per_session(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+
+    async def run():
+        await g.prewarm("call-1")  # the call's start: spawned before the first question
+        said = [await g.ask_text("안녕", "call-1"), await g.ask_text("또 안녕", "call-1"), await g.ask_text("다른 통화", "call-2")]
+        pids = [json.loads(line)["pid"] for line in (tmp_path / "args.json").read_text().splitlines()]
+        argv = json.loads((tmp_path / "args.json").read_text().splitlines()[0])["argv"]
+        gen = g.ask_stream("느린 질문", "call-1")  # barge-in mid-turn: the process drains and stays usable
+        async for ev in gen:
+            break
+        await gen.aclose()
+        t = time.perf_counter()
+        again = await g.ask_text("다시", "call-1")  # right after the barge-in: not stuck behind the slow answer
+        again_s = time.perf_counter() - t
+        lookup = await g.ask_text("서버 상태 괜찮아?", "call-1")  # Haiku by the lookup rule, same process
+        n_procs = len((tmp_path / "args.json").read_text().splitlines())
+        await g.warm_pool.close_all()
+        return said, pids, argv, again, again_s, lookup, n_procs
+    said, pids, argv, again, again_s, lookup, n_procs = asyncio.run(run())
+    assert said == ["네, 1번째예요.", "네, 2번째예요.", "네, 1번째예요."]
+    assert len(pids) == 2 and "--input-format" in argv and "stream-json" in argv
+    assert again == "네, 4번째예요." and again_s < 0.5 and n_procs == 2, again_s  # interrupted, same process
+    ctl = [json.loads(x) for x in (tmp_path / "args.json.ctl").read_text().splitlines()]
+    assert {"subtype": "interrupt"} in ctl and {"subtype": "set_model", "model": "claude-haiku-5-5"} in ctl
+    assert lookup == "네, 5번째예요."
+    assert g.resolve(g.DEFAULTS, None, None, "chat", "서버 상태 괜찮아?")[0] == "haiku"
+    assert g.resolve(g.DEFAULTS, None, None, "chat", "이번 주 계획 짜 줘")[0] == "sonnet"
+    assert g.resolve(g.DEFAULTS, "opus", None, "chat", "서버 상태 괜찮아?")[0] == "opus"  # a forced model wins
+    assert g.resolve(g.DEFAULTS, None, None, "schedule", "오늘 일정 뭐 있어?")[0] == "sonnet"  # task_defaults win
+    assert g.fake.db["sessions"]["call-1"]["claude_session"] == "warm-1"
+
+
+def run_settings(tmp):
+    args = json.loads((tmp / "args.json").read_text())
+    return args, json.loads(args[args.index("--settings") + 1])
+
+
+def test_runs_load_only_enabled_connectors(gw):
+    g, c, tmp = gw
+    c.post("/v1/ask", json={"text": "a", "session": "s1"})
+    args, st = run_settings(tmp)
+    urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
+    assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp"}  # defaults
+    assert st["enabledPlugins"] == {"figma@official": False, "legal@x": False}
+    assert "mcp__claude_ai_Gmail" in args and "mcp__claude_ai_Notion" not in args
+    r = c.put("/v1/connectors", json={"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
+                                      "custom": [{"name": "wiki", "url": "https://wiki.example/mcp"},
+                                                 {"name": "off", "url": "https://off.example/mcp", "enabled": False}]})
+    assert r.status_code == 200
+    view = {x["name"]: x for x in r.json()["claude_ai"]}
+    assert view["Notion"]["enabled"] and not view["Gmail"]["enabled"] and view["Slack"]["status"] == "needs_auth"
+    assert r.json()["custom"][0]["has_secret"] is False
+    c.post("/v1/ask", json={"text": "b", "session": "s2"})
+    args, st = run_settings(tmp)
+    urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
+    assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp"}
+    assert "mcp__claude_ai_Notion" in args and "mcp__wiki" not in args  # no secret yet: the server is skipped
+
+
+def test_connector_secret_is_write_only(gw):
+    g, c, tmp = gw
+    c.put("/v1/connectors", json={"custom": [{"name": "wiki", "url": "https://wiki.example/mcp"}]})
+    assert c.put("/v1/connectors/secret/wiki", json={"value": "SECRET-TOKEN"}).status_code == 204
+    f = tmp / "mcp" / "wiki"
+    assert f.read_text() == "SECRET-TOKEN" and f.stat().st_mode & 0o777 == 0o600
+    for path in ("/v1/connectors", "/v1/settings"):
+        assert "SECRET-TOKEN" not in c.get(path).text
+    assert c.get("/v1/connectors").json()["custom"][0]["has_secret"] is True
+    seen = {}
+
+    async def spy(text, session, **kw):  # the generated --mcp-config carries the header to Claude only
+        servers, allowed, *_ = g.run_args(await g.load_settings(), [])
+        seen.update(servers=servers, allowed=allowed)
+    asyncio.run(spy("x", "s"))
+    assert seen["servers"]["wiki"]["headers"] == {"Authorization": "Bearer SECRET-TOKEN"} and "mcp__wiki" in seen["allowed"]
+    for bad in ("../x", "a b", ""):
+        assert c.put(f"/v1/connectors/secret/{bad}", json={"value": "v"}).status_code in (400, 404, 405)
+    assert c.put("/v1/connectors/secret/wiki", json={"value": ""}).status_code == 400
+
+
+def test_connectors_validation(gw):
+    g, c, _ = gw
+    ok = {"custom": [{"name": "tail", "url": "http://100.64.0.12:9000/mcp"}, {"name": "pub", "url": "https://x.example/mcp"}]}
+    assert c.put("/v1/connectors", json=ok).status_code == 200  # http only to a tailnet address
+    for url in ["http://x.example/mcp", "http://192.168.1.5/mcp", "http://100.128.0.1/mcp", "http://localhost/mcp"]:
+        assert c.put("/v1/connectors", json={"custom": [{"name": "a", "url": url}]}).status_code == 400, url
+    g.fake.db["settings"] = {**g.fake.db.get("settings", {})}
+    # a server may only use its own secret (auth_ref = its name), even through the settings route
+    assert c.put("/v1/settings", json={"connectors": {"custom": [{"name": "evil", "url": "https://e.example/mcp",
+                                                                   "auth_ref": "pub"}]}}).status_code == 400
+    for bad in [{"claude_ai": [{"name": "Gmail", "enabled": "yes"}]}, {"custom": [{"name": "a b", "url": "https://x"}]},
+                {"custom": [{"name": "a", "url": "ftp://x"}]}, {"custom": [{"name": "a", "url": "https://x", "token": "t"}]},
+                {"custom": [{"name": "a", "url": "https://x"}, {"name": "a", "url": "https://y"}]}, {"other": 1}]:
+        assert c.put("/v1/connectors", json=bad).status_code == 400, bad
+
+
+def test_limited_has_no_connectors(limited):
+    g, c, tmp = limited
+    assert c.get("/v1/connectors").status_code == 403
+    assert c.put("/v1/connectors", json={"claude_ai": {}}).status_code == 403
+    assert c.put("/v1/connectors/secret/x", json={"value": "v"}).status_code == 403
+    assert c.put("/v1/settings", json={"connectors": {"claude_ai": {}}}).status_code == 403
+    assert not (tmp / "mcp").exists()

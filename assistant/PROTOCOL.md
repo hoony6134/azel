@@ -43,8 +43,11 @@ answering a call the assistant placed; the server then speaks that call's openin
   - `{"type":"state","value":"listening"|"thinking"|"speaking"}`
   - `{"type":"transcript","text":"…"}` — what the user said
   - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — sentence being spoken
+  - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
+  - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
-    playback now**
+    playback now** (after a `pause`, or after a tap-to-interrupt). An interrupt while paused is followed by
+    `resume`, so the (now empty) queue is never left paused; a barge-in check whose STT fails also resumes.
   - `{"type":"activity","phase","label","tool","kind","route":"claude"}` — what the assistant is doing, for
     the app's status line, icon and sounds. Only Claude turns send any; a Qwen turn sends none. `kind`:
     `calendar|mail|memory|schedule|server|files|web|terminal|notes|generic` (gistra/planit → schedule,
@@ -65,6 +68,20 @@ answering a call the assistant placed; the server then speaks that call's openin
   Claude briefing per 10 min, within which the last briefing text is spoken again. Barge-in works
   as for any reply. The call log records `reason: "briefing"`; what was said becomes the call's
   `opening`.
+- Barge-in and noise. Voice activity needs Silero's probability (0.5; noisy 0.7) **and** a margin over the
+  call's own noise floor (10 dB; noisy 15 dB). The floor follows the level down fast and up about 1 % per
+  32 ms frame, so steady background chatter becomes the floor within seconds. While the assistant is
+  speaking, speech onset only sends `pause`. The interrupt is committed when that utterance ends, only if
+  it had at least 500 ms of voiced frames and its transcript has real content: two or more Hangul syllables
+  outside filler sounds (음, 어…), and not a Whisper silence hallucination. Otherwise the server sends
+  `resume`. Shorter blips (a cough, a click) end in `resume` without STT. The commit comes about 0.5 s after
+  the utterance ends, plus STT; playback is paused from the onset, so the assistant goes quiet as fast as
+  before. While the assistant is thinking (STT, Qwen or Claude running), voice activity never cancels: the
+  new utterance is transcribed, noise is ignored, and stop words (아니, 그만, 잠깐, 취소…) or a new question
+  replace the current answer (`interrupt`, then the new one). Anything else is answered after the current
+  one. Shared setting `noise_mode` `normal`|`noisy`: noisy raises the thresholds (min voiced 400 ms) and
+  turns voice barge-in off while the assistant speaks; tap-to-interrupt still works. Tunable by env:
+  `VAD_THRESHOLD`, `NOISE_MARGIN_DB`, `MIN_VOICED_MS`, `BARGE_MIN_VOICED_MS` and their `NOISY_` variants.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
@@ -125,6 +142,11 @@ validation (ahead, within 30 days, known repeat, `weekly:N` on that weekday; a t
 means KST). A weekday mismatch asks back ("무슨 요일 몇 시에 할까요?"). With no time the voice server asks back ("몇 시에 깨워
 드릴까요?") and the next utterance with a time completes it.
 
+No bare acknowledgements: when a question or request (not a greeting, thanks or yes/no confirmation) gets a
+Qwen reply with no content (only "네", "알겠습니다", "확인해 볼게요" and the like), the voice server holds it back,
+asks Qwen once more with a nudge, and hands the turn to Claude if the second reply is empty too. A leading
+acknowledgement followed by content is spoken as usual.
+
 Routing, per other ask: the full-mode link (with Claude) with the lowest `priority` among healthy links (3+ consecutive
 failed asks — timeouts or errors without a `code` — make a link unhealthy until it answers again; it
 is then tried last). With no full link, limited links take the ask only when the utterance is not
@@ -139,8 +161,11 @@ get only the current utterance, never the call's earlier turns (which may be per
 For the phone without Tailscale. Exposed paths only; everything else is blocked at the proxy:
 - voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
 - gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
-  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|DELETE /v1/history`, `GET|DELETE
-  /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`, `GET /v1/proactive/log` (bearer header).
+  `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
+  `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
+  `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
+  `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
+  `GET|POST|DELETE /v1/wake/enroll` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -180,7 +205,9 @@ these files are 0600 and survive a restart. Only full gateways seed empty shared
 device that created them.
 
 - `POST /v1/ask` `{"text","session","model"?,"path"?,"task"?}` → NDJSON stream of
-  `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}`, with
+  `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}` (or, when a Claude run ends in an
+  error with nothing said, `{"type":"error","code":"limit"|"claude_error","message":"<speakable>"}`: `limit` for the
+  subscription's usage limit, with the reset time when Claude names it), with
   `{"type":"activity","phase","tool","label","kind","route":"claude"}` interleaved (kinds as in section 1): `tool_start`/`tool_end` per tool call on the
   `claude -p` path (labels mapped from the tool name only: gistra_* 학사 일정, planit_* 할 일, Google
   Calendar 캘린더, Gmail 메일, memory_* 기억, infra_* 서버 상태, Notion 노션, daemon run_command /
@@ -200,8 +227,15 @@ device that created them.
                 "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
-   "history_days":365,"reply_length":"normal"}
+   "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":""}
   ```
+  `personality` (text up to 600 chars, else 400) is Azel's character: one persona block (`assistant_name` +
+  personality) goes into Qwen's system prompt, Claude's voice style, briefings and autonomous-call openings,
+  so both models sound like the same person. `""`, whitespace, `null` or a missing key mean the built-in
+  default; the stored value is returned as is (`""` after "기본값으로 되돌리기"), and `GET /v1/settings`
+  adds the read-only `personality_default` (the default text, for the app's placeholder; a `PUT` that sends
+  it back is fine, it is never stored). The gateway also pushes it to the voice server, so the default text
+  has one source.
   `reply_length` `brief`|`normal`|`detailed` (else 400) sets how long answers run, with the same wording for
   Qwen's system prompt and Claude's voice style: brief = one or two sentences; normal = brief for chit-chat,
   about four or five sentences for explanations, summaries, schedules and status reports; detailed = up to
@@ -218,6 +252,33 @@ device that created them.
   name: the gateways use it for the VoIP push `caller` and Claude's prompts, and the voice server for
   Qwen's system prompt (built per turn from the settings pushed over the link), so a rename applies on
   the next turn or call everywhere.
+- Connectors: which MCP servers a full gateway's Claude runs load (warm or one-shot). Shared setting `connectors`
+  (also writable as part of `PUT /v1/settings`):
+  ```json
+  {"claude_ai": {"Gmail": true, "Notion": false},
+   "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "transport": "http", "enabled": true, "auth_ref": "wiki"}]}
+  ```
+  `claude_ai` keys are claude.ai connector display names without the `claude.ai ` prefix; a name not listed takes its
+  default (Cygnus MCP, Google Calendar, Gmail on; everything else off). `custom`: ≤ 20 servers, `name` a unique ASCII
+  slug (`[A-Za-z0-9_-]{1,40}`, also the tool prefix `mcp__<name>`), `url` https (plain http only to a tailnet
+  address, 100.64.0.0/10), `transport` `http`|`sse` (default http), `enabled` (default true), optional `auth_ref`,
+  which must equal the server's own `name` (a server never uses another's secret). Secrets never go into settings. Each
+  run also loads the device daemons, no plugin MCP servers, and every tool up front (no ToolSearch). A custom server
+  whose secret file is missing or not 0600 is skipped. Full gateways only; limited → 403 on every route below.
+  - `GET /v1/connectors[?refresh=true]` → `{"claude_ai":[{"name","enabled","status":"connected"|"needs_auth"}],
+    "custom":[{"name","url","transport","enabled","has_secret"}]}` (the app's pinned shape). The claude.ai list is
+    this gateway's login as `claude mcp list` sees it (cached from startup; `refresh=true` re-reads, ~15 s); anything
+    not connected is `needs_auth`.
+  - `PUT /v1/connectors` with the same shape without `status` / `has_secret` → the GET shape (400 with a reason on a
+    bad shape). Replaces both lists; stored as the setting above, a custom server's secret named after the server.
+  - `PUT /v1/connectors/secret/{name}` `{"value": "<token>"}` (a raw token is sent as `Authorization: Bearer <token>`)
+    or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
+    `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
+    Claude processes. Each full gateway that should use the server needs its own copy.
+- Wake-word enrollment (full gateways only; not mounted on limited ones; `gateway/wake_enroll.py`, owned by the
+  wakeword session): `POST /v1/wake/enroll` multipart `clips[]` (16 kHz mono 16-bit WAV, 0.4–2.5 s) →
+  `{"accepted","rejected":[{"index","reason"}],"training"}`; `GET /v1/wake/enroll` → `{"clips","trained_at",
+  "status":"none"|"training"|"ready"|"failed"}`; `DELETE /v1/wake/enroll` → 204. Clips stay on that gateway's host.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
   haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.
@@ -229,8 +290,38 @@ device that created them.
   the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
+- Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
+  `{"id" (slug a-z0-9_-),"name" (1–12 Hangul/Latin/space, unique),"voice" (a TTS speaker),"voice_style"
+  (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb", orb tint),
+  "default_model" (null|haiku|sonnet|opus),"share_memory" (bool, default false),"created_at","primary",
+  "deleted_at"}`. Stored in the shared settings as `personas`; settings without it migrate to one persona
+  `azel` (primary) holding `assistant_name` and `personality`, which stay readable (and writable) as the
+  primary's for older clients. `GET /v1/personas` (`?include=deleted`), `POST /v1/personas` → 201
+  (`name`, `voice` required; max 8 live personas), `GET|PUT /v1/personas/{id}` (PUT: any field but id,
+  primary, created_at), `DELETE /v1/personas/{id}` (marks `deleted_at`: its calls, history and schedule
+  keep `persona_id` and the name stays resolvable; the primary cannot be deleted → 400),
+  `POST /v1/personas/{id}/primary`. Voices are checked against the TTS server's `/v1/audio/voices`
+  (fallback `BISEO_TTS_VOICES`; neither reachable → 503). `DELETE /v1/personas/{id}?delete_history=true|false`
+  (default false): the persona's own notes and call summaries (memory records with `meta.persona_id`) and
+  its calls' follow-up contexts are always deleted; its call history is deleted with `delete_history=true`,
+  otherwise it stays with `"persona_deleted": true` on each item (the app shows "삭제된 비서"). If ruchba
+  cannot do that (503), the persona is not deleted either. `GET /v1/voices` →
+  `[{"id","label","desc","lang"}]`, the TTS speakers with Korean labels (e.g. `{"id":"sohee","label":"소희",
+  "desc":"따뜻한 한국어 여성","lang":"ko"}`). `POST /v1/personas/voice-sample` `{"voice","voice_style"?,"text"}`
+  (text 1–60 chars) → `audio/wav` for the editor's "들어보기"; at most one per 2 s per gateway (429);
+  502 if the TTS server cannot be reached. `assistant_name` stays a read/write alias of the primary persona's
+  name.
+  Calls: `/v1/call?persona=<id>` (default the primary; a placed call keeps the persona it rang as) builds
+  Qwen's system prompt from that persona (name, character, reply_length) and speaks with its voice and
+  style. Conversation history and the Claude session map are keyed by (persona, session). Asks over the
+  link carry `"persona"`, so Claude's voice style is that persona's. Push `caller` is the persona's name.
+  Briefing, deadline, alert and autonomous calls come from the primary. Every call_log start, history
+  item, schedule item and proactive_log row carries `persona_id`; `/v1/history` and `/v1/schedule` take
+  `?persona=`. The brain gets `"persona"` on `call_event`, `tool` and `recall` frames and may send
+  `context` frames with `"persona"` (no `session` = that persona's shared block; frames without it are the
+  primary's).
 - Scheduled calls (full gateways only; limited → 403). Item (the same shape on the voice path):
-  `{"id","at","repeat","kind","note","status","attempts","created_by"}` with `at` an ISO 8601 string with
+  `{"id","at","repeat","kind","note","status","attempts","created_by","persona_id"}` with `at` an ISO 8601 string with
   offset in KST (e.g. `"2026-11-22T10:00:00+09:00"`, accepted and returned), `repeat` null | `"daily"` |
   `"weekdays"` | `"weekly:<dow>"` (0 = Monday … 6 = Sunday; must match the weekday of `at`, else 400),
   `kind` `wake`|`reminder`, `status`
@@ -401,13 +492,13 @@ asks, call_logs or schedule requests.
 - brain → voice `{"type":"context","session"?,"value"}`: the Korean context block (≤ 2400 chars: profile,
   situation, recent calls), pushed on connect and whenever it changes (situation refresh every 5 min). With
   `session`: that call only (a placed call adds its reason). The voice server uses a block younger than 15 min, only
-  in Qwen's SYSTEM, and as "알고 있는 것" ahead of a Claude ask on a full link. Never to a limited link.
-- voice → brain `{"type":"call_event","event":"start"|"end","session","reason"?}`; the brain answers a start with
+  in Qwen's SYSTEM; it is never sent to any link.
+- voice → brain `{"type":"call_event","event":"start"|"end","session","reason"?,"opening"?}` (a placed call's); the brain answers a start with
   that session's context.
 - voice → brain `{"type":"tool","id","name","args"}` → `{"id","type":"tool_result","result":"…"}` (Korean, for Qwen).
   Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
   `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
-  schedule list). Timeout 4 s.
+  schedule list). Timeout 3 s.
 - voice → brain `{"type":"recall","id","text"}` → `{"id","type":"recall_result","hits":["…"]}` (≤ 2 memory hits);
   the voice server waits at most 400 ms, then answers without them.
 
@@ -420,7 +511,7 @@ before.
 Memory written by the brain (no schema change; record kind `note`, contexts):
 - after every ended call with ≥ 12 characters of user speech: a `note` record `"[통화 요약 <when>] <summary> 결정: …
   후속: …"` with `meta {"type":"call_summary","call","title","at","decisions","facts","followups"}`; follow-ups as
-  context `call-<first 12 of the history id>` (`open_questions` = follow-ups, which the gateways' autonomous
+  context `call-followup-<call>` (`open_questions` = follow-ups, which the gateways' autonomous
   signals read); facts merged into `azel-profile` by Qwen.
 - `azel-profile`: stable facts and preferences, seeded once from Cygnus memory through a full gateway's
   `/v1/ask` (Claude), then refined from calls.
@@ -430,3 +521,7 @@ Memory written by the brain (no schema change; record kind `note`, contexts):
   checkpoint note), scheduled calls, pending approvals, full-writer devices, open call follow-ups (3 days),
   `azel-todos`, and recent call summaries (3 days). First line `## 상황 (…)`; a note there without it is a gateway's
   checkpoint and is moved to `azel-checkpoint`.
+- Persona data (full callers only): `DELETE /v1/state/personas/{id}/data?history=true|false` → deletes records
+  with `meta.persona_id` = id, the `call-followup-<call>` contexts of its calls and its todos (`azel-todos-<id>`); with `history=true` also its
+  calls (and their transcript records), otherwise flags them `persona_deleted` → `{"notes_deleted","calls",
+  "history_deleted"}`. History items carry `persona_deleted`.
