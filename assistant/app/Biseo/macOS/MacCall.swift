@@ -202,7 +202,7 @@ final class MacCall: ObservableObject {
 
     /// keepPanel: leave the transcript / error on screen after the server hung up or something failed.
     private func end(error message: String?, keepPanel: Bool) {
-        if inCall { Recents.add(CallRecord(session: activeSession, start: connectedAt ?? Date(), lines: log.lines)) }
+        if inCall { NotificationCenter.default.post(name: callEndedNotification, object: nil) }
         client.stop()
         if let message { error = message }
         inCall = false

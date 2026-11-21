@@ -181,7 +181,7 @@ final class CallManager: NSObject, ObservableObject {
 
     private func teardown() {
         client.stop()
-        if let activeSession { Recents.add(CallRecord(session: activeSession, start: connectedAt ?? Date(), lines: log.lines)) }
+        if activeSession != nil { NotificationCenter.default.post(name: callEndedNotification, object: nil) }
         activeSession = nil
         callUUID = nil
         callID = nil

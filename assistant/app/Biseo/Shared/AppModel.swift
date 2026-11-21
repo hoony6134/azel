@@ -7,7 +7,6 @@ final class AppModel: ObservableObject {
     @Published var status: ServerStatus?
     @Published var statusError: Error?
     @Published var approvals: [[String: Any]] = []
-    @Published var recents: [CallRecord] = Recents.load()
     @Published var session: String
     let sessionPrefix: String
     private var timer: Timer?
@@ -15,9 +14,6 @@ final class AppModel: ObservableObject {
     init(sessionPrefix: String) {
         self.sessionPrefix = sessionPrefix
         session = Session.current(sessionPrefix)
-        NotificationCenter.default.addObserver(forName: Recents.changed, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.recents = Recents.load() }
-        }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
