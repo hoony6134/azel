@@ -941,6 +941,9 @@ async def schedule_reply(text, action, session, now=None):
 
 
 _tts_cache: dict[str, tuple[bytes, int]] = {}
+# Measured 2026-11-21 against the shared TTS server (sohee): ~0.15 s of synthesis per syllable (about 0.7x real
+# time), one request at a time behind a GPU lock: two concurrent requests took longer than the same two in a row.
+SYNTH_S_PER_SYL = float(os.environ.get("SYNTH_MS_PER_SYL", "150")) / 1000
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
@@ -1096,12 +1099,30 @@ async def respond(text, session, t0, timings, on_event=None):
             await sentences.put(None)
 
     producer = asyncio.create_task(produce())
-    spoken = []
+    spoken, back, play_end = [], [], 0.0
     hist.append({"role": "user", "content": text})
+
+    async def next_chunk():
+        """The next text to synthesize. Sentences that queued up while the last one was synthesized go out
+        together (fewer, longer TTS calls), but only as many as the audio already sent covers: TTS is not
+        streamed and runs at about 0.7x real time, so a chunk longer than that leaves the phone silent."""
+        s = back.pop() if back else await sentences.get()
+        if s is None or s in (FILLER, FILLER_LONG):
+            return s
+        room = max(0.0, play_end - time.monotonic()) / SYNTH_S_PER_SYL
+        while not back and not sentences.empty():
+            nxt = sentences.get_nowait()
+            if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
+                back.append(nxt)
+                break
+            s = f"{s} {nxt}"
+        return s
+
     try:
-        while (s := await sentences.get()) is not None:
+        while (s := await next_chunk()) is not None:
             pcm, sr = await tts(s)
             timings.setdefault("first_audio_ms", ms(t0))
+            play_end = max(time.monotonic(), play_end) + len(pcm) / 2 / sr  # when the phone finishes this chunk
             if s not in (FILLER, FILLER_LONG):
                 spoken.append(s)
             yield s, route["value"], pcm, sr
@@ -1855,6 +1876,23 @@ if __name__ == "__main__":
             globals().update(llm_stream=tagging_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
             return [s async for s, *_ in respond("회의가 무슨 요일이었더라", "late", time.perf_counter(), {})]
         said_late = asyncio.run(late_tag_check())
+
+        async def merge_check():  # sentences that queue up during a slow synthesis go out together, within the audio sent
+            async def burst_llm(messages, max_tokens=600):
+                yield "첫 문장은 이렇게 말해요. "
+                await asyncio.sleep(0.05)
+                yield "두 번째 문장이에요. 세 번째 문장이에요. 네 번째 문장도 있어요. 마지막 문장입니다."
+
+            async def slow_tts(sentence):
+                await asyncio.sleep(0.2)
+                return b"\0\0" * 24000 * (3 if sentence.startswith("첫") else 1), 24000  # 3 s of audio, then 1 s
+            globals().update(llm_stream=burst_llm, tts=slow_tts)
+            history.pop("azel:merge", None)
+            return [s async for s, *_ in respond("문장 여러 개 말해 줘", "merge", time.perf_counter(), {})]
+        merged = asyncio.run(merge_check())
+        globals().update(llm_stream=real_llm, tts=real[1])
+        assert merged[0] == "첫 문장은 이렇게 말해요." and len(merged) < 5, merged
+        assert " ".join(merged) == "첫 문장은 이렇게 말해요. 두 번째 문장이에요. 세 번째 문장이에요. 네 번째 문장도 있어요. 마지막 문장입니다."
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
         assert not any("CLA" in s or "[" in s for s in said_late) and said_late[-1] == "정확히 확인해 보니 목요일이에요.", said_late
         async def prefetch_check():  # the opening is synthesized when the call message arrives, not on connect
@@ -2180,7 +2218,7 @@ if __name__ == "__main__":
 
             async def voice_tts(sentence):
                 voices.append((CALL_PERSONA.get() or {}).get("voice"))
-                return b"\0" * 480, 24000
+                return b"\0" * 24000, 24000  # 0.5 s of audio
 
             async def hi_llm(messages, max_tokens=600):
                 prompts.append(messages[0]["content"])
