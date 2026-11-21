@@ -1,4 +1,4 @@
-"""김비서 gateway: Claude access, settings, usage, devices, approvals, calls, push, scheduler.
+"""박비서 gateway: Claude access, settings, usage, devices, approvals, calls, push, scheduler.
 
 Contract: ../PROTOCOL.md section 3. Run: uv run gateway.py  (binds the Tailscale IP only)
 """
@@ -284,7 +284,7 @@ async def place_call(reason, opening=None):
     db.q("insert into calls values(?,?,?,?,?)", (call_id, reason, opening or "", "ringing", time.time()))
     # The opening must reach the voice server before the phone can answer and connect.
     await link_send({"type": "call", "call_id": call_id, "opening": opening or ""})
-    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": "김비서"})
+    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": "박비서"})
     return {"call_id": call_id, **push}
 
 
