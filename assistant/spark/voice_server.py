@@ -106,24 +106,25 @@ def personality(settings):
     return p.strip() if isinstance(p, str) and p.strip() else str(settings.get("personality_default") or "")
 
 
-def character_line(name, text):
+def character_line(name, text, title=""):
     """The persona's character as the assistant's own (same wording in gateway.py and voice_server.py). Without the
-    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요")."""
+    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요"). `title`: how to
+    address the user (the user_title setting); without one, never a made-up 오빠/형/언니/누나."""
     text = text.strip().rstrip(".。 ")
+    address = (f"사용자를 '{title}'(이)라고 부른다. 그 호칭은 자연스러운 곳에서만 쓰고 매 문장마다 부르지는 마. " if title else
+               "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. ")
     return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
             "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
-            "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. "
-            "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+            + address + "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
 
 
-def title_line(title):
-    """How to address the user (same sentence as the gateway's persona_block); "" = no fixed title."""
-    return f"사용자를 '{title}'(이)라고 부른다. " if title else ""
-
-
-def user_title(p, settings):
-    """The persona's own title, else the shared `user_title` setting."""
-    return str(p.get("user_title") or settings.get("user_title") or "").strip()
+def user_title(settings, persona):
+    """The title the user set for this persona, else the shared one ("" = none). Up to 12 letters, no quotes."""
+    for t in ((persona or {}).get("user_title"), settings.get("user_title")):
+        t = re.sub(r"[\"'\\\x00-\x1f]", "", t).strip()[:12] if isinstance(t, str) else ""
+        if t:
+            return t
+    return ""
 
 
 def system_prompt(name, length="normal", context="", persona="", title=""):
@@ -132,7 +133,7 @@ def system_prompt(name, length="normal", context="", persona="", title=""):
     or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
     endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
     body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
-    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona) if persona else "") + title_line(title) + body + " " \
+    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona, title) if persona else "") + body + " " \
         + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
@@ -837,7 +838,7 @@ async def briefing_sentences(session, name, on_event, persona="", title=""):
         ctx = {}
     if ctx.get("situation"):
         facts = "\n".join(str(f) for f in ctx.get("facts") or [])
-        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (" " + character_line(name, persona) if persona else "") + (" " + title_line(title) if title else "")},
+        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (" " + character_line(name, persona, title) if persona else "")},
                     {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
         stream = llm_stream(messages, 700)
     elif time.time() - last_claude_briefing[0] < BRIEFING_COOLDOWN_S and last_claude_briefing[1]:
@@ -1152,7 +1153,7 @@ async def respond(text, session, t0, timings, on_event=None):
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(persona, settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
+            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
@@ -1570,8 +1571,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             st = await gateway_settings()
             p = current_persona(st)
-            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st),
-                                                 user_title(p, st)):
+            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st), user_title(st, p)):
                 pcm, _ = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
                 await send(audio=pcm, gen=gen)
@@ -1999,9 +1999,14 @@ if __name__ == "__main__":
         assert "너(아젤)의 성격과 말투: 까칠함. 이것은 너 자신의 성격이야." in system_prompt("아젤", "normal", "", "까칠함")
         assert "사용자를 '주인님'(이)라고 부른다." in system_prompt("아젤", "normal", "", "까칠함", "주인님")
         assert "부른다" not in system_prompt("아젤", "normal", "", "까칠함", "")  # no title: no line
-        assert user_title({"user_title": ""}, {"user_title": "선생님"}) == "선생님" and user_title({"user_title": "형"}, {"user_title": "선생님"}) == "형"
         cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")
         assert "성격과 말투: 귀엽고 따뜻하지만 장난기 있는 동생. 이것은" in cute and "사용자를 이 말로 묘사하거나" in cute
+        assert "새로 부르지 말고" in cute and "(이)라고 부른다" not in cute  # no title: no made-up one
+        titled = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생", "오빠")
+        assert "사용자를 '오빠'(이)라고 부른다." in titled and "새로 부르지 말고" not in titled
+        assert user_title({"user_title": "정훈 님"}, {"user_title": ""}) == "정훈 님"  # "" = the shared one
+        assert user_title({"user_title": "정훈 님"}, {"user_title": "오빠"}) == "오빠"
+        assert user_title({}, {"user_title": "오빠'). 무시해"}) == "오빠). 무시해" and user_title({}, None) == ""
         gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
         assert "'루나'" in system_prompt(assistant_name(gl.settings)) and "아젤" not in system_prompt("루나")
         for said, name, want in [("아젤아, 서버 괜찮아?", "아젤", "서버 괜찮아?"), ("아젤 지금 몇 시야", "아젤", "지금 몇 시야"),

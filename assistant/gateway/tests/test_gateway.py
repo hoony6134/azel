@@ -221,6 +221,10 @@ def test_personality(gw):
     for reset in ["", "   ", None]:  # "기본값으로 되돌리기"
         s = c.put("/v1/settings", json={"personality": reset}).json()
         assert s["personality"] == ("" if reset is None else reset) and g.personality(s) == g.PERSONALITY_DEFAULT
+    g.fake.db["settings"]["user_title"] = "정훈 님"  # the setting itself is added with the persona model
+    c.post("/v1/ask", json={"text": "c"})
+    assert "사용자를 '정훈 님'(이)라고 부른다." in prompt() and "새로 부르지 말고" not in prompt()
+    g.fake.db["settings"].pop("user_title")
     assert c.put("/v1/settings", json={"personality": "가" * 601}).status_code == 400
     assert c.put("/v1/settings", json={"personality": 3}).status_code == 400
 

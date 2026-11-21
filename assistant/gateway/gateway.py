@@ -106,11 +106,6 @@ def check_title(v, field):
     return " ".join(v.split())
 
 
-def user_title(settings, p=None):
-    """The title in effect: the persona's own, else the shared one ("" = none)."""
-    return ((p or {}).get("user_title") or settings.get("user_title") or "").strip()
-
-
 # reply_length: the same wording the voice server gives Qwen, so both routes answer at the same length.
 LENGTH_STYLE = {
     "brief": "짧게 한두 문장으로 요점만 말해. ",
@@ -133,14 +128,25 @@ def personality(settings):
     return p.strip() if isinstance(p, str) and p.strip() else PERSONALITY_DEFAULT
 
 
-def character_line(name, text):
+def character_line(name, text, title=""):
     """The persona's character as the assistant's own (same wording in gateway.py and voice_server.py). Without the
-    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요")."""
+    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요"). `title`: how to
+    address the user (the user_title setting); without one, never a made-up 오빠/형/언니/누나."""
     text = text.strip().rstrip(".。 ")
+    address = (f"사용자를 '{title}'(이)라고 부른다. 그 호칭은 자연스러운 곳에서만 쓰고 매 문장마다 부르지는 마. " if title else
+               "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. ")
     return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
             "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
-            "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. "
-            "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+            + address + "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+
+
+def user_title(settings, persona):
+    """The title the user set for this persona, else the shared one ("" = none). Up to 12 letters, no quotes."""
+    for t in ((persona or {}).get("user_title"), settings.get("user_title")):
+        t = re.sub(r"[\"'\\\x00-\x1f]", "", t).strip()[:12] if isinstance(t, str) else ""
+        if t:
+            return t
+    return ""
 
 
 def persona_block(settings):
@@ -149,9 +155,7 @@ def persona_block(settings):
     p = active_persona(settings)
     text = p["personality"].strip() if isinstance(p.get("personality"), str) and p["personality"].strip() \
         else PERSONALITY_DEFAULT
-    title = user_title(settings, p)
-    return f"너의 이름은 '{p['name']}'이야. " + character_line(p["name"], text) + \
-        (f"사용자를 '{title}'(이)라고 부른다. " if title else "")
+    return f"너의 이름은 '{p['name']}'이야. " + character_line(p["name"], text, user_title(settings, p))
 
 
 # ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
