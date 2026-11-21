@@ -17,10 +17,13 @@ def test_usage(client):
     client.post("/v1/state/usage", json={"device": "macbook", "model": "sonnet", "path": "claude_code",
                                          "cost_usd": 0.25})
     client.post("/v1/state/usage", json={"model": "opus", "path": "api", "cost_usd": 1, "ts": t0 - 86400 * 400})
+    for _ in range(2):  # a replayed row (gateway migration) is stored once however often it is sent
+        client.post("/v1/state/usage", json={"model": "opus", "path": "api", "cost_usd": 2, "ts": t0 - 86400 * 400,
+                                             "import_key": "migrate:macbook:7"})
     rows = client.get(f"/v1/state/usage?since={t0 - 60}").json()
     assert [(r["model"], r["cost_usd"], r["device"]) for r in rows] == [("sonnet", 0.25, "macbook")]
     assert abs(rows[0]["ts"] - t0) < 60
-    assert len(client.get("/v1/state/usage").json()) == 2
+    assert len(client.get("/v1/state/usage").json()) == 3
 
 
 def test_devices_and_push_tokens(client):
@@ -29,6 +32,7 @@ def test_devices_and_push_tokens(client):
     client.put("/v1/state/devices/macbook", json={"name": "맥북", "url": "http://y/mcp"})  # upsert
     [d] = client.get("/v1/state/devices").json()
     assert d["url"] == "http://y/mcp" and d["harness"] == [] and time.time() - d["last_seen"] < 60
+    assert d["writer"] == "full"
     assert client.put("/v1/state/devices/x", json={"name": "", "url": "u"}).status_code == 422
     client.put("/v1/state/push_tokens/abc", json={"bundle_id": "xyz.scian.biseo", "env": "production"})
     assert client.get("/v1/state/push_tokens").json() == [
@@ -110,6 +114,28 @@ def test_ip_gate_fails_closed(client):
     for peer in ["172.19.0.1", "10.0.0.5", "192.168.1.2", "127.0.0.1", "8.8.8.8", "testclient", ""]:
         assert_limited(limited_client(peer, "t0k"))
     assert limited_client("100.64.0.4", "t0k").get("/v1/state/push_tokens").status_code == 200
+
+
+def test_limited_writer_cannot_take_over_a_full_device(client):
+    client.put("/v1/state/devices/mbp", json={"name": "macbook", "url": "http://100.64.0.8:8893/mcp"})
+    for lim in [limited_client("100.64.0.8", "l1m"), limited_client("203.0.113.9", "t0k")]:
+        r = lim.put("/v1/state/devices/mbp", json={"name": "macbook", "url": "http://evil/mcp"})
+        assert r.status_code == 403
+        assert lim.put("/v1/state/devices/spark2", json={"name": "spark", "url": "http://s/mcp"}).status_code == 200
+    rows = {d["id"]: d for d in client.get("/v1/state/devices").json()}
+    assert rows["mbp"]["url"] == "http://100.64.0.8:8893/mcp" and rows["mbp"]["writer"] == "full"
+    assert rows["spark2"]["writer"] == "limited"
+    client.put("/v1/state/devices/spark2", json={"name": "spark", "url": "http://s2/mcp"})  # a full writer may claim
+    assert {d["id"]: d for d in client.get("/v1/state/devices").json()}["spark2"]["writer"] == "full"
+
+
+def test_approval_ids_kept_on_migration(client):
+    body = {"id": "abcdef012345", "device": "macbook", "command": "git push"}
+    assert client.post("/v1/state/approvals", json=body).json() == {"approval_id": "abcdef012345"}
+    assert client.post("/v1/state/approvals", json={**body, "command": "rm -rf"}).status_code == 200  # no-op
+    assert client.get("/v1/state/approvals/abcdef012345").json()["command"] == "git push"
+    assert limited_client("100.64.0.8", "l1m").post("/v1/state/approvals", json={**body, "id": "0" * 12}).status_code == 403
+    assert client.post("/v1/state/approvals", json={**body, "id": "nope"}).status_code == 422
 
 
 def test_bad_tokens(client):

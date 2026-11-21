@@ -70,11 +70,12 @@ create schema if not exists {STATE};
 create table if not exists {STATE}.kv(key text primary key, value jsonb not null, updated timestamptz not null default now());
 create table if not exists {STATE}.usage(
     id bigserial primary key, ts timestamptz not null default now(), device text, model text, path text, task text,
-    input_tokens int not null default 0, output_tokens int not null default 0, cost_usd double precision not null default 0);
+    input_tokens int not null default 0, output_tokens int not null default 0, cost_usd double precision not null default 0,
+    import_key text unique);
 create index if not exists usage_ts on {STATE}.usage (ts);
 create table if not exists {STATE}.devices(
     id text primary key, name text not null, url text not null, harness jsonb not null default '[]',
-    gateway text, last_seen timestamptz not null default now());
+    gateway text, last_seen timestamptz not null default now(), writer text not null default 'limited');
 create table if not exists {STATE}.push_tokens(
     token text primary key, bundle_id text not null, env text not null, ts timestamptz not null default now());
 create table if not exists {STATE}.calls(
@@ -302,13 +303,14 @@ class Usage(BaseModel):
     output_tokens: int = 0
     cost_usd: float = 0
     ts: float | None = None  # epoch seconds; set only when replaying old rows (gateway --migrate)
+    import_key: str | None = None  # replayed rows carry one, so running the migration twice adds nothing
 
 
 @app.post("/v1/state/usage", dependencies=[lim])
 def add_usage(u: Usage):
-    db(f"insert into {STATE}.usage(ts, device, model, path, task, input_tokens, output_tokens, cost_usd)"
-       " values(coalesce(to_timestamp(%s), now()),%s,%s,%s,%s,%s,%s,%s)",
-       (u.ts, u.device, u.model, u.path, u.task, u.input_tokens, u.output_tokens, u.cost_usd))
+    db(f"insert into {STATE}.usage(ts, device, model, path, task, input_tokens, output_tokens, cost_usd, import_key)"
+       " values(coalesce(to_timestamp(%s), now()),%s,%s,%s,%s,%s,%s,%s,%s) on conflict (import_key) do nothing",
+       (u.ts, u.device, u.model, u.path, u.task, u.input_tokens, u.output_tokens, u.cost_usd, u.import_key))
     return {"ok": True}
 
 
@@ -326,16 +328,22 @@ class Device(BaseModel):
 
 
 @app.put("/v1/state/devices/{did}", dependencies=[lim])
-def put_device(did: str, d: Device):
-    db(f"insert into {STATE}.devices values(%s,%s,%s,%s,%s,now()) on conflict(id) do update set name=excluded.name,"
-       " url=excluded.url, harness=excluded.harness, gateway=excluded.gateway, last_seen=now()",
-       (did, d.name, d.url, Jsonb(d.harness), d.gateway))
+def put_device(did: str, d: Device, request: Request):
+    """Upsert a daemon's row, stamped with the writer's role. A limited writer may not touch a row a full
+    writer owns: full gateways send the shared token to these urls and feed their output to Claude."""
+    writer = role(request)
+    if not db(f"insert into {STATE}.devices values(%s,%s,%s,%s,%s,now(),%s) on conflict(id) do update set"
+              " name=excluded.name, url=excluded.url, harness=excluded.harness, gateway=excluded.gateway,"
+              f" last_seen=now(), writer=excluded.writer where {STATE}.devices.writer = 'limited'"
+              " or excluded.writer = 'full' returning id", (did, d.name, d.url, Jsonb(d.harness), d.gateway, writer)):
+        raise HTTPException(403, "device id belongs to a full gateway")
     return {"ok": True}
 
 
 @app.get("/v1/state/devices", dependencies=[lim])
 def list_devices():
-    return db(f"select id, name, url, harness, gateway, {EPOCH.format('last_seen')} from {STATE}.devices order by id")
+    return db(f"select id, name, url, harness, gateway, writer, {EPOCH.format('last_seen')} from {STATE}.devices"
+              " order by id")
 
 
 class PushToken(BaseModel):
@@ -377,6 +385,7 @@ def answer_call(cid: str):
 
 
 class Approval(BaseModel):
+    id: str | None = Field(None, pattern=r"^[0-9a-f]{12}$")  # kept when migrating; full writers only
     device: str = ""
     tool: str = ""
     command: str = ""
@@ -387,10 +396,12 @@ APPROVAL_COLS = f"id, device, tool, command, cwd, status, {EPOCH.format('created
 
 
 @app.post("/v1/state/approvals", dependencies=[lim])
-def add_approval(a: Approval):
-    aid = uuid.uuid4().hex[:12]
-    db(f"insert into {STATE}.approvals(id, device, tool, command, cwd) values(%s,%s,%s,%s,%s)",
-       (aid, a.device, a.tool, a.command, a.cwd))
+def add_approval(a: Approval, request: Request):
+    if a.id and role(request) != "full":
+        raise HTTPException(403, "only full gateways may choose an approval id")
+    aid = a.id or uuid.uuid4().hex[:12]
+    db(f"insert into {STATE}.approvals(id, device, tool, command, cwd) values(%s,%s,%s,%s,%s)"
+       " on conflict (id) do nothing", (aid, a.device, a.tool, a.command, a.cwd))
     return {"approval_id": aid}
 
 

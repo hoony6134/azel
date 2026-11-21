@@ -267,6 +267,27 @@ def test_first_start_seeds_ruchba_from_old_settings(tmp_path, monkeypatch):
     assert g.fake.db["settings"] == {"default_model": "opus", "monthly_budget_usd": 300}
 
 
+def test_limited_writer_cannot_steer_full_gateways(gw, monkeypatch):
+    g, c, tmp = gw
+    c.post("/v1/devices/register", json={"id": "macbook", "name": "macbook", "url": "http://100.64.0.8:8893/mcp"})
+    lim = TestClient(g.fake, headers={"Authorization": "Bearer l1m"})  # a team machine's gateway
+    takeover = lim.put("/v1/state/devices/macbook", json={"name": "macbook", "url": "http://evil/mcp", "gateway": "x"})
+    assert takeover.status_code == 403 and g.fake.db["devices"]["macbook"]["url"] == "http://100.64.0.8:8893/mcp"
+    assert lim.put("/v1/state/devices/evil", json={"name": "evil", "url": "http://evil/mcp"}).status_code == 200
+    c.post("/v1/ask", json={"text": "a"})
+    args = json.loads((tmp / "args.json").read_text())
+    assert "mcp__macbook" in args and "mcp__evil" not in args  # never handed to claude -p, never gets the token
+    probed = []
+
+    async def fake_probe(url, token=False):
+        probed.append((url, token))
+        return {"ok": True, "ms": 1}
+    monkeypatch.setattr(g, "probe", fake_probe)
+    c.get("/v1/status")
+    assert ("http://evil/mcp", False) in probed and ("http://100.64.0.8:8893/mcp", True) in probed
+    assert all(not tok for url, tok in probed if url.endswith("/health"))  # health checks carry no token
+
+
 def test_ruchba_down_read_only(gw):
     g, c, tmp = gw
     c.put("/v1/settings", json={"default_model": "opus"})

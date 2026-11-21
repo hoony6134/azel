@@ -215,14 +215,18 @@ def auth(request: Request):
 
 
 # ---------- Claude ----------
+def trusted(d):
+    """May this gateway send its token to the device's url and feed its output to Claude? Full gateways trust
+    only rows written by full gateways (a limited writer could point a row at any url); a limited gateway
+    only its own daemon."""
+    return d.get("writer") == "full" if MODE == "full" else d.get("gateway") == DEVICE
+
+
 async def fresh_devices():
     rows = await state.get("/v1/state/devices")
     if rows is None:  # ruchba down and nothing cached yet
         rows = list(local_devices.values())
-    rows = [d for d in rows if d["last_seen"] > time.time() - DEVICE_FRESH_S]
-    if MODE == "limited":  # a team machine may only reach its own daemon
-        rows = [d for d in rows if d.get("gateway") == DEVICE]
-    return rows
+    return [d for d in rows if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
 
 
 def resolve(settings, model, path, task):
@@ -694,12 +698,13 @@ async def usage():
             "budget_usd": (await load_settings())["monthly_budget_usd"]}
 
 
-async def probe(url):
+async def probe(url, token=False):
+    """Reachability only. The token goes along only when asked (a trusted daemon); health routes need none."""
     t = time.perf_counter()
+    headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {TOKEN}"} if token else {})
     try:
         # Headers only: an MCP endpoint may answer GET with a stream that never ends.
-        async with httpx.AsyncClient(timeout=3) as c, c.stream(
-                "GET", url, headers={"Authorization": f"Bearer {TOKEN}", "Accept": "text/event-stream"}) as r:
+        async with httpx.AsyncClient(timeout=3) as c, c.stream("GET", url, headers=headers) as r:
             ok = r.status_code < 500
         return {"ok": ok, "ms": round((time.perf_counter() - t) * 1000)}
     except httpx.HTTPError:
@@ -710,7 +715,7 @@ async def probe(url):
 async def status():
     devs = await state.get("/v1/state/devices", list(local_devices.values()))
     probes = await asyncio.gather(probe(f"{VOICE_URL}/health"), probe(f"{TTS_URL}/health"),
-                                  probe(f"{STATE_URL}/health"), *[probe(d["url"]) for d in devs])
+                                  probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
             "devices": [{"id": d["id"], "name": d["name"], **p,
@@ -725,7 +730,7 @@ async def register(body: dict):
     if not body["id"].replace("_", "").replace("-", "").isalnum() or not body["id"].isascii():
         raise HTTPException(400, "id must be an ASCII slug")
     row = {"name": body["name"], "url": body["url"], "harness": body.get("harness", []), "gateway": DEVICE}
-    local_devices[body["id"]] = {"id": body["id"], **row, "last_seen": time.time()}
+    local_devices[body["id"]] = {"id": body["id"], **row, "last_seen": time.time(), "writer": MODE}
     try:
         await state.call("PUT", f"/v1/state/devices/{body['id']}", row)
     except StateDown:

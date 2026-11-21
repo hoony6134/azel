@@ -221,7 +221,10 @@ records, search, contacts and context, answers 403) when either:
 - `POST /v1/state/usage` *limited* `{"device","model","path","task","input_tokens","output_tokens",
   "cost_usd","ts"?}`; `GET /v1/state/usage?since=<epoch>` *limited* → rows, oldest first.
 - `PUT /v1/state/devices/{id}` *limited* `{"name","url","harness","gateway"}` (upsert, sets
-  `last_seen`); `GET /v1/state/devices` *limited* → `[{"id","name","url","harness","gateway","last_seen"}]`.
+  `last_seen` and `writer` = the caller's role, `full` or `limited`). A limited caller may not overwrite a
+  row whose writer is `full` (403). `GET /v1/state/devices` *limited* →
+  `[{"id","name","url","harness","gateway","writer","last_seen"}]`. Full gateways use (and send the shared
+  token to) only rows with `writer: "full"`; limited gateways only rows with their own `gateway`.
 - `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env"}`; `GET /v1/state/push_tokens`.
 - `POST /v1/state/calls` `{"id","reason","opening"}`; `POST /v1/state/calls/{id}/answer` → the row,
   marked answered (404 if missing).

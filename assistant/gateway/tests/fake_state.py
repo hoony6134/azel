@@ -41,8 +41,11 @@ def make():
         return [u for u in db["usage"] if u["ts"] >= since]
 
     @app.put("/v1/state/devices/{did}")
-    def put_device(did: str, body: dict):
-        db["devices"][did] = {"id": did, "harness": [], **body, "last_seen": time.time()}
+    def put_device(did: str, body: dict, request: Request):
+        writer = "limited" if request.headers.get("authorization") == "Bearer l1m" else "full"
+        if writer == "limited" and db["devices"].get(did, {}).get("writer") == "full":
+            raise HTTPException(403, "device id belongs to a full gateway")
+        db["devices"][did] = {"id": did, "harness": [], **body, "last_seen": time.time(), "writer": writer}
         return {"ok": True}
 
     @app.get("/v1/state/devices")
