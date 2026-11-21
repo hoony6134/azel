@@ -1,12 +1,13 @@
 import importlib
+import array
 import io
+import random
 import stat
 import sys
 import time
 import wave
 from pathlib import Path
 
-import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,7 +19,7 @@ def wav(seconds=1.0, sr=16000, ch=1, amp=8000):
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(ch), w.setsampwidth(2), w.setframerate(sr)
-        w.writeframes((np.random.randn(int(seconds * sr) * ch) * amp).clip(-32000, 32000).astype(np.int16).tobytes())
+        w.writeframes(array.array("h", (int(random.uniform(-amp, amp)) for _ in range(int(seconds * sr) * ch))).tobytes())
     return buf.getvalue()
 
 
