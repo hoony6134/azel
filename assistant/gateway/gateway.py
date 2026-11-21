@@ -92,6 +92,24 @@ API_KEY = read_api_key()
 assert MODE == "full" or API_KEY, f"limited mode needs {API_KEY_PATH}"
 
 
+def secret(name, fallback=None):
+    """A 0600 token file under HOME; `fallback` when it does not exist."""
+    path = HOME / name
+    if not path.exists():
+        return fallback
+    assert path.stat().st_mode & 0o077 == 0, f"{path} must be chmod 600"
+    return path.read_text().strip()
+
+
+# Tokens: `token` guards this gateway's API and its daemons' MCP endpoints (the shared token on jh devices,
+# a device-local one on team devices). `link_token` dials the voice server (full devices: the link token;
+# team devices: the link_limited one). The state API takes the shared token, or on team devices the
+# scoped `state_token_limited`.
+LINK_TOKEN = secret("link_token", TOKEN)  # shortcut: falls back to the shared token until link tokens are rolled out
+STATE_TOKEN = TOKEN if MODE == "full" else secret("state_token_limited")
+assert STATE_TOKEN, "limited mode needs state_token_limited"
+
+
 # ---------- shared state (memory service on ruchba) ----------
 class StateDown(Exception):
     """ruchba unreachable: callers fall back to the cache (read-only) or refuse with 503."""
@@ -99,7 +117,7 @@ class StateDown(Exception):
 
 class State:
     def __init__(self, url):
-        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {TOKEN}"})
+        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {STATE_TOKEN}"})
         self.cache: dict = {}
 
     async def call(self, method, path, body=None, **params):
@@ -545,7 +563,7 @@ async def voice_link():
     backoff = 1
     while True:
         try:
-            async with websockets.connect(VOICE_LINK, additional_headers={"Authorization": f"Bearer {TOKEN}"},
+            async with websockets.connect(VOICE_LINK, additional_headers={"Authorization": f"Bearer {LINK_TOKEN}"},
                                           max_size=None, ping_interval=20, open_timeout=10) as ws:
                 link["ws"], backoff = ws, 1
                 await link_send({"type": "hello", "device": DEVICE, "mode": MODE, "priority": PRIORITY})

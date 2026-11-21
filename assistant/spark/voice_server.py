@@ -8,6 +8,7 @@ Contract: ../PROTOCOL.md sections 1-2.
 """
 import asyncio
 import base64
+import hashlib
 import hmac
 import io
 import json
@@ -30,7 +31,11 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen3.8-Flash-Next")
 TTS_URL = os.environ.get("TTS_URL", "http://100.64.0.11:8890/v1/audio/speech")
 TTS_VOICE = os.environ.get("TTS_VOICE", "sohee")
 STT_MODEL = os.environ.get("STT_MODEL", "openai/whisper-large-v3-turbo")
-TOKEN_FILE = os.environ.get("TOKEN_FILE", "/run/secrets/biseo_token")
+# Only SHA-256 digests of accepted tokens live on this shared team machine, never a token itself.
+# One "<label> <hex digest>" per line: client (apps, /v1/call and /v1/turn), link (full gateways),
+# link_limited (team-device gateways: always limited, whatever their hello says).
+HASH_FILE = os.environ.get("TOKEN_HASH_FILE", "/run/secrets/biseo_token_hashes")
+LABELS = ("client", "link", "link_limited")
 NAME = os.environ.get("ASSISTANT_NAME", "박비서")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "12"))
 END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
@@ -60,13 +65,26 @@ NO_GATEWAY = "지금 Claude 게이트웨이에 연결이 안 돼요."
 TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트|에러", "mac": r"맥북|파일|폴더|터미널",
               "schedule": r"일정|할 일|과제|캘린더|회의|수업|마감|알람|브리핑"}
 
+def load_hashes(text: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {k: [] for k in LABELS}
+    for line in text.splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        label, digest = line.split()
+        assert label in LABELS and re.fullmatch(r"[0-9a-f]{64}", digest), f"bad token hash line for {label!r}"
+        out[label].append(digest)
+    assert out["client"] and out["link"], "token hash file needs client and link entries"
+    return out
+
+
 CHECK_ONLY = "--check" in sys.argv
 if not CHECK_ONLY:
     import torch
     from pysilero_vad import SileroVoiceActivityDetector
     from transformers import pipeline
     asr = pipeline("automatic-speech-recognition", model=STT_MODEL, torch_dtype=torch.float16, device="cuda:0")
-    TOKEN = open(TOKEN_FILE).read().strip()
+    HASHES = load_hashes(open(HASH_FILE).read())
 asr_lock = asyncio.Lock()
 history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
 client = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5))
@@ -76,9 +94,10 @@ class Link:
     """One gateway connection. Gateways dial in here (Spark may not open connections to jh hosts, and
     personal Claude credentials stay off this shared team machine)."""
 
-    def __init__(self, ws):
-        self.ws, self.lock = ws, asyncio.Lock()
-        self.device, self.mode, self.priority = "?", "full", 50  # until hello (older gateways never send one)
+    def __init__(self, ws, limited=False):
+        self.ws, self.lock, self.locked = ws, asyncio.Lock(), limited  # locked: a link_limited token
+        self.device, self.priority = "?", 50  # until hello (older gateways never send one)
+        self.mode = "limited" if limited else "full"
         self.fails = 0  # consecutive failed asks; 3 or more = unhealthy, tried last
 
     async def send(self, obj):
@@ -97,8 +116,8 @@ class GatewayLinks:
         self.settings: dict = {}
         self.openings: dict[str, str] = {}
 
-    def add(self, ws):
-        lk = Link(ws)
+    def add(self, ws, limited=False):
+        lk = Link(ws, limited)
         self.links.append(lk)
         return lk
 
@@ -125,7 +144,8 @@ class GatewayLinks:
     def receive(self, lk, msg):
         t = msg.get("type")
         if t == "hello":
-            lk.device, lk.mode = str(msg.get("device", "?")), msg.get("mode", "full")
+            lk.device = str(msg.get("device", "?"))
+            lk.mode = "limited" if lk.locked else msg.get("mode", "full")  # a limited token cannot claim full
             lk.priority = int(msg.get("priority", 50))
             for old in [o for o in self.links if o is not lk and o.device == lk.device]:
                 self.remove(old)  # that gateway reconnected; its old socket is dead
@@ -168,9 +188,21 @@ def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
 
 
-def check_token(got: str):
-    if not hmac.compare_digest(got.encode(), TOKEN.encode()):
+def token_label(got: str, labels=("client",)):
+    """Which of `labels` this token belongs to (None if none), comparing digests in constant time."""
+    digest, hit = hashlib.sha256(got.encode()).hexdigest(), None
+    for label in labels:
+        for h in HASHES[label]:
+            if hmac.compare_digest(digest, h):
+                hit = label
+    return hit
+
+
+def check_token(got: str, labels=("client",)):
+    label = token_label(got, labels)
+    if label is None:
         raise HTTPException(401, "bad token")
+    return label
 
 
 def auth(request: Request):
@@ -215,9 +247,12 @@ async def gateway_settings():
     return links.settings  # pushed by the gateways on connect and on every change
 
 
-async def claude_stream(text, session, model, task, personal=False, timeout=180):
-    """Text deltas from a gateway over its link; RuntimeError carries a speakable message."""
+async def claude_stream(text, session, model, task, personal=False, context="", timeout=180):
+    """Text deltas from a gateway over its link; RuntimeError carries a speakable message.
+
+    `context` (recent turns of the call) goes only to full-mode links: earlier turns may be personal."""
     lk = links.pick(personal)
+    text = (context if lk.mode == "full" else "") + text
     rid, q, finished = uuid.uuid4().hex, asyncio.Queue(), False
     links.queues[rid] = (q, lk)
     try:
@@ -303,7 +338,7 @@ async def respond(text, session, t0, timings):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            async for delta in claude_stream(recent_context(hist) + text, session, model, task, personal):
+            async for delta in claude_stream(text, session, model, task, personal, recent_context(hist)):
                 got_text.set()
                 buf += delta
                 done, buf = split_ready(buf, final=False)
@@ -433,12 +468,13 @@ class Turn:
 @app.websocket("/v1/gateway-link")
 async def gateway_link(ws: WebSocket):
     try:
-        check_token(ws.headers.get("authorization", "").removeprefix("Bearer ").strip())
+        label = check_token(ws.headers.get("authorization", "").removeprefix("Bearer ").strip(),
+                            ("link", "link_limited"))
     except HTTPException:
         await ws.close(code=4401)
         return
     await ws.accept()
-    lk = links.add(ws)  # every gateway stays connected; routing picks one per ask
+    lk = links.add(ws, limited=label == "link_limited")  # every gateway stays connected; routing picks one per ask
     try:
         while True:
             links.receive(lk, json.loads(await ws.receive_text()))
@@ -608,6 +644,15 @@ if __name__ == "__main__":
             raise AssertionError("picked a link with none connected")
         except RuntimeError as e:
             assert str(e) == NO_GATEWAY
+        locked = gl.add(FakeWS(), limited=True)  # a link_limited token claiming full stays limited
+        gl.receive(locked, {"type": "hello", "device": "x", "mode": "full", "priority": 1})
+        assert locked.mode == "limited"
+        try:
+            gl.pick(True)
+            raise AssertionError("personal ask reached a link_limited gateway")
+        except RuntimeError as e:
+            assert str(e) == NO_PERSONAL
+        gl.remove(locked)
         old = gl.add(FakeWS())  # a gateway that predates hello counts as full
         assert gl.pick(True) is old
         gl.remove(old)
@@ -617,21 +662,22 @@ if __name__ == "__main__":
             a, b = links.add(FakeWS()), links.add(FakeWS())
             links.receive(a, {"type": "hello", "device": "macbook", "mode": "full", "priority": 10})
             links.receive(b, {"type": "hello", "device": "spark", "mode": "limited", "priority": 90})
-            gen = claude_stream("서버 괜찮아?", "s", None, "chat")
+            gen = claude_stream("서버 괜찮아?", "s", None, "chat", context="최근 통화 내용:\n사용자: 일정\n\n")
             first = asyncio.ensure_future(gen.__anext__())
             await asyncio.sleep(0)
             ask = a.ws.sent[-1]
-            assert ask["type"] == "ask" and not b.ws.sent
+            assert ask["type"] == "ask" and not b.ws.sent and ask["text"].startswith("최근 통화 내용")
             links.receive(a, {"id": ask["id"], "type": "text", "delta": "네"})
             assert await first == "네"
             await gen.aclose()  # barge-in
             assert a.ws.sent[-1] == {"type": "cancel", "id": ask["id"]} and not links.queues
             links.remove(a)
             got = []
-            gen = claude_stream("환율 알려줘", "s", None, "chat")
+            gen = claude_stream("환율 알려줘", "s", None, "chat", context="최근 통화 내용:\n사용자: 일정\n\n")
             task = asyncio.ensure_future(gen.__anext__())
             await asyncio.sleep(0)
             ask = b.ws.sent[-1]
+            assert ask["text"] == "환율 알려줘"  # limited links never see earlier turns
             links.receive(b, {"id": ask["id"], "type": "text", "delta": "1400원이에요."})
             got.append(await task)
             links.receive(b, {"id": ask["id"], "type": "done"})
@@ -645,4 +691,22 @@ if __name__ == "__main__":
                 assert str(e) == NO_PERSONAL
             links.remove(b)
         asyncio.run(stream_check())
+        h = {k: hashlib.sha256(k.encode()).hexdigest() for k in ("app-tok", "link-tok", "lim-tok")}
+        HASHES = load_hashes(f"# generated on the Mac\nclient {h['app-tok']}\nlink {h['link-tok']}\n"
+                             f"link_limited {h['lim-tok']}\n")
+        assert check_token("app-tok") == "client" and token_label("link-tok") is None  # link token: not a client
+        assert check_token("link-tok", ("link", "link_limited")) == "link"
+        assert check_token("lim-tok", ("link", "link_limited")) == "link_limited"
+        for bad in ["", "app-tok ", h["app-tok"]]:  # a stolen digest is not a token
+            try:
+                check_token(bad)
+                raise AssertionError(f"accepted {bad!r}")
+            except HTTPException:
+                pass
+        for broken in ["client abc", f"admin {h['app-tok']}", f"link {h['link-tok']}"]:
+            try:
+                load_hashes(broken)
+                raise AssertionError(f"loaded {broken!r}")
+            except AssertionError as e:
+                assert "loaded" not in str(e)
         print("voice_server checks ok")

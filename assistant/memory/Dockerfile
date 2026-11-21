@@ -10,5 +10,5 @@ RUN .venv/bin/python -c "from huggingface_hub import hf_hub_download as d; r='Xe
 COPY memory_service.py ./
 COPY tests ./tests
 ENV HF_HUB_OFFLINE=1 BISEO_HOME=/config
-# 0.0.0.0 inside the container only; compose publishes the port on the Tailscale IP alone.
-CMD [".venv/bin/uvicorn", "memory_service:app", "--host", "0.0.0.0", "--port", "8894"]
+# Host networking (compose.yaml): bind ruchba's Tailscale IP only (BISEO_HOST, default 100.64.0.10), never 0.0.0.0.
+CMD [".venv/bin/python", "memory_service.py"]

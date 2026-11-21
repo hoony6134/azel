@@ -4,6 +4,7 @@ Long-term facts stay in Cygnus MCP.
 Contract: ../PROTOCOL.md section 5. Runs on ruchba in Docker (compose.yaml), Tailscale IP only.
 """
 import hmac
+import ipaddress
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -30,9 +31,24 @@ KINDS = ("transcript", "task_log", "daemon_result", "note")
 W_VEC, W_LEX, W_FRESH, FRESH_DAYS = 0.6, 0.3, 0.1, 30
 STATE = os.environ.get("BISEO_STATE_SCHEMA", "state")
 assert STATE.replace("_", "").isalnum(), "BISEO_STATE_SCHEMA must be a plain identifier"
-# Team machines (vd-spark, vd-core) run limited gateways: from these tailnet IPs only the routes marked
-# `lim` answer, whatever token is sent, because the shared token also sits on those machines.
+# Team machines (vd-spark, vd-core) run limited gateways. Two independent gates keep them to the routes
+# marked `lim`: the scoped token in state_token_limited, and BISEO_LIMITED_IPS, which also limits the
+# shared token from those tailnet IPs. With BISEO_LIMITED_IPS set the IP gate fails closed: a peer that
+# is not a tailnet address (Docker's userland proxy shows 172.x bridge IPs) is treated as limited.
 LIMITED_IPS = {ip.strip() for ip in os.environ.get("BISEO_LIMITED_IPS", "").split(",") if ip.strip()}
+TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def load_limited_token(home: Path, token: str):
+    path = home / "state_token_limited"
+    if not path.exists():
+        return None
+    limited = path.read_text().strip()
+    assert limited and limited != token, "state_token_limited must be set and differ from the shared token"
+    return limited
+
+
+LIMITED_TOKEN = load_limited_token(HOME, TOKEN)
 
 SCHEMA = """
 create extension if not exists pg_trgm;
@@ -97,16 +113,32 @@ def db(sql, args=None):
         return cur.fetchall() if cur.description else []
 
 
+def limited_peer(host):
+    if not LIMITED_IPS:
+        return False
+    try:
+        return host in LIMITED_IPS or ipaddress.ip_address(host) not in TAILNET
+    except ValueError:  # not an IP at all: fail closed
+        return True
+
+
+def role(request: Request):
+    """'full' or 'limited' for a request, or 401."""
+    got = request.headers.get("authorization", "").removeprefix("Bearer ").strip().encode()
+    if hmac.compare_digest(got, TOKEN.encode()):
+        return "limited" if limited_peer(request.client.host if request.client else "") else "full"
+    if LIMITED_TOKEN and hmac.compare_digest(got, LIMITED_TOKEN.encode()):
+        return "limited"
+    raise HTTPException(401, "bad token")
+
+
 def token_only(request: Request):
-    got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(got.encode(), TOKEN.encode()):
-        raise HTTPException(401, "bad token")
+    role(request)
 
 
 def auth(request: Request):
-    token_only(request)
-    if request.client and request.client.host in LIMITED_IPS:
-        raise HTTPException(403, "not allowed from a limited host")
+    if role(request) != "full":
+        raise HTTPException(403, "not allowed for a limited gateway")
 
 
 @asynccontextmanager

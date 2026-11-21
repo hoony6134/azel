@@ -75,17 +75,54 @@ def test_leases(client):
     assert client.post("/v1/state/leases/job", json={"holder": "x", "ttl_s": 0}).status_code == 422
 
 
-def test_limited_host_gets_limited_routes_only(client):
-    lim = TestClient(sys.modules["memory_service"].app, client=("203.0.113.9", 1),
-                     headers={"Authorization": "Bearer t0k"})
+LIMITED_ONLY = [("put", "/v1/state/settings"), ("get", "/v1/state/push_tokens"), ("get", "/v1/state/approvals"),
+                ("post", "/v1/state/approvals/x"), ("post", "/v1/state/leases/x"), ("get", "/v1/state/sessions/v1"),
+                ("post", "/v1/state/calls"), ("post", "/v1/search"), ("get", "/v1/contacts"), ("get", "/v1/context"),
+                ("post", "/v1/records")]
+
+
+def limited_client(peer, token):
+    return TestClient(sys.modules["memory_service"].app, client=(peer, 1), headers={"Authorization": f"Bearer {token}"})
+
+
+def assert_limited(lim):
     assert lim.get("/v1/state/settings").status_code == 200
     assert lim.post("/v1/state/usage", json={"model": "haiku", "path": "api"}).status_code == 200
     assert lim.put("/v1/state/devices/spark", json={"name": "스파크", "url": "http://s/mcp"}).status_code == 200
+    assert lim.get("/v1/state/devices").status_code == 200
     aid = lim.post("/v1/state/approvals", json={"device": "spark", "command": "rm x"}).json()["approval_id"]
     assert lim.get(f"/v1/state/approvals/{aid}").status_code == 200
-    for method, path in [("put", "/v1/state/settings"), ("get", "/v1/state/push_tokens"),
-                         ("get", "/v1/state/approvals"), ("post", f"/v1/state/approvals/{aid}"),
-                         ("post", "/v1/state/leases/x"), ("get", "/v1/state/sessions/v1"),
-                         ("post", "/v1/search"), ("get", "/v1/contacts"), ("get", "/v1/context")]:
-        assert getattr(lim, method)(path, **({"json": {}} if method in ("put", "post") else {})).status_code == 403
-    assert lim.get("/v1/state/settings", headers={"Authorization": "Bearer nope"}).status_code == 401
+    for method, path in LIMITED_ONLY:
+        r = getattr(lim, method)(path, **({"json": {}} if method in ("put", "post") else {}))
+        assert r.status_code == 403, (method, path, r.status_code)
+
+
+def test_limited_ip_with_shared_token(client):
+    assert_limited(limited_client("203.0.113.9", "t0k"))
+
+
+def test_limited_token_from_a_full_peer(client):
+    assert_limited(limited_client("100.64.0.8", "l1m"))
+
+
+def test_ip_gate_fails_closed(client):
+    # Docker's userland proxy rewrites peers to bridge addresses; never let those count as full.
+    for peer in ["172.19.0.1", "10.0.0.5", "192.168.1.2", "127.0.0.1", "8.8.8.8", "testclient", ""]:
+        assert_limited(limited_client(peer, "t0k"))
+    assert limited_client("100.64.0.4", "t0k").get("/v1/state/push_tokens").status_code == 200
+
+
+def test_bad_tokens(client):
+    for token in ["nope", "", "l1m-", "t0k-"]:
+        assert limited_client("100.64.0.8", token).get("/v1/state/settings").status_code == 401
+
+
+def test_limited_token_must_differ(tmp_path):
+    import pytest
+    m = sys.modules["memory_service"]
+    assert m.load_limited_token(tmp_path, "t0k") is None  # opt-in
+    (tmp_path / "state_token_limited").write_text("t0k\n")
+    with pytest.raises(AssertionError, match="differ"):
+        m.load_limited_token(tmp_path, "t0k")
+    (tmp_path / "state_token_limited").write_text("other\n")
+    assert m.load_limited_token(tmp_path, "t0k") == "other"

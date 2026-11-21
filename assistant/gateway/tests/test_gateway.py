@@ -268,10 +268,15 @@ def test_alert_calls_once_across_gateways(gw, monkeypatch):
 
 
 # ---------- limited mode (team devices) ----------
+def private(path, text):
+    path.write_text(text)
+    os.chmod(path, 0o600)
+
+
 @pytest.fixture
 def limited(tmp_path, monkeypatch):
-    (tmp_path / "anthropic_api_key").write_text("sk-test\n")
-    os.chmod(tmp_path / "anthropic_api_key", 0o600)
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    private(tmp_path / "state_token_limited", "l1m\n")
     g = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         yield g, c, tmp_path
@@ -285,6 +290,23 @@ def test_limited_key_file_must_be_private(tmp_path, monkeypatch):
     os.unlink(tmp_path / "anthropic_api_key")
     with pytest.raises(AssertionError, match="limited mode needs"):
         start(tmp_path, monkeypatch, BISEO_MODE="limited")
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    with pytest.raises(AssertionError, match="state_token_limited"):
+        start(tmp_path, monkeypatch, BISEO_MODE="limited")
+
+
+def test_tokens_per_mode(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch)
+    assert g.LINK_TOKEN == "t0k" and g.STATE_TOKEN == "t0k"  # before link tokens exist: the shared token
+    private(tmp_path / "link_token", "l1nk\n")
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    private(tmp_path / "state_token_limited", "l1m\n")
+    g = start(tmp_path, monkeypatch, BISEO_MODE="limited")
+    assert g.LINK_TOKEN == "l1nk" and g.STATE_TOKEN == "l1m"
+    assert g.State("http://x").client.headers["authorization"] == "Bearer l1m"
+    os.chmod(tmp_path / "link_token", 0o644)
+    with pytest.raises(AssertionError, match="chmod 600"):
+        start(tmp_path, monkeypatch)
 
 
 def test_limited_refuses_personal_data(limited, monkeypatch):

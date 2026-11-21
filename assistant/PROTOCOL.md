@@ -2,8 +2,18 @@
 
 Every service listens only on its host's Tailscale address. Every request carries
 `Authorization: Bearer <token>` (WebSocket: `?token=<token>` query, since iOS
-`URLSessionWebSocketTask` can set headers but browsers can't). One shared token for
-now, kept in a 0600 file (`~/.config/biseo/token` on the Mac), never in code or logs.
+`URLSessionWebSocketTask` can set headers but browsers can't). Tokens live in 0600 files under
+`~/.config/biseo/`, never in code or logs:
+
+| File | Holds | Where |
+|---|---|---|
+| `token` | shared token: apps → voice server (`client`), gateways' own API, daemons, memory service | jh devices, ruchba; team devices hold a device-local token here instead (their gateway ↔ daemon only) |
+| `link_token` | full gateways → voice server `/v1/gateway-link` (`link`) | full gateway hosts |
+| `link_token` (team copy) | limited gateways → `/v1/gateway-link` (`link_limited`) | vd-spark, vd-core |
+| `state_token_limited` | limited gateways → memory service state API (limited routes only) | vd-spark, vd-core, ruchba |
+| `token_hashes` | `<label> <sha256 hex>` per line for `client`, `link`, `link_limited` | vd-spark (voice server, at `/run/secrets/biseo_token_hashes`) |
+
+The voice server stores **no plaintext token**: it compares SHA-256 digests (`hmac.compare_digest`).
 
 | Component | Host | Address | Owner dir |
 |---|---|---|---|
@@ -15,7 +25,7 @@ now, kept in a 0600 file (`~/.config/biseo/token` on the Mac), never in code or 
 
 ## 1. Live call — `WS /v1/call` on the voice server
 
-Query: `token`, `session` (stable per conversation), optional `call_id` (set when
+Query: `token` (a `client` token), `session` (stable per conversation), optional `call_id` (set when
 answering a call the assistant placed; the server then speaks that call's opening first).
 
 - Client → server **binary**: mono PCM16 little-endian, 16 kHz, any frame size
@@ -36,8 +46,9 @@ answering a call the assistant placed; the server then speaks that call's openin
 
 The **gateway dials the voice server**, never the reverse: under the Headscale ACL the
 Spark (`tag:vujade`) may not open connections to jh hosts, and the Spark is shared team
-hardware that must not hold personal Claude credentials. Auth: `Authorization: Bearer`
-header (not query). **Every gateway keeps its own link**; the voice server holds all of them at once.
+hardware that must not hold personal Claude credentials. Auth: `Authorization: Bearer <link token>`
+header (not query): a `link` token, or a `link_limited` token, whose link is always limited whatever
+its hello says. **Every gateway keeps its own link**; the voice server holds all of them at once.
 JSON text frames:
 
 - gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority"}` first on every
@@ -56,7 +67,8 @@ failed asks — timeouts or errors without a `code` — make a link unhealthy un
 is then tried last). With no full link, limited links take the ask only when the utterance is not
 personal (calendar, mail, memory, contacts, GISTRA courses/assignments, Planit, briefings; task
 `schedule`); a personal ask is answered "개인 비서 기능은 지금 쓸 수 없어요." With no link at all:
-"지금 Claude 게이트웨이에 연결이 안 돼요." A dropped link fails only its own pending asks.
+"지금 Claude 게이트웨이에 연결이 안 돼요." A dropped link fails only its own pending asks. Limited links
+get only the current utterance, never the call's earlier turns (which may be personal).
 `GET /health` lists the connected gateways.
 
 ## 2. One-shot turn — `POST /v1/turn` on the voice server (testing, benchmark)
@@ -68,7 +80,9 @@ Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm1
 
 Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BISEO_DEVICE` (ASCII
 slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
-`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`.
+`BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`. Token files (0600, else the
+gateway refuses to start): `token`, `link_token` (falls back to `token` until link tokens are rolled
+out), and in limited mode `state_token_limited` (required).
 
 - **full** (jh-only devices): Claude via `claude -p` with the user's login and claude.ai connectors
   (Cygnus MCP, Calendar, Gmail) plus every fresh device daemon. Runs the scheduler.
@@ -164,9 +178,13 @@ Runs in Docker (`memory/compose.yaml`, container `biseo-memory`, restart unless-
 
 Tables in their own schema (`state`, env `BISEO_STATE_SCHEMA`), created on start. Timestamps are
 epoch seconds. Gateways reach them only through these routes, never the DB, so DB credentials stay
-on ruchba. `BISEO_LIMITED_IPS` (comma list, e.g. vd-spark and vd-core) restricts requests from those
-tailnet IPs to the routes marked *limited* below whatever token they send (the shared token also sits
-on team machines); every other route answers them 403.
+on ruchba. A request is **limited** (only the routes marked *limited* below; everything else, including
+records, search, contacts and context, answers 403) when either:
+- it carries the scoped token from `/config/state_token_limited` (optional file; the service refuses to
+  start if it equals the shared token), or
+- `BISEO_LIMITED_IPS` is set (comma list: vd-spark, vd-core) and the peer is in it, **or the peer is not
+  a tailnet address** (100.64.0.0/10). Fail closed: Docker's userland proxy rewrites peers to bridge
+  addresses (172.x), so the container runs with host networking and binds 100.64.0.10 itself.
 
 - `GET /v1/state/settings` *limited* → the settings document (`{}` if none); `PUT` replaces it.
 - `POST /v1/state/usage` *limited* `{"device","model","path","task","input_tokens","output_tokens",

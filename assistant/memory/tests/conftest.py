@@ -23,6 +23,7 @@ def client(tmp_path_factory):
         con.execute(f"create schema {schema}")
     tmp = tmp_path_factory.mktemp("home")
     (tmp / "token").write_text("t0k\n")
+    (tmp / "state_token_limited").write_text("l1m\n")
     sep = "&" if "?" in url else "?"
     mp = pytest.MonkeyPatch()
     mp.setenv("BISEO_HOME", str(tmp))
@@ -33,7 +34,8 @@ def client(tmp_path_factory):
     import memory_service
     m = importlib.reload(memory_service)
     try:
-        with TestClient(m.app, headers={"Authorization": "Bearer t0k"}) as c:
+        # a tailnet peer: with BISEO_LIMITED_IPS set, anything else is treated as limited
+        with TestClient(m.app, client=("100.64.0.8", 50000), headers={"Authorization": "Bearer t0k"}) as c:
             yield c
     finally:
         mp.undo()
