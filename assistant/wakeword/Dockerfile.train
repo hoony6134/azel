@@ -1,0 +1,14 @@
+FROM qwen3-tts:local
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg && rm -rf /var/lib/apt/lists/*
+# openWakeWord at a fixed commit; its train.py drives augmentation + training.
+RUN git clone https://github.com/dscripka/openWakeWord /opt/oww && cd /opt/oww && git checkout 368c03716d1e92591906a84949bc477f3a834455 \
+ && pip install --no-cache-dir -e /opt/oww --no-deps
+RUN pip install --no-cache-dir torchinfo torchmetrics "audiomentations==0.33.0" "torch-audiomentations==0.11.0" "speechbrain>=1.0,<1.1" mutagen \
+    pronouncing "acoustics==0.2.6" pyyaml "datasets<4" "huggingface-hub>=0.34,<1.0" pyarrow onnx onnxscript tqdm "scipy<1.17" "onnxruntime>=1.17" "tflite-runtime; platform_machine=='x86_64'"
+# speechbrain 1.0 calls torchaudio.list_audio_backends(), removed in torchaudio 2.10 (loading now goes
+# through torchcodec). Restore it so speechbrain imports; openWakeWord only uses read_audio/reverberate.
+# Loaded by a .pth line, because Ubuntu's own sitecustomize.py shadows one in the venv.
+COPY torchaudio_compat.py /venv/lib/python3.12/site-packages/
+RUN echo 'import torchaudio_compat' > /venv/lib/python3.12/site-packages/zz_torchaudio_compat.pth
+RUN python -c "import openwakeword.utils as u; u.download_models()"
+WORKDIR /work

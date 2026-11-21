@@ -1,0 +1,21 @@
+# 김비서 memory service. Tailnet only: the port is published on ruchba's Tailscale IP.
+services:
+  memory:
+    build: .
+    image: biseo-memory
+    container_name: biseo-memory
+    restart: unless-stopped
+    user: "1001:1001"   # ubuntu, owner of the 0600 token and db_url files
+    environment:
+      TZ: Asia/Seoul
+    volumes:
+      - /home/ubuntu/.config/biseo/token:/config/token:ro
+      - ./db_url:/config/db_url:ro
+    ports:
+      - "100.64.0.10:8894:8894"
+    mem_limit: 600m
+    healthcheck:
+      test: ["CMD", ".venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8894/health')"]
+      interval: 60s
+      timeout: 5s
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }

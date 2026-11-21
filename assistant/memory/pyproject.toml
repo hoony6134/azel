@@ -1,0 +1,12 @@
+[project]
+name = "biseo-memory"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["fastapi", "uvicorn", "psycopg[binary]", "psycopg-pool", "onnxruntime", "tokenizers",
+                "huggingface-hub", "numpy"]
+
+[dependency-groups]
+dev = ["pytest", "httpx"]
+
+[tool.uv]
+package = false

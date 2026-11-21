@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>xyz.scian.biseo-wake</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jh/.local/bin/uv</string>
+    <string>run</string>
+    <string>--frozen</string>
+    <string>--project</string>
+    <string>__WAKE_DIR__</string>
+    <string>python</string>
+    <string>__WAKE_DIR__/biseo_wake.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__WAKE_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/jh/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/jh/Library/Logs/biseo-wake.log</string>
+  <key>StandardErrorPath</key><string>/Users/jh/Library/Logs/biseo-wake.log</string>
+</dict>
+</plist>

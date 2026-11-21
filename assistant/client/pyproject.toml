@@ -1,0 +1,8 @@
+[project]
+name = "assistant-client"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["httpx", "numpy", "sounddevice", "soundfile", "pysilero-vad", "websockets"]
+
+[tool.uv]
+package = false

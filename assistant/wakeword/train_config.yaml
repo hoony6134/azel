@@ -1,0 +1,27 @@
+# openWakeWord training config for "김비서". Clips come from gen_http.py (Qwen3-TTS voices,
+# Whisper-filtered); --generate_clips is never used (it needs English Piper TTS).
+model_name: "kim_biseo"
+target_phrase: ["김비서"]
+custom_negative_phrases: []
+n_samples: 2500
+n_samples_val: 400
+tts_batch_size: 50
+augmentation_batch_size: 16
+piper_sample_generator_path: "/nonexistent"
+output_dir: "/work/clips"
+rir_paths: ["/work/data/rirs"]
+background_paths: ["/work/data/background"]
+background_paths_duplication_rate: [1]
+false_positive_validation_data_path: "/work/data/validation_set_features.npy"
+augmentation_rounds: 2
+feature_data_files:
+  "ACAV100M_sample": "/work/data/openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+batch_n_per_class:
+  "ACAV100M_sample": 1024
+  "adversarial_negative": 50
+  "positive": 50
+model_type: "dnn"
+layer_size: 32
+steps: 30000
+max_negative_weight: 1500
+target_false_positives_per_hour: 0.2

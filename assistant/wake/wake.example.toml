@@ -1,0 +1,23 @@
+# copy to ~/.config/biseo/wake.toml (every key is optional; these are the defaults)
+
+# Built-in openWakeWord name for testing. When the Korean model is trained, set
+#   model = "~/.config/biseo/kim_biseo.onnx"
+model = "hey_jarvis"
+threshold = 0.5
+
+server = "http://100.64.0.11:8891"
+tts_url = "http://100.64.0.11:8890/v1/audio/speech"
+ack_text = "네?"
+voice = "sohee"
+
+silence_ms = 600       # silence that ends a request
+max_record_s = 15
+followup_s = 6         # after a reply, listen this long without the wake word
+mute_after_ms = 300    # ignore the mic this long after our own audio stops
+vad_threshold = 0.5
+
+# Each detection is logged (time, score, request?, transcript) as JSON lines.
+# save_audio = true also keeps the ~2 s around each detection as a WAV next to the log.
+save_audio = false
+log_path = "~/.local/state/biseo/wake.jsonl"
+token_path = "~/.config/biseo/token"

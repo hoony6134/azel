@@ -1,0 +1,25 @@
+# Copy to ~/.config/biseo/daemon.toml (chmod 600). Unset keys use the defaults in biseo_daemon.py.
+id = "macbook"            # ASCII slug: MCP server name on the Claude side
+name = "맥북"              # display name
+host = "100.64.0.8"       # Tailscale IP; 0.0.0.0 is refused
+port = 8893
+token_file = "~/.config/biseo/token"
+gateway_url = "http://100.64.0.8:8892"
+allowed_roots = ["~/dev"]
+# Prefix match on shell-split tokens. Path-like arguments must stay inside allowed_roots.
+# No npm/yarn/pnpm run/test: package scripts run arbitrary code (use delegate for that).
+allowed_commands = ["git status", "git log", "git diff", "ls", "rg"]
+# Matched anywhere in the token list; these are never run without a gateway approval.
+approval_required = ["rm", "git push", "git reset --hard", "sudo", "mv", "chmod", "chown"]
+log_path = "~/.local/state/biseo/daemon.jsonl"   # tool-call JSON lines; used_approvals.txt sits beside it
+read_max_bytes = 256000
+output_max_bytes = 64000
+command_timeout = 120
+delegate_timeout = 3600
+claude_bin = "claude"
+# browse(url, selector?, wait_for?, max_chars?): headless Chromium page text. Hosts resolving to loopback,
+# link-local, private or Tailscale (100.64/10) addresses are refused unless listed here by exact hostname.
+browse_enabled = true
+browse_timeout_s = 20     # capped at 20
+browse_max_chars = 20000
+browse_allow_private = []
