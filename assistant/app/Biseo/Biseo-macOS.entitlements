@@ -8,5 +8,10 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- The wake listener stays muted while ~/Library/Application Support/Azel/in-call exists. -->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+	<array>
+		<string>/Library/Application Support/Azel/</string>
+	</array>
 </dict>
 </plist>

@@ -63,3 +63,11 @@ final class WakeRetrainTests: XCTestCase {
         XCTAssertEqual(WakeEnrollStatus.percent(93), "93%")
     }
 }
+
+final class WakeMoreClipsTests: XCTestCase {
+    func testCountLineAndRoomUpToSixty() {
+        XCTAssertEqual(WakeEnrollStatus.countLine(clips: 24, minClips: 20), "24/60, 20개부터 학습")
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 20, minClips: 20), 10, "more past 20")
+        XCTAssertEqual(WakeEnrollModel.sessionLength(stored: 58, minClips: 20), 2)
+    }
+}
