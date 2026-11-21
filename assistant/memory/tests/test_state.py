@@ -305,12 +305,16 @@ def test_delete_persona_data(client):
     client.post("/v1/records", json={"kind": "note", "text": "둠드의 메모", "meta": {"persona_id": "doomed"}})
     client.post("/v1/records", json={"kind": "note", "text": "아젤의 메모", "meta": {"persona_id": "azel"}})
     client.put("/v1/context/call-followup-dz1", json={"summary": "후속", "open_questions": ["?"]})
+    client.put("/v1/context/azel-todos-doomed", json={"summary": "둠드 할 일", "open_questions": []})
+    client.put("/v1/context/azel-todos", json={"summary": "아젤 할 일", "open_questions": []})
     r = client.delete("/v1/state/personas/doomed/data").json()
     assert r == {"notes_deleted": 1, "calls": 2, "history_deleted": False}
     rows = {h["id"]: h for h in client.get("/v1/state/history?limit=100&persona=doomed").json()}
     assert set(rows) == {"dz1", "dz2"} and all(h["persona_deleted"] for h in rows.values())  # "삭제된 비서"
     assert client.get("/v1/state/history/keep1").json()["persona_deleted"] is False
     assert client.get("/v1/context/call-followup-dz1").status_code == 404
+    assert client.get("/v1/context/azel-todos-doomed").status_code == 404
+    assert client.get("/v1/context/azel-todos").json()["summary"] == "아젤 할 일"  # the primary's todos stay
     notes = [h["text"] for h in client.post("/v1/search", json={"query": "메모", "kinds": ["note"], "limit": 50}).json()]
     assert "둠드의 메모" not in notes and "아젤의 메모" in notes
     assert client.delete("/v1/state/personas/doomed/data?history=true").json()["history_deleted"]

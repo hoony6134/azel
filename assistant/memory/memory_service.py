@@ -795,12 +795,11 @@ def delete_calls(ids):
 @app.delete("/v1/state/personas/{pid}/data", dependencies=[v1])
 def delete_persona_data(pid: str = FPath(pattern=r"^[a-z0-9_-]{1,32}$"), history: bool = False):
     """A persona is being deleted: its own notes and call summaries (records with meta.persona_id, written by the
-    brain) and the follow-up contexts of its calls always go. Its call history goes too with history=true; otherwise
+    brain), the follow-up contexts of its calls and its todos (context azel-todos-<id>) always go. Its call history goes too with history=true; otherwise
     the rows stay, flagged persona_deleted, so the app shows them as "삭제된 비서"."""
     calls = [r["id"] for r in db(f"select id from {HIST} where persona_id=%s", (pid,))]
     notes = len(db("delete from records where meta->>'persona_id' = %s returning id", (pid,)))
-    if calls:
-        db("delete from context where task_id = any(%s)", ([f"call-followup-{c}" for c in calls],))
+    db("delete from context where task_id = any(%s)", ([f"call-followup-{c}" for c in calls] + [f"azel-todos-{pid}"],))
     if history:
         delete_calls(calls)
     else:

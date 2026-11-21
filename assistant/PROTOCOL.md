@@ -509,7 +509,7 @@ before.
 Memory written by the brain (no schema change; record kind `note`, contexts):
 - after every ended call with ≥ 12 characters of user speech: a `note` record `"[통화 요약 <when>] <summary> 결정: …
   후속: …"` with `meta {"type":"call_summary","call","title","at","decisions","facts","followups"}`; follow-ups as
-  context `call-<first 12 of the history id>` (`open_questions` = follow-ups, which the gateways' autonomous
+  context `call-followup-<call>` (`open_questions` = follow-ups, which the gateways' autonomous
   signals read); facts merged into `azel-profile` by Qwen.
 - `azel-profile`: stable facts and preferences, seeded once from Cygnus memory through a full gateway's
   `/v1/ask` (Claude), then refined from calls.
@@ -520,6 +520,6 @@ Memory written by the brain (no schema change; record kind `note`, contexts):
   `azel-todos`, and recent call summaries (3 days). First line `## 상황 (…)`; a note there without it is a gateway's
   checkpoint and is moved to `azel-checkpoint`.
 - Persona data (full callers only): `DELETE /v1/state/personas/{id}/data?history=true|false` → deletes records
-  with `meta.persona_id` = id and the `call-followup-<call>` contexts of its calls; with `history=true` also its
+  with `meta.persona_id` = id, the `call-followup-<call>` contexts of its calls and its todos (`azel-todos-<id>`); with `history=true` also its
   calls (and their transcript records), otherwise flags them `persona_deleted` → `{"notes_deleted","calls",
   "history_deleted"}`. History items carry `persona_deleted`.
