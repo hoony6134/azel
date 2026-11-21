@@ -653,22 +653,34 @@ async def briefing_sentences(session, name, on_event):
         messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name)},
                     {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
         stream = llm_stream(messages, 700)
+    elif time.time() - last_claude_briefing[0] < BRIEFING_COOLDOWN_S and last_claude_briefing[1]:
+        for s in split_ready(last_claude_briefing[1], final=True)[0]:  # asked again soon: no second Claude run
+            yield s
+        return
     else:
         yield FILLER
         await on_event(dict(ROUTING))
         stream = claude_stream(BRIEFING_CLAUDE, session, None, "schedule", personal=True, on_event=on_event)
-    buf, first = "", True
+    buf, first, said, failed = "", True, [], False
     try:
         async for delta in stream:
             buf += delta
             done, buf = split_ready(buf, final=False, first=first)
             for s in done:
                 first = False
+                said.append(s)
                 yield s
     except RuntimeError as e:  # no gateway / Claude failed: say why
-        buf = str(e)
-    for s in split_ready(buf, final=True)[0]:
+        buf, failed = str(e), True
+    rest = split_ready(buf, final=True)[0]
+    if not ctx.get("situation") and not failed:  # remember a whole Claude briefing for the cooldown
+        last_claude_briefing[:] = [time.time(), " ".join(said + rest)]
+    for s in rest:
         yield s
+
+
+BRIEFING_COOLDOWN_S = 600  # at most one Claude-fallback briefing per 10 min; within it the last text is reused
+last_claude_briefing: list = [0.0, ""]
 
 
 # ---------- scheduled calls: "내일 10시에 깨워 줘" (local; the gateway stores and fires them) ----------
@@ -750,10 +762,19 @@ def parse_when(text, now=None):
     return at, repeat
 
 
+def to_kst(dt):
+    """A naive time (as Qwen may write it) means KST, never the container's own zone."""
+    return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
+
+
+def weekday_matches(at, repeat):
+    return not (repeat and repeat.startswith("weekly:")) or at.weekday() == int(repeat.split(":")[1])
+
+
 def valid_schedule(at, repeat, now=None):
     now = now or datetime.now(KST)
     return at is not None and now + timedelta(seconds=30) < at <= now + timedelta(days=30) and \
-        (repeat is None or repeat in REPEATS)
+        (repeat is None or repeat in REPEATS) and weekday_matches(at, repeat)
 
 
 async def qwen_schedule(text, now):
@@ -769,7 +790,7 @@ async def qwen_schedule(text, now):
             if len(out) > 400:
                 break
         data = json.loads(out[out.index("{"):out.rindex("}") + 1])
-        at = datetime.fromisoformat(data["at"]).astimezone(KST) if data.get("at") else None
+        at = to_kst(datetime.fromisoformat(data["at"])) if data.get("at") else None
         return at, data.get("repeat"), data.get("kind") if data.get("kind") in ("wake", "reminder") else None
     except Exception:  # unparseable or invalid: the caller asks back instead of guessing
         return None, None, None
@@ -794,6 +815,9 @@ async def schedule_reply(text, action, session, now=None):
         if at is None:
             pending_schedule[session] = (time.time(), {"kind": kind, "repeat": repeat})
             return "몇 시에 깨워 드릴까요?" if kind == "wake" else "몇 시에 전화드릴까요?"
+        if repeat in REPEATS and not weekday_matches(at, repeat):  # e.g. Qwen said weekly:0 for a Wednesday
+            pending_schedule[session] = (time.time(), {"kind": kind, "repeat": None})
+            return "무슨 요일 몇 시에 할까요?"
         if not valid_schedule(at, repeat, now):
             return "지금부터 30일 안쪽의 시간으로만 예약할 수 있어요."
         note = "" if kind == "wake" else text[:100]
@@ -1661,6 +1685,9 @@ if __name__ == "__main__":
         assert replies == [FILLER, "오늘 브리핑이에요.", "회의가 하나 있어요."], replies
         assert types.count("activity") == 2  # routing, then the tool step
         assert [m for m in logs if m["event"] == "start"][-1]["opening"] == "오늘 브리핑이에요. 회의가 하나 있어요."
+        replies, types, logs = briefing_check("")  # again within 10 min: the same text, no second Claude run
+        assert replies == ["오늘 브리핑이에요.", "회의가 하나 있어요."] and "activity" not in types, replies
+        last_claude_briefing[:] = [0.0, ""]
         globals()["llm_stream"] = real_llm
         logs = history_check()
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
@@ -1698,6 +1725,10 @@ if __name__ == "__main__":
                            ("10시에 회의 있어", None), ("클로드가 뭐야?", None)]:
             assert schedule_intent(said) == want, (said, schedule_intent(said))
         assert valid_schedule(sat8 + timedelta(days=29), None, sat8) and not valid_schedule(sat8 - timedelta(minutes=1), None, sat8)
+        assert to_kst(datetime(2026, 11, 22, 10, 0)).isoformat() == "2026-11-22T10:00:00+09:00"  # naive = KST
+        assert to_kst(datetime(2026, 11, 22, 1, 0, tzinfo=timezone.utc)).hour == 10
+        wed9 = datetime(2026, 11, 25, 9, 0, tzinfo=KST)
+        assert weekday_matches(wed9, "weekly:2") and not weekday_matches(wed9, "weekly:0") and weekday_matches(wed9, None)
         assert not valid_schedule(sat8 + timedelta(days=31), None, sat8) and not valid_schedule(sat8 + timedelta(hours=1), "hourly", sat8)
 
         class GatewayWS(FakeWS):  # a full gateway that answers schedule requests
@@ -1735,6 +1766,19 @@ if __name__ == "__main__":
             globals()["llm_stream"] = json_answer
             out.append(await schedule_reply("점심 먹고 나서 깨워 줘", "create", "s3", sat8))  # rules miss it: Qwen
             assert gw_ws.sent[-1]["at"] == "2026-11-21T13:00:00+09:00"
+
+            async def naive_answer(messages):  # Qwen left out the offset: it means KST, not the container's zone
+                yield '{"action":"create","at":"2026-11-21T14:00:00","repeat":null,"kind":"wake","note":""}'
+            globals()["llm_stream"] = naive_answer
+            assert await schedule_reply("점심 먹고 한숨 자고 나서 깨워 줘", "create", "s6", sat8) == "내일 오전 10시에 깨워 드릴게요."
+            assert gw_ws.sent[-1]["at"] == "2026-11-21T14:00:00+09:00"
+
+            async def wrong_weekday(messages):  # weekly:0 (Monday) but 2026-11-25 is a Wednesday
+                yield '{"action":"create","at":"2026-11-25T09:00:00+09:00","repeat":"weekly:0","kind":"wake","note":""}'
+            globals()["llm_stream"] = wrong_weekday
+            n_sent = len(gw_ws.sent)
+            assert await schedule_reply("수요일마다 그 시간에 깨워 줘", "create", "s7", sat8) == "무슨 요일 몇 시에 할까요?"
+            assert len(gw_ws.sent) == n_sent  # nothing stored
             out.append(await schedule_reply("어제 7시에 깨워 줘", "create", "s4", sat8 + timedelta(days=1, hours=1)))
             assert not links.pick(False, need_claude=False) is None
             try:
