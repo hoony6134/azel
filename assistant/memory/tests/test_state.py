@@ -276,6 +276,53 @@ def test_fix_call_directions_is_idempotent(client):
         client.delete(f"/v1/state/history/{hid}")
 
 
+def test_persona_tags(client):
+    client.post("/v1/state/history/pA/start", json={"session": "s", "persona_id": "luna"})
+    client.post("/v1/state/history/pB/start", json={"session": "s"})  # older voice servers: the primary
+    ids = lambda q: [r["id"] for r in client.get(f"/v1/state/history?limit=100{q}").json()]  # noqa: E731
+    assert "pA" in ids("&persona=luna") and "pB" not in ids("&persona=luna") and "pB" in ids("&persona=azel")
+    assert client.get("/v1/state/history/pA").json()["persona_id"] == "luna"
+    assert client.post("/v1/state/history/pC/start", json={"persona_id": "Bad Id!"}).status_code == 422
+    at = time.time() + 3600
+    a = client.post("/v1/state/schedule", json={"at": at, "persona_id": "luna"}).json()
+    b = client.post("/v1/state/schedule", json={"at": at + 60}).json()
+    assert a["persona_id"] == "luna" and b["persona_id"] == "azel"
+    assert [r["id"] for r in client.get("/v1/state/schedule?persona=luna").json()] == [a["id"]]
+    client.post("/v1/state/proactive_log", json={"reason": "x", "persona_id": "azel"})
+    assert client.get("/v1/state/proactive_log").json()[0]["persona_id"] == "azel"
+    for hid in ("pA", "pB"):
+        client.delete(f"/v1/state/history/{hid}")
+    client.delete(f"/v1/state/schedule/{a['id']}")
+    client.delete(f"/v1/state/schedule/{b['id']}")
+
+
+def test_delete_persona_data(client):
+    for hid in ("dz1", "dz2"):
+        client.post(f"/v1/state/history/{hid}/start", json={"persona_id": "doomed"})
+        client.post(f"/v1/state/history/{hid}/turns", json={"user": "안녕 둠드", "assistant": ["네"]})
+        client.post(f"/v1/state/history/{hid}/end", json={})
+    client.post("/v1/state/history/keep1/start", json={"persona_id": "azel"})
+    client.post("/v1/records", json={"kind": "note", "text": "둠드의 메모", "meta": {"persona_id": "doomed"}})
+    client.post("/v1/records", json={"kind": "note", "text": "아젤의 메모", "meta": {"persona_id": "azel"}})
+    client.put("/v1/context/call-followup-dz1", json={"summary": "후속", "open_questions": ["?"]})
+    client.put("/v1/context/azel-todos-doomed", json={"summary": "둠드 할 일", "open_questions": []})
+    client.put("/v1/context/azel-todos", json={"summary": "아젤 할 일", "open_questions": []})
+    r = client.delete("/v1/state/personas/doomed/data").json()
+    assert r == {"notes_deleted": 1, "calls": 2, "history_deleted": False}
+    rows = {h["id"]: h for h in client.get("/v1/state/history?limit=100&persona=doomed").json()}
+    assert set(rows) == {"dz1", "dz2"} and all(h["persona_deleted"] for h in rows.values())  # "삭제된 비서"
+    assert client.get("/v1/state/history/keep1").json()["persona_deleted"] is False
+    assert client.get("/v1/context/call-followup-dz1").status_code == 404
+    assert client.get("/v1/context/azel-todos-doomed").status_code == 404
+    assert client.get("/v1/context/azel-todos").json()["summary"] == "아젤 할 일"  # the primary's todos stay
+    notes = [h["text"] for h in client.post("/v1/search", json={"query": "메모", "kinds": ["note"], "limit": 50}).json()]
+    assert "둠드의 메모" not in notes and "아젤의 메모" in notes
+    assert client.delete("/v1/state/personas/doomed/data?history=true").json()["history_deleted"]
+    assert client.get("/v1/state/history?limit=100&persona=doomed").json() == []
+    assert client.delete("/v1/state/personas/Bad!/data").status_code == 422
+    client.delete("/v1/state/history/keep1")
+
+
 def test_bad_tokens(client):
     for token in ["nope", "", "l1m-", "t0k-"]:
         assert limited_client("100.64.0.8", token).get("/v1/state/settings").status_code == 401

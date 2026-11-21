@@ -478,10 +478,10 @@ canvas.jar { display:block; }
     <div class="title" style="margin-top:0">비서</div>
     <div class="stack">
       <div class="card">
-        <div class="prow2 t-celadon"><span class="pdot"></span>아젤 <span class="basic">기본</span><span class="v">Sohee</span></div>
-        <div class="prow2 t-azalea"><span class="pdot"></span>소담<span class="v">Serena</span></div>
-        <div class="prow2 t-sky"><span class="pdot"></span>하람<span class="v">Vivian</span></div>
-        <div class="prow2 t-amber"><span class="pdot"></span>도윤<span class="v">Ryan</span></div>
+        <div class="prow2 t-celadon"><span class="pdot"></span>아젤 <span class="basic">기본</span><span class="v">소희</span></div>
+        <div class="prow2 t-azalea"><span class="pdot"></span>소담<span class="v">세레나</span></div>
+        <div class="prow2 t-sky"><span class="pdot"></span>하람<span class="v">비비안</span></div>
+        <div class="prow2 t-amber"><span class="pdot"></span>도윤<span class="v">라이언</span></div>
         <div class="prow2" style="color:var(--celadon);font-weight:600"><span style="width:24px;text-align:center;font-size:22px">+</span>비서 추가</div>
         <div class="foot" style="margin-top:6px;line-height:1.4">비서는 8명까지 만들 수 있어요 · 4/8. 순서를 바꾸면 홈의 순서도 바뀌어요.</div>
       </div>
@@ -520,7 +520,7 @@ canvas.jar { display:block; }
     <div class="flabel">색</div>
     <div class="swatches" role="radiogroup" aria-label="색"><span class="sw t-celadon" role="radio" aria-checked="false" aria-label="청자"></span><span class="sw t-indigo" role="radio" aria-checked="false" aria-label="쪽빛"></span><span class="sw t-amber" role="radio" aria-checked="false" aria-label="호박"></span><span class="sw t-azalea on" role="radio" aria-checked="true" aria-label="진달래"></span><span class="sw t-sprout" role="radio" aria-checked="false" aria-label="연두"></span><span class="sw t-sky" role="radio" aria-checked="false" aria-label="하늘"></span><span class="sw t-plum" role="radio" aria-checked="false" aria-label="자주"></span><span class="sw t-ash" role="radio" aria-checked="false" aria-label="먹"></span></div>
     <div class="flabel">목소리</div>
-    <div class="field" style="padding:2px 14px"><div class="vrow"><span class="chk"></span>Sohee<span class="play" role="button" aria-label="Sohee 들어보기">▶ 들어보기</span></div><div class="vrow"><span class="chk">✓</span>Serena<span class="play" role="button" aria-label="Serena 들어보기">■ 재생 중</span></div><div class="vrow"><span class="chk"></span>Vivian<span class="play" role="button" aria-label="Vivian 들어보기">▶ 들어보기</span></div></div>
+    <div class="field" style="padding:2px 14px"><div class="vrow"><span class="chk"></span><span style="display:flex;flex-direction:column;gap:1px">소희<span class="foot" style="color:var(--text2)">따뜻한 한국어 여성 목소리</span></span><span class="play" role="button" aria-label="소희 들어보기">▶ 들어보기</span></div><div class="vrow"><span class="chk">✓</span><span style="display:flex;flex-direction:column;gap:1px">세레나<span class="foot" style="color:var(--text2)">차분한 여성 목소리</span></span><span class="play" role="button" aria-label="세레나 들어보기">■ 재생 중</span></div><div class="vrow"><span class="chk"></span><span style="display:flex;flex-direction:column;gap:1px">비비안<span class="foot" style="color:var(--text2)">밝은 여성 목소리</span></span><span class="play" role="button" aria-label="비비안 들어보기">▶ 들어보기</span></div></div>
     <div class="flabel">말투</div>
     <div class="field" style="color:var(--text)">차분하고 천천히</div>
   </div>
@@ -546,7 +546,8 @@ canvas.jar { display:block; }
   <div class="sheetbg" style="z-index:2;background:rgba(0,0,0,.35)"></div>
   <div class="alert" role="alertdialog" aria-label="소담을 지울까요?">
     <h3>‘소담’을 지울까요?</h3>
-    <p>통화 기록은 남아요.</p>
+    <p>이 비서의 메모와 통화 요약이 지워져요. 통화 기록은 ‘삭제된 비서’로 남아요.</p>
+    <div style="display:flex;align-items:center;gap:10px;justify-content:center;padding:0 16px 14px;font-size:15px" role="checkbox" aria-checked="false"><span style="width:20px;height:20px;border-radius:6px;border:1.5px solid var(--text2)"></span>통화 기록도 함께 삭제</div>
     <div class="ab"><span>취소</span><span>지우기</span></div>
   </div>
 </div></div>

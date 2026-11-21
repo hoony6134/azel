@@ -157,6 +157,11 @@ def make():
         db["context"][tid] = {"task_id": tid, **body}
         return db["context"][tid]
 
+    @app.delete("/v1/state/personas/{pid}/data")
+    def persona_data(pid: str, history: bool = False):
+        app.persona_data = (pid, history)
+        return {"notes_deleted": 0, "calls": 0, "history_deleted": history}
+
     @app.post("/v1/state/schedule")
     def s_add(body: dict):
         sid = uuid.uuid4().hex[:12]

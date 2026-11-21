@@ -8,6 +8,7 @@ Contract: ../PROTOCOL.md sections 1-2.
 """
 import asyncio
 import base64
+import contextvars
 import hashlib
 import hmac
 import io
@@ -54,7 +55,8 @@ LENGTH_STYLE = {
 LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어 존댓말로 자연스럽게 말해. 첫 문장은 열 글자 안팎으로 짧게 시작해. "
+    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해(예: '오늘 일정은 두 개예요,'). "
+    "'네'나 '알겠습니다'만 하고 끝내지 마. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
     f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
@@ -70,10 +72,46 @@ def reply_length(settings):
     return settings.get("reply_length") if settings.get("reply_length") in LENGTH_STYLE else "normal"
 
 
-def system_prompt(name, length="normal", context=""):
+# ---------- personas (PROTOCOL.md section 3): the call's persona sets name, character and voice ----------
+CALL_PERSONA: contextvars.ContextVar = contextvars.ContextVar("call_persona", default=None)  # set per /v1/call
+
+
+def personas_of(settings):
+    """Live personas from the shared settings; a gateway from before personas gives the one assistant."""
+    ps = [p for p in settings.get("personas") or [] if isinstance(p, dict) and p.get("id") and not p.get("deleted_at")]
+    return ps or [{"id": "azel", "name": assistant_name(settings), "voice": TTS_VOICE, "voice_style": "",
+                   "personality": settings.get("personality") or "", "primary": True}]
+
+
+def pick_persona(settings, pid=None):
+    ps = personas_of(settings)
+    return next((p for p in ps if p["id"] == pid), None) or next((p for p in ps if p.get("primary")), ps[0])
+
+
+def persona_text(p, settings):
+    """A persona's character ("" = the default the gateway sends as personality_default)."""
+    t = p.get("personality")
+    return t.strip() if isinstance(t, str) and t.strip() else str(settings.get("personality_default") or "")
+
+
+def current_persona(settings):
+    return CALL_PERSONA.get() or pick_persona(settings)
+
+
+def personality(settings):
+    """Azel's character from the shared settings ("" = the default the gateway sends as personality_default)."""
+    p = settings.get("personality")
+    return p.strip() if isinstance(p, str) and p.strip() else str(settings.get("personality_default") or "")
+
+
+def system_prompt(name, length="normal", context="", persona=""):
     """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
-    at once. `context`: extra situation text from the brain, appended last."""
-    return f"너는 사용자의 개인 비서 '{name}'야. " + SYSTEM_BODY + " " + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
+    at once. `context`: the brain's block, appended last; with it, Qwen answers personal questions from the context
+    or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
+    endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
+    body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
+    return f"너는 사용자의 개인 비서 '{name}'야. " + (f"성격: {persona} " if persona else "") + body + " " \
+        + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
 
@@ -171,7 +209,7 @@ class GatewayLinks:
         self.queues: dict[str, tuple[asyncio.Queue, Link]] = {}
         self.settings: dict = {}
         self.openings: dict[str, str] = {}
-        self.brain_ctx: tuple[float, str] | None = None  # (received at, block) from the brain, for every call
+        self.persona_ctx: dict[str, tuple[float, str]] = {}  # (received at, block) per persona ("" = the primary)
         self.session_ctx: dict[str, tuple[float, str]] = {}  # per call session (e.g. why the assistant called)
 
     def add(self, ws, limited=False):
@@ -244,7 +282,7 @@ class GatewayLinks:
                 self.remove(old)  # that gateway reconnected; its old socket is dead
         elif t == "context":
             if lk.brain and isinstance(msg.get("value"), str):
-                self.take_context(msg.get("session"), msg["value"])
+                self.take_context(msg.get("session"), msg["value"], msg.get("persona"))
         elif t in ("settings", "call") and lk.mode != "full":
             return  # shared settings and call openings come from full gateways only
         elif t == "settings":
@@ -257,7 +295,8 @@ class GatewayLinks:
                 old = self.openings.pop(next(iter(self.openings)))
                 if old["audio"]:
                     old["audio"].cancel()
-            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")))
+            self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")),
+                                                            str(msg.get("persona") or ""))
         elif isinstance(msg.get("id"), str) and isinstance(t, str) and msg["id"] in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
@@ -268,27 +307,30 @@ links = GatewayLinks()
 # ---------- brain: context and local tools for Qwen (PROTOCOL.md section 6) ----------
 BRAIN_FRESH_S = 900  # an older context block is ignored (the brain pushes one at least every 5 min while it changes)
 RECALL_WAIT_S = 0.4  # per-turn memory retrieval may delay the answer this much at most
-TOOL_WAIT_S = 4.0
+TOOL_WAIT_S = 3.0  # a slow brain never stalls a turn
 TOOL_TAG = "[TOOL]"
 MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|우리|네가)|했었|했던|라고 했|물어봤")
 BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")
 
 
-def _take_context(self, session, value):
+def _take_context(self, session, value, persona=None):
     value = value[:6000]
     if isinstance(session, str) and session:
         if len(self.session_ctx) > 200:
             self.session_ctx.pop(next(iter(self.session_ctx)))
         self.session_ctx[session] = (time.time(), value)
-    else:
-        self.brain_ctx = (time.time(), value)
+    else:  # a persona's shared block; frames without `persona` are the primary's (as before personas)
+        self.persona_ctx[persona if isinstance(persona, str) and persona else ""] = (time.time(), value)
 
 
-def _context_for(self, session):
-    """The freshest block for this call ('' when no brain is up): the session's own, else the shared one."""
+def _context_for(self, session, persona=None):
+    """The freshest block for this call ('' when no brain is up): the session's own, else the persona's."""
     if not self.brain_link():
         return ""
-    got = [c for c in (self.session_ctx.get(session), self.brain_ctx) if c and time.time() - c[0] < BRAIN_FRESH_S]
+    pid = persona or (CALL_PERSONA.get() or {}).get("id") or ""
+    shared = self.persona_ctx.get(pid) or (self.persona_ctx.get("") if (CALL_PERSONA.get() or {}).get("primary", True)
+                                           else None)
+    got = [c for c in (self.session_ctx.get(session), shared) if c and time.time() - c[0] < BRAIN_FRESH_S]
     return max(got)[1] if got else ""
 
 
@@ -322,23 +364,19 @@ GatewayLinks.take_context, GatewayLinks.context_for, GatewayLinks.brain_link = _
 GatewayLinks.brain_request, GatewayLinks.brain_event = _brain_request, _brain_event
 
 BRAIN_BODY = (
-    "아래 [아는 것]은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
+    "아래 '참고할 상황'은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
     "여기에 답이 있으면 Claude 없이 네가 바로 답해. 없는 내용은 절대 지어내지 마. "
     f"더 찾아봐야 하면 다른 말 없이 한 줄로 {TOOL_TAG} {{\"name\": 도구, \"args\": {{…}}}} 만 출력해. 도구: "
     "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
     "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
-    "[아는 것]과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
+    "참고할 상황과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
     f"최신 정보, 서버 진단, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해."
 )
 
 
-def brain_system(name, ctx, hits=(), length="normal"):
-    """Qwen's SYSTEM when the brain is up: voice style, the routing and tool rules, then what the brain knows."""
-    body = SYSTEM_BODY.split("중요:")[0] + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) + " "  # voice style + length
-    mem = ("\n[이번 말과 관련된 기록]\n" + "\n".join(f"- {h}" for h in hits)) if hits else ""
-    # Stable parts first, the clock and this turn's hits last, so the endpoint's prefix cache covers the context.
-    return f"너는 사용자의 개인 비서 '{name}'야. " + body + BRAIN_BODY + f"\n\n[아는 것]\n{ctx}\n" + now_kst().strip() + mem
+def memory_hits(hits):
+    return ("\n[이번 말과 관련된 기록]\n" + "\n".join(f"- {h}" for h in hits)) if hits else ""
 
 
 async def run_tool(raw, session):
@@ -354,7 +392,8 @@ async def run_tool(raw, session):
     if name not in BRAIN_TOOLS:
         return f"없는 도구예요: {name}"
     try:
-        reply = await links.brain_request({"type": "tool", "name": name, "args": args}, TOOL_WAIT_S)
+        reply = await links.brain_request({"type": "tool", "name": name, "args": args,
+                                           "persona": (CALL_PERSONA.get() or {}).get("id")}, TOOL_WAIT_S)
         return str(reply.get("result", ""))[:2000]
     except (RuntimeError, asyncio.TimeoutError):
         return "지금은 그 도구를 쓸 수 없어요."
@@ -364,7 +403,8 @@ async def recall(text, timings):
     """Up to two memory hits for this utterance, or none if the brain cannot answer within RECALL_WAIT_S."""
     t = time.perf_counter()
     try:
-        reply = await links.brain_request({"type": "recall", "text": text[:300]}, RECALL_WAIT_S)
+        reply = await links.brain_request({"type": "recall", "text": text[:300],
+                                           "persona": (CALL_PERSONA.get() or {}).get("id")}, RECALL_WAIT_S)
         hits = [str(h)[:300] for h in reply.get("hits", [])][:2] if isinstance(reply.get("hits"), list) else []
     except (RuntimeError, asyncio.TimeoutError):
         hits = []
@@ -372,20 +412,21 @@ async def recall(text, timings):
     return hits
 
 
-def prepare_opening(text, reason=""):
+def prepare_opening(text, reason="", persona=""):
     """Split a placed call's opening and start synthesizing it now, so the phone hears it the moment it
     connects (the push arrives seconds before the callee answers)."""
     parts = split_ready(text, final=True)[0] if text else []
-    op = {"text": text, "parts": parts, "audio": None, "reason": reason}
+    op = {"text": text, "parts": parts, "audio": None, "reason": reason, "persona": persona}
     if parts:
         try:
-            op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts))
+            op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts, persona))
         except RuntimeError:
             pass  # no event loop (self-checks): synthesize on connect instead
     return op
 
 
-async def _synth_all(parts):
+async def _synth_all(parts, persona=""):
+    CALL_PERSONA.set(pick_persona(links.settings, persona))  # this task only: the voice the call rings with
     return [(await tts(p))[0] for p in parts]
 
 
@@ -485,10 +526,31 @@ def pre_route(text, settings, local=False):
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
 
 
+# A reply with no content: acknowledgements and promises only ("네.", "알겠습니다", "네, 확인해 볼게요").
+ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알았어요|좋아요|그럼요|물론이죠|맞아요|그렇죠|그래요|"
+                       r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
+TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|"
+                     r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
+NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
+         f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
+
+
+def content_free(reply):
+    """True when nothing is left once acknowledgements, promises and punctuation are removed."""
+    rest = ACK_WORDS.sub("", reply)
+    return not re.search(r"[가-힣A-Za-z0-9]", rest)
+
+
+def needs_answer(text):
+    """A question or request (not a greeting, thanks or yes/no confirmation): a bare "네" is no answer."""
+    return not TRIVIAL.fullmatch(text.strip())
+
+
 def hold_tag_prefix(buf):
     """(speakable text, held tail): a tail that could still grow into the routing tag is never spoken early."""
     at = buf.rfind("[")
-    if at != -1 and ROUTE_TAG.startswith(buf[at:].rstrip()) and len(buf) - at < len(ROUTE_TAG) + 2:
+    tail = buf[at:].rstrip()
+    if at != -1 and (ROUTE_TAG.startswith(tail) or TOOL_TAG.startswith(tail)) and len(buf) - at < len(ROUTE_TAG) + 2:
         return buf[:at], buf[at:]
     return buf, ""
 
@@ -607,7 +669,8 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
     rid, q, finished = uuid.uuid4().hex, asyncio.Queue(), False
     links.queues[rid] = (q, lk)
     try:
-        await lk.send({"type": "ask", "id": rid, "text": text, "session": session, "model": model, "task": task})
+        await lk.send({"type": "ask", "id": rid, "text": text, "session": session, "model": model, "task": task,
+                       "persona": (CALL_PERSONA.get() or {}).get("id")})
         while True:
             try:
                 ev = await asyncio.wait_for(q.get(), timeout)
@@ -649,7 +712,7 @@ BRIEFING_CLAUDE = (  # the morning-briefing call's prompt, for when no situation
 )
 
 
-async def briefing_sentences(session, name, on_event):
+async def briefing_sentences(session, name, on_event, persona=""):
     """Sentences of a spoken briefing. Fast path: the local Qwen composes it from the situation note a full
     gateway hands over (first sentence within about 2 s). No note yet: a filler, then Claude via the link."""
     try:
@@ -658,7 +721,7 @@ async def briefing_sentences(session, name, on_event):
         ctx = {}
     if ctx.get("situation"):
         facts = "\n".join(str(f) for f in ctx.get("facts") or [])
-        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name)},
+        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (f" 성격: {persona}" if persona else "")},
                     {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
         stream = llm_stream(messages, 700)
     elif time.time() - last_claude_briefing[0] < BRIEFING_COOLDOWN_S and last_claude_briefing[1]:
@@ -830,7 +893,7 @@ async def schedule_reply(text, action, session, now=None):
             return "지금부터 30일 안쪽의 시간으로만 예약할 수 있어요."
         note = "" if kind == "wake" else text[:100]
         msg = {"type": "schedule", "action": "create", "at": at.isoformat(), "repeat": repeat, "kind": kind,
-               "note": note}
+               "note": note, "persona_id": (CALL_PERSONA.get() or {}).get("id")}
     try:
         reply = await links.request(msg)
     except (RuntimeError, asyncio.TimeoutError):
@@ -842,15 +905,19 @@ _tts_cache: dict[str, tuple[bytes, int]] = {}
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
-    # Fillers and short acknowledgements ("네,") repeat constantly: synthesize them once.
+    p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
+    voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
+    # Fillers and short acknowledgements ("네,") repeat constantly: synthesize them once (per voice).
     cacheable = sentence in (FILLER, FILLER_LONG) or len(sentence) <= 6
-    if cacheable and sentence in _tts_cache:
-        return _tts_cache[sentence]
-    r = await client.post(TTS_URL, json={"input": sentence, "voice": TTS_VOICE, "response_format": "wav"})
+    key = (voice, style, sentence)
+    if cacheable and key in _tts_cache:
+        return _tts_cache[key]
+    body = {"input": sentence, "voice": voice, "response_format": "wav", **({"instructions": style} if style else {})}
+    r = await client.post(TTS_URL, json=body)
     r.raise_for_status()
     wav, sr = sf.read(io.BytesIO(r.content), dtype="int16")
     if cacheable and len(_tts_cache) < 500:
-        _tts_cache[sentence] = (wav.tobytes(), sr)
+        _tts_cache[key] = (wav.tobytes(), sr)
     return wav.tobytes(), sr
 
 
@@ -871,9 +938,11 @@ def recent_context(hist, n=6):
 
 async def respond(text, session, t0, timings, on_event=None):
     """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
-    hist = history[session]
     settings = await gateway_settings()
-    name = assistant_name(settings)
+    persona = current_persona(settings)
+    hkey = f"{persona['id']}:{session}"  # history and the Claude session map are per persona
+    hist = history[hkey]
+    name = persona["name"]
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
@@ -898,8 +967,7 @@ async def respond(text, session, t0, timings, on_event=None):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            known = f"비서가 알고 있는 것(참고만):\n{ctx}\n\n" if ctx else ""  # full links only, like the turns
-            async for delta in claude_stream(text, session, model, task, personal, known + recent_context(hist),
+            async for delta in claude_stream(text, hkey, model, task, personal, recent_context(hist),
                                              on_event=on_event):
                 got_text.set()
                 buf += delta
@@ -924,11 +992,23 @@ async def respond(text, session, t0, timings, on_event=None):
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = brain_system(name, ctx, await recall(bare, timings), length) if ctx \
-                else system_prompt(name, length) + now_kst()
+            system = system_prompt(name, length, ctx, persona_text(persona, settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
-            for rounds in range(3):  # at most two tool calls, then an answer
-                buf, state = "", "maybe"
+            guard = needs_answer(bare)  # a question or request must not end with a bare "네"
+            ack_held, flushed, nudged = [], False, False
+
+            async def say(s):
+                nonlocal flushed
+                if guard and not flushed and content_free(" ".join(ack_held + [s])):
+                    ack_held.append(s)  # "네," alone: keep it back until real content follows
+                    return
+                for x in ack_held + [s]:
+                    await sentences.put(x)
+                ack_held.clear()
+                flushed = True
+
+            for rounds in range(4):  # at most two tool calls and one nudge, then an answer
+                buf, state, said_round = "", "maybe", []
                 async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
                     timings.setdefault("llm_first_token_ms", ms(t0))
                     buf += delta
@@ -938,12 +1018,20 @@ async def respond(text, session, t0, timings, on_event=None):
                         continue  # might be a tag; a tool call is collected whole
                     if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
                         return await via_claude()
+                    if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
+                        before, _, after = buf.partition(TOOL_TAG)
+                        for s in split_ready(before, final=True)[0]:
+                            said_round.append(s)
+                            await say(s)
+                        buf, state = TOOL_TAG + after, "tool"
+                        continue
                     speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
                     done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
                     buf = rest + held
                     for s in done:
                         timings.setdefault("first_sentence_ms", ms(t0))
-                        await sentences.put(s)
+                        said_round.append(s)
+                        await say(s)
                 if state == "tool" and ctx and rounds < 2:
                     t_tool = time.perf_counter()
                     result = await run_tool(buf.strip().split("\n")[0], session)
@@ -954,7 +1042,16 @@ async def respond(text, session, t0, timings, on_event=None):
                 if state == "tool" or ROUTE_TAG in buf:
                     return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
                 for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
-                    await sentences.put(s)
+                    said_round.append(s)
+                    await say(s)
+                if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
+                    ack_held.clear()
+                    if nudged:
+                        return await via_claude()
+                    nudged = True
+                    messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
+                                 {"role": "user", "content": NUDGE}]
+                    continue
                 break
         finally:
             await sentences.put(None)
@@ -1023,24 +1120,64 @@ async def turn(request: Request, session: str = "default"):
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
-class Turn:
-    """Server-side end-of-speech detection over a stream of 16 kHz PCM16 bytes."""
-    FRAME = 512
+# Voice activity: Silero's probability AND a margin over the call's own noise floor (background noise, other
+# people's voices far away). Tunable; `noise_mode: noisy` (shared setting) raises the bar and turns voice
+# barge-in off during playback (tap-to-interrupt still works).
+VAD_MODES = {
+    "normal": {"threshold": float(os.environ.get("VAD_THRESHOLD", "0.5")),
+               "margin_db": float(os.environ.get("NOISE_MARGIN_DB", "10")),
+               "min_voiced_ms": int(os.environ.get("MIN_VOICED_MS", "250")),
+               "barge_voiced_ms": int(os.environ.get("BARGE_MIN_VOICED_MS", "500")), "barge": True},
+    "noisy": {"threshold": float(os.environ.get("NOISY_VAD_THRESHOLD", "0.7")),
+              "margin_db": float(os.environ.get("NOISY_MARGIN_DB", "15")),
+              "min_voiced_ms": int(os.environ.get("NOISY_MIN_VOICED_MS", "400")),
+              "barge_voiced_ms": 10**9, "barge": False},
+}
 
-    def __init__(self, vad, end_silence_ms=END_SILENCE_MS, threshold=0.5):
-        self.vad, self.threshold = vad, threshold
+
+class Turn:
+    """Server-side end-of-speech detection over a stream of 16 kHz PCM16 bytes, gated by an adaptive noise floor."""
+    FRAME = 512
+    FLOOR_MIN = 30.0  # int16 RMS; digital silence must not make every breath "10 dB above the floor"
+    FLOOR_START_MAX = 300.0  # a quiet room; speech is roughly 2000-8000
+
+    def __init__(self, vad, end_silence_ms=END_SILENCE_MS, threshold=None, mode="normal"):
+        self.vad = vad
+        self.set_mode(mode)
+        if threshold is not None:
+            self.threshold = threshold
         self.end_frames = max(1, int(end_silence_ms / 1000 * 16000 / self.FRAME))
         self.pre = int(0.3 * 16000 / self.FRAME)
         self.pending = b""
         self.ring, self.speech, self.silent, self.voiced = [], [], 0, 0
+        self.floor, self.last_voiced_s = None, 0.0
+
+    def set_mode(self, mode):
+        m = VAD_MODES.get(mode, VAD_MODES["normal"])
+        self.mode, self.threshold, self.margin = mode if mode in VAD_MODES else "normal", m["threshold"], \
+            10 ** (m["margin_db"] / 20)
+        self.min_voiced_s, self.barge_voiced_s, self.barge = m["min_voiced_ms"] / 1000, m["barge_voiced_ms"] / 1000, m["barge"]
+
+    def loud_enough(self, frame):
+        """Track the noise floor (down fast, up slowly, so steady babble becomes the floor within seconds while a
+        sentence barely moves it) and say whether this frame stands out from it by the margin."""
+        x = np.frombuffer(frame, np.int16).astype(np.float32)
+        rms = max(float(np.sqrt(np.mean(x * x))), 1.0)
+        if self.floor is None:  # capped: if the user talks the moment the call connects, the floor is not their voice
+            self.floor = min(max(rms, self.FLOOR_MIN), self.FLOOR_START_MAX)
+        loud = rms >= self.floor * self.margin
+        # down fast (pauses between words), up 1 % per 32 ms frame: steady babble becomes the floor in ~4 s
+        self.floor = max(self.FLOOR_MIN, 0.7 * self.floor + 0.3 * rms if rms < self.floor else self.floor * 1.01)
+        return loud
 
     def feed(self, data: bytes):
-        """Yield ("start", None) when speech begins and ("end", float32 audio) when it ends."""
+        """Yield ("start", None) when speech begins, ("end", float32 audio) when it ends (self.last_voiced_s is its
+        voiced time), and ("drop", None) when what started was too short to be a turn (a click, a cough)."""
         self.pending += data
         step = self.FRAME * 2
         while len(self.pending) >= step:
             frame, self.pending = self.pending[:step], self.pending[step:]
-            voiced = self.vad(frame) >= self.threshold
+            voiced = self.loud_enough(frame) and self.vad(frame) >= self.threshold
             if not self.speech:
                 self.ring = (self.ring + [frame])[-self.pre:]
                 if voiced:
@@ -1053,8 +1190,36 @@ class Turn:
             if self.silent >= self.end_frames:
                 audio = np.frombuffer(b"".join(self.speech), dtype=np.int16).astype(np.float32) / 32768
                 self.speech, self.ring = [], []
-                if self.voiced * self.FRAME >= 0.25 * 16000:  # less voiced time is a click or cough
-                    yield "end", audio
+                self.last_voiced_s = self.voiced * self.FRAME / 16000
+                yield ("end", audio) if self.last_voiced_s >= self.min_voiced_s else ("drop", None)
+
+
+FILLER_SOUNDS = re.compile(r"(음+|어+|아+|으+|흠+|에+|그+|저기|그러니까)[\s.,!?~]*")
+STOP_WORDS = re.compile(r"아니|그만|잠깐|취소|됐어|멈춰|스톱|stop|그거 말고", re.I)
+QUESTION = re.compile(r"\?|뭐|언제|어디|누구|왜|어떻게|몇|얼마|무슨|어때|알려|해\s*줘|줄래|할까|인가|나요|까요|니\b")
+
+
+def real_content(text):
+    """A transcript that is someone talking to the assistant, not noise: two or more Hangul syllables outside
+    filler sounds (음, 어…), and not one of Whisper's silence hallucinations."""
+    text = (text or "").strip()
+    if not text or text.rstrip(".!") in HALLUCINATIONS:
+        return False
+    words = [w for w in re.split(r"\s+", text) if not FILLER_SOUNDS.fullmatch(w)]
+    return len(re.findall(r"[가-힣]", "".join(words))) >= 2 or bool(re.search(r"[A-Za-z]{3,}", text))
+
+
+def barge_verdict(text, voiced_s, vad_turn):
+    """While the assistant was speaking: 'interrupt' only for long enough speech with real content, else 'resume'."""
+    return "interrupt" if vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text) else "resume"
+
+
+def followup_action(text):
+    """While the assistant is thinking: 'ignore' noise, 'replace' the question being worked on (stop words or a
+    new question), or 'queue' it to answer afterwards."""
+    if not real_content(text):
+        return "ignore"
+    return "replace" if STOP_WORDS.search(text) or QUESTION.search(text) else "queue"
 
 
 @app.websocket("/v1/gateway-link")
@@ -1080,7 +1245,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = ""):
+               intent: str = "", persona: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -1093,11 +1258,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     session = session or f"call-{int(time.time())}"
     log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
     start_log = {"event": "start", "log_id": log_id}
-    vad_turn = Turn(SileroVoiceActivityDetector())
+    vad_turn = Turn(SileroVoiceActivityDetector(), mode=links.settings.get("noise_mode", "normal"))
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
     # faster than real time, so "still talking" is judged by this, not by the task.
-    current: dict = {"task": None, "play_end": 0.0}
+    current: dict = {"task": None, "play_end": 0.0, "paused_at": None}
 
     async def send(obj=None, audio=None):
         async with send_lock:
@@ -1131,6 +1296,51 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
                 guard.first_end = guard.play_end = current["play_end"]
 
+    async def pause():
+        """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
+        current["paused_at"] = time.monotonic()
+        await send({"type": "pause"})
+
+    async def resume():
+        if current["paused_at"] is not None:
+            current["play_end"] += time.monotonic() - current["paused_at"]  # playback stood still meanwhile
+            current["paused_at"] = None
+            await send({"type": "resume"})
+
+    async def barge_check(audio, voiced_s):
+        """Second stage: interrupt only for real speech, else let the reply play on. Whatever fails (STT down),
+        the app never stays paused."""
+        t = time.perf_counter()
+        verdict, text = "resume", ""
+        try:
+            text = await transcribe(audio)
+            verdict = barge_verdict(text, voiced_s, vad_turn)
+        except Exception as e:  # STT down: treat it as noise and play on
+            print("barge-in check failed:", type(e).__name__, flush=True)
+        finally:
+            if verdict != "interrupt":
+                await resume()
+        if verdict != "interrupt":
+            return
+        await interrupt()
+        current["task"] = asyncio.current_task()
+        await answer(audio, text, timings={"barge_stt_ms": ms(t)})
+
+    async def followup(audio, prev):
+        """Speech while the assistant is thinking: a replacement cancels the current answer, a follow-up waits."""
+        text = await transcribe(audio)
+        act = followup_action(text)
+        if act == "ignore":
+            return
+        if act == "replace":
+            if prev and not prev.done():
+                prev.cancel()
+            await asyncio.gather(prev, return_exceptions=True) if prev else None
+            await send({"type": "interrupt"})
+        else:
+            await asyncio.gather(prev, return_exceptions=True) if prev else None
+        await answer(audio, text)
+
     async def interrupt(protected=False):
         # Let the opening's first sentence finish playing; re-read, since its end is known only once sent.
         while protected and (wait := guard.wait(time.monotonic())) > 0:
@@ -1140,12 +1350,17 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             task.cancel()
         current["play_end"] = guard.play_end = 0.0
         await send({"type": "interrupt"})  # barge-in: the client drops its queue
+        if current["paused_at"] is not None:  # it was paused: un-pause the (now empty) queue, or it stays stuck
+            current["paused_at"] = None
+            await send({"type": "resume"})
 
     async def speak_briefing():
         spoken = []
         try:
             await send({"type": "state", "value": "speaking"})
-            async for s in briefing_sentences(session, assistant_name(await gateway_settings()), send):
+            st = await gateway_settings()
+            p = current_persona(st)
+            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st)):
                 pcm, _ = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"})
                 await send(audio=pcm)
@@ -1153,7 +1368,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     spoken.append(s)
         finally:  # what was actually said becomes the call's opening in history (the start event is an upsert)
             if spoken:
-                history[session].append({"role": "assistant", "content": " ".join(spoken)})
+                history[f"{current_persona(await gateway_settings())['id']}:{session}"].append(
+                    {"role": "assistant", "content": " ".join(spoken)})
                 await links.log({**start_log, "opening": " ".join(spoken)})
             await send({"type": "state", "value": "listening"})
 
@@ -1172,8 +1388,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if text and not is_greeting(text, len(audio) / 16000):
             await interrupt_then_answer(audio, text)
 
-    async def answer(audio, text=None):
-        t0, timings = time.perf_counter(), {}
+    async def answer(audio, text=None, timings=None):
+        t0, timings = time.perf_counter(), timings or {}
         turn = {"assistant": [], "activity": [], "route": "", "interrupted": False}
 
         async def on_event(ev):
@@ -1213,12 +1429,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
+        # The persona: a placed call's own (it rang as that persona), else ?persona=, else the primary. Every task
+        # this call starts inherits it (name, character, TTS voice, history key, Claude session, tags).
+        CALL_PERSONA.set(pick_persona(links.settings, (op or {}).get("persona") or persona))
+        pid = CALL_PERSONA.get()["id"]
         briefing = intent == "briefing" and not call_id
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
-        await links.brain_event({"type": "call_event", "event": "start", "session": session,
-                                 "reason": (op or {}).get("reason", "") and (op or {}).get("text", "")})
-        start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started,
+        await links.brain_event({"type": "call_event", "event": "start", "session": session, "persona": pid,
+                                 "reason": (op or {}).get("reason", ""), "opening": (op or {}).get("text", "")})
+        start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started, persona_id=pid,
                          # the user's point of view, like a phone's call log: the assistant calling = incoming
                          direction="incoming" if call_id else "outgoing",
                          reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
@@ -1227,7 +1447,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             current["task"] = asyncio.create_task(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
-                history[session].append({"role": "assistant", "content": op["text"]})
+                history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
                 current["task"] = asyncio.create_task(speak_opening(op))
         await send({"type": "state", "value": "listening"})
@@ -1242,21 +1462,34 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
                     asyncio.create_task(tap_interrupt())
                 continue
+            vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
                 now = time.monotonic()
                 task = current["task"]
                 busy = task and not task.done()
-                if kind == "start" and (busy or now < current["play_end"]):
-                    if guard.start(now) == "interrupt":
-                        await interrupt()
+                playing = now < current["play_end"] or current["paused_at"] is not None
+                if kind == "start" and guard.active(now):
+                    guard.start(now)  # a placed call's opening: its own rules (first sentence, greetings)
+                elif kind == "start" and playing and current["paused_at"] is None and vad_turn.barge:
+                    await pause()
+                elif kind == "drop":
+                    guard.end(now, 0.0)
+                    await resume()  # a click or cough: the reply plays on
                 elif kind == "end":
-                    act = guard.end(now, len(audio) / 16000)
-                    if act == "answer":
-                        current["task"] = asyncio.create_task(answer(audio))
-                    elif act == "check":
-                        asyncio.create_task(check_greeting(audio))
+                    if guard.speech_at is not None:
+                        act = guard.end(now, len(audio) / 16000)
+                        if act == "check":
+                            asyncio.create_task(check_greeting(audio))
+                        else:
+                            asyncio.create_task(interrupt_then_answer(audio))
+                    elif current["paused_at"] is not None:
+                        asyncio.create_task(barge_check(audio, vad_turn.last_voiced_s))
+                    elif playing and not vad_turn.barge:
+                        pass  # noisy mode: speech over the reply is not a turn
+                    elif busy:  # thinking: never cancel on raw voice, decide on the transcript
+                        current["task"] = asyncio.create_task(followup(audio, task))
                     else:
-                        asyncio.create_task(interrupt_then_answer(audio))
+                        current["task"] = asyncio.create_task(answer(audio))
             if guard.tick(time.monotonic()) == "interrupt":
                 await interrupt()
     except WebSocketDisconnect:
@@ -1296,7 +1529,42 @@ if __name__ == "__main__":
         assert [k for k, _ in ev] == ["start", "end"] and 0.9 < len(ev[1][1]) / 16000 < 1.6, ev
         assert list(t.feed(quiet)) == []
         short = (np.ones(3000, np.int16) * 3000).tobytes()   # 0.19 s blip: no turn
-        assert [k for k, _ in t.feed(short + quiet)] == ["start"]
+        assert [k for k, _ in t.feed(short + quiet)] == ["start", "drop"]  # a blip: no turn, and playback resumes
+
+        # noise: Silero says "speech" for everything here (its worst case); only the noise floor stands between
+        def tone(seconds, amp, seed=0):
+            rng = np.random.default_rng(seed)
+            return (rng.standard_normal(int(16000 * seconds)) * amp).clip(-32000, 32000).astype(np.int16).tobytes()
+        always = lambda frame: 0.95  # noqa: E731
+        silence = np.zeros(16000, np.int16).tobytes()
+        t = Turn(always)
+        babble = tone(8, 1000, 1)  # continuous babble; speech below is 15 dB louder (1000 * 5.6)
+        assert [k for k, _ in t.feed(babble)] in ([], ["start", "drop"])  # learns it as the floor, no turn
+        assert [k for k, _ in t.feed(tone(4, 1000, 2))] == []  # and stays quiet on it
+        ev = list(t.feed(tone(0.8, 5600, 3) + tone(1, 1000, 4)))  # "잠깐만" over the babble
+        assert [k for k, _ in ev] == ["start", "end"] and t.last_voiced_s >= 0.5, (ev, t.last_voiced_s)
+        t = Turn(always)
+        t.feed(silence) and None
+        list(t.feed(silence))
+        cough = tone(0.2, 8000, 5)
+        assert [k for k, _ in t.feed(cough + silence)] == ["start", "drop"]  # a 200 ms cough: never a turn
+        bursts = b"".join(tone(0.1, 9000, 6 + i) + silence[:9600] for i in range(5))  # door slams, clatter
+        kinds = [k for k, _ in t.feed(bursts + silence)]
+        # bursts 300 ms apart merge into one utterance (end-of-speech needs 500 ms of quiet); it reaches STT, and
+        # noise transcribes to nothing or a hallucination, which the transcript gate rejects
+        assert kinds[0] == "start" and (kinds[-1] == "drop" or barge_verdict("", t.last_voiced_s, t) == "resume")
+        noisy = Turn(always, mode="noisy")
+        list(noisy.feed(silence))
+        assert not noisy.barge and noisy.threshold > t.threshold and noisy.margin > t.margin
+        for text, voiced, want in [("잠깐만", 0.8, "interrupt"), ("잠깐만", 0.3, "resume"), ("음", 0.9, "resume"),
+                                   ("어 어", 0.9, "resume"), ("시청해 주셔서 감사합니다", 1.0, "resume"), ("", 1.0, "resume"),
+                                   ("그거 말고 내일 거", 1.2, "interrupt")]:
+            assert barge_verdict(text, voiced, t) == want, (text, voiced)
+        assert barge_verdict("잠깐만", 2.0, noisy) == "resume"  # noisy: voice never interrupts playback
+        for text, want in [("음", "ignore"), ("", "ignore"), ("아니 그거 말고", "replace"), ("잠깐", "replace"),
+                           ("내일 날씨는 어때?", "replace"), ("그리고 메일도 확인해 줘", "replace"),
+                           ("고마워요", "queue"), ("그리고 회의는 세 시예요", "queue")]:
+            assert followup_action(text) == want, (text, followup_action(text))
         class FakeWS:
             def __init__(self):
                 self.sent = []
@@ -1440,7 +1708,7 @@ if __name__ == "__main__":
             await asyncio.gather(first, return_exceptions=True)
             await gen.aclose()
         asyncio.run(cut_before_speaking())
-        assert list(history["cut"]) == [{"role": "user", "content": "내일 일정 알려줘"}]  # no placeholder turn
+        assert list(history["azel:cut"]) == [{"role": "user", "content": "내일 일정 알려줘"}]  # no placeholder turn
         assert not any("끊김" in m["content"] for h in history.values() for m in h)
         claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S = real
 
@@ -1484,6 +1752,10 @@ if __name__ == "__main__":
             assert LENGTH_STYLE[length] in system_prompt("아젤", reply_length({"reply_length": length}))
         assert reply_length({"reply_length": "huge"}) == "normal" and reply_length({}) == "normal"
         assert system_prompt("아젤", "normal", "내일 9시 회의").endswith("참고할 상황:\n내일 9시 회의")
+        assert personality({"personality": "  ", "personality_default": "기본 성격"}) == "기본 성격"
+        assert personality({"personality": "까칠함", "personality_default": "기본 성격"}) == "까칠함"
+        assert personality({}) == "" and "성격:" not in system_prompt("아젤")  # no settings yet: no persona line
+        assert "성격: 까칠함" in system_prompt("아젤", "normal", "", "까칠함")
         gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
         assert "'루나'" in system_prompt(assistant_name(gl.settings)) and "아젤" not in system_prompt("루나")
         for said, name, want in [("아젤아, 서버 괜찮아?", "아젤", "서버 괜찮아?"), ("아젤 지금 몇 시야", "아젤", "지금 몇 시야"),
@@ -1493,6 +1765,37 @@ if __name__ == "__main__":
         assert pre_route(strip_vocative("스파크야 안녕", "스파크"), {})[0] is False  # a name that is also a keyword
         assert [tag_state(h) for h in ("", "[CLA", "[CLAUDE]", "네")] == ["maybe", "maybe", "tag", "no"]
         assert hold_tag_prefix("수요일이요. [CL") == ("수요일이요. ", "[CL") and hold_tag_prefix("네 [1]번") == ("네 [1]번", "")
+        for reply, empty in [("네", True), ("네.", True), ("알겠습니다!", True), ("네, 확인해 볼게요.", True), ("좋아요~", True),
+                             ("십팔이야.", False), ("Thanks.", False), ("네, 18이에요.", False), ("100도예요.", False), ("", True)]:
+            assert content_free(reply) is empty, reply
+        assert needs_answer("물은 몇 도에서 끓어?") and needs_answer("라면 끓이는 법 알려줘")
+        assert not needs_answer("고마워!") and not needs_answer("응") and not needs_answer("안녕하세요") and not needs_answer("네")
+
+        async def ack_check(replies, user="물은 몇 도에서 끓어?"):  # Qwen's successive replies → what gets spoken
+            calls = []
+
+            async def acking_llm(messages, max_tokens=600):
+                calls.append(messages)
+                yield replies[min(len(calls), len(replies)) - 1]
+
+            async def answer_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                yield "클로드가 답해요."
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            globals().update(llm_stream=acking_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
+            history.pop("azel:ack", None)
+            said = [s async for s, *_ in respond(user, "ack", time.perf_counter(), {})]
+            return said, calls
+        said, calls = asyncio.run(ack_check(["네.", "물은 100도에서 끓어요."]))
+        assert said == ["물은 100도에서 끓어요."] and calls[1][-1]["content"] == NUDGE, said  # nudged once, "네" unsaid
+        said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
+        assert said == ["클로드가 답해요."] and len(calls) == 2, said  # empty twice: Claude takes the turn
+        said, _ = asyncio.run(ack_check(["네, 100도예요."]))
+        assert said == ["네,", "100도예요."], said  # an acknowledgement followed by content is fine
+        said, calls = asyncio.run(ack_check(["네."], user="고마워"))
+        assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
 
         async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
             async def tagging_llm(messages, max_tokens=600):
@@ -1702,6 +2005,114 @@ if __name__ == "__main__":
             logs = [m for m in gw_ws.sent if m.get("type") == "call_log"]
             links.remove(gw_ws.lk)
             return replies, types, logs
+        def barge_route_check():
+            """Two-stage barge-in through /v1/call while a briefing plays: a cough pauses and resumes, '잠깐만'
+            pauses and interrupts. Silero is stubbed to say 'speech' for everything (its worst case)."""
+            from fastapi.testclient import TestClient
+
+            class BriefGW(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "briefing_context":
+                        links.receive(self.lk, {"id": m["id"], "type": "briefing_context", "situation": "메모", "facts": []})
+
+            async def long_briefing(messages, max_tokens=600):
+                for i in range(6):
+                    yield f"브리핑 {i}번째 문장이에요. "
+
+            async def long_tts(sentence):
+                return b"\0" * 96000, 24000  # 2 s each: the reply keeps playing while the user talks
+
+            async def stt(audio):  # continuous speech → words; a cough or burst → nothing
+                return "잠깐만" if float(np.mean(np.abs(audio) > 0.1)) > 0.25 and len(audio) >= 16000 else ""
+            globals().update(llm_stream=long_briefing, tts=long_tts, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda frame: 0.95))
+            gw_ws = BriefGW()
+            gw_ws.lk = links.add(gw_ws)
+            links.receive(gw_ws.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            got = []
+
+            def until(w, kind):
+                while True:
+                    m = w.receive()
+                    if m.get("text"):
+                        got.append(json.loads(m["text"])["type"])
+                        if got[-1] == kind:
+                            return
+
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?intent=briefing&session=bg", headers={"Authorization": "Bearer app-tok"}) as w:
+                until(w, "reply")  # the briefing is playing
+                w.send_bytes(np.zeros(8000, np.int16).tobytes() + tone(0.2, 8000, 9) + np.zeros(16000, np.int16).tobytes())
+                until(w, "resume")  # cough: paused, then resumed
+                assert "interrupt" not in got and got.count("pause") == 1, got
+                t_speech = time.monotonic()
+                w.send_bytes(tone(0.8, 9000, 10) + np.zeros(16000, np.int16).tobytes())
+                until(w, "interrupt")  # a clear "잠깐만": paused, then interrupted
+                commit_s = time.monotonic() - t_speech
+                assert got[-2:] == ["pause", "interrupt"] or "pause" in got[got.index("resume") + 1:], got
+                w.send_text(json.dumps({"type": "hangup"}))
+            links.remove(gw_ws.lk)
+            return commit_s
+        def pause_edge_check(stt_fails):
+            """A tap during a pause, or STT failing during a pause: the app is never left paused."""
+            from fastapi.testclient import TestClient
+
+            class BriefGW(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "briefing_context":
+                        links.receive(self.lk, {"id": m["id"], "type": "briefing_context", "situation": "메모", "facts": []})
+
+            async def long_briefing(messages, max_tokens=600):
+                for i in range(6):
+                    yield f"브리핑 {i}번째 문장이에요. "
+
+            async def long_tts(sentence):
+                return b"\0" * 96000, 24000
+
+            async def stt(audio):
+                if stt_fails:
+                    raise httpx.ConnectError("stt down")
+                return "음"
+            globals().update(llm_stream=long_briefing, tts=long_tts, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda frame: 0.95))
+            gw_ws = BriefGW()
+            gw_ws.lk = links.add(gw_ws)
+            links.receive(gw_ws.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            got = []
+
+            def until(w, kind):
+                while True:
+                    m = w.receive()
+                    if m.get("text"):
+                        got.append(json.loads(m["text"])["type"])
+                        if got[-1] == kind:
+                            return
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?intent=briefing&session=pe", headers={"Authorization": "Bearer app-tok"}) as w:
+                until(w, "reply")
+                if stt_fails:  # speech long enough for STT, which then fails
+                    w.send_bytes(np.zeros(8000, np.int16).tobytes() + tone(0.8, 9000, 11) + np.zeros(16000, np.int16).tobytes())
+                    until(w, "resume")
+                else:  # speech starts (pause), then the user taps
+                    w.send_bytes(np.zeros(8000, np.int16).tobytes() + tone(0.3, 9000, 12))
+                    until(w, "pause")
+                    w.send_text(json.dumps({"type": "interrupt"}))
+                    until(w, "resume")
+                    assert "interrupt" in got[got.index("pause"):], got
+                w.send_text(json.dumps({"type": "hangup"}))
+            links.remove(gw_ws.lk)
+            return got
+        got = pause_edge_check(stt_fails=False)
+        assert got.index("pause") < got.index("interrupt") < len(got) - 1 - got[::-1].index("resume") + 1
+        got = pause_edge_check(stt_fails=True)
+        assert got[-1] == "resume" and "interrupt" not in got[got.index("pause"):], got
+        commit_s = barge_route_check()
+        assert commit_s < 3.0, commit_s  # speech 0.8 s + 0.5 s trailing silence + STT (stubbed here)
+        globals().update(llm_stream=real_llm, tts=real[1])
         replies, types, logs = briefing_check("[4] 토론지 오늘 23시")  # fast path: local Qwen from the note
         assert replies == ["오늘 브리핑이에요.", "토론지가 오늘 밤 11시까지예요.", "승인 대기가 한 건 있어요."], replies
         assert FILLER not in replies and "activity" not in types
@@ -1716,6 +2127,62 @@ if __name__ == "__main__":
         assert replies == ["오늘 브리핑이에요.", "회의가 하나 있어요."] and "activity" not in types, replies
         last_claude_briefing[:] = [0.0, ""]
         globals()["llm_stream"] = real_llm
+        def persona_check():
+            """/v1/call?persona=luna: Qwen speaks as 루나 in her voice, history and logs are hers; a call placed as
+            luna (no ?persona) is hers too, opening voice included."""
+            from fastapi.testclient import TestClient
+            voices, prompts = [], []
+
+            async def voice_tts(sentence):
+                voices.append((CALL_PERSONA.get() or {}).get("voice"))
+                return b"\0" * 480, 24000
+
+            async def hi_llm(messages, max_tokens=600):
+                prompts.append(messages[0]["content"])
+                yield "안녕하세요, 루나예요."
+
+            async def stt(audio):
+                return "안녕"
+            globals().update(tts=voice_tts, llm_stream=hi_llm, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            links.receive(full, {"type": "settings", "value": {"personality_default": "기본 성격", "personas": [
+                {"id": "azel", "name": "아젤", "voice": "sohee", "personality": "", "primary": True},
+                {"id": "luna", "name": "루나", "voice": "vivian", "voice_style": "부드럽게", "personality": "느긋함"},
+                {"id": "old", "name": "옛비서", "voice": "ryan", "deleted_at": 1.0}]}})
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            speech = np.zeros(8000, np.int16).tobytes() + (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+
+            def one_turn(path):
+                with tc.websocket_connect(path, headers={"Authorization": "Bearer app-tok"}) as w:
+                    w.send_bytes(speech)
+                    while True:
+                        m = w.receive()
+                        if m.get("text") and json.loads(m["text"])["type"] in ("turn_done", "error"):
+                            break
+                    w.send_text(json.dumps({"type": "hangup"}))
+                time.sleep(0.05)
+            one_turn("/v1/call?session=ps&persona=luna")
+            assert "'루나'" in prompts[-1] and "성격: 느긋함" in prompts[-1] and set(voices) == {"vivian"}, (prompts, voices)
+            assert "luna:ps" in history and "azel:ps" not in history
+            start = [m for m in full.ws.sent if m.get("type") == "call_log" and m["event"] == "start"][-1]
+            assert start["persona_id"] == "luna"
+            voices.clear()
+            one_turn("/v1/call?session=ps2&persona=old")  # deleted persona: the primary
+            assert "'아젤'" in prompts[-1] and "성격: 기본 성격" in prompts[-1] and set(voices) == {"sohee"}
+            voices.clear()
+
+            async def placed():  # the gateway rings as luna: the opening is synthesized in her voice up front
+                links.receive(full, {"type": "call", "call_id": "cl", "opening": "루나예요. 일어날 시간이에요.",
+                                     "persona": "luna"})
+                await links.openings["cl"]["audio"]
+            asyncio.run(placed())
+            assert set(voices) == {"vivian"}
+            links.remove(full)
+            links.settings = {}
+            globals().update(tts=real[1], llm_stream=real_llm)
+        persona_check()
         logs = history_check()
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs
@@ -1887,6 +2354,18 @@ if __name__ == "__main__":
             assert "광주에 삶" in sysmsg and "서버 이전 끝남" in sysmsg and TOOL_TAG in sysmsg
             assert "랩미팅 발표는 다음 주로" in prompts[1][-1]["content"] and timings["recall_ms"] < 400
             assert not [m for m in gw.ws.sent if m.get("type") == "ask"]  # answered locally, no Claude
+            late = []
+
+            async def late_tool_llm(messages, max_tokens=600):  # words first, then a tool call
+                late.append(messages)
+                for d in (["찾아볼게요. [TO", 'OL] {"name": "search_memory", "args": {"query": "랩미팅"}}']
+                          if len(late) == 1 else ["다음 주로 미루셨어요."]):
+                    yield d
+            globals()["llm_stream"] = late_tool_llm
+            said = asyncio.run(run("랩미팅 어떻게 됐지?", "s"))
+            assert all("TOOL" not in x and "{" not in x for x, _ in said) and said[-1] == ("다음 주로 미루셨어요.", "qwen"), said
+            assert "랩미팅 발표는 다음 주로" in late[1][-1]["content"]
+            globals()["llm_stream"] = fake_llm
             prompts.clear()
             t = time.perf_counter()
             asyncio.run(run("느린 기억 찾기", "s"))  # the brain never answers recall: give up after RECALL_WAIT_S

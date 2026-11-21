@@ -10,6 +10,7 @@ Contract: ../PROTOCOL.md section 3. Run: uv run gateway.py  (binds the Tailscale
            uv run gateway.py --migrate  (copy the old local gateway.db into ruchba; also runs once on first start)
 """
 import asyncio
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -27,7 +28,11 @@ from urllib.parse import quote
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+import connectors
+import wake_enroll
+from claude_warm import Pool, base_cmd
 
 HOME = Path(os.environ.get("BISEO_HOME", Path.home() / ".config/biseo"))
 TOKEN = (HOME / "token").read_text().strip()
@@ -55,6 +60,11 @@ WORKDIR = HOME / "claude-work"  # empty cwd so no project CLAUDE.md leaks into a
 KST = timezone(timedelta(hours=9))
 DEVICE_FRESH_S = 150
 MAX_TOOL_TURNS = 8
+# One warm `claude` per voice session (claude_warm.py); one-shot jobs (briefings, checkpoints, brain) stay cold.
+WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no")
+COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
+warm_pool = Pool()
+call_warm_keys: dict[str, str] = {}  # call_log id -> its warm process key, closed when the call ends
 assert MODE in ("full", "limited"), "BISEO_MODE must be full or limited"
 
 MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"}
@@ -72,7 +82,11 @@ DEFAULTS = {
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
+    "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
+    "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
+    "noise_mode": "normal",  # normal | noisy: the voice server's voice-activity thresholds and barge-in
+    "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
 }
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
 
@@ -85,16 +99,81 @@ LENGTH_STYLE = {
 }
 
 
+# Azel's character (shared setting `personality`; "" / missing = this default). The single source: the gateway
+# sends the default to the voice server in the settings (`personality_default`), so Qwen and Claude get the same text.
+PERSONALITY_DEFAULT = (
+    "유능하고 믿음직한 개인 비서. 핵심부터 정확하게 말하고, 일정·마감·장애·돈·건강처럼 중요한 일은 진지하게 "
+    "다룬다. 분위기가 편할 때만 짧고 재치 있는 한마디를 덧붙이되 답 하나에 한 번을 넘기지 않는다. 급하거나 나쁜 소식, 사용자가 지쳐 보일 때,"
+    " 위험한 작업이나 승인이 필요한 일에는 장난을 치지 않는다. 존댓말을 쓰되 딱딱하지 않게, 친한 동료처럼 말한다. 과장된 칭찬이나 이모티콘 같은 말투는 쓰지 않는다."
+)
+
+
+def personality(settings):
+    p = settings.get("personality")
+    return p.strip() if isinstance(p, str) and p.strip() else PERSONALITY_DEFAULT
+
+
+def persona_block(settings):
+    """Who is talking: name and character of the persona this ask belongs to (the primary by default). Used for
+    Claude's voice style and every prompt that speaks to the user."""
+    p = active_persona(settings)
+    text = p["personality"].strip() if isinstance(p.get("personality"), str) and p["personality"].strip() \
+        else PERSONALITY_DEFAULT
+    return f"너의 이름은 '{p['name']}'이야. 성격: {text} "
+
+
+# ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
+PERSONA_ID = re.compile(r"[a-z0-9_-]{1,32}")
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+TINTS = {"celadon", "indigo", "amber", "azalea", "sprout", "sky", "plum", "ash"}  # the app's orb tints
+MAX_PERSONAS = 8
+DEFAULT_TTS_VOICE = os.environ.get("BISEO_TTS_VOICE", "sohee")
+current_persona: contextvars.ContextVar = contextvars.ContextVar("persona", default=None)  # set per ask/call
+
+
+def migrate_personas(s):
+    """Settings from before personas: the assistant becomes persona `azel` (primary), keeping its name and
+    character; `assistant_name`/`personality` stay readable as the primary's for older clients."""
+    ps = [p for p in s.get("personas") or [] if isinstance(p, dict) and p.get("id")]
+    if not any(p.get("primary") and not p.get("deleted_at") for p in ps):
+        ps = [p for p in ps if p.get("id") != "azel"]
+        ps.insert(0, {"id": "azel", "name": s.get("assistant_name") or DEFAULTS["assistant_name"],
+                      "voice": DEFAULT_TTS_VOICE, "voice_style": "", "personality": s.get("personality") or "",
+                      "color": "#7C5CFF", "default_model": None, "share_memory": False, "created_at": 0,
+                      "primary": True})
+    s["personas"] = ps
+    prim = primary_persona(s)
+    s["assistant_name"], s["personality"] = prim.get("name") or DEFAULTS["assistant_name"], prim.get("personality") or ""
+    return s
+
+
+def live_personas(s):
+    return [p for p in s["personas"] if not p.get("deleted_at")]
+
+
+def primary_persona(s):
+    return next(p for p in s["personas"] if p.get("primary") and not p.get("deleted_at"))
+
+
+def persona_by_id(s, pid, include_deleted=False):
+    return next((p for p in s["personas"] if p["id"] == pid and (include_deleted or not p.get("deleted_at"))), None)
+
+
+def active_persona(s):
+    pid = current_persona.get()
+    return (persona_by_id(s, pid) if pid else None) or primary_persona(s)
+
+
 def name_prompt(settings):
-    """Name and reply length, from the shared settings."""
-    return f"너의 이름은 '{settings['assistant_name']}'이야. " + LENGTH_STYLE.get(settings.get("reply_length"),
-                                                                           LENGTH_STYLE["normal"])
+    """Persona and reply length, from the shared settings."""
+    return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"])
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
-    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 시작해. "
+    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 하되 '네'가 아니라 "
+    "내용으로 시작해. "
     "마크다운, 목록, 표, 이모지, URL, 코드 블록을 쓰지 마. '확인하지 않은 것' 같은 꼬리말도 붙이지 마. "
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
 )
@@ -287,6 +366,8 @@ async def load_settings():
         doc = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
     s.update(doc)
     s["proactive"] = migrate_proactive(s.get("proactive"))
+    migrate_personas(s)
+    s["personality_default"] = PERSONALITY_DEFAULT  # shown, never stored (the app's placeholder, the voice server's text)
     s["default_device"] = OLD_DEVICE_NAMES.get(s["default_device"], s["default_device"])
     s["device_fallback"] = [OLD_DEVICE_NAMES.get(d, d) for d in s["device_fallback"]]
     return s
@@ -357,11 +438,19 @@ async def fresh_devices():
     return [d for d in rows if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
 
 
-def resolve(settings, model, path, task):
+# A short status or lookup question: Haiku answers it about 1 s sooner. Anything with several steps stays Sonnet.
+LOOKUP = re.compile(r"괜찮|상태|뭐 ?있|몇 ?(개|시|명)|언제|어디|켜져|있어\?|됐어\?|알려 ?줘|확인해 ?줘")
+MULTI_STEP = re.compile(r"그리고|하고 나서|정리|계획|짜 ?줘|비교|분석|고쳐|만들|보내|써 ?줘|요약|왜")
+
+
+def resolve(settings, model, path, task, text=""):
+    """(model, path). A model the user chose (in the ask, `default_model` or `task_defaults`) always wins; with
+    none, short lookups get Haiku and everything else Sonnet."""
     td = settings["task_defaults"].get(task or "", {})
     model = model or td.get("model") or settings["default_model"]
     if model in ("auto", "qwen"):  # the voice server only calls us when Claude is wanted
-        model = "sonnet"
+        said = text.rsplit("\n\n", 1)[-1]  # the voice server prefixes recent turns
+        model = "haiku" if len(said) <= 40 and LOOKUP.search(said) and not MULTI_STEP.search(said) else "sonnet"
     path = path or td.get("path") or settings["claude_path"]
     if path == "auto":
         path = "api" if API_KEY else "claude_code"
@@ -429,29 +518,27 @@ async def ask_claude_code(text, model, session):
     devices = await fresh_devices()
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
-    cmd = [CLAUDE, "-p", text, "--model", MODELS[model], "--output-format", "stream-json", "--verbose",
-           "--include-partial-messages", "--append-system-prompt", style,
-           "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit",
-           "--allowedTools", "mcp__claude_ai_Cygnus_MCP", "mcp__claude_ai_Google_Calendar",
-           "mcp__claude_ai_Gmail", *[f"mcp__{d['id']}" for d in devices]]
-    prev = await state.get(f"/v1/state/sessions/{quote(session, safe='')}")
-    if prev and prev["device"] == DEVICE:  # `claude -p` sessions live on the host that made them
-        cmd += ["--resume", prev["claude_session"]]
-    cfg = None
-    if devices:
-        fd, cfg = tempfile.mkstemp(suffix=".json")  # holds the token: 0600, deleted after the call
-        with os.fdopen(fd, "w") as f:
-            json.dump({"mcpServers": {d["id"]: {"type": "http", "url": d["url"],
-                                                "headers": {"Authorization": f"Bearer {TOKEN}"}}
-                                      for d in devices}}, f)
-        cmd += ["--mcp-config", cfg]
-    env = os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"}  # wait for claude.ai connectors
-    proc = await asyncio.create_subprocess_exec(*cmd, cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.DEVNULL, limit=2**24)
+    servers, allowed, run_settings, run_env = run_args(settings, devices)
+    resume = await resume_id(session)
+    cfg, proc = None, None
+    if WARM and not session.startswith(COLD_SESSIONS):
+        source = (await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, resume, run_settings,
+                                      run_env)).turn(text, MODELS[model])
+    else:
+        if servers:
+            fd, cfg = tempfile.mkstemp(suffix=".json")  # holds tokens: 0600, deleted after the call
+            with os.fdopen(fd, "w") as f:
+                json.dump({"mcpServers": servers}, f)
+        env = os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"} | run_env  # wait for the (few) servers
+        cmd = base_cmd(MODELS[model], style, allowed, cfg, resume, run_settings)
+        proc = await asyncio.create_subprocess_exec(cmd[0], "-p", text, *cmd[1:],
+                                                    cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL, limit=2**24)
+        source = proc.stdout
     final = {"model": model, "path": "claude_code"}
     open_tools: dict[str, str] = {}  # tool_use id -> name, until its result comes back
     try:
-        async for raw in proc.stdout:
+        async for raw in source:
             try:
                 e = json.loads(raw)
             except ValueError:
@@ -474,20 +561,58 @@ async def ask_claude_code(text, model, session):
             elif e.get("type") == "result":
                 u = e.get("usage", {})
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
-                             output_tokens=u.get("output_tokens", 0), error=e.get("is_error", False))
+                             output_tokens=u.get("output_tokens", 0), error=e.get("is_error", False),
+                             result=str(e.get("result") or "")[:300])
                 if e.get("session_id"):
                     try:
                         await state.call("PUT", f"/v1/state/sessions/{quote(session, safe='')}",
                                          {"claude_session": e["session_id"], "device": DEVICE})
                     except StateDown:
                         pass  # the next turn just starts a fresh Claude session
-        await proc.wait()
+        if proc:
+            await proc.wait()
     finally:
-        if proc.returncode is None:
+        if proc and proc.returncode is None:
             proc.kill()
         if cfg:
             os.unlink(cfg)
     yield final
+
+
+discovery = connectors.Discovery(CLAUDE)
+
+
+def run_args(settings, devices):
+    """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
+    custom servers the user switched on, plus the device daemons."""
+    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME)
+
+
+async def resume_id(session):
+    prev = await state.get(f"/v1/state/sessions/{quote(session, safe='')}")
+    return prev["claude_session"] if prev and prev["device"] == DEVICE else None  # sessions live on their host
+
+
+async def prewarm(session, persona_id=None):
+    """A call started: start its warm Claude now, so MCP connects while the user is still talking. Same model,
+    prompt (the call's persona) and devices as ask_claude_code would use for a chat turn, so that turn reuses it.
+    `session` is the key the voice server's asks use: "<persona>:<call session>"."""
+    if not (WARM and CLAUDE_OK and MODE == "full") or not isinstance(session, str) or not session \
+            or session.startswith(COLD_SESSIONS):
+        return
+    current_persona.set(persona_id if isinstance(persona_id, str) else None)  # this task only
+    try:
+        WORKDIR.mkdir(parents=True, exist_ok=True)
+        devices, settings = await fresh_devices(), await load_settings()
+        model, path = resolve(settings, None, None, "chat")
+        if path != "claude_code":
+            return
+        style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
+        servers, allowed, run_settings, run_env = run_args(settings, devices)
+        await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session),
+                            run_settings, run_env)
+    except Exception as e:
+        print("prewarm failed:", type(e).__name__, flush=True)
 
 
 async def mcp(url, method, params):
@@ -589,10 +714,12 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if await month_cost() >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}
         return
-    model, path = resolve(settings, model, path, task)
+    model, path = resolve(settings, model, path, task, text)
     gen = ask_claude_code if path == "claude_code" else ask_api
+    said = False
     async for item in gen(text, model, session):
         if isinstance(item, str):
+            said = said or bool(item.strip())
             yield {"type": "text", "delta": item}
         elif item.get("type") == "activity":
             yield item
@@ -600,8 +727,29 @@ async def ask_stream(text, session, model=None, path=None, task=None):
             await record_usage({"model": model, "path": path, "task": task or "",
                                 "input_tokens": item.get("input_tokens", 0),
                                 "output_tokens": item.get("output_tokens", 0), "cost_usd": item.get("cost_usd", 0)})
+            if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
+                yield claude_failure(item.get("result", ""))
+                return
             spent = await month_cost()
-            yield {"type": "done", **item, "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+            yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
+                   "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
+
+
+LIMIT_WORDS = re.compile(r"limit|429|rate|quota|resets?|한도|사용량", re.I)
+
+
+def claude_failure(result):
+    """A Claude run that ended in an error with nothing said: a speakable error event (code `limit` for the usage
+    limit, else `claude_error`). The result text names the reason; only its gist reaches the caller."""
+    if LIMIT_WORDS.search(result):
+        when = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", result, re.I)
+        hint = ""
+        if when:
+            h = int(when.group(1)) % 12 + (12 if when.group(3).lower() == "pm" else 0)
+            hint = f" {'오전' if h < 12 else '오후'} {h % 12 or 12}시{' ' + when.group(2) + '분' if when.group(2) and when.group(2) != '00' else ''}쯤 풀려요."
+        return {"type": "error", "code": "limit",
+                "message": "지금은 Claude 사용 한도에 걸려서 답할 수 없어요." + (hint or " 조금 뒤에 다시 물어봐 주세요.")}
+    return {"type": "error", "code": "claude_error", "message": "지금은 Claude가 답하지 못했어요. 조금 뒤에 다시 물어봐 주세요."}
 
 
 async def ask_text(text, session, **kw):
@@ -651,8 +799,9 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
-async def place_call(reason, opening=None, call_id=None):
-    """Ring the phone. `call_id`: chosen by the caller when it must be recorded before the phone rings."""
+async def place_call(reason, opening=None, call_id=None, persona_id=None):
+    """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
+    `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
         raise HTTPException(403, "limited gateways do not place calls")
     if opening is None and reason == "morning_briefing":
@@ -666,9 +815,12 @@ async def place_call(reason, opening=None, call_id=None):
     except StateDown:
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
-    await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason})
-    caller = (await load_settings())["assistant_name"]
-    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": caller})
+    settings = await load_settings()
+    persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
+    await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
+                     "persona": persona["id"]})
+    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
+                                 "persona": persona["id"]})
     return {"call_id": call_id, **push}
 
 
@@ -874,7 +1026,9 @@ async def qwen_decide(signals, now):
         return {"call": False, "urgency": 0, "reason": "신호 없음", "opening": ""}
     when = datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d %H:%M (%a)")
     try:
-        d = await llm_json(DECIDE_PROMPT, f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
+        persona = persona_block(await load_settings())  # the opening is said in Azel's voice
+        d = await llm_json(DECIDE_PROMPT + f" opening은 이 비서의 말투로 써: {persona}",
+                           f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
     except Exception as e:
         print("autonomous decision failed:", type(e).__name__, flush=True)
         d = None
@@ -919,7 +1073,8 @@ async def autonomous_tick(now_dt, a):
     if not isinstance(recent, list):  # unreadable history = unknown cap and gap: fail closed, no call
         raise StateDown("proactive_log unreadable")
     blocked = guard(decision, now, recent, a)
-    entry = {**decision, "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
+    entry = {**decision, "persona_id": primary_persona(await load_settings())["id"],
+             "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
              "blocked_by": blocked, "signals": {k: v[:10] for k, v in signals.items()}}
     if blocked is None:  # write the row first: if it cannot be recorded, the cap cannot count it, so no call
         entry["call_id"] = uuid.uuid4().hex
@@ -974,7 +1129,7 @@ def public_item(row):
     """The /v1/schedule item shape (app and voice alike): `at` as ISO 8601 in KST, no internal fields."""
     return {"id": row["id"], "at": datetime.fromtimestamp(row["at"], KST).isoformat(), "repeat": row["repeat"],
             "kind": row["kind"], "note": row["note"], "status": row["status"], "attempts": row["attempts"],
-            "created_by": row["created_by"]}
+            "created_by": row["created_by"], "persona_id": row.get("persona_id", "azel")}
 
 
 def next_at(at, repeat, now=None):
@@ -1010,7 +1165,11 @@ def confirm_text(item, now=None):
 
 async def schedule_create(body, created_by, now=None):
     """(public item, sentence to speak)."""
-    row = await state.call("POST", "/v1/state/schedule", check_schedule(body, created_by, now))
+    settings = await load_settings()
+    pid = body.get("persona_id") or primary_persona(settings)["id"]
+    if not persona_by_id(settings, pid):
+        raise HTTPException(400, "persona_id: no such persona")
+    row = await state.call("POST", "/v1/state/schedule", {**check_schedule(body, created_by, now), "persona_id": pid})
     return public_item(row), confirm_text(row, now)
 
 
@@ -1098,7 +1257,7 @@ async def attempt(item, now):
     call_id = uuid.uuid4().hex  # in the claim itself, so call_answered always finds this attempt
     claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now, call_id=call_id)
     if claimed:
-        await place_call(item["kind"], opening_for(item), call_id=call_id)
+        await place_call(item["kind"], opening_for(item), call_id=call_id, persona_id=item.get("persona_id"))
 
 
 async def missed(item, now, late=False):
@@ -1152,6 +1311,7 @@ async def link_send(obj):
 
 
 async def serve_ask(m):
+    current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)  # this task only
     try:
         async for ev in ask_stream(m["text"], m.get("session") or "default", m.get("model"), None, m.get("task")):
             await link_send({"id": m["id"], **ev})
@@ -1171,6 +1331,14 @@ async def handle_link(ws):
         elif m.get("type") == "cancel" and (t := tasks.pop(m.get("id"), None)):
             t.cancel()
         elif m.get("type") == "call_log":
+            if m.get("event") == "start" and isinstance(m.get("session"), str):
+                pid = m.get("persona_id") if isinstance(m.get("persona_id"), str) else "azel"
+                warm_key = f"{pid}:{m['session']}"  # what the voice server's asks use as the session
+                if isinstance(m.get("log_id"), str):
+                    call_warm_keys[m["log_id"]] = warm_key
+                asyncio.create_task(prewarm(warm_key, pid))
+            elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
+                asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
@@ -1214,17 +1382,31 @@ async def voice_link():
 @asynccontextmanager
 async def lifespan(app):
     HOME.mkdir(parents=True, exist_ok=True)
-    tasks = [asyncio.create_task(voice_link())]
+    tasks = [asyncio.create_task(voice_link()), asyncio.create_task(reap_warm())]
     if MODE == "full":  # scheduled jobs need personal data
         tasks.append(asyncio.create_task(scheduler()))
+        if CLAUDE_OK:
+            tasks.append(asyncio.create_task(discovery.refresh()))
         if OLD_DB.exists() and not MIGRATED.exists():
             tasks.append(asyncio.create_task(migrate_once()))
     yield
     for t in tasks:
         t.cancel()
+    await warm_pool.close_all()
+
+
+async def reap_warm():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await warm_pool.reap()
+        except Exception as e:
+            print("warm reap failed:", type(e).__name__, flush=True)
 
 
 app = FastAPI(title="biseo-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
+if MODE == "full":  # wake-word enrollment (wake_enroll.py): the user's own clips stay on jh devices
+    app.include_router(wake_enroll.router)
 
 
 @app.exception_handler(StateDown)
@@ -1238,6 +1420,7 @@ async def ask(body: dict):
         raise HTTPException(400, "text required")
 
     async def gen():
+        current_persona.set(body.get("persona") if isinstance(body.get("persona"), str) else None)
         async for ev in ask_stream(body["text"], body.get("session", "default"), body.get("model"),
                                    body.get("path"), body.get("task")):
             yield json.dumps(ev, ensure_ascii=False) + "\n"
@@ -1251,6 +1434,8 @@ async def get_settings():
 
 @app.put("/v1/settings")
 async def put_settings(body: dict):
+    body.pop("personality_default", None)  # read-only: an app may send the whole document back
+    body.pop("personas", None)  # managed through /v1/personas
     unknown = set(body) - set(DEFAULTS)
     if unknown:
         raise HTTPException(400, f"unknown keys: {sorted(unknown)}")
@@ -1268,13 +1453,28 @@ async def put_settings(body: dict):
                                     for k, v in both.items()})
         check_proactive(merged)
         body["proactive"] = merged
+    if "personality" in body:
+        if body["personality"] is None:
+            body["personality"] = ""
+        if not isinstance(body["personality"], str) or len(body["personality"]) > 600:
+            raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
+    if "noise_mode" in body and body["noise_mode"] not in ("normal", "noisy"):
+        raise HTTPException(400, "noise_mode: normal or noisy")
     if "reply_length" in body and body["reply_length"] not in LENGTH_STYLE:
         raise HTTPException(400, f"reply_length: one of {sorted(LENGTH_STYLE)}")
+    if "connectors" in body:
+        full_only()
+        try:
+            body["connectors"] = connectors.check(body["connectors"])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
     s = await load_settings() | body
-    await save_settings(s)
+    prim = primary_persona(s)  # older clients edit the primary persona through assistant_name / personality
+    prim["name"], prim["personality"] = s["assistant_name"], s["personality"]
+    await save_settings({k: v for k, v in s.items() if k != "personality_default"})
     await link_send({"type": "settings", "value": s})
     return s
 
@@ -1338,6 +1538,202 @@ def full_only():
         raise HTTPException(403, "not available on a limited gateway")
 
 
+# Korean labels for the TTS server's speakers (Qwen3-TTS CustomVoice); unknown speakers show their id.
+VOICE_INFO = {
+    "sohee": ("소희", "따뜻한 한국어 여성", "ko"), "vivian": ("비비안", "밝고 또렷한 중국어 여성", "zh"),
+    "serena": ("세레나", "부드럽고 차분한 중국어 여성", "zh"), "uncle_fu": ("푸 아저씨", "나이 지긋하고 묵직한 중국어 남성", "zh"),
+    "dylan": ("딜런", "베이징 말씨의 젊은 남성", "zh"), "eric": ("에릭", "쓰촨 말씨의 쾌활한 남성", "zh"),
+    "ryan": ("라이언", "힘 있는 영어 남성", "en"), "aiden": ("에이든", "밝고 친근한 영어 남성", "en"),
+    "ono_anna": ("오노 안나", "경쾌한 일본어 여성", "ja"),
+}
+_tts_voices: dict = {"at": 0.0, "voices": []}
+_sample_at: list = [0.0]  # voice samples: one per 2 s on this gateway
+
+
+@app.get("/v1/voices")
+async def voices():
+    """The TTS speakers for the persona editor, with Korean labels."""
+    full_only()
+    return [{"id": v, "label": VOICE_INFO.get(v, (v, "", ""))[0], "desc": VOICE_INFO.get(v, (v, "", ""))[1],
+             "lang": VOICE_INFO.get(v, (v, "", ""))[2]} for v in await tts_voices()]
+
+
+async def tts_sample(text, voice, style):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(f"{TTS_URL}/v1/audio/speech", json={"input": text, "voice": voice, "response_format": "wav",
+                                                             **({"instructions": style} if style else {})})
+    r.raise_for_status()
+    return r.content
+
+
+@app.post("/v1/personas/voice-sample")
+async def voice_sample(body: dict):
+    """"들어보기" in the persona editor: a short line in a voice and style → audio/wav. One per 2 s."""
+    full_only()
+    text, voice, style = body.get("text"), body.get("voice"), body.get("voice_style") or ""
+    if not (isinstance(text, str) and 0 < len(text.strip()) <= 60):
+        raise HTTPException(400, "text: 1-60 characters")
+    if not isinstance(voice, str) or voice.lower() not in await tts_voices():
+        raise HTTPException(400, "voice: not a TTS speaker")
+    if not isinstance(style, str) or len(style) > 200:
+        raise HTTPException(400, "voice_style: text up to 200 characters")
+    if time.time() - _sample_at[0] < 2:
+        raise HTTPException(429, "one sample per 2 seconds")
+    _sample_at[0] = time.time()
+    try:
+        return Response(await tts_sample(text.strip(), voice.lower(), style), media_type="audio/wav")
+    except httpx.HTTPError:
+        raise HTTPException(502, "TTS server unreachable")
+
+
+async def tts_voices():
+    """The TTS server's speakers (cached 10 min); BISEO_TTS_VOICES as the list when it cannot be reached."""
+    if time.time() - _tts_voices["at"] < 600 and _tts_voices["voices"]:
+        return _tts_voices["voices"]
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{TTS_URL}/v1/audio/voices")
+        r.raise_for_status()
+        _tts_voices.update(at=time.time(), voices=[str(v).lower() for v in r.json()["voices"]])
+    except (httpx.HTTPError, ValueError, KeyError):
+        fallback = [v.strip().lower() for v in os.environ.get("BISEO_TTS_VOICES", "").split(",") if v.strip()]
+        if not fallback:
+            raise HTTPException(503, "TTS server unreachable: cannot check the voice")
+        return fallback
+    return _tts_voices["voices"]
+
+
+PERSONA_FIELDS = {"name", "voice", "voice_style", "personality", "color", "default_model", "share_memory"}
+
+
+async def check_persona(body, s, pid=None):
+    """Validate persona fields (a trust boundary: the app writes them). `pid`: the persona being edited."""
+    unknown = set(body) - PERSONA_FIELDS - ({"id"} if pid is None else set())
+    if unknown:
+        raise HTTPException(400, f"unknown persona fields: {sorted(unknown)}")
+    if pid is not None and "voice" in body and body["voice"] is None:
+        del body["voice"]  # edit: null keeps the current voice (create still requires one)
+    for k in ("voice_style", "personality", "color"):  # the app sends null for "unset"
+        if k in body and body[k] is None:
+            if pid is not None and k != "color":
+                body[k] = ""  # edit: clear the text; a null color keeps the current one
+            else:
+                del body[k]  # create: the defaults apply
+    if "name" in body:
+        if not (isinstance(body["name"], str) and NAME_RE.fullmatch(body["name"]) and body["name"].strip()):
+            raise HTTPException(400, "name: 1-12 Hangul/Latin letters or spaces")
+        body["name"] = " ".join(body["name"].split())
+        if any(p["name"] == body["name"] and p["id"] != pid for p in live_personas(s)):
+            raise HTTPException(400, "name: another persona already has it")
+    if "voice" in body and (not isinstance(body["voice"], str) or body["voice"].lower() not in await tts_voices()):
+        raise HTTPException(400, "voice: not a TTS speaker (GET the TTS server's /v1/audio/voices)")
+    if not isinstance(body.get("voice_style", ""), str) or len(body.get("voice_style", "")) > 200:
+        raise HTTPException(400, "voice_style: text up to 200 characters")
+    if not isinstance(body.get("personality", ""), str) or len(body.get("personality", "")) > 600:
+        raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
+    if "color" in body:
+        c = body["color"]
+        if not (isinstance(c, str) and (COLOR_RE.fullmatch(c) or c.lower() in TINTS)):
+            raise HTTPException(400, f"color: #rrggbb or a tint name ({'|'.join(sorted(TINTS))})")
+        body["color"] = c if c.startswith("#") else c.lower()
+    if body.get("default_model") not in (None, *MODELS):
+        raise HTTPException(400, f"default_model: null or one of {sorted(MODELS)}")
+    if not isinstance(body.get("share_memory", False), bool):
+        raise HTTPException(400, "share_memory: true or false")
+
+
+def persona_view(p):
+    return {k: p.get(k) for k in ("id", "name", "voice", "voice_style", "personality", "color", "default_model",
+                                  "share_memory", "created_at", "primary", "deleted_at")}
+
+
+async def save_personas(s):
+    await save_settings({k: v for k, v in migrate_personas(s).items() if k != "personality_default"})
+    await link_send({"type": "settings", "value": s})
+
+
+@app.get("/v1/personas")
+async def personas_list(include: str = ""):
+    full_only()
+    s = await load_settings()
+    return [persona_view(p) for p in (s["personas"] if include == "deleted" else live_personas(s))]
+
+
+@app.post("/v1/personas", status_code=201)
+async def personas_create(body: dict):
+    full_only()
+    s = await load_settings()
+    if len(live_personas(s)) >= MAX_PERSONAS:
+        raise HTTPException(400, f"at most {MAX_PERSONAS} personas")
+    for k in ("name", "voice"):
+        if not body.get(k):
+            raise HTTPException(400, f"{k} required")
+    await check_persona(body, s)
+    pid = body.pop("id", None) or f"p{uuid.uuid4().hex[:7]}"
+    if not (isinstance(pid, str) and PERSONA_ID.fullmatch(pid)) or persona_by_id(s, pid, include_deleted=True):
+        raise HTTPException(400, "id: a new ASCII slug (a-z, 0-9, _ -)")
+    p = {"id": pid, "voice_style": "", "personality": "", "color": "celadon", "default_model": None,
+         "share_memory": False, **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
+    s["personas"].append(p)
+    await save_personas(s)
+    return persona_view(p)
+
+
+@app.get("/v1/personas/{pid}")
+async def personas_get(pid: str):
+    full_only()
+    p = persona_by_id(await load_settings(), pid, include_deleted=True)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    return persona_view(p)
+
+
+@app.put("/v1/personas/{pid}")
+async def personas_put(pid: str, body: dict):
+    full_only()
+    s = await load_settings()
+    p = persona_by_id(s, pid)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    await check_persona(body, s, pid)
+    p.update(body)
+    if "voice" in body:
+        p["voice"] = body["voice"].lower()
+    await save_personas(s)
+    return persona_view(p)
+
+
+@app.delete("/v1/personas/{pid}")
+async def personas_delete(pid: str, delete_history: bool = False):
+    """Marks it deleted (the name stays resolvable; never the primary). Its own notes and call summaries always go;
+    its call history stays, flagged "삭제된 비서", unless delete_history=true."""
+    full_only()
+    s = await load_settings()
+    p = persona_by_id(s, pid)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    if p.get("primary"):
+        raise HTTPException(400, "the primary persona cannot be deleted; make another one primary first")
+    # data first: if ruchba cannot do it (StateDown → 503), the persona is not marked deleted either
+    await state.call("DELETE", f"/v1/state/personas/{quote(pid, safe='')}/data", history=str(delete_history).lower())
+    p["deleted_at"] = time.time()
+    await save_personas(s)
+    return persona_view(p)
+
+
+@app.post("/v1/personas/{pid}/primary")
+async def personas_primary(pid: str):
+    full_only()
+    s = await load_settings()
+    p = persona_by_id(s, pid)
+    if not p:
+        raise HTTPException(404, "no such persona")
+    for q in s["personas"]:
+        q["primary"] = q is p
+    await save_personas(s)
+    return persona_view(p)
+
+
 @app.get("/v1/proactive/log")
 async def proactive_log(limit: int = 50, since: float = 0):
     """Why the assistant called, or decided not to: every autonomous decision, newest first."""
@@ -1345,12 +1741,67 @@ async def proactive_log(limit: int = 50, since: float = 0):
     return await state.call("GET", "/v1/state/proactive_log", limit=max(1, min(limit, 500)), since=since)
 
 
+def connectors_out(conn):
+    """The pinned app shape (PROTOCOL.md section 3): status is connected | needs_auth, no URLs of claude.ai
+    connectors, never a secret."""
+    v = connectors.view(conn, discovery, HOME)
+    return {"claude_ai": [{"name": c["name"], "enabled": c["enabled"],
+                           "status": "connected" if c["status"] == "connected" else "needs_auth"} for c in v["claude_ai"]],
+            "custom": [{"name": c["name"], "url": c["url"], "transport": c.get("transport", "http"),
+                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"]} for c in v["custom"]]}
+
+
+def connectors_in(body):
+    """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name."""
+    ai, custom = body.get("claude_ai", []), body.get("custom", [])
+    if not isinstance(ai, list) or not all(isinstance(c, dict) and set(c) <= {"name", "enabled", "status"} for c in ai) \
+            or not isinstance(custom, list) or set(body) - {"claude_ai", "custom"}:
+        raise HTTPException(400, 'connectors: {"claude_ai":[{"name","enabled"}],"custom":[{"name","url","transport","enabled"}]}')
+    try:
+        return connectors.check({"claude_ai": {c.get("name"): c.get("enabled") for c in ai},
+                                 "custom": [{**{k: v for k, v in c.items() if k != "has_secret"},
+                                             "auth_ref": c.get("name")} if isinstance(c, dict) else c for c in custom]})
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/v1/connectors")
+async def connectors_get(refresh: bool = False):
+    """The claude.ai connectors this gateway's login has (status from `claude mcp list`), the custom servers and
+    which are switched on. Never a secret."""
+    full_only()
+    if refresh or not discovery.at:
+        await discovery.refresh()
+    return connectors_out((await load_settings())["connectors"])
+
+
+@app.put("/v1/connectors")
+async def connectors_put(body: dict):
+    """Replace the switches and the custom list (the GET shape without status / has_secret)."""
+    full_only()
+    await put_settings({"connectors": connectors_in(body)})
+    return connectors_out((await load_settings())["connectors"])
+
+
+@app.put("/v1/connectors/secret/{name}")
+async def connectors_secret(name: str, body: dict):
+    """Write-only: `{"value": "<token or JSON headers>"}` into ~/.config/biseo/mcp/<name> (0600) on this gateway."""
+    full_only()
+    try:
+        connectors.put_secret(HOME, name, body.get("value"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    await warm_pool.close_all()  # running processes still hold the old secret
+    return Response(status_code=204)
+
+
 @app.get("/v1/schedule")
-async def schedule_get(include: str = ""):
+async def schedule_get(include: str = "", persona: str | None = None):
     """Pending and fired items, soonest first; `include=all` adds answered, missed and cancelled ones."""
     full_only()
     status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
-    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", status=status) or []]
+    params = {"status": status} | ({"persona": persona} if persona else {})
+    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", **params) or []]
 
 
 @app.post("/v1/schedule", status_code=201)
@@ -1369,9 +1820,10 @@ async def schedule_delete(sid: str):
 
 
 @app.get("/v1/history")
-async def history(limit: int = 20, before: float | None = None, q: str | None = None):
+async def history(limit: int = 20, before: float | None = None, q: str | None = None, persona: str | None = None):
     full_only()
-    params = {"limit": limit} | ({"before": before} if before is not None else {}) | ({"q": q} if q else {})
+    params = {"limit": limit} | ({"before": before} if before is not None else {}) | ({"q": q} if q else {}) \
+        | ({"persona": persona} if persona else {})
     return await state.call("GET", "/v1/state/history", **params)
 
 
