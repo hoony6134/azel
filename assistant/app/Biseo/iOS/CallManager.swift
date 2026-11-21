@@ -38,6 +38,7 @@ final class CallManager: NSObject, ObservableObject {
     private let pushRegistry = PKPushRegistry(queue: .main)
     private let client = CallClient()
     private var voipToken: Data?
+    private var alertToken: Data?
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
@@ -135,11 +136,21 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// Sends the PushKit token to the gateway once both it and the server token exist.
+    /// Sends both tokens in one register call; runs again whenever either changes (the gateway
+    /// requires the VoIP token, so an alert token alone waits for it).
     func registerPush() {
         guard let token = voipToken, Config.token != nil else { return }
+        let alert = alertToken
         Task { @MainActor in
-            do { try await Gateway.registerPush(token: token) } catch { self.error = "푸시 등록 실패: \(error.localizedDescription)" }
+            do { try await Gateway.registerPush(token: token, alertToken: alert) } catch { self.error = "푸시 등록 실패: \(error.localizedDescription)" }
         }
+    }
+
+    /// APNs alert token from `didRegisterForRemoteNotificationsWithDeviceToken`.
+    func setAlertToken(_ token: Data) {
+        guard token != alertToken else { return }
+        alertToken = token
+        registerPush()
     }
 
     // MARK: Call lifecycle

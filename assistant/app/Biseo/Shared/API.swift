@@ -196,17 +196,24 @@ enum Gateway {
         _ = try await send("PUT", "/v1/settings", json: try JSONEncoder().encode(s))
     }
 
-    static func registerPush(token: Data) async throws {
+    /// `POST /v1/push/register`: the VoIP token (required by the gateway) plus, when there is one,
+    /// the alert token for ordinary notifications (task finished, missed scheduled calls).
+    static func registerPush(token: Data, alertToken: Data? = nil) async throws {
         #if DEBUG
         let env = "sandbox"
         #else
         let env = "production"
         #endif
-        _ = try await send("POST", "/v1/push/register", json: [
-            "voip_token": token.map { String(format: "%02x", $0) }.joined(),
-            "bundle_id": Bundle.main.bundleIdentifier ?? "xyz.scian.biseo",
-            "env": env,
-        ])
+        _ = try await send("POST", "/v1/push/register",
+                           json: registerBody(voip: token, alert: alertToken, bundleID: Bundle.main.bundleIdentifier ?? "xyz.scian.biseo", env: env))
+    }
+
+    static func hex(_ token: Data) -> String { token.map { String(format: "%02x", $0) }.joined() }
+
+    static func registerBody(voip: Data, alert: Data?, bundleID: String, env: String) -> [String: Any] {
+        var body: [String: Any] = ["voip_token": hex(voip), "bundle_id": bundleID, "env": env]
+        if let alert { body["alert_token"] = hex(alert) }
+        return body
     }
 }
 

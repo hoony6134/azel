@@ -7,6 +7,7 @@ struct BiseoApp: App {
     @StateObject private var history = HistoryModel()
     @StateObject private var schedule = ScheduleModel()
     @Environment(\.scenePhase) private var scenePhase
+    @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var appDelegate
 
     init() {
         _ = CallManager.shared // PushKit must be registered on every launch, including background VoIP launches
@@ -86,5 +87,29 @@ final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate 
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
         [.banner, .sound]
+    }
+}
+
+/// Alert pushes (task finished, missed scheduled calls): ask for permission once, on first
+/// launch, then register with APNs on every launch so a changed token is re-sent.
+final class PushAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        Task { @MainActor in
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            if settings.authorizationStatus == .notDetermined {
+                _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            }
+            application.registerForRemoteNotifications()
+        }
+        return true
+    }
+
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        CallManager.shared.setAlertToken(deviceToken)
+    }
+
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        Log.call.error("alert push registration failed: \(error.localizedDescription, privacy: .public)")
     }
 }

@@ -40,3 +40,16 @@ final class TaskTests: XCTestCase {
         XCTAssertEqual(TaskModel.taskID(from: ["task": 9]), "9")
     }
 }
+
+final class PushRegisterTests: XCTestCase {
+    func testRegisterBodyCarriesBothTokensAsHex() {
+        let body = Gateway.registerBody(voip: Data([0xab, 0x01]), alert: Data([0x0f, 0xff]), bundleID: "xyz.scian.biseo", env: "sandbox")
+        XCTAssertEqual(body["voip_token"] as? String, "ab01")
+        XCTAssertEqual(body["alert_token"] as? String, "0fff")
+        XCTAssertEqual(body["bundle_id"] as? String, "xyz.scian.biseo")
+        XCTAssertEqual(body["env"] as? String, "sandbox")
+        let voipOnly = Gateway.registerBody(voip: Data([0x01]), alert: nil, bundleID: "b", env: "production")
+        XCTAssertNil(voipOnly["alert_token"], "no alert token yet: the key is left out")
+        XCTAssertEqual(voipOnly["voip_token"] as? String, "01")
+    }
+}
