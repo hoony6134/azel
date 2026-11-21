@@ -48,6 +48,11 @@ END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
 KST = timezone(timedelta(hours=9))
 MAX_UPLOAD = 16000 * 2 * 60  # one minute of 16 kHz PCM16
 ROUTE_TAG = "[CLAUDE]"
+# Conversation, not dictation: what Qwen does with a proposal or a passing remark (user report: "끝말 입기 하자" got only
+# "네, 끝말잇기 하자." back).
+AGENCY = ("사용자의 말을 그대로 따라 하거나 '네, ~하자'로만 끝내지 마. 게임, 퀴즈, 이야기, 연습처럼 같이 하자는 말이면 바로 "
+          "시작해서 네 첫 수를 두고, 다음 턴에도 이어서 진행해. 음성 인식이 틀린 말('끝말 입기')은 뜻으로 알아들어. 잡담에는 "
+          "질문이나 생각, 성격에 맞는 가벼운 농담을 하나 보태.")
 
 # reply_length (shared setting, the app exposes it): how long answers run. The short first clause stays for latency.
 LENGTH_STYLE = {
@@ -67,7 +72,7 @@ SYSTEM_BODY = (
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
     f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
-    "잡담, 인사, 간단한 상식, 계산, 방금 대화 내용 정리는 네가 바로 답해."
+    "잡담, 인사, 간단한 상식, 계산, 방금 대화 내용 정리는 네가 바로 답해. " + AGENCY
 )
 
 
@@ -130,6 +135,160 @@ def user_title(settings, persona):
         if t:
             return t
     return ""
+
+
+def dueum(syl):
+    """두음법칙: the other syllable a word may start with ('력' -> '역', '리' -> '이', '뉴' -> '유'), else None."""
+    c = ord(syl) - 0xAC00
+    if not 0 <= c < 11172:
+        return None
+    lead, vowel, tail = c // 588, c % 588 // 28, c % 28
+    if lead == 5 and vowel in (2, 6, 7, 12, 17, 20):  # ㄹ + ㅑㅕㅖㅛㅠㅣ -> ㅇ
+        lead = 11
+    elif lead == 5 and vowel in (0, 1, 8, 11, 13, 18):  # ㄹ + ㅏㅐㅗㅚㅜㅡ -> ㄴ
+        lead = 2
+    elif lead == 2 and vowel in (6, 12, 17, 20):  # ㄴ + ㅕㅛㅠㅣ -> ㅇ
+        lead = 11
+    else:
+        return None
+    return chr(0xAC00 + lead * 588 + vowel * 28 + tail)
+
+
+WORD_CHAIN_START = re.compile(r"끝\s*말\s*(잇|입|이|있|익|읽|잊)\s*기")
+TWENTY_START = re.compile(r"스무\s*고개")
+QUIZ_START = re.compile(r"퀴즈|문제\s*(하나\s*)?(내|줘)|수수께끼|심심")
+GAME_STOP = re.compile(r"그만|졌어|항복|끝내자|안 ?할래|이제 됐어|다른 거 하자")
+ACTIVITY = re.compile(r"게임|놀이|(이야기|얘기)\s*(해|들려)\s*(줘|줄래)|브레인\s*스토밍|아이디어\s*(내|좀)|"
+                      r"연습\s*(하자|해|시켜)|말\s*상대")
+# A game in progress, per history key. The server keeps what must not drift (the chain's last word and used words,
+# the twenty-questions answer and count, the quiz's answer); Qwen only says it in the persona's voice.
+games: dict[str, dict] = {}
+
+
+async def qwen_line(system, max_tokens=80):
+    """One short, non-conversational Qwen answer (a word, a pair): the game's move, chosen apart from the reply."""
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": "출력해."}]
+    return "".join([d async for d in unthink(llm_stream(msgs, max_tokens=max_tokens), Unthink())]).strip()
+
+
+def chain_word(text):
+    """The word a player said: the last Hangul run of 2+ syllables, without a polite ending ("과자요" -> "과자")."""
+    words = re.findall(r"[가-힣]{2,}", text)
+    return re.sub(r"(이에요|예요|이요|입니다|요)$", "", words[-1]) if words else ""
+
+
+def chain_error(prev, word, used):
+    if len(word) < 2:
+        return "두 글자 이상 낱말이 아니에요"
+    if word in used:
+        return f"'{word}'는 이미 나왔어요"
+    if prev and word[0] not in (prev[-1], dueum(prev[-1])):
+        return f"'{prev[-1]}'(으)로 시작해야 해요"
+    return None
+
+
+async def chain_pick(prev, used):
+    """The assistant's next word: Qwen proposes, the referee decides (3 tries); None means the assistant loses."""
+    need, alt = (prev[-1], dueum(prev[-1])) if prev else ("", None)
+    for _ in range(3):
+        raw = await qwen_line("끝말잇기 낱말 고르기. " + (f"'{need}'" + (f" 또는 '{alt}'" if alt else "") + "로 시작하는 "
+                              if need else "") + "두 글자 이상의 흔한 한국어 명사 하나만 출력해. 다른 말은 쓰지 마. "
+                              + (f"쓰면 안 되는 낱말: {', '.join(used)}" if used else ""), max_tokens=20)
+        words = re.findall(r"[가-힣]{2,}", raw)
+        if words and not chain_error(prev, words[0], used):
+            return words[0]
+    return None
+
+
+async def quiz_pick(done):
+    """(question, answer) for a quick general-knowledge quiz; None when Qwen gives nothing usable."""
+    raw = await qwen_line("짧은 상식 퀴즈 하나를 만들어. 답이 하나로 분명하고 네가 확실히 아는 사실만. 다음 문제와 겹치지 마: "
+                          + ("; ".join(done) or "없음") + '. JSON 하나만: {"q": "문제", "a": "정답"}', max_tokens=160)
+    try:
+        d = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+        return (str(d["q"]).strip(), str(d["a"]).strip()) if d.get("q") and d.get("a") else None
+    except (ValueError, KeyError):
+        return None
+
+
+async def play_note(hkey, said):
+    """This turn of a game (끝말잇기, 스무고개, 퀴즈), started or continued: the note for Qwen's prompt, or ""."""
+    game = games.get(hkey)
+    if game and GAME_STOP.search(said):
+        games.pop(hkey, None)
+        return "\n[놀이] 사용자가 그만하자고 했어. 즐거웠다고 짧게 마무리해. 문제나 낱말은 더 내지 마."
+    if game is None and WORD_CHAIN_START.search(said):
+        first = await chain_pick("", [])
+        if not first:
+            return ""
+        games[hkey] = {"kind": "chain", "last": first, "used": [first]}
+        return (f"\n[끝말잇기] 사용자가 끝말잇기를 하자고 했어(음성 인식이 '끝말 입기'처럼 틀려도 끝말잇기야). 따라 말하지 "
+                f"말고 바로 시작해: 네 첫 낱말은 '{first}'야. 이 낱말을 작은따옴표로 감싸 말하고 사용자 차례라고 짧게 알려.")
+    if game is None and TWENTY_START.search(said):
+        secret = re.findall(r"[가-힣]{2,}", await qwen_line(
+            "스무고개 정답으로 쓸 흔한 동물이나 사물 하나를 한 낱말로만 출력해.", max_tokens=20))
+        if not secret:
+            return ""
+        games[hkey] = {"kind": "twenty", "secret": secret[0], "asked": 0}
+        return (f"\n[스무고개] 네가 정답을 '{secret[0]}'(으)로 정했어. 절대 말하지 마. '제가 하나 정했어요. 스무 번 안에 "
+                "맞혀 보세요. 첫 질문 해 주세요.'처럼 시작해.")
+    if game is None and QUIZ_START.search(said):
+        qa = await quiz_pick([])
+        if not qa:
+            return ""
+        games[hkey] = {"kind": "quiz", "q": qa[0], "a": qa[1], "done": [qa[0]], "right": 0}
+        lead = "심심해하니 퀴즈로 놀자고 짧게 말하고, " if "심심" in said else ""
+        return (f"\n[퀴즈] {lead}이 문제를 그대로 내: \"{qa[0]}\" 그리고 '정답은요?'로 물어. 정답('{qa[1]}')은 "
+                "말하지 마. 되묻지 말고 이번에 바로 문제를 내.")
+    if game is None:
+        return ""
+    if game["kind"] == "chain":
+        word = chain_word(said)
+        if err := chain_error(game["last"], word, game["used"]):
+            return (f"\n[끝말잇기] 사용자가 '{word}'라고 했는데 규칙에 안 맞아: {err}. 부드럽게 알려 주고 다시 해 보라고 "
+                    "해. 네 낱말은 말하지 마.")
+        game["used"].append(word)
+        game["last"] = word
+        mine = await chain_pick(word, game["used"])
+        if not mine:
+            games.pop(hkey, None)
+            return f"\n[끝말잇기] 사용자의 '{word}' 좋아. 이어 갈 낱말이 없어서 네가 졌어. 졌다고 웃으며 인정하고 마무리해."
+        game["used"].append(mine)
+        game["last"] = mine
+        return (f"\n[끝말잇기] 사용자의 '{word}' 좋아. 네 낱말은 '{mine}'야. 이 낱말만 작은따옴표로 감싸 말하고 사용자 "
+                "차례라고 해. 다른 낱말이나 글자를 말하지 마.")
+    if game["kind"] == "twenty":
+        game["asked"] += 1
+        if game["secret"] in said:
+            games.pop(hkey, None)
+            return f"\n[스무고개] 사용자가 정답 '{game['secret']}'을(를) {game['asked']}번 만에 맞혔어! 축하하고 끝내."
+        if game["asked"] >= 20:
+            games.pop(hkey, None)
+            return f"\n[스무고개] 스무 번이 다 됐어. 정답이 '{game['secret']}'였다고 알려 주고 끝내."
+        return (f"\n[스무고개] 정답은 '{game['secret']}'야(절대 말하지 마). 사용자의 질문에 이 정답 기준으로 사실대로 "
+                f"'네' 또는 '아니요'로 답하고 한마디 덧붙여. 남은 질문은 {20 - game['asked']}개라고 알려 줘.")
+    nxt = await quiz_pick(game["done"])  # quiz: grade this answer, then the next question
+    note = (f"\n[퀴즈] 방금 문제 \"{game['q']}\"의 정답은 '{game['a']}'야. 사용자의 답 '{said}'이(가) 맞는지 판단해서 "
+            "맞으면 칭찬하고 틀리면 정답을 알려 줘.")
+    if not nxt:
+        games.pop(hkey, None)
+        return note + " 그리고 퀴즈를 마무리해."
+    game.update(q=nxt[0], a=nxt[1], done=[*game["done"], nxt[0]])
+    return note + f" 그다음 새 문제를 그대로 내: \"{nxt[0]}\" 정답('{nxt[1]}')은 말하지 마."
+
+
+def activity_note(said):
+    """Other proposals (이야기, 브레인스토밍, 연습…): Qwen starts them now instead of echoing or handing over."""
+    if not ACTIVITY.search(said):
+        return ""
+    return ("\n[활동] 사용자가 같이 뭘 하자고 해. 따라 말하지 말고, 되묻지도 말고, 이번 답에서 바로 시작해: 이야기면 첫 장면을 "
+            "두세 문장으로, 브레인스토밍이면 아이디어 두세 개, 연습이면 첫 연습 문제나 첫 대사. 다음 턴에도 이어서 진행해.")
+
+
+def local_prompt(text):
+    """Qwen's prompt in local mode: no hand-over tag to emit (there is no Claude to hand over to)."""
+    text = re.sub(r"[^.。]*" + re.escape(ROUTE_TAG) + r"[^.。]*[.。]\s*", "", text)
+    return text + " 할 수 없거나 모르는 건 짧게 모른다고 말하고, 지어내지 마."
 
 
 def system_prompt(name, length="normal", context="", persona="", title=""):
@@ -264,6 +423,12 @@ history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
 # The conversation (persona:session) of the turn being answered: link requests that create a task or a reminder carry
 # it, and the call that later reports back is seeded with that conversation's recent turns.
 CALL_ORIGIN: contextvars.ContextVar = contextvars.ContextVar("call_origin", default="")
+# brain_mode for this call: auto | local (Qwen only, never Claude or a paid API) | claude_api | claude_code. From
+# /v1/call?mode=, else the shared setting; the app can switch it mid-call. Link requests carry it to the gateway.
+BRAIN_MODES = ("auto", "local", "claude_api", "claude_code")
+CALL_MODE: contextvars.ContextVar = contextvars.ContextVar("call_mode", default="")
+MODE_TYPES = ("ask", "tool_call", "schedule", "task")
+LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
 ORIGIN_TYPES = ("tool_call", "schedule", "task")
 ORIGIN_TURNS = 8
 ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
@@ -289,6 +454,8 @@ class Link:
     async def send(self, obj):
         if obj.get("type") in ORIGIN_TYPES and (origin := CALL_ORIGIN.get()) and "origin_session" not in obj:
             obj = {**obj, "origin_session": origin}  # the conversation a task or reminder will continue
+        if obj.get("type") in MODE_TYPES and (mode := CALL_MODE.get()) and "mode" not in obj:
+            obj = {**obj, "mode": mode}  # the gateway answers and runs tasks in this call's mode
         async with self.lock:
             await self.ws.send_text(json.dumps(obj, ensure_ascii=False))
 
@@ -487,7 +654,7 @@ BRAIN_BODY = (
     "참고할 상황에 'Cygnus 도구' 목록이 있으면 일정, 과제, 할 일, 서버 상태는 그 도구로 확인해서 답해. "
     "참고할 상황과 도구로 안 되는 일(일정 정보도 일정 도구도 없을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
     f"최신 정보, 서버 재시작 같은 작업, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
-    "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해."
+    "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해. " + AGENCY
 )
 
 
@@ -794,8 +961,9 @@ ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알
                        r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
 TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|여보세요|여보|"
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
-SMALL_TALK = ("이건 질문이나 부탁이 아니라 그냥 하는 말이야. 도구나 확인 없이, 네 성격대로 한두 문장으로 자연스럽게 "
-              "대꾸해. 일정이나 할 일 내용은 지어내지 마.")
+SMALL_TALK = ("이건 도구가 필요한 질문이 아니야. 도구나 확인 없이 네 성격대로 바로 답해. 같이 뭘 하자는 말(게임, 퀴즈, "
+              "이야기, 연습)이면 따라 말하지 말고 지금 바로 시작해서 네 첫 수를 둬. 그냥 하는 말이면 맞장구만 치지 말고 질문이나 "
+              "생각, 가벼운 농담을 하나 덧붙여. 일정이나 할 일 내용은 지어내지 마.")
 NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
          f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
 
@@ -1474,12 +1642,21 @@ async def respond(text, session, t0, timings, on_event=None, kept=None):
     local = bool(ctx) or "memory_recall" in gw_names
     to_claude, model = (False, None) if sched or job else pre_route(
         bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
+    offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local"
+    play = "" if sched or job else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
+    if play:  # a game note is terse; the persona's own register and title still hold ("너 차례!" was 반말 for 아젤)
+        play += " 말투(존댓말/반말)와 호칭은 평소 네 성격대로 지키고, 사용자를 '당신'이라고 부르지 마."
+    if offline or play:
+        to_claude = False  # local mode: Qwen answers what it can and says plainly what it can't
     sentences: asyncio.Queue = asyncio.Queue()
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
     route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
     address = Address(user_title(settings, persona), hkey, not any(m["role"] == "assistant" for m in hist))
 
     async def via_claude():
+        if offline:  # never Claude in local mode: say so and offer the switch
+            await sentences.put(LOCAL_LINE)
+            return
         route["value"] = "claude"
         if on_event:
             await on_event(dict(ROUTING))  # before any filler
@@ -1543,8 +1720,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None):
                 return await via_claude()
             length = reply_length(settings)
             gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
-            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) \
-                + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "")
+            system = (local_prompt if offline or play else str)(system_prompt(
+                name, length, ctx, persona_text(persona, settings), user_title(settings, persona))) \
+                + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
+                + play
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged, chatted, dropped = [], False, False, False, False
@@ -1636,7 +1815,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None):
                             return await via_claude()
                         nudged = True
                         messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
-                                     {"role": "user", "content": NUDGE}]
+                                     {"role": "user", "content": local_prompt(NUDGE) if offline else NUDGE}]
                         continue
                     break
             except Ungrounded:
@@ -1896,7 +2075,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = "", persona: str = ""):
+               intent: str = "", persona: str = "", mode: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -1920,6 +2099,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                      # the reply whose audio went out last, and the last one the app reported fully played (an app
                      # that sends {"type":"played"} at all: "reports")
                      "audio_gen": 0, "played": None, "reports": False}
+    # this call's brain mode: ?mode=, else the shared setting; replies spawned later copy the current value
+    current["mode"] = mode if mode in BRAIN_MODES else (links.settings.get("brain_mode") or "auto")
+    CALL_MODE.set(current["mode"])
 
     def spawn(coro):
         """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
@@ -1957,6 +2139,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             else:
                 if obj.get("type") == "reply":
                     current["said"].append((time.monotonic(), str(obj.get("text", ""))))
+                if obj.get("type") == "state":
+                    obj = {**obj, "mode": current["mode"]}  # every state frame says which brain is answering
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
     guard = OpeningGuard()
@@ -2201,6 +2385,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
                 current["task"] = spawn(speak_opening(op))
+        await send({"type": "mode", "value": current["mode"]})  # the app shows which brain answers
         await send({"type": "state", "value": "listening"})
         while True:
             msg = await ws.receive()
@@ -2218,6 +2403,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                         current["played"] = current["audio_gen"]
                         if current["paused_at"] is None:
                             current["play_end"] = time.monotonic()
+                if kind == "mode" and (v := json.loads(msg["text"]).get("value")) in BRAIN_MODES:
+                    current["mode"] = v
+                    CALL_MODE.set(v)  # from the next reply on
+                    await send({"type": "mode", "value": v})
                 continue
             vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -2268,6 +2457,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
+        def nomode(f):  # state frames carry the call's brain mode; most checks don't care
+            return {k: v for k, v in f.items() if k != "mode"} if isinstance(f, dict) else f
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
         for noise in ["MBC 뉴스 김철수입니다.", "MBC 뉴스 이덕영입니다", "시청해 주셔서 감사합니다", "시청해주셔서 감사합니다!",
@@ -3009,7 +3200,7 @@ if __name__ == "__main__":
                     types.append(f["type"])
                     if f["type"] == "reply":
                         replies.append(f["text"])
-                    if f == {"type": "state", "value": "listening"} and replies:
+                    if nomode(f) == {"type": "state", "value": "listening"} and replies:
                         break
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.05)
@@ -3181,7 +3372,7 @@ if __name__ == "__main__":
                     # the reply is 0.5 s of audio: still "speaking" until it has played, plus the tail
                     assert time.monotonic() - first_audio >= 0.5 + PLAY_TAIL_S - 0.05 and states[-1] == "speaking", states
                     assert ev["type"] == "turn_done" and ev["audio_ends_in_ms"] > 300, ev
-                    assert json.loads(w.receive_text()) == {"type": "state", "value": "listening"}
+                    assert nomode(json.loads(w.receive_text())) == {"type": "state", "value": "listening"}
                     w.send_text(json.dumps({"type": "hangup"}))
                 time.sleep(0.05)
             one_turn("/v1/call?session=ps&persona=luna")
@@ -3200,9 +3391,85 @@ if __name__ == "__main__":
                 await links.openings["cl"]["audio"]
             asyncio.run(placed())
             assert set(voices) == {"vivian"}
+            with tc.websocket_connect("/v1/call?session=pm&mode=local", headers={"Authorization": "Bearer app-tok"}) as w:
+                assert json.loads(w.receive_text()) == {"type": "mode", "value": "local"}  # on connect
+                assert json.loads(w.receive_text()) == {"type": "state", "value": "listening", "mode": "local"}
+                w.send_text(json.dumps({"type": "mode", "value": "bogus"}))  # ignored
+                w.send_text(json.dumps({"type": "mode", "value": "claude_api"}))
+                assert json.loads(w.receive_text()) == {"type": "mode", "value": "claude_api"}  # on each change
+                w.send_text(json.dumps({"type": "hangup"}))
             links.remove(full)
             links.settings = {}
             globals().update(tts=real[1], llm_stream=real_llm)
+        def play_check():
+            """The referee with a scripted Qwen: moves are checked here, never taken on Qwen's word."""
+            script = iter(["사과", "바나나", "일기", "역도", "고양이",
+                           '{"q": "한국의 수도는?", "a": "서울"}', '{"q": "물의 화학식은?", "a": "H2O"}'])
+
+            async def fake_line(system, max_tokens=80):
+                return next(script)
+            globals()["qwen_line"] = fake_line
+            games.clear()
+            n = [asyncio.run(play_note("g:1", "끝말 입기 하자"))]  # the STT slip from the user's report
+            assert games["g:1"]["last"] == "사과" and "'사과'" in n[0]
+            n.append(asyncio.run(play_note("g:1", "과일이요")))  # Qwen's "바나나" is refused, "일기" taken
+            assert "'일기'" in n[1] and "바나나" not in n[1] and games["g:1"]["last"] == "일기"
+            n.append(asyncio.run(play_note("g:1", "바나나")))  # the user's wrong start: refused, nothing changes
+            assert "'기'(으)로 시작해야" in n[2] and games["g:1"]["last"] == "일기"
+            games["g:1"].update(last="역사", used=["역사"])
+            n.append(asyncio.run(play_note("g:1", "사력")))  # 력 -> 역 (두음법칙): Qwen's "역도" is accepted
+            assert "'역도'" in n[3] and games["g:1"]["last"] == "역도"
+            assert "마무리" in asyncio.run(play_note("g:1", "아 졌어 그만")) and "g:1" not in games
+            assert asyncio.run(play_note("g:2", "스무고개 하자")) and games["g:2"]["secret"] == "고양이"
+            assert "남은 질문은 19개" in asyncio.run(play_note("g:2", "동물이야?"))
+            assert "맞혔어" in asyncio.run(play_note("g:2", "혹시 고양이?")) and "g:2" not in games
+            q = asyncio.run(play_note("g:3", "심심해"))
+            assert "한국의 수도는?" in q and "서울" in q and "심심해하니" in q
+            a2 = asyncio.run(play_note("g:3", "서울"))
+            assert "'서울'" in a2 and "물의 화학식은?" in a2 and games["g:3"]["a"] == "H2O"
+            globals()["qwen_line"] = real_qwen_line
+        real_qwen_line = qwen_line
+        play_check()
+        games.clear()
+        assert [dueum(x) for x in "력리뉴락라름나사"] == ["역", "이", "유", "낙", "나", "늠", None, None]
+        for said in ("이야기 들려줘", "브레인스토밍 하자", "게임하자"):
+            assert activity_note(said), said
+        assert not activity_note("오늘 날씨 어때?") and not asyncio.run(play_note("g:9", "끝까지 말해 봐"))
+        assert "따라 하거나" in system_prompt("아젤") and ROUTE_TAG not in local_prompt(system_prompt("아젤") + activity_note("게임하자"))
+        def local_mode_check():
+            """Local mode: Qwen has no hand-over tag, and anything that would go to Claude gets the can't-do line."""
+            prompts = []
+
+            async def qwen(messages, max_tokens=600):
+                prompts.append(messages[0]["content"])
+                yield ROUTE_TAG  # as if Qwen still tried to hand over
+
+            async def claude(*a, **k):
+                raise AssertionError("Claude in local mode")
+                yield ""
+
+            async def fake_tts(sentence, *a, **k):
+                return b"", 24000
+            globals().update(llm_stream=qwen, claude_stream=claude, tts=fake_tts, FILLER_AFTER_S=5)
+            ctx = contextvars.copy_context()
+            ctx.run(CALL_MODE.set, "local")
+            async def said_by(gen):
+                return [x async for x, *_ in gen]
+            out = ctx.run(asyncio.run, said_by(respond("오늘 코스피 어때?", "loc", time.perf_counter(), {})))
+            globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
+            return out, prompts
+        said, prompts = local_mode_check()
+        assert said == [LOCAL_LINE] and prompts and all(ROUTE_TAG not in p for p in prompts), (said, prompts)
+        assert ROUTE_TAG not in local_prompt(NUDGE) and ROUTE_TAG in NUDGE
+
+        class Rec(FakeWS):
+            pass
+        rec = Link(Rec())
+        ctx = contextvars.copy_context()
+        ctx.run(CALL_MODE.set, "claude_code")
+        ctx.run(asyncio.run, rec.send({"type": "ask", "id": "x"}))
+        ctx.run(asyncio.run, rec.send({"type": "call_log", "event": "end"}))
+        assert rec.ws.sent[0]["mode"] == "claude_code" and "mode" not in rec.ws.sent[1]  # requests only
         persona_check()
         logs = history_check()
         (k1, early), (k2, held) = played_check()
@@ -3381,11 +3648,11 @@ if __name__ == "__main__":
                            "평일 오전 10시부터 오후 6시까지 2시간마다 전화드릴게요. 맞죠?", "알겠어요, 예약하지 않을게요.",
                            "지금은 예약을 받을 수 없어요."], replies
         at, after = tap_check(0.0)  # tapped during the first sentence: deferred until it has played
-        assert 0.25 <= at < 1.0 and after == {"type": "state", "value": "listening"}, (at, after)
+        assert 0.25 <= at < 1.0 and nomode(after) == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.4)  # after the first sentence: immediate
-        assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
+        assert at < 0.55 and nomode(after) == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.05, broken_tts=True)  # TTS failed: the protection is dropped, not held an hour
-        assert at < 0.5 and after == {"type": "state", "value": "listening"}, (at, after)
+        assert at < 0.5 and nomode(after) == {"type": "state", "value": "listening"}, (at, after)
 
         def stale_audio_check(queued):
             """A reply streams with slow TTS; the user taps interrupt mid-stream (queued=True: after a follow-up was
@@ -3430,7 +3697,7 @@ if __name__ == "__main__":
                     frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
                     if len([f for f in frames if f == "audio"]) > 40:
                         break
-                    if frames[-1] == {"type": "state", "value": "listening"} and {"type": "interrupt"} in frames:
+                    if nomode(frames[-1]) == {"type": "state", "value": "listening"} and {"type": "interrupt"} in frames:
                         time.sleep(1.0)  # anything still coming from the old reply arrives now
                         w.send_text(json.dumps({"type": "hangup"}))
                         break
@@ -3441,7 +3708,7 @@ if __name__ == "__main__":
         for queued in (False, True):
             after, frames = stale_audio_check(queued)
             assert "audio" not in after, (queued, frames)  # no old audio once the interrupt is out
-            assert after == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
+            assert [nomode(x) for x in after] == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
             starts = [f for f in frames if isinstance(f, dict) and f.get("type") == "reply_start"]
             assert starts and frames.index(starts[0]) < frames.index("audio"), frames  # reply_start precedes the audio
         globals().update(tts=real[1], llm_stream=real_llm)
@@ -3521,7 +3788,7 @@ if __name__ == "__main__":
         globals().update(tts=real[1], llm_stream=real_llm)
         assert frames.count({"type": "interrupt"}) == 1, frames  # tap A's late interrupt was skipped
         cut = frames.index({"type": "interrupt"})
-        assert frames[cut + 1] == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
+        assert nomode(frames[cut + 1]) == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
 
         def origin_call_check():
             """A task's finish call (origin_session) starts with the conversation it came from, then the opening."""
