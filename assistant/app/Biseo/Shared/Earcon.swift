@@ -147,7 +147,8 @@ enum EarconPreview {
         e.attach(p)
         e.connect(p, to: e.mainMixerNode, format: PCM.speakerFormat)
         lock.lock(); _peak = 0; lock.unlock()
-        e.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: e.mainMixerNode.outputFormat(forBus: 0)) { b, _ in
+        if Config.isTestHost { e.mainMixerNode.outputVolume = 0 }   // tests check the level, not the speaker
+        p.installTap(onBus: 0, bufferSize: 1024, format: PCM.speakerFormat) { b, _ in
             guard let d = b.floatChannelData else { return }
             var m: Float = 0
             for i in 0..<Int(b.frameLength) { m = max(m, abs(d[0][i])) }

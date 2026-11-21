@@ -49,8 +49,20 @@ struct BiseoMacApp: App {
 @MainActor
 enum ApprovalWindow {
     private static var window: NSPanel?
+    private static let closer = Closer()
+
+    /// The title-bar close button ends the presentation too, so the next approval can show.
+    private final class Closer: NSObject, NSWindowDelegate {
+        func windowWillClose(_ notification: Notification) { MainActor.assumeIsolated { ApprovalCenter.shared.presented = nil } }
+    }
+
+    private static func done(_ w: NSWindow) {
+        w.orderOut(nil)
+        ApprovalCenter.shared.presented = nil
+    }
 
     static func install() {
+        guard !Config.isTestHost else { return }   // a test run must not poll the real gateway or pop windows
         ApprovalCenter.shared.present = { show($0) }
         ApprovalCenter.shared.start()
     }
@@ -64,10 +76,11 @@ enum ApprovalWindow {
             p.isReleasedWhenClosed = false
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.delegate = closer
             window = p
             return p
         }()
-        w.contentView = NSHostingView(rootView: ApprovalSheet(request: a) { w.orderOut(nil) }.frame(width: 440))
+        w.contentView = NSHostingView(rootView: ApprovalSheet(request: a) { done(w) }.frame(width: 440))
         w.setContentSize(w.contentView?.fittingSize ?? NSSize(width: 440, height: 420))
         w.center()
         NSApp.activate(ignoringOtherApps: true)

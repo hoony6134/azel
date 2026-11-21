@@ -121,7 +121,12 @@ final class ApprovalCenter: ObservableObject {
     @Published var presented: ApprovalRequest?
     @Published private(set) var all: [ApprovalRequest] = []
     @Published private(set) var status: SectionStatus = .ok
-    private var seen: Set<String> = []
+    /// Approvals already put in front of the user: never again, across launches.
+    private var seen: Set<String> = Set(UserDefaults.standard.stringArray(forKey: ApprovalCenter.seenKey) ?? [])
+    /// The pending ids of the previous poll: an approval must be pending twice in a row to pop up,
+    /// so a list flapping pending ↔ expired (user bug, 2026-11-22) can't flash the sheet.
+    private var lastPending: Set<String> = []
+    private static let seenKey = "approvalsShown"
     private var poll: Task<Void, Never>?
     /// Mac: shows the sheet in its own window.
     var present: ((ApprovalRequest) -> Void)?
@@ -131,7 +136,7 @@ final class ApprovalCenter: ObservableObject {
 
     /// Poll every 5 s while the app is in the foreground (approvals expire in 5 minutes).
     func start() {
-        guard poll == nil else { return }
+        guard poll == nil, !Config.isTestHost else { return }
         poll = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -148,13 +153,24 @@ final class ApprovalCenter: ObservableObject {
         case .success(let list):
             all = list
             status = .ok
-            if presented == nil, let next = Self.nextToShow(list, seen: seen) { show(next) }
+            let (next, pendingNow) = Self.stableNext(list, previous: lastPending, seen: seen)
+            lastPending = pendingNow
+            // A sheet already up stays up: a poll never replaces or closes it (it shows the live state).
+            if presented == nil, let next { show(next) }
         case .failure(let e): status = SectionStatus.from(e) ?? status
         }
     }
 
+    /// Pending in this poll and the one before, and never shown: the oldest such one. Also returns
+    /// this poll's pending ids, to compare against next time.
+    nonisolated static func stableNext(_ list: [ApprovalRequest], previous: Set<String>, seen: Set<String>, now: Date = Date()) -> (ApprovalRequest?, Set<String>) {
+        let pending = Set(list.filter { $0.isPending && !$0.isExpired(now: now) }.map(\.id))
+        let next = nextToShow(list.filter { previous.contains($0.id) }, seen: seen, now: now)
+        return (next, pending)
+    }
+
     /// The oldest pending, unexpired approval not presented yet.
-    static func nextToShow(_ list: [ApprovalRequest], seen: Set<String>, now: Date = Date()) -> ApprovalRequest? {
+    nonisolated static func nextToShow(_ list: [ApprovalRequest], seen: Set<String>, now: Date = Date()) -> ApprovalRequest? {
         list.filter { $0.isPending && !$0.isExpired(now: now) && !seen.contains($0.id) }
             .min { ($0.created ?? .distantPast) < ($1.created ?? .distantPast) }
     }
@@ -162,10 +178,17 @@ final class ApprovalCenter: ObservableObject {
     /// Asks for the sheet; it counts as seen only once it is on screen (`markShown`), so one that
     /// couldn't present (e.g. under the call cover) comes back on the next poll.
     func show(_ a: ApprovalRequest) {
-        if let present { present(a) } else { presented = a }
+        presented = a                  // also on the Mac, so a poll never swaps the window's content
+        present?(a)
     }
 
-    func markShown(_ id: String) { seen.insert(id) }
+    func markShown(_ id: String) {
+        guard seen.insert(id).inserted else { return }
+        UserDefaults.standard.set(Array(seen.suffix(300)), forKey: Self.seenKey)
+    }
+
+    /// The latest copy of an approval from the last poll; nil when the poll didn't list it.
+    func live(_ id: String) -> ApprovalRequest? { all.first { $0.id == id } }
 
     /// Push tap (`type: "approval"`, `approval_id`).
     func open(id: String) async {
@@ -190,8 +213,17 @@ final class ApprovalCenter: ObservableObject {
 struct ApprovalSheet: View {
     let request: ApprovalRequest
     var onDone: () -> Void
+    @ObservedObject private var center = ApprovalCenter.shared
     @State private var message: String?
     @State private var working = false
+
+    /// Decided or expired on the server: the sheet says so and offers 닫기 instead of closing by
+    /// itself. A poll that merely misses the item changes nothing.
+    private func settled(now: Date) -> String? {
+        let live = center.live(request.id) ?? request
+        if live.isPending && !live.isExpired(now: now) && !request.isExpired(now: now) { return nil }
+        return live.isPending || live.status == "expired" ? "만료됐어요" : "이미 처리됐어요 (\(ApprovalRequest.outcome(live)))"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.l) {
@@ -223,6 +255,12 @@ struct ApprovalSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                if let state = settled(now: ctx.date) {
+                    VStack(spacing: Theme.s) {
+                        Label(state, systemImage: "checkmark.circle").foregroundStyle(Theme.text2)
+                        Button("닫기") { onDone() }.frame(maxWidth: .infinity).frame(height: 40)
+                    }
+                } else {
                 let expired = request.isExpired(now: ctx.date)
                 VStack(spacing: Theme.s) {
                     Button { decide(.once) } label: {
@@ -238,6 +276,7 @@ struct ApprovalSheet: View {
                 }
                 .disabled(expired || working)
                 .opacity(expired ? 0.5 : 1)
+                }
             }
         }
         .padding(24)

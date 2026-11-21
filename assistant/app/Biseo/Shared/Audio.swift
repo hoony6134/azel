@@ -176,6 +176,7 @@ final class AudioIO {
         mixer.installTap(onBus: 0, bufferSize: 1024, format: mixer.outputFormat(forBus: 0)) { [weak self] buffer, _ in
             self?.levels.update(out: buffer)
         }
+        if Config.isTestHost { mixer.outputVolume = 0 }
         try engine.start()
         player.play()
         startDucking()
