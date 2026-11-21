@@ -401,7 +401,11 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     // §17.8: the persona's name before the route chip.
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
-                    if let m = BrainMode.chip(call.brainMode) { Text(m).font(.caption.weight(.semibold)).foregroundStyle(Theme.indigo) }
+                    if let m = BrainMode.chip(call.brainMode) {
+                        Text(m).font(.caption.weight(.semibold)).foregroundStyle(Theme.indigo)
+                            .onTapGesture { if call.brainMode == BrainMode.local.rawValue { call.chooseBrain(.auto) } }
+                            .help(call.brainMode == BrainMode.local.rawValue ? "클릭하면 자동으로 바꿔요" : "")
+                    }
                     if let r = call.log.lastRoute { RouteChip(route: r) }
                 }
             }

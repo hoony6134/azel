@@ -34,3 +34,17 @@ final class BrainModeTests: XCTestCase {
         XCTAssertNil(CallClient.reportedMode(try dec.decode(CallEvent.self, from: Data(#"{"type":"state","value":"thinking"}"#.utf8))))
     }
 }
+
+final class BrainModeFrameTests: XCTestCase {
+    /// The confirmed contract (brain, claude/brain-next): a mode frame right after connect and after
+    /// each accepted change, and a `mode` key on every state frame.
+    func testConfirmedFrames() throws {
+        let d = JSONDecoder()
+        XCTAssertEqual(CallClient.reportedMode(try d.decode(CallEvent.self, from: Data(#"{"type":"mode","value":"local"}"#.utf8))), "local")
+        XCTAssertEqual(CallClient.reportedMode(try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening","mode":"claude_api"}"#.utf8))), "claude_api")
+        let req = try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "s", callID: nil, persona: "p1", mode: "local")
+        let items = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first { $0.name == "mode" }?.value, "local")
+        XCTAssertEqual(items.first { $0.name == "persona" }?.value, "p1")
+    }
+}
