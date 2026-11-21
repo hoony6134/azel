@@ -3,7 +3,7 @@
 model_name: "azel"
 target_phrase: ["아젤"]
 custom_negative_phrases: []
-n_samples: 2500
+n_samples: 1500
 n_samples_val: 400
 tts_batch_size: 50
 augmentation_batch_size: 16
