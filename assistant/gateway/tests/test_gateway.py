@@ -23,6 +23,7 @@ def start(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("BISEO_CLAUDE", str(HERE / "fake_claude.py"))
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("BISEO_WARM_CLAUDE", "0")  # the one-shot fake; test_warm_claude covers the warm path
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     sys.path.insert(0, str(HERE.parent))
@@ -34,6 +35,15 @@ def start(tmp_path, monkeypatch, **env):
     async def no_link():  # tests drive the link by hand
         return None
     g.voice_link = no_link
+
+    async def discovered():  # what `claude mcp list` / `claude plugin list` would report
+        g.discovery.connectors = [{"name": "Cygnus MCP", "url": "https://mcp.example/cygnus", "status": "connected"},
+                                  {"name": "Gmail", "url": "https://gmail.example/mcp", "status": "connected"},
+                                  {"name": "Google Calendar", "url": "https://cal.example/mcp", "status": "connected"},
+                                  {"name": "Notion", "url": "https://notion.example/mcp", "status": "connected"},
+                                  {"name": "Slack", "url": "https://slack.example/mcp", "status": "needs_auth"}]
+        g.discovery.plugins, g.discovery.at = ["figma@official", "legal@x"], 1.0
+    g.discovery.refresh = discovered
     return g
 
 
@@ -1079,3 +1089,101 @@ def test_mcp_client_parses_sse_and_json(gw, monkeypatch):
     assert asyncio.run(g.mcp("http://d/mcp", "tools/list", {})) == {"tools": []}
     with pytest.raises(RuntimeError, match="nope"):
         asyncio.run(g.mcp("http://d/mcp", "tools/list", {}))
+
+
+def test_warm_claude_keeps_one_process_per_session(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+
+    async def run():
+        await g.prewarm("call-1")  # the call's start: spawned before the first question
+        said = [await g.ask_text("안녕", "call-1"), await g.ask_text("또 안녕", "call-1"), await g.ask_text("다른 통화", "call-2")]
+        pids = [json.loads(line)["pid"] for line in (tmp_path / "args.json").read_text().splitlines()]
+        argv = json.loads((tmp_path / "args.json").read_text().splitlines()[0])["argv"]
+        gen = g.ask_stream("느린 질문", "call-1")  # barge-in mid-turn: the process drains and stays usable
+        async for ev in gen:
+            break
+        await gen.aclose()
+        t = time.perf_counter()
+        again = await g.ask_text("다시", "call-1")  # right after the barge-in: not stuck behind the slow answer
+        again_s = time.perf_counter() - t
+        lookup = await g.ask_text("서버 상태 괜찮아?", "call-1")  # Haiku by the lookup rule, same process
+        n_procs = len((tmp_path / "args.json").read_text().splitlines())
+        await g.warm_pool.close_all()
+        return said, pids, argv, again, again_s, lookup, n_procs
+    said, pids, argv, again, again_s, lookup, n_procs = asyncio.run(run())
+    assert said == ["네, 1번째예요.", "네, 2번째예요.", "네, 1번째예요."]
+    assert len(pids) == 2 and "--input-format" in argv and "stream-json" in argv
+    assert again == "네, 4번째예요." and again_s < 0.5 and n_procs == 2, again_s  # interrupted, same process
+    ctl = [json.loads(x) for x in (tmp_path / "args.json.ctl").read_text().splitlines()]
+    assert {"subtype": "interrupt"} in ctl and {"subtype": "set_model", "model": "claude-haiku-5-5"} in ctl
+    assert lookup == "네, 5번째예요."
+    assert g.resolve(g.DEFAULTS, None, None, "chat", "서버 상태 괜찮아?")[0] == "haiku"
+    assert g.resolve(g.DEFAULTS, None, None, "chat", "이번 주 계획 짜 줘")[0] == "sonnet"
+    assert g.resolve(g.DEFAULTS, "opus", None, "chat", "서버 상태 괜찮아?")[0] == "opus"  # a forced model wins
+    assert g.resolve(g.DEFAULTS, None, None, "schedule", "오늘 일정 뭐 있어?")[0] == "sonnet"  # task_defaults win
+    assert g.fake.db["sessions"]["call-1"]["claude_session"] == "warm-1"
+
+
+def run_settings(tmp):
+    args = json.loads((tmp / "args.json").read_text())
+    return args, json.loads(args[args.index("--settings") + 1])
+
+
+def test_runs_load_only_enabled_connectors(gw):
+    g, c, tmp = gw
+    c.post("/v1/ask", json={"text": "a", "session": "s1"})
+    args, st = run_settings(tmp)
+    urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
+    assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp"}  # defaults
+    assert st["enabledPlugins"] == {"figma@official": False, "legal@x": False}
+    assert "mcp__claude_ai_Gmail" in args and "mcp__claude_ai_Notion" not in args
+    r = c.put("/v1/connectors", json={"claude_ai": {"Gmail": False, "Notion": True},
+                                      "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "auth_ref": "wiki"},
+                                                 {"name": "off", "url": "https://off.example/mcp", "enabled": False}]})
+    assert r.status_code == 200
+    view = {x["name"]: x for x in r.json()["claude_ai"]}
+    assert view["Notion"]["enabled"] and not view["Gmail"]["enabled"] and view["Slack"]["status"] == "needs_auth"
+    assert r.json()["custom"][0]["has_secret"] is False
+    c.post("/v1/ask", json={"text": "b", "session": "s2"})
+    args, st = run_settings(tmp)
+    urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
+    assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp"}
+    assert "mcp__claude_ai_Notion" in args and "mcp__wiki" not in args  # no secret yet: the server is skipped
+
+
+def test_connector_secret_is_write_only(gw):
+    g, c, tmp = gw
+    c.put("/v1/connectors", json={"custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "auth_ref": "wiki"}]})
+    assert c.put("/v1/connectors/secret/wiki", json={"value": "SECRET-TOKEN"}).json() == {"ok": True}
+    f = tmp / "mcp" / "wiki"
+    assert f.read_text() == "SECRET-TOKEN" and f.stat().st_mode & 0o777 == 0o600
+    for path in ("/v1/connectors", "/v1/settings"):
+        assert "SECRET-TOKEN" not in c.get(path).text
+    assert c.get("/v1/connectors").json()["custom"][0]["has_secret"] is True
+    seen = {}
+
+    async def spy(text, session, **kw):  # the generated --mcp-config carries the header to Claude only
+        servers, allowed, *_ = g.run_args(await g.load_settings(), [])
+        seen.update(servers=servers, allowed=allowed)
+    asyncio.run(spy("x", "s"))
+    assert seen["servers"]["wiki"]["headers"] == {"Authorization": "Bearer SECRET-TOKEN"} and "mcp__wiki" in seen["allowed"]
+    for bad in ("../x", "a b", ""):
+        assert c.put(f"/v1/connectors/secret/{bad}", json={"value": "v"}).status_code in (400, 404, 405)
+    assert c.put("/v1/connectors/secret/wiki", json={"value": ""}).status_code == 400
+
+
+def test_connectors_validation(gw):
+    g, c, _ = gw
+    for bad in [{"claude_ai": {"Gmail": "yes"}}, {"custom": [{"name": "a b", "url": "https://x"}]},
+                {"custom": [{"name": "a", "url": "ftp://x"}]}, {"custom": [{"name": "a", "url": "https://x", "token": "t"}]},
+                {"custom": [{"name": "a", "url": "https://x"}, {"name": "a", "url": "https://y"}]}, {"other": 1}]:
+        assert c.put("/v1/connectors", json=bad).status_code == 400, bad
+
+
+def test_limited_has_no_connectors(limited):
+    g, c, tmp = limited
+    assert c.get("/v1/connectors").status_code == 403
+    assert c.put("/v1/connectors", json={"claude_ai": {}}).status_code == 403
+    assert c.put("/v1/connectors/secret/x", json={"value": "v"}).status_code == 403
+    assert c.put("/v1/settings", json={"connectors": {"claude_ai": {}}}).status_code == 403
+    assert not (tmp / "mcp").exists()

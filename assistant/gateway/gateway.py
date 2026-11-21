@@ -29,6 +29,9 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import connectors
+from claude_warm import Pool, base_cmd
+
 HOME = Path(os.environ.get("BISEO_HOME", Path.home() / ".config/biseo"))
 TOKEN = (HOME / "token").read_text().strip()
 SETTINGS_PATH = HOME / "settings.json"  # offline copy of the shared settings
@@ -55,6 +58,10 @@ WORKDIR = HOME / "claude-work"  # empty cwd so no project CLAUDE.md leaks into a
 KST = timezone(timedelta(hours=9))
 DEVICE_FRESH_S = 150
 MAX_TOOL_TURNS = 8
+# One warm `claude` per voice session (claude_warm.py); one-shot jobs (briefings, checkpoints, brain) stay cold.
+WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no")
+COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
+warm_pool = Pool()
 assert MODE in ("full", "limited"), "BISEO_MODE must be full or limited"
 
 MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"}
@@ -73,6 +80,7 @@ DEFAULTS = {
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
+    "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
 }
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
 
@@ -358,11 +366,19 @@ async def fresh_devices():
     return [d for d in rows if d["last_seen"] > time.time() - DEVICE_FRESH_S and trusted(d)]
 
 
-def resolve(settings, model, path, task):
+# A short status or lookup question: Haiku answers it about 1 s sooner. Anything with several steps stays Sonnet.
+LOOKUP = re.compile(r"괜찮|상태|뭐 ?있|몇 ?(개|시|명)|언제|어디|켜져|있어\?|됐어\?|알려 ?줘|확인해 ?줘")
+MULTI_STEP = re.compile(r"그리고|하고 나서|정리|계획|짜 ?줘|비교|분석|고쳐|만들|보내|써 ?줘|요약|왜")
+
+
+def resolve(settings, model, path, task, text=""):
+    """(model, path). A model the user chose (in the ask, `default_model` or `task_defaults`) always wins; with
+    none, short lookups get Haiku and everything else Sonnet."""
     td = settings["task_defaults"].get(task or "", {})
     model = model or td.get("model") or settings["default_model"]
     if model in ("auto", "qwen"):  # the voice server only calls us when Claude is wanted
-        model = "sonnet"
+        said = text.rsplit("\n\n", 1)[-1]  # the voice server prefixes recent turns
+        model = "haiku" if len(said) <= 40 and LOOKUP.search(said) and not MULTI_STEP.search(said) else "sonnet"
     path = path or td.get("path") or settings["claude_path"]
     if path == "auto":
         path = "api" if API_KEY else "claude_code"
@@ -430,29 +446,27 @@ async def ask_claude_code(text, model, session):
     devices = await fresh_devices()
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
-    cmd = [CLAUDE, "-p", text, "--model", MODELS[model], "--output-format", "stream-json", "--verbose",
-           "--include-partial-messages", "--append-system-prompt", style,
-           "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit",
-           "--allowedTools", "mcp__claude_ai_Cygnus_MCP", "mcp__claude_ai_Google_Calendar",
-           "mcp__claude_ai_Gmail", *[f"mcp__{d['id']}" for d in devices]]
-    prev = await state.get(f"/v1/state/sessions/{quote(session, safe='')}")
-    if prev and prev["device"] == DEVICE:  # `claude -p` sessions live on the host that made them
-        cmd += ["--resume", prev["claude_session"]]
-    cfg = None
-    if devices:
-        fd, cfg = tempfile.mkstemp(suffix=".json")  # holds the token: 0600, deleted after the call
-        with os.fdopen(fd, "w") as f:
-            json.dump({"mcpServers": {d["id"]: {"type": "http", "url": d["url"],
-                                                "headers": {"Authorization": f"Bearer {TOKEN}"}}
-                                      for d in devices}}, f)
-        cmd += ["--mcp-config", cfg]
-    env = os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"}  # wait for claude.ai connectors
-    proc = await asyncio.create_subprocess_exec(*cmd, cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.DEVNULL, limit=2**24)
+    servers, allowed, run_settings, run_env = run_args(settings, devices)
+    resume = await resume_id(session)
+    cfg, proc = None, None
+    if WARM and not session.startswith(COLD_SESSIONS):
+        source = (await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, resume, run_settings,
+                                      run_env)).turn(text, MODELS[model])
+    else:
+        if servers:
+            fd, cfg = tempfile.mkstemp(suffix=".json")  # holds tokens: 0600, deleted after the call
+            with os.fdopen(fd, "w") as f:
+                json.dump({"mcpServers": servers}, f)
+        env = os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"} | run_env  # wait for the (few) servers
+        cmd = base_cmd(MODELS[model], style, allowed, cfg, resume, run_settings)
+        proc = await asyncio.create_subprocess_exec(cmd[0], "-p", text, *cmd[1:],
+                                                    cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL, limit=2**24)
+        source = proc.stdout
     final = {"model": model, "path": "claude_code"}
     open_tools: dict[str, str] = {}  # tool_use id -> name, until its result comes back
     try:
-        async for raw in proc.stdout:
+        async for raw in source:
             try:
                 e = json.loads(raw)
             except ValueError:
@@ -482,13 +496,48 @@ async def ask_claude_code(text, model, session):
                                          {"claude_session": e["session_id"], "device": DEVICE})
                     except StateDown:
                         pass  # the next turn just starts a fresh Claude session
-        await proc.wait()
+        if proc:
+            await proc.wait()
     finally:
-        if proc.returncode is None:
+        if proc and proc.returncode is None:
             proc.kill()
         if cfg:
             os.unlink(cfg)
     yield final
+
+
+discovery = connectors.Discovery(CLAUDE)
+
+
+def run_args(settings, devices):
+    """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
+    custom servers the user switched on, plus the device daemons."""
+    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME)
+
+
+async def resume_id(session):
+    prev = await state.get(f"/v1/state/sessions/{quote(session, safe='')}")
+    return prev["claude_session"] if prev and prev["device"] == DEVICE else None  # sessions live on their host
+
+
+async def prewarm(session):
+    """A call started: start its warm Claude now, so MCP connects while the user is still talking. Same model,
+    prompt and devices as ask_claude_code would use for a chat turn, so that turn reuses it."""
+    if not (WARM and CLAUDE_OK and MODE == "full") or not isinstance(session, str) or not session \
+            or session.startswith(COLD_SESSIONS):
+        return
+    try:
+        WORKDIR.mkdir(parents=True, exist_ok=True)
+        devices, settings = await fresh_devices(), await load_settings()
+        model, path = resolve(settings, None, None, "chat")
+        if path != "claude_code":
+            return
+        style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
+        servers, allowed, run_settings, run_env = run_args(settings, devices)
+        await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session),
+                            run_settings, run_env)
+    except Exception as e:
+        print("prewarm failed:", type(e).__name__, flush=True)
 
 
 async def mcp(url, method, params):
@@ -590,7 +639,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if await month_cost() >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}
         return
-    model, path = resolve(settings, model, path, task)
+    model, path = resolve(settings, model, path, task, text)
     gen = ask_claude_code if path == "claude_code" else ask_api
     async for item in gen(text, model, session):
         if isinstance(item, str):
@@ -1172,6 +1221,8 @@ async def handle_link(ws):
         elif m.get("type") == "cancel" and (t := tasks.pop(m.get("id"), None)):
             t.cancel()
         elif m.get("type") == "call_log":
+            if m.get("event") == "start":
+                asyncio.create_task(prewarm(m.get("session")))
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
@@ -1215,14 +1266,26 @@ async def voice_link():
 @asynccontextmanager
 async def lifespan(app):
     HOME.mkdir(parents=True, exist_ok=True)
-    tasks = [asyncio.create_task(voice_link())]
+    tasks = [asyncio.create_task(voice_link()), asyncio.create_task(reap_warm())]
     if MODE == "full":  # scheduled jobs need personal data
         tasks.append(asyncio.create_task(scheduler()))
+        if CLAUDE_OK:
+            tasks.append(asyncio.create_task(discovery.refresh()))
         if OLD_DB.exists() and not MIGRATED.exists():
             tasks.append(asyncio.create_task(migrate_once()))
     yield
     for t in tasks:
         t.cancel()
+    await warm_pool.close_all()
+
+
+async def reap_warm():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await warm_pool.reap()
+        except Exception as e:
+            print("warm reap failed:", type(e).__name__, flush=True)
 
 
 app = FastAPI(title="biseo-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
@@ -1271,6 +1334,12 @@ async def put_settings(body: dict):
         body["proactive"] = merged
     if "reply_length" in body and body["reply_length"] not in LENGTH_STYLE:
         raise HTTPException(400, f"reply_length: one of {sorted(LENGTH_STYLE)}")
+    if "connectors" in body:
+        full_only()
+        try:
+            body["connectors"] = connectors.check(body["connectors"])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -1344,6 +1413,36 @@ async def proactive_log(limit: int = 50, since: float = 0):
     """Why the assistant called, or decided not to: every autonomous decision, newest first."""
     full_only()
     return await state.call("GET", "/v1/state/proactive_log", limit=max(1, min(limit, 500)), since=since)
+
+
+@app.get("/v1/connectors")
+async def connectors_get(refresh: bool = False):
+    """The claude.ai connectors this gateway's login has (status from `claude mcp list`), the custom servers and
+    which are switched on. Never a secret."""
+    full_only()
+    if refresh or not discovery.at:
+        await discovery.refresh()
+    return connectors.view((await load_settings())["connectors"], discovery, HOME)
+
+
+@app.put("/v1/connectors")
+async def connectors_put(body: dict):
+    """Replace the switches and the custom list (same shape as the `connectors` setting)."""
+    full_only()
+    await put_settings({"connectors": body})
+    return connectors.view((await load_settings())["connectors"], discovery, HOME)
+
+
+@app.put("/v1/connectors/secret/{name}")
+async def connectors_secret(name: str, body: dict):
+    """Write-only: `{"value": "<token or JSON headers>"}` into ~/.config/biseo/mcp/<name> (0600) on this gateway."""
+    full_only()
+    try:
+        connectors.put_secret(HOME, name, body.get("value"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    await warm_pool.close_all()  # running processes still hold the old secret
+    return {"ok": True}
 
 
 @app.get("/v1/schedule")
