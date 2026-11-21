@@ -213,11 +213,11 @@ def test_personality(gw):
     assert s["personality"] == "" and s["personality_default"] == g.PERSONALITY_DEFAULT
     c.post("/v1/ask", json={"text": "a"})
     prompt = lambda: (a := json.loads((tmp / "args.json").read_text()))[a.index("--append-system-prompt") + 1]  # noqa: E731
-    assert f"성격: {g.PERSONALITY_DEFAULT}" in prompt()  # empty = the default, for Claude too
+    assert f"성격과 말투: {g.PERSONALITY_DEFAULT.rstrip('.')}. 이것은 너 자신의 성격이야." in prompt()  # empty = the default, for Claude too
     s = c.put("/v1/settings", json={**s, "personality": "느긋하고 다정함"}).json()  # whole document back: fine
     assert s["personality"] == "느긋하고 다정함" and "personality_default" not in g.fake.db["settings"]
     c.post("/v1/ask", json={"text": "b"})
-    assert "성격: 느긋하고 다정함" in prompt() and g.PERSONALITY_DEFAULT not in prompt()
+    assert "성격과 말투: 느긋하고 다정함. 이것은" in prompt() and g.PERSONALITY_DEFAULT not in prompt()
     for reset in ["", "   ", None]:  # "기본값으로 되돌리기"
         s = c.put("/v1/settings", json={"personality": reset}).json()
         assert s["personality"] == ("" if reset is None else reset) and g.personality(s) == g.PERSONALITY_DEFAULT

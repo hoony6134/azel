@@ -104,13 +104,23 @@ def personality(settings):
     return p.strip() if isinstance(p, str) and p.strip() else str(settings.get("personality_default") or "")
 
 
+def character_line(name, text):
+    """The persona's character as the assistant's own (same wording in gateway.py and voice_server.py). Without the
+    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요")."""
+    text = text.strip().rstrip(".。 ")
+    return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
+            "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
+            "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. "
+            "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+
+
 def system_prompt(name, length="normal", context="", persona=""):
     """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
     at once. `context`: the brain's block, appended last; with it, Qwen answers personal questions from the context
     or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
     endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
     body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
-    return f"너는 사용자의 개인 비서 '{name}'야. " + (f"성격: {persona} " if persona else "") + body + " " \
+    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona) if persona else "") + body + " " \
         + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
@@ -815,7 +825,7 @@ async def briefing_sentences(session, name, on_event, persona=""):
         ctx = {}
     if ctx.get("situation"):
         facts = "\n".join(str(f) for f in ctx.get("facts") or [])
-        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (f" 성격: {persona}" if persona else "")},
+        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (" " + character_line(name, persona) if persona else "")},
                     {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
         stream = llm_stream(messages, 700)
     elif time.time() - last_claude_briefing[0] < BRIEFING_COOLDOWN_S and last_claude_briefing[1]:
@@ -1950,8 +1960,10 @@ if __name__ == "__main__":
         assert system_prompt("아젤", "normal", "내일 9시 회의").endswith("참고할 상황:\n내일 9시 회의")
         assert personality({"personality": "  ", "personality_default": "기본 성격"}) == "기본 성격"
         assert personality({"personality": "까칠함", "personality_default": "기본 성격"}) == "까칠함"
-        assert personality({}) == "" and "성격:" not in system_prompt("아젤")  # no settings yet: no persona line
-        assert "성격: 까칠함" in system_prompt("아젤", "normal", "", "까칠함")
+        assert personality({}) == "" and "성격" not in system_prompt("아젤")  # no settings yet: no persona line
+        assert "너(아젤)의 성격과 말투: 까칠함. 이것은 너 자신의 성격이야." in system_prompt("아젤", "normal", "", "까칠함")
+        cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")
+        assert "성격과 말투: 귀엽고 따뜻하지만 장난기 있는 동생. 이것은" in cute and "사용자를 이 말로 묘사하거나" in cute
         gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
         assert "'루나'" in system_prompt(assistant_name(gl.settings)) and "아젤" not in system_prompt("루나")
         for said, name, want in [("아젤아, 서버 괜찮아?", "아젤", "서버 괜찮아?"), ("아젤 지금 몇 시야", "아젤", "지금 몇 시야"),
@@ -2402,13 +2414,13 @@ if __name__ == "__main__":
                     w.send_text(json.dumps({"type": "hangup"}))
                 time.sleep(0.05)
             one_turn("/v1/call?session=ps&persona=luna")
-            assert "'루나'" in prompts[-1] and "성격: 느긋함" in prompts[-1] and set(voices) == {"vivian"}, (prompts, voices)
+            assert "'루나'" in prompts[-1] and "성격과 말투: 느긋함." in prompts[-1] and set(voices) == {"vivian"}, (prompts, voices)
             assert "luna:ps" in history and "azel:ps" not in history
             start = [m for m in full.ws.sent if m.get("type") == "call_log" and m["event"] == "start"][-1]
             assert start["persona_id"] == "luna"
             voices.clear()
             one_turn("/v1/call?session=ps2&persona=old")  # deleted persona: the primary
-            assert "'아젤'" in prompts[-1] and "성격: 기본 성격" in prompts[-1] and set(voices) == {"sohee"}
+            assert "'아젤'" in prompts[-1] and "성격과 말투: 기본 성격." in prompts[-1] and set(voices) == {"sohee"}
             voices.clear()
 
             async def placed():  # the gateway rings as luna: the opening is synthesized in her voice up front

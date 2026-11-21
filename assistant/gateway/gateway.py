@@ -117,13 +117,23 @@ def personality(settings):
     return p.strip() if isinstance(p, str) and p.strip() else PERSONALITY_DEFAULT
 
 
+def character_line(name, text):
+    """The persona's character as the assistant's own (same wording in gateway.py and voice_server.py). Without the
+    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요")."""
+    text = text.strip().rstrip(".。 ")
+    return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
+            "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
+            "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. "
+            "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+
+
 def persona_block(settings):
     """Who is talking: name and character of the persona this ask belongs to (the primary by default). Used for
     Claude's voice style and every prompt that speaks to the user."""
     p = active_persona(settings)
     text = p["personality"].strip() if isinstance(p.get("personality"), str) and p["personality"].strip() \
         else PERSONALITY_DEFAULT
-    return f"너의 이름은 '{p['name']}'이야. 성격: {text} "
+    return f"너의 이름은 '{p['name']}'이야. " + character_line(p["name"], text)
 
 
 # ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
