@@ -1450,13 +1450,25 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     # faster than real time, so "still talking" is judged by this, not by the task.
     # gen: the reply generation. Every reply claims a new one and an interrupt bumps it, so audio (and captions) a
     # superseded reply produces afterwards is dropped here: binary frames carry no id the app could check.
-    current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set()}
+    current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set(), "side": set()}
 
     def spawn(coro):
         """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
         t = asyncio.create_task(coro)
         current["replies"].add(t)
         t.add_done_callback(current["replies"].discard)
+        t.add_done_callback(_settled)
+        return t
+
+    def _settled(t):  # a speaking task that failed (TTS down) is logged, never an unretrieved-exception warning
+        if not t.cancelled() and t.exception():
+            print("call task failed:", type(t.exception()).__name__, flush=True)
+
+    def side(coro):
+        """A helper task that must not block the receive loop (an interrupt, a tap): cancelled on hangup."""
+        t = asyncio.create_task(coro)
+        current["side"].add(t)
+        t.add_done_callback(current["side"].discard)
         return t
 
     def new_reply():
@@ -1558,8 +1570,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             t.cancel()
         if olds:  # its TTS, Qwen and Claude work stop before the app is told (a Claude run gets a link cancel)
             await asyncio.wait(olds, timeout=3)
+            for t in olds:  # a reply that had already failed (TTS down): its error is consumed here, not lost
+                if t.done() and not t.cancelled():
+                    t.exception()
         current["play_end"] = guard.play_end = 0.0
         await send({"type": "interrupt"})  # barge-in: the client drops its queue
+        await send({"type": "state", "value": "listening"})  # the cancelled reply's own "listening" is dropped
         if current["paused_at"] is not None:  # it was paused: un-pause the (now empty) queue, or it stays stuck
             current["paused_at"] = None
             await send({"type": "resume"})
@@ -1587,12 +1603,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 await links.log({**start_log, "opening": " ".join(spoken)})
             if not cut:
                 await until_played()
-            await send({"type": "state", "value": "listening"})
+            await send({"type": "state", "value": "listening"}, gen=gen)  # not after it was interrupted
 
     async def tap_interrupt():
         guard.speech_at = None
         await interrupt(protected=True)  # cancels the reply task; its Claude run gets a link cancel on the way out
-        await send({"type": "state", "value": "listening"})
 
     async def interrupt_then_answer(audio, text=None):
         await interrupt(protected=True)
@@ -1648,7 +1663,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                                  "timings": timings, "at": time.time()})
             if not turn["interrupted"]:  # a failed turn's partial reply still plays out first
                 await until_played()
-            await send({"type": "state", "value": "listening"})
+            await send({"type": "state", "value": "listening"}, gen=gen)  # an interrupted or superseded turn: none
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
@@ -1683,7 +1698,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 if kind == "hangup":
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
-                    asyncio.create_task(tap_interrupt())
+                    side(tap_interrupt())
                 continue
             vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -1714,13 +1729,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     else:
                         current["task"] = spawn(answer(audio))
             if guard.tick(time.monotonic()) == "interrupt":
-                await interrupt()
+                side(interrupt())  # never awaited here: the loop keeps reading audio meanwhile
     except WebSocketDisconnect:
         pass
-    finally:
-        if current["task"]:
-            current["task"].cancel()
-            await asyncio.gather(current["task"], return_exceptions=True)  # its turn is logged before the end
+    finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
+        left = [t for t in {*current["replies"], *current["side"], current["task"]} if t and not t.done()]
+        for t in left:
+            t.cancel()
+        await asyncio.gather(*left, return_exceptions=True)  # its turn is logged before the end
         ended = time.time()
         await links.log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
         await links.brain_event({"type": "call_event", "event": "end", "session": session})
@@ -2668,9 +2684,33 @@ if __name__ == "__main__":
         for queued in (False, True):
             after, frames = stale_audio_check(queued)
             assert "audio" not in after, (queued, frames)  # no old audio once the interrupt is out
+            assert after == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
             starts = [f for f in frames if isinstance(f, dict) and f.get("type") == "reply_start"]
             assert starts and frames.index(starts[0]) < frames.index("audio"), frames  # reply_start precedes the audio
         globals().update(tts=real[1], llm_stream=real_llm)
+
+        def hangup_check():
+            """A Claude turn is running when the caller hangs up: the ask is cancelled over the link."""
+            async def stt(audio):
+                return "맥북 서버 상태 자세히 봐 줘"
+            from fastapi.testclient import TestClient
+            globals().update(transcribe=stt, SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            gw_ws = FakeWS()
+            lk = links.add(gw_ws)
+            links.receive(lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?session=hang", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(speech)
+                end = time.monotonic() + 3
+                while time.monotonic() < end and not any(m.get("type") == "ask" for m in gw_ws.sent):
+                    time.sleep(0.02)
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.3)
+            asks = [m for m in gw_ws.sent if m.get("type") == "ask"]
+            links.remove(lk)
+            return asks, [m for m in gw_ws.sent if m.get("type") == "cancel"]
+        asks, cancels = hangup_check()
+        assert asks and [c["id"] for c in cancels] == [asks[0]["id"]], (asks, cancels)
         # no token ever reaches a log: the container disables access logs and INFO, and query strings are redacted
         cmd = json.loads(re.search(r"^CMD\s+(\[.*\])\s*$", open(os.path.join(os.path.dirname(os.path.abspath(
             __file__)), "Dockerfile")).read(), re.M).group(1))
