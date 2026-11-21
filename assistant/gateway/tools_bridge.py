@@ -46,6 +46,9 @@ CALL_USER = {
         "repeat_cron": {"type": ["string", "null"], "description": (
             "반복이면 5칸 cron(KST, 분 시 일 월 요일, 요일 0=일요일). 예: 매일 7시 '0 7 * * *', 화목 2시 '0 14 * * 2,4', "
             "평일 10시~6시 2시간마다 '0 10-18/2 * * 1-5', 매월 1일 '0 9 1 * *'. 전화 사이 30분 이상, 하루 20번까지")},
+        "repeat_text": {"type": "string", "maxLength": 200, "description": (
+            "반복 요청을 사용자가 말한 그대로(예: '평일 10시부터 6시까지 2시간마다'). repeat_cron 대신 써도 돼요: "
+            "게이트웨이가 규칙으로 바꾸고 읽어 줄 문장을 돌려줘요")},
         "start_date": {"type": ["string", "null"], "description": "반복 시작일 YYYY-MM-DD"},
         "end_date": {"type": ["string", "null"], "description": "반복 마지막 날 YYYY-MM-DD"},
         "notify": {"type": "string", "enum": ["call", "push"], "description": "'알림으로'면 push, 기본 call"},
@@ -163,7 +166,8 @@ class Bridge:
                 r = result(True, out)
         except Need as e:
             r = result(False, e.question, needs={"kind": e.kind, "question": e.question,
-                                                 **({"options": e.options} if e.options else {})})
+                                                 **({"options": e.options} if e.options else {}),
+                                                 **({"args": e.resend} if e.resend else {})})
             r["_model"] = e.hint
         except Fail as e:
             r = result(False, e.message, error={"code": e.code, "message": e.message})
@@ -276,6 +280,15 @@ class Bridge:
             heard = self.heard(args["when_text"], None, kind, "만들지")
             when = heard["at"].isoformat()
         by = "app" if caller == "app" else "voice"
+        if args.get("repeat_text") and not args.get("repeat_cron"):  # the user's words -> a checked rule (cron.py)
+            if "llm" not in self.d:
+                raise Fail("unavailable", "지금은 반복 예약을 받을 수 없어요.")
+            w = await C.from_words(args["repeat_text"], self.d["llm"], self.now())
+            args = {**{k: v for k, v in args.items() if k != "repeat_text"}, "repeat_cron": w["cron"],
+                    "start_date": w["start_date"] and w["start_date"].isoformat(),
+                    "end_date": w["end_date"] and w["end_date"].isoformat(),
+                    "notify": args.get("notify") or w["notify"], "kind": args.get("kind") or w["kind"]}
+            kind = args["kind"] if args["kind"] in ("reminder", "wake") else "reminder"
         if args.get("repeat_cron"):
             return await self.call_user_rule(args, reason, kind, pid, by)
         key = (str(when or ""), pid)  # a model's retry often rewords the reason; a person's form never repeats by itself
@@ -323,8 +336,11 @@ class Bridge:
             verb = "알림 드릴게요" if args.get("notify") == "push" else "전화드릴게요"
             rule = C.rule_text(expr, start, end)
             q = f"{rule}{'' if rule.endswith('마다') else '에'} {verb}. 맞죠?"
+            keep = ("reason", "kind", "notify", "persona_id", "id", "scope", "purpose")
+            resend = {**{k: args[k] for k in keep if args.get(k)}, "repeat_cron": expr,
+                      "start_date": start and start.isoformat(), "end_date": end and end.isoformat(), "confirmed": True}
             raise Need("confirm", q, f"아직 저장하지 않았어요. 사용자에게 '{q}'라고 읽어 주고, 맞다고 하면 confirmed=true로 "
-                                     "다시 불러 주세요.")
+                                     "다시 불러 주세요.", resend=resend)
         return expr, start, end
 
     async def call_user_rule(self, args, reason, kind, pid, by="voice"):
@@ -478,9 +494,9 @@ class Need(Exception):
     """Nothing happened: the user must answer first. kind: confirm | clarify | choose. `question` is for the user,
     `hint` tells a model how to resend."""
 
-    def __init__(self, kind, question, hint=None, options=None):
+    def __init__(self, kind, question, hint=None, options=None, resend=None):
         super().__init__(question)
-        self.kind, self.question, self.hint, self.options = kind, question, hint or question, options
+        self.kind, self.question, self.hint, self.options, self.resend = kind, question, hint or question, options, resend
 
 
 class Fail(Exception):

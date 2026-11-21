@@ -3090,6 +3090,7 @@ bridge = tools_bridge.Bridge(
     task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t, steps=full),
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
+    llm=lambda system, user: llm_json(system, user),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
 
 
@@ -3189,9 +3190,11 @@ async def serve_tool(m):
 
         async def progress(say):
             await link_send({"id": m["id"], "type": "tool_progress", "say": say})
-        r = await bridge.call(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
-                              on_progress=progress)
-        await link_send({"id": m["id"], "type": "tool_result", "result": r["content"], "is_error": r["is_error"]})
+        r = await bridge.run(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
+                             surface="voice", on_progress=progress)
+        # result: what Qwen reads; spoken and needs: what the voice fast path says and holds (ACTIONS.md §2)
+        await link_send({"id": m["id"], "type": "tool_result", "result": tools_bridge.for_model(r),
+                         "is_error": not r["ok"], "spoken": r["spoken"], "needs": r["needs"]})
     except Exception as e:
         print("tool over link failed:", type(e).__name__, flush=True)
         await link_send({"id": m["id"], "type": "tool_result", "result": "도구를 쓰지 못했어요.", "is_error": True})

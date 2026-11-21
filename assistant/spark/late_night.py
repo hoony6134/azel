@@ -130,6 +130,10 @@ def when_from_words(text, now, inherit=None, kind="reminder"):
     if not m:
         return {**done, "at": None, "ask": "몇 시로 할까요?"}
     part, h = m.group(1), ko_int(m.group(2))
+    if part is None:  # "내일 7시 … 저녁" or an answer appended later ("내일 7시에 전화해줘 저녁"): the part said apart
+        rest = text[:m.start()] + " " + text[m.end():]
+        if p := re.search(r"(오전|오후|아침|저녁|밤|새벽|낮|점심)", rest):
+            part = p.group(1)
     minute = 30 if m.group(3) == "반" else ko_int(m.group(4)) if m.group(4) else 0
     if h > 24 or minute > 59:
         return {**done, "at": None, "ask": "몇 시인지 다시 말씀해 주세요."}

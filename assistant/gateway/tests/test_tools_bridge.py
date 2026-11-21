@@ -447,3 +447,22 @@ def test_when_text_is_resolved_by_the_gateway_not_the_model():
     r = run(b.call("call_user", {"reason": "과제", "when_text": "내일 오후 1시"}))
     assert r["content"].startswith("오늘(11월 23일) 오후 1시로 잡았어요.")
     assert w.schedule[-1]["interpretation"] == "새벽 '내일' → 오늘로 해석"
+
+
+def test_repeat_text_becomes_a_checked_rule_with_a_resend():
+    w = World()
+    b = w.bridge()
+
+    async def qwen(system, user):
+        return {"cron": "0 10-18/2 * * 1-5", "kind": "reminder", "purpose": "스트레칭"}
+    b.d["llm"] = qwen
+    r = run(b.run("call_user", {"reason": "스트레칭", "repeat_text": "평일 10시부터 6시까지 2시간마다"}, caller="qwen"))
+    assert r["needs"]["kind"] == "confirm" and r["needs"]["args"]["repeat_cron"] == "0 10-18/2 * * 1-5" and not w.schedule
+    r = run(b.run("call_user", r["needs"]["args"], caller="qwen"))  # the user said yes: resend as given
+    assert r["ok"] and w.schedule[-1]["cron"] == "0 10-18/2 * * 1-5"
+
+    async def broken(system, user):
+        return {"cron": "every day"}
+    b.d["llm"] = broken
+    r = run(b.run("call_user", {"reason": "x", "repeat_text": "언젠가 매일"}, caller="qwen"))
+    assert r["error"]["code"] == "invalid" and "이해하지 못했어요" in r["spoken"]

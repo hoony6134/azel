@@ -103,6 +103,8 @@ ITEM22 = at(23, 22)  # the item being changed: today 오후 10시
     # two plausible readings with a named day: ask
     (MON9, "내일 7시에 전화해줘", None, "reminder", None, "11월 24일 아침 7시요, 저녁 7시요?"),
     (MON9, "내일 오후 7시에 전화해줘", None, "reminder", at(24, 19), None),
+    (MON9, "내일 7시에 전화해줘 저녁", None, "reminder", at(24, 19), None),  # the answer to "아침이요, 저녁이요?"
+    (MON9, "내일 7시에 전화해줘 아침이요", None, "reminder", at(24, 7), None),
     (MON9, "내일 3시", None, "reminder", at(24, 15), None),
     # late night still applies
     (at(23, 0, 30), "내일 오후 1시에 전화해줘", None, "reminder", at(23, 13), None),

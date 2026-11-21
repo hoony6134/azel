@@ -63,7 +63,8 @@ def test_tools_over_the_link(tgw):  # noqa: F811
     asyncio.run(g.serve_tool({"type": "tool_call", "id": "t1", "name": "call_user", "args": {"reason": "알림"},
                               "persona": "azel"}))
     assert sent[0]["type"] == "tools" and "call_user" in [t["name"] for t in sent[0]["tools"]]
-    assert sent[1] == {"id": "t1", "type": "tool_result", "result": "지금 전화를 걸게요.", "is_error": False}
+    assert sent[1] == {"id": "t1", "type": "tool_result", "result": "지금 전화를 걸게요.", "is_error": False,
+                       "spoken": "지금 전화를 걸게요.", "needs": None}
 
 
 def test_api_backed_task_calls_when_done(tgw, monkeypatch):  # noqa: F811

@@ -13,8 +13,11 @@ def test_rule_needs_a_yes_then_lists_with_its_text(gw):  # noqa: F811
     g, c, _ = gw
     body = {"reason": "스트레칭", "repeat_cron": "0 10-18/2 * * 1-5", "kind": "reminder", "notify": "push"}
     r = c.post("/v1/schedule", json=body, headers=V2)
-    assert r.status_code == 200 and r.json()["needs"] == {
-        "kind": "confirm", "question": "평일 오전 10시부터 오후 6시까지 2시간마다 알림 드릴게요. 맞죠?"}
+    needs = r.json()["needs"]
+    assert r.status_code == 200 and needs["kind"] == "confirm" \
+        and needs["question"] == "평일 오전 10시부터 오후 6시까지 2시간마다 알림 드릴게요. 맞죠?"
+    assert needs["args"] == {"reason": "스트레칭", "kind": "reminder", "notify": "push", "repeat_cron": "0 10-18/2 * * 1-5",
+                             "start_date": None, "end_date": None, "confirmed": True}  # resend these after a yes
     assert c.post("/v1/schedule", json=body).status_code == 409  # legacy body: needs as 409 with the question
     assert not g.fake.db["schedule"]  # nothing made before the yes
     r = c.post("/v1/schedule", json={**body, "confirmed": True}, headers=V2)
