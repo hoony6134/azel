@@ -21,7 +21,12 @@ LEAK_RE = re.compile(r"(하라고|라고\b|라고[ .,]|해\s*줘|해\s*달라|�
 
 def purpose_rule(raw):
     """'오후 1시에 역사 특강 과제하라고 전화해줘' -> '역사 특강 과제'; '약 먹으라고' -> '약 먹기'; '' when nothing is left."""
-    text = CALL_RE.sub("", TIME_RE.sub(" ", str(raw or ""))).strip()  # the call verb only once: "엄마한테 전화" stays
+    text = str(raw or "")
+    # "…조사하고 끝나면 나한테 전화 줘": the hand-back clause is how to report, not what the work is
+    text = re.sub(r"\s*(하고|한 ?다음에?|한 ?뒤에?|하면서|해서)?\s*,?\s*(끝나면|다 ?되면|완료되면|마치면|끝내고|끝나고)\b.*$",
+                  "", text).strip()
+    text = re.sub(r"\s*에\s*대해(서)?\s*", " ", text)  # "오픈 자비스에 대해 조사" -> "오픈 자비스 조사"
+    text = CALL_RE.sub("", TIME_RE.sub(" ", text)).strip()  # the call verb only once: "엄마한테 전화" stays
     if m := re.search(r"^(.*\S)\s*시간(이에요|이야|입니다|이네요|이다)?[.!~]*$", text):  # "약 드실 시간이에요." (old notes)
         return f"{m.group(1)} 시간"[:MAX_PURPOSE] if valid_purpose(m.group(1)) else ""
     for _ in range(3):
