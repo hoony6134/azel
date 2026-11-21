@@ -208,6 +208,9 @@ struct SettingsScreen<Extra: View>: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
     @ViewBuilder var extra: Extra
+    @State private var serverDevices: [String] = []
+    @StateObject private var memory = MemoryModel()
+    @State private var showMemory = false
     @State private var settings: AppSettings?
     @State private var loaded: AppSettings?
     @State private var usage: [String: Any] = [:]
@@ -268,6 +271,26 @@ struct SettingsScreen<Extra: View>: View {
                             #endif
                     }
                 }
+                if memory.available == true {
+                    Card("기억") {
+                        Button { showMemory = true } label: {
+                            HStack {
+                                Text("기억하는 것들").foregroundStyle(Theme.text)
+                                Spacer()
+                                Text("\(memory.items.count)개").font(.subheadline.monospacedDigit()).foregroundStyle(Theme.text3)
+                                Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .sheet(isPresented: $showMemory) {
+                            NavigationStack { MemoryScreen(model: memory).toolbar { ToolbarItem(placement: .cancellationAction) { Button("닫기") { showMemory = false } } } }
+                                #if os(macOS)
+                                .frame(width: 520, height: 620)
+                                #endif
+                        }
+                    }
+                }
                 ApprovalRulesCard()
                 usageCard
                 statusCard
@@ -290,8 +313,8 @@ struct SettingsScreen<Extra: View>: View {
         }
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("설정")
-        .task { await load() }
-        .refreshable { await load() }
+        .task { await load(); await loadDevices(); await memory.refresh() }
+        .refreshable { await load(); await loadDevices() }
         .onChange(of: settings) { _, new in scheduleSave(new) }
         .sheet(isPresented: $showSetup) {
             SetupFlow(startAt: 1) { showSetup = false; Task { await load() } }
@@ -651,8 +674,13 @@ struct SettingsScreen<Extra: View>: View {
                        p.wrappedValue.autonomous.window = w })
     }
 
+    /// `GET /v1/devices` (public): the gateway's registered and static devices.
+    private func loadDevices() async {
+        if case .success(let d) = await attempt({ try await TaskAPI.devices() }) { serverDevices = d }
+    }
+
     private func deviceCard(_ s: Binding<AppSettings>) -> some View {
-        let known = (model.status?.devices.map { DeviceID.normalize($0.name) } ?? []) + DeviceID.known
+        let known = serverDevices + (model.status?.devices.map { DeviceID.normalize($0.name) } ?? []) + DeviceID.known
             + [s.wrappedValue.default_device] + s.wrappedValue.device_fallback
         let names = known.reduce(into: [String]()) { if !$0.contains($1) && !$1.isEmpty { $0.append($1) } }
         return Card("기기") {

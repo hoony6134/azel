@@ -54,6 +54,12 @@ struct CallScreen: View {
             GlazeBackground(state: jarState, tint: tint)
             VStack(spacing: Theme.l) {
                 topBar
+                if let c = call.callContext {
+                    Label(c.chip, systemImage: c.kind == "task" ? "checklist" : "bell").font(.footnote.weight(.semibold))
+                        .foregroundStyle(Theme.text).lineLimit(1)
+                        .padding(.horizontal, Theme.m).padding(.vertical, 4)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
                 if let banner {
                     Label(banner, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(Theme.danger)
                         .padding(.horizontal, Theme.l).padding(.vertical, Theme.s)

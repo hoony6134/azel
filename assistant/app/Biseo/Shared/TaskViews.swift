@@ -110,6 +110,19 @@ struct TaskDetailView: View {
                     TaskBadgeView(status: t.status)
                 }
                 if let d = t.device { Label(d, systemImage: "laptopcomputer").font(.footnote).foregroundStyle(Theme.text2) }
+                if let note = t.note, t.isActive {
+                    Label(note, systemImage: "hourglass").font(.footnote).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                }
+                if t.isActive, t.notify != nil {
+                    Toggle("끝나면 전화", isOn: Binding(get: { t.notify == "call" }, set: { on in
+                        Task {
+                            do { try await tasks.setNotify(t, call: on); message = nil }
+                            catch GatewayError.http(let code) where code == 404 || code == 405 { message = "끝나면 전화는 서버 업데이트 후 바꿀 수 있어요" }
+                            catch { message = "바꾸지 못했어요: " + FriendlyError.describe(error).title }
+                        }
+                    }))
+                    .tint(Theme.celadon).foregroundStyle(Theme.text)
+                }
                 if let b = t.backend {
                     Label("엔진: " + TaskBackend.label(b), systemImage: "cpu").font(.footnote).foregroundStyle(Theme.text2)
                     if let why = t.fallback_reason, !why.isEmpty {
@@ -148,6 +161,9 @@ struct TaskDetailView: View {
                         }
                         .accessibilityElement(children: .combine)
                     }
+                }
+                if let e = t.error, t.status == "failed" {
+                    Card("실패 이유") { Text(e).foregroundStyle(Theme.text).textSelection(.enabled) }
                 }
                 if let r = t.result, !r.isEmpty {
                     Card("결과") { Text(r).foregroundStyle(Theme.text).textSelection(.enabled) }
