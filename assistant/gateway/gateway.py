@@ -1610,6 +1610,12 @@ async def check_persona(body, s, pid=None):
     unknown = set(body) - PERSONA_FIELDS - ({"id"} if pid is None else set())
     if unknown:
         raise HTTPException(400, f"unknown persona fields: {sorted(unknown)}")
+    for k in ("voice_style", "personality", "color"):  # the app sends null for "unset"
+        if k in body and body[k] is None:
+            if pid is not None and k != "color":
+                body[k] = ""  # edit: clear the text; a null color keeps the current one
+            else:
+                del body[k]  # create: the defaults apply
     if "name" in body:
         if not (isinstance(body["name"], str) and NAME_RE.fullmatch(body["name"]) and body["name"].strip()):
             raise HTTPException(400, "name: 1-12 Hangul/Latin letters or spaces")
@@ -1620,8 +1626,6 @@ async def check_persona(body, s, pid=None):
         raise HTTPException(400, "voice: not a TTS speaker (GET the TTS server's /v1/audio/voices)")
     if not isinstance(body.get("voice_style", ""), str) or len(body.get("voice_style", "")) > 200:
         raise HTTPException(400, "voice_style: text up to 200 characters")
-    if body.get("personality") is None and "personality" in body:
-        body["personality"] = ""
     if not isinstance(body.get("personality", ""), str) or len(body.get("personality", "")) > 600:
         raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
     if "color" in body and not (isinstance(body["color"], str) and COLOR_RE.fullmatch(body["color"])):

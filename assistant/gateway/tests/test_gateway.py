@@ -243,6 +243,20 @@ def test_personas_migrate_from_one_assistant(gw):
     assert c.get("/v1/personas/azel").json()["name"] == "아젤"
 
 
+def test_personas_null_optional_fields(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    nulls = {"voice_style": None, "personality": None, "color": None, "default_model": None}
+    r = c.post("/v1/personas", json={"id": "nul", "name": "널이", "voice": "sohee", **nulls})
+    assert r.status_code == 201, r.text
+    assert (r.json()["voice_style"], r.json()["personality"], r.json()["color"]) == ("", "", "#7C5CFF")
+    assert r.json()["default_model"] is None
+    c.put("/v1/personas/nul", json={"voice_style": "차분함", "personality": "꼼꼼함", "color": "#112233"})
+    r = c.put("/v1/personas/nul", json=nulls)
+    assert r.status_code == 200, r.text
+    assert (r.json()["voice_style"], r.json()["personality"], r.json()["color"]) == ("", "", "#112233")
+
+
 def test_personas_crud_and_limits(gw, monkeypatch):
     g, c, _ = gw
     persona_gw(g, monkeypatch)
