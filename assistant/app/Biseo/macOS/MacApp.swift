@@ -6,10 +6,12 @@ struct BiseoMacApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "mac")
     @StateObject private var wake = WakeModel()
     @StateObject private var history = HistoryModel()
+    @StateObject private var schedule = ScheduleModel()
     @ObservedObject private var call = MacCall.shared
 
     init() {
         Recordings.cleanup()
+        Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
         HotKey.register()
     }
@@ -24,7 +26,7 @@ struct BiseoMacApp: App {
         .menuBarExtraStyle(.window)
 
         Window("Azel", id: "main") {
-            MainWindow(model: model, wake: wake, history: history)
+            MainWindow(model: model, wake: wake, history: history, schedule: schedule)
         }
         .defaultSize(width: 760, height: 720)
 
@@ -41,23 +43,17 @@ struct BiseoMacApp: App {
     }
 }
 
-/// The jar silhouette as a 16 pt template image for the menu bar; filled during a call, dot for approvals.
+/// The menu-bar orb (assistant/design/icon templates): outline when idle, filled during a call,
+/// plus a dot when approvals are pending. Always a template image so it follows the menu bar.
 enum JarIcon {
     static func make(filled: Bool, dot: Bool) -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 16), flipped: true) { rect in
-            let path = JarPath.make(center: CGPoint(x: 8, y: 8), R: 6.2, t: 0, level: 0, from: .idle, to: .idle, mix: 1, reduceMotion: true)
-            let ns = NSBezierPath()
-            path.forEach { el in
-                switch el {
-                case .move(let p): ns.move(to: p)
-                case .line(let p): ns.line(to: p)
-                case .closeSubpath: ns.close()
-                default: break
-                }
-            }
+        let base = NSImage(named: filled ? "MenuBarTemplateFilled" : "MenuBarTemplate") ?? NSImage()
+        guard dot else { base.isTemplate = true; return base }
+        let size = NSSize(width: base.size.width + 4, height: base.size.height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(origin: .zero, size: base.size))
             NSColor.black.set()
-            if filled { ns.fill() } else { ns.lineWidth = 1.4; ns.stroke() }
-            if dot { NSBezierPath(ovalIn: NSRect(x: 13, y: 0, width: 5, height: 5)).fill() }
+            NSBezierPath(ovalIn: NSRect(x: size.width - 6, y: size.height - 6, width: 6, height: 6)).fill()
             return true
         }
         image.isTemplate = true
@@ -101,6 +97,7 @@ struct Popover: View {
     @ObservedObject var wake: WakeModel
     @ObservedObject var history: HistoryModel
     @ObservedObject private var call = MacCall.shared
+    @ObservedObject private var tasks = TaskModel.shared
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -117,10 +114,12 @@ struct Popover: View {
                 Button("연결 설정…") { show() }.buttonStyle(.borderedProminent).tint(Theme.celadon)
             } else {
                 HStack(spacing: Theme.m) {
-                    MoonJar(state: call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
-                            levels: call.levels).frame(width: 64, height: 64)
+                    MoonJar(state: call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
+                            levels: call.levels, sway: true, tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon)
+                        .frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: Theme.s) {
-                        Text(MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요").font(.subheadline).foregroundStyle(Theme.text2)
+                        Text((PersonaModel.shared.personas.count > 1 ? "\(PersonaModel.shared.callName) · " : "")
+                             + (MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요")).font(.subheadline).foregroundStyle(Theme.text2)
                         Button { call.inCall ? call.hangUp() : call.start(panel: true) } label: {
                             Label(call.inCall ? "끊기" : "전화", systemImage: call.inCall ? "phone.down.fill" : "phone.fill")
                         }
@@ -128,11 +127,23 @@ struct Popover: View {
                         .foregroundStyle(call.inCall ? Color.white : Theme.onAccent)
                     }
                 }
+                MiniOrbRow(model: PersonaModel.shared, size: 28, showNames: false)
                 Grid(horizontalSpacing: Theme.s) {
                     GridRow {
                         small("오늘 브리핑", "sun.max") { startBriefing() }
                         small("새 대화", "square.and.pencil") { model.newConversation() }
                     }
+                }
+                if !TaskModel.shared.active.isEmpty {
+                    let running = TaskModel.shared.active
+                    Button { show() } label: {
+                        HStack {
+                            Label("작업 \(running.count)개 진행 중", systemImage: "gearshape.2").foregroundStyle(Theme.text)
+                            Spacer()
+                            Text(running.first?.goal ?? "").font(.footnote).foregroundStyle(Theme.text3).lineLimit(1)
+                        }
+                    }
+                    .buttonStyle(.plain)
                 }
                 if !model.approvals.isEmpty {
                     Button { show() } label: {
@@ -169,7 +180,7 @@ struct Popover: View {
         .padding(Theme.l)
         .frame(width: 340)
         .background(Theme.bgRaised)
-        .task { await model.refresh(); await wake.refresh(); await history.refresh() }
+        .task { await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh(); await TaskModel.shared.refresh() }
     }
 
     private func small(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -178,7 +189,7 @@ struct Popover: View {
 
     private func startBriefing() {
         // Briefing uses its own session prefix, like the iPhone's 오늘 브리핑.
-        call.start(panel: true, session: Session.current("briefing"))
+        call.start(panel: true, session: Session.current("briefing"), intent: "briefing", persona: PersonaModel.shared.primary)
     }
 
     private func show() {
@@ -214,6 +225,31 @@ struct HistorySplit: View {
     }
 }
 
+/// History inside the main window: list and detail side by side without a second split view.
+struct HistoryPane: View {
+    @ObservedObject var history: HistoryModel
+    @State private var selection: HistoryItem?
+
+    var body: some View {
+        HStack(spacing: 0) {
+            HistoryList(model: history, selection: $selection, onCall: { MacCall.shared.start(panel: true) })
+                .frame(width: 280)
+                .onDeleteCommand { if let s = selection { history.delete(s); selection = nil } }
+            Divider()
+            Group {
+                if let selection {
+                    NavigationStack { HistoryDetailView(item: selection, history: history) }.id(selection.id)
+                } else {
+                    Text("기록을 고르세요").foregroundStyle(Theme.text3)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.bg)
+        }
+        .task { await history.refresh() }
+    }
+}
+
 @MainActor @ViewBuilder func wakeButton(_ wake: WakeModel) -> some View {
     switch wake.state {
     case .running, .loaded: Button("끄기") { wake.toggle() }.font(.footnote)
@@ -237,6 +273,7 @@ struct MainWindow: View {
     @ObservedObject var model: AppModel
     @ObservedObject var wake: WakeModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @State private var section: String? = "home"
 
     var body: some View {
@@ -251,12 +288,19 @@ struct MainWindow: View {
                     }
                     .navigationSplitViewColumnWidth(min: 160, ideal: 180)
                 } detail: {
-                    switch section {
-                    case "approvals": ApprovalsScreen(model: model)
-                    case "history": HistorySplit(history: history)
-                    case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
-                    default: MacHome(model: model, history: history) { section = "history" }
+                    // A fixed minimum size: a detail whose min size moved with its (animated)
+                    // content made the split view re-measure inside a layout pass and AppKit
+                    // aborted (crash report 2026-11-21 23:55).
+                    Group {
+                        switch section {
+                        case "approvals": ApprovalsScreen(model: model)
+                        case "history": HistoryPane(history: history)   // no split view nested in this one
+                        case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
+                        default: MacHome(model: model, history: history, schedule: schedule) { section = "history" }
+                        }
                     }
+                    .frame(minWidth: 460, maxWidth: .infinity, minHeight: 420, maxHeight: .infinity)
+                    .navigationSplitViewColumnWidth(min: 460, ideal: 640)
                 }
             } else {
                 SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
@@ -269,19 +313,21 @@ struct MainWindow: View {
 
 /// Home with the call in place: the jar grows and the dock appears when a call is up.
 struct MacHome: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     var showAll: () -> Void
     @ObservedObject private var call = MacCall.shared
     @State private var openItem: HistoryItem?
 
     private var jarState: JarState {
-        call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline)
+        call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline)
     }
 
     var body: some View {
         ZStack {
-            if call.inCall { GlazeBackground(state: jarState) } else { Theme.bg.ignoresSafeArea() }
+            if call.inCall { GlazeBackground(state: jarState, tint: call.activePersona?.glaze ?? Theme.glazeCeladon) } else { Theme.bg.ignoresSafeArea() }
             ScrollView {
                 VStack(spacing: Theme.xl) {
                     if !call.inCall {
@@ -290,9 +336,16 @@ struct MacHome: View {
                             Text(Date(), format: .dateTime.month().day().weekday(.wide)).font(.subheadline).foregroundStyle(Theme.text2)
                         }
                     } else {
+                        if let p = call.activePersona {
+                            HStack(spacing: 6) {
+                                Circle().fill(p.tint).frame(width: 8, height: 8)
+                                Text(p.name).font(.headline).foregroundStyle(Theme.text)
+                            }
+                        }
                         Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }
-                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt,
+                            tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
@@ -301,6 +354,9 @@ struct MacHome: View {
                         .animation(Theme.enter, value: call.inCall)
                     if call.inCall {
                         if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                        if UserDefaults.standard.string(forKey: "noiseMode") == "noisy" && jarState == .speaking {
+                            Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
+                        }
                         captions; dock
                     } else { idle }
                     if let e = call.error { Text(e).font(.footnote).foregroundStyle(Theme.danger) }
@@ -320,12 +376,14 @@ struct MacHome: View {
     private var idle: some View {
         VStack(spacing: Theme.l) {
             Button { call.start(panel: false) } label: {
-                Label("\(AssistantName.current)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
+                Label("\(PersonaModel.shared.callName)에게 전화", systemImage: "phone.fill").font(.headline).foregroundStyle(Theme.onAccent)
                     .frame(maxWidth: .infinity).frame(height: 52)
                     .background(Theme.celadon, in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
             }
             .buttonStyle(.plain).disabled(model.statusError != nil)
             Text("어디서든 \(HotKey.label)로 부를 수 있어요").font(.footnote).foregroundStyle(Theme.text3)
+            ScheduleCard(schedule: schedule)
+            RunningTasksCard(tasks: TaskModel.shared, app: model)
             VStack(alignment: .leading, spacing: Theme.m) {
                 HStack {
                     Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
@@ -347,7 +405,20 @@ struct MacHome: View {
     private var captions: some View {
         VStack(alignment: .leading, spacing: Theme.m) {
             ForEach(call.lines.suffix(4)) { line in
-                Text(line.text + (line.interrupted ? " …" : ""))
+                Group {
+                    if !line.mine && line.id == call.lines.last?.id {
+                        TimelineView(.animation(minimumInterval: 1 / 20, paused: !call.playing)) { _ in
+                            let k = call.karaoke(stepped: reduceMotion)
+                            if k.texts.joined(separator: " ") == line.text {
+                                KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
+                            } else {
+                                Text(line.text + (line.interrupted ? " …" : ""))
+                            }
+                        }
+                    } else {
+                        Text(line.text + (line.interrupted ? " …" : ""))
+                    }
+                }
                     .font(line.mine ? .body : .title2.weight(.medium))
                     .foregroundStyle(line.mine ? Theme.text2 : line.interrupted ? Theme.text3 : Theme.text)
                     .frame(maxWidth: .infinity, alignment: .leading)

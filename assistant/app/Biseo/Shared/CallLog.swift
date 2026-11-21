@@ -18,11 +18,15 @@ struct CallLog: Equatable {
     mutating func apply(_ event: CallEvent) {
         switch event.type {
         case "transcript":
-            guard let t = event.text else { return }
+            guard let t = LegacyText.clean(event.text) else { return }
             lines.append(CallLine(mine: true, text: t))
             replyOpen = false
         case "reply":
-            guard let t = event.text else { return }
+            guard let t = LegacyText.clean(event.text) else {
+                // A bare legacy marker: mark the reply it belongs to instead of showing the text.
+                if event.text != nil, let i = lines.indices.last, !lines[i].mine { lines[i].interrupted = true }
+                return
+            }
             if replyOpen, let i = lines.indices.last, !lines[i].mine {
                 lines[i].text += " " + t
                 lines[i].route = event.route ?? lines[i].route
@@ -44,3 +48,17 @@ struct CallLog: Equatable {
 
 /// Posted when a call ends so the history list reloads (the server writes the record).
 let callEndedNotification = Notification.Name("biseo.call.ended")
+
+/// Before a server fix, interrupted turns were stored with the literal text "(말이 끊김)". It is
+/// never shown; the turn gets a subtle 끊김 mark from `interrupted` instead.
+enum LegacyText {
+    static let interruptedMarker = "(말이 끊김)"
+
+    /// The text without the marker; nil when nothing else is left.
+    static func clean(_ s: String?) -> String? {
+        guard let s else { return nil }
+        let out = s.replacingOccurrences(of: interruptedMarker, with: "")
+            .replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return out.isEmpty ? nil : out
+    }
+}

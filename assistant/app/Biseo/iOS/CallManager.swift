@@ -1,5 +1,6 @@
 import AVFoundation
 import CallKit
+import UIKit
 import PushKit
 
 /// CallKit + PushKit + `WS /v1/call`. Provider and push callbacks run on the main queue.
@@ -8,6 +9,15 @@ final class CallManager: NSObject, ObservableObject {
 
     @Published private(set) var inCall = false
     @Published private(set) var state = ""          // listening | thinking | speaking
+    /// Reply audio still playing (the server can move on before the last of it is heard).
+    @Published private(set) var playing = false
+    /// The state the UI shows: 말하는 중 while reply audio is still playing.
+    var displayState: String { CallClient.displayState(server: state, playing: playing) }
+    /// The reply paragraph being heard (sentences, characters heard, sentence being spoken).
+    func karaoke(stepped: Bool) -> (texts: [String], spoken: Double, current: Int?) {
+        let k = client.karaokeState()
+        return (k.texts, stepped ? k.stepped : k.spoken, k.current)
+    }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }
@@ -21,6 +31,8 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var activity = ActivityLog()
     @Published private(set) var surgeAt: Date?
     @Published private(set) var pulseAt: Date?
+    /// The thinking pulse's visual twin: a shimmer across the orb.
+    @Published private(set) var shimmerAt: Date?
     /// Last interrupt (server or tap), drives the jar's ripple.
     @Published private(set) var interruptedAt: Date?
     /// Incoming calls show the push's `caller`; outgoing ones the cached assistant name.
@@ -31,11 +43,14 @@ final class CallManager: NSObject, ObservableObject {
     private let pushRegistry = PKPushRegistry(queue: .main)
     private let client = CallClient()
     private var voipToken: Data?
+    private var alertToken: Data?
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
-    private var incoming: [UUID: (callID: String?, reason: String?, caller: String)] = [:]
+    private var incoming: [UUID: (callID: String?, reason: String?, caller: String, persona: String?)] = [:]
     private var activeSession: String?
+    /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
+    @Published private(set) var activePersona: Persona?
 
     private override init() {
         let config = CXProviderConfiguration()
@@ -46,7 +61,10 @@ final class CallManager: NSObject, ObservableObject {
         super.init()
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
-        client.onClose = { [weak self] in self?.fail(nil) }
+        client.onPlayback = { [weak self] in self?.playing = $0 }
+        client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date() } }
+        client.onClose = { [weak self] in self?.fail($0) }
+        client.onWarning = { [weak self] in self?.error = $0 }
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
         // The system call UI's speaker button and AirPods coming and going change the route too.
@@ -57,11 +75,15 @@ final class CallManager: NSObject, ObservableObject {
 
     // MARK: UI actions
 
-    func startCall(prefix: String = "iphone") {
+    /// `persona`: nil = the one chosen in the app (or the primary).
+    @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil) {
         guard !inCall else { return }
         sessionPrefix = prefix
-        callerName = nil
-        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: AssistantName.current))
+        let who = persona ?? PersonaModel.shared.selected
+        activePersona = who
+        callerName = who?.name
+        // §17.6: the handle is the persona id; the system UI and Recents show localizedCallerName.
+        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: who?.id ?? AssistantName.current))
         controller.request(CXTransaction(action: action)) { [weak self] err in
             if let err { DispatchQueue.main.async { self?.error = err.localizedDescription } }
         }
@@ -79,9 +101,19 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// Goes through CallKit so the system call UI shows the hold state too.
+    #if DEBUG
+    /// `-callPreview <state>`: shows the call screen without a call, for screenshots.
+    func debugPreview(state: String) {
+        inCall = true
+        self.state = state
+        connectedAt = Date().addingTimeInterval(-72)
+        log.lines = [CallLine(mine: true, text: "내일 일정 알려줘"), CallLine(mine: false, text: "내일은 오전 10시에 팀 회의가 있어요.", route: "claude")]
+    }
+    #endif
+
     /// Tap on the jar while it speaks.
     func interrupt() {
-        guard inCall, state == "speaking" else { return }
+        guard inCall, displayState == "speaking" else { return }
         client.interrupt()
         log.apply(CallEvent(type: "interrupt"))
         state = "listening"
@@ -109,11 +141,21 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// Sends the PushKit token to the gateway once both it and the server token exist.
+    /// Sends both tokens in one register call; runs again whenever either changes (the gateway
+    /// requires the VoIP token, so an alert token alone waits for it).
     func registerPush() {
         guard let token = voipToken, Config.token != nil else { return }
+        let alert = alertToken
         Task { @MainActor in
-            do { try await Gateway.registerPush(token: token) } catch { self.error = "푸시 등록 실패: \(error.localizedDescription)" }
+            do { try await Gateway.registerPush(token: token, alertToken: alert) } catch { self.error = "푸시 등록 실패: \(error.localizedDescription)" }
         }
+    }
+
+    /// APNs alert token from `didRegisterForRemoteNotificationsWithDeviceToken`.
+    func setAlertToken(_ token: Data) {
+        guard token != alertToken else { return }
+        alertToken = token
+        registerPush()
     }
 
     // MARK: Call lifecycle
@@ -143,7 +185,9 @@ final class CallManager: NSObject, ObservableObject {
             return
         }
         activeSession = callID ?? Session.current(sessionPrefix)
-        do { try client.start(session: activeSession!, callID: callID) } catch {
+        // Outgoing briefing calls (오늘 브리핑, Siri) tell the server what to open with.
+        let intent = callID == nil && sessionPrefix == "briefing" ? "briefing" : nil
+        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
@@ -166,6 +210,10 @@ final class CallManager: NSObject, ObservableObject {
             MainActor.assumeIsolated { ActivityAnnouncer.toolStarted(label, thinking: thinking) } // handle() runs on main
         case "activity" where event.phase == "tool_end":
             pulseAt = Date()
+        case "hangup", "end":
+            // The server ended the call: tell CallKit so the system UI goes away.
+            fail(nil)
+            return
         case "error": error = event.message
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
@@ -183,6 +231,7 @@ final class CallManager: NSObject, ObservableObject {
         client.stop()
         if activeSession != nil { NotificationCenter.default.post(name: callEndedNotification, object: nil) }
         activeSession = nil
+        activePersona = nil
         callUUID = nil
         callID = nil
         sessionPrefix = "iphone"
@@ -199,7 +248,14 @@ extension CallManager: CXProviderDelegate {
     func providerDidReset(_ provider: CXProvider) { teardown() }
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        let persona = activePersona, caller = callerName
         begin(action.callUUID, callID: nil)
+        activePersona = persona
+        callerName = caller
+        let named = CXCallUpdate()
+        named.localizedCallerName = caller ?? AssistantName.current
+        named.remoteHandle = action.handle
+        provider.reportCall(with: action.callUUID, updated: named)
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: nil)
         action.fulfill()
     }
@@ -208,14 +264,29 @@ extension CallManager: CXProviderDelegate {
         let info = incoming.removeValue(forKey: action.callUUID)
         begin(action.callUUID, callID: info?.callID)
         callerName = info?.caller
+        // The push names the persona that is calling; its glaze tints the call screen.
+        let personaID = info?.persona
+        activePersona = MainActor.assumeIsolated { PersonaModel.shared.persona(id: personaID) }
         if let reason = info?.reason { log.lines.append(CallLine(mine: false, text: "용건: \(reason)")) }
         action.fulfill()
     }
 
+    /// X on the Dynamic Island, the Lock Screen or the app (user bug, 2026-11-21). There is only
+    /// ever one call, so end whatever is up even if the UUID doesn't match, and finish the hangup
+    /// inside a background task so it reaches the server while the app is backgrounded.
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
         incoming[action.callUUID] = nil
-        if action.callUUID == callUUID { teardown() }
+        Log.call.info("callkit end (matches current: \(action.callUUID == self.callUUID, privacy: .public))")
+        if inCall || callUUID != nil { Self.inBackgroundTask { self.teardown() } }
         action.fulfill()
+    }
+
+    /// Keeps the app alive for the few hundred ms the hangup frame and socket close need.
+    static func inBackgroundTask(_ work: () -> Void) {
+        var task = UIBackgroundTaskIdentifier.invalid
+        task = UIApplication.shared.beginBackgroundTask(withName: "hangup") { UIApplication.shared.endBackgroundTask(task) }
+        work()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
@@ -247,7 +318,8 @@ extension CallManager: PKPushRegistryDelegate {
         let p = payload.dictionaryPayload
         let caller = p["caller"] as? String ?? AssistantName.current
         let uuid = UUID()
-        incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller)
+        incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller,
+                          (p["persona"] as? String) ?? (p["persona"] as? NSNumber).map(\.stringValue))
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: caller)
         update.localizedCallerName = caller

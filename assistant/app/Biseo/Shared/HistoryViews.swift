@@ -28,6 +28,10 @@ enum HistoryFormat {
         return out
     }
 
+    /// From the user's side, like the phone's call log: incoming = the assistant called.
+    static func directionLabel(incoming: Bool) -> String { incoming ? "받은 전화" : "건 전화" }
+    static func directionGlyph(incoming: Bool) -> String { incoming ? "phone.arrow.down.left" : "phone.arrow.up.right" }
+
     static let kindNames = ["calendar": "캘린더", "mail": "메일", "memory": "기억", "schedule": "일정", "server": "서버",
                             "files": "파일", "notes": "노션", "web": "웹", "terminal": "명령"]
 
@@ -35,7 +39,7 @@ enum HistoryFormat {
         var parts = [item.start.formatted(date: .omitted, time: .shortened), item.title ?? "제목 없음"]
         if let d = item.duration_s { parts.append("\(max(1, Int((d / 60).rounded())))분") }
         if let t = item.turns { parts.append("\(t)턴") }
-        parts.append(item.incoming ? "\(AssistantName.josa(AssistantName.current, "이", "가")) 건 전화" : "내가 건 전화")
+        parts.append(directionLabel(incoming: item.incoming))
         if item.routeList.contains("claude") { parts.append("Claude 사용") }
         return parts.joined(separator: ", ")
     }
@@ -45,10 +49,10 @@ enum HistoryFormat {
 struct DirectionGlyph: View {
     let incoming: Bool
     var body: some View {
-        Image(systemName: incoming ? "phone.arrow.down.left" : "phone.arrow.up.right")
+        Image(systemName: HistoryFormat.directionGlyph(incoming: incoming))
             .font(.system(size: 17)).frame(width: 20)
             .foregroundStyle(incoming ? Theme.celadon : Theme.text2)
-            .accessibilityHidden(true)
+            .accessibilityLabel(HistoryFormat.directionLabel(incoming: incoming))
     }
 }
 
@@ -66,7 +70,15 @@ struct HistoryRow: View {
             DirectionGlyph(incoming: item.incoming)
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.title ?? "제목 없음").foregroundStyle(Theme.text).lineLimit(1)
-                Text(HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(selected ? Theme.text2 : Theme.text3)
+                HStack(spacing: 4) {
+                    // §17.7: "● 소담 · 오전 8:02 · 4분 · 6턴"; a removed persona reads "삭제된 비서".
+                    if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id, deleted: item.persona_deleted == true) {
+                        Circle().fill(who.tint).frame(width: 8, height: 8)
+                        Text(who.name + " ·").foregroundStyle(who.name == "삭제된 비서" ? Theme.text3 : Theme.text2)
+                    }
+                    Text(HistoryFormat.meta(item)).foregroundStyle(selected ? Theme.text2 : Theme.text3)
+                }
+                .font(.footnote.monospacedDigit())
                 if let match = item.match { Text(highlight(match)).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
                 if failed {
                     HStack(spacing: Theme.xs) {
@@ -185,12 +197,14 @@ struct HistoryList: View {
 
     var body: some View {
         Group {
-            if !model.loadedOnce && model.items.isEmpty && model.error == nil {
+            if !model.loadedOnce && model.items.isEmpty && model.status == .ok {
                 List(0..<6, id: \.self) { _ in HistoryRow(item: HistoryItem(id: "p", title: "오늘 일정 뭐 있어?", started_at: Date().timeIntervalSince1970, duration_s: 240, turns: 6)) }
                     .redacted(reason: .placeholder)
             } else if model.items.isEmpty, let q = model.results.map({ _ in model.query }) {
                 ContentUnavailableView { Text("‘\(q)’에 맞는 기록이 없어요").font(.subheadline).foregroundStyle(Theme.text2) }
-            } else if model.items.isEmpty, model.error != nil, model.offlineSince == nil {
+            } else if model.items.isEmpty, model.status == .unavailable {
+                EmptyState(title: "기록은 서버 업데이트 후 볼 수 있어요", message: "이 기능은 서버 업데이트 후 사용할 수 있어요.")
+            } else if model.items.isEmpty, model.status.isFailed, model.offlineSince == nil {
                 EmptyState(title: "기록을 불러올 수 없어요", message: FriendlyError.describe(model.error!).message,
                            detail: model.error?.localizedDescription, action: ("다시 시도", { Task { await model.refresh() } }))
             } else if model.items.isEmpty {
@@ -212,6 +226,9 @@ struct HistoryList: View {
     @ViewBuilder private var list: some View {
         let sections = HistoryFormat.byDay(model.items)
         let rows = List(selection: selection) {
+            if PersonaModel.shared.personas.count > 1 {
+                PersonaFilterRow(selected: $model.personaFilter).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            }
             if let since = model.offlineSince {
                 OfflineBanner(since: since) { Task { await model.refresh() } }.listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
@@ -358,6 +375,9 @@ struct HistoryDetailView: View {
             Text(item.title ?? "제목 없음").font(.title3.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(3)
             HStack(spacing: Theme.xs) {
                 DirectionGlyph(incoming: item.incoming).font(.footnote)
+                if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id, deleted: item.persona_deleted == true) {
+                    PersonaChip(name: who.name, tint: who.tint)
+                }
                 Text(HistoryFormat.dayTitle(item.start) + " " + HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text2)
                 ForEach(item.routeList, id: \.self) { RouteChip(route: $0) }
             }
@@ -375,14 +395,13 @@ struct HistoryDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.leading, 60)
             }
+            if turn.assistant == nil, turn.interrupted == true { InterruptedMark() }
             if let reply = turn.assistant {
                 VStack(alignment: .leading, spacing: 6) {
                     if let route = turn.route { RouteChip(route: route) }
                     Text(reply + (turn.interrupted == true ? " …" : "")).font(.title3).foregroundStyle(dim ? Theme.text3 : Theme.text)
                         .textSelection(.enabled)
-                    if turn.interrupted == true {
-                        Label("말이 끊겼어요", systemImage: "scissors").font(.footnote).foregroundStyle(Theme.text3)
-                    }
+                    if turn.interrupted == true { InterruptedMark() }
                     if let steps = turn.activity, !steps.isEmpty { trail(i, steps) }
                 }
             }
@@ -551,4 +570,44 @@ struct RecordingPlayerBar: View {
     }
 
     private func clock(_ t: Double) -> String { String(format: "%d:%02d", Int(t) / 60, Int(t) % 60) }
+}
+
+/// Subtle "끊김" mark on an interrupted turn.
+struct InterruptedMark: View {
+    var body: some View {
+        Label("끊김", systemImage: "scissors").font(.footnote).foregroundStyle(Theme.text3)
+            .accessibilityLabel("말이 끊김")
+    }
+}
+
+/// §17.7 filter: "전체" + one chip per existing persona; single select; accent fill when chosen.
+struct PersonaFilterRow: View {
+    @Binding var selected: String?
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.s) {
+                chip("전체", tint: Theme.celadon, on: selected == nil) { selected = nil }
+                ForEach(PersonaModel.shared.ordered) { p in
+                    chip(p.name, tint: p.tint, dot: p.tint, on: selected == p.id) { selected = p.id }
+                }
+            }
+        }
+        .accessibilityLabel("비서별로 보기")
+    }
+
+    private func chip(_ title: String, tint: Color, dot: Color? = nil, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let dot { Circle().fill(on ? Theme.onAccent : dot).frame(width: 8, height: 8) }
+                Text(title).font(.subheadline.weight(on ? .semibold : .regular))
+            }
+            .foregroundStyle(on ? Theme.onAccent : Theme.text)
+            .padding(.horizontal, Theme.m).frame(minHeight: 32)
+            .background(on ? tint : .clear, in: Capsule())
+            .overlay(Capsule().strokeBorder(on ? .clear : Theme.stroke))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(on ? .isSelected : [])
+    }
 }

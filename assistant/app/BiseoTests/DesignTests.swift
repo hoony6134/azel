@@ -13,7 +13,7 @@ final class JarPathTests: XCTestCase {
         // Speaking at full level moves more than idle ever can.
         let idle = (0..<60).map { abs(JarPath.wobble(.idle, θ: 0.3, t: Double($0) / 10, level: 1)) }.max()!
         let speaking = (0..<60).map { abs(JarPath.wobble(.speaking, θ: 0.3, t: Double($0) / 10, level: 1)) }.max()!
-        XCTAssertLessThanOrEqual(idle, 0.008)
+        XCTAssertLessThanOrEqual(idle, 0.028, "§6.3 undulation stays within 0.018 + 0.010")
         XCTAssertGreaterThan(speaking, 0.05)
     }
 
@@ -87,5 +87,36 @@ final class GreetingTests: XCTestCase {
         XCTAssertEqual(greeting(at: at(8)), "좋은 아침이에요")
         XCTAssertEqual(greeting(at: at(14)), "좋은 오후예요")
         XCTAssertEqual(greeting(at: at(21)), "좋은 저녁이에요")
+    }
+}
+
+final class IdleMotionTests: XCTestCase {
+    func testShimmersAre8To12SecondsApartAndNeverOverlap() {
+        var starts: [Double] = []
+        var wasOn = false
+        for i in 0..<(600 * 20) {                 // 10 minutes at 20 Hz
+            let t = 1_000_000 + Double(i) / 20
+            let on = JarPath.shimmer(at: t) != nil
+            if on && !wasOn { starts.append(t) }
+            wasOn = on
+        }
+        XCTAssertGreaterThanOrEqual(starts.count, 49)
+        for (a, b) in zip(starts, starts.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(b - a, 8 - 0.06)
+            XCTAssertLessThanOrEqual(b - a, 12 + 0.06)
+        }
+        XCTAssertNil(JarPath.shimmer(at: starts[0] + JarPath.shimmerLength + 0.05), "1.6 s long")
+    }
+
+    func testBreathAndGlowAreInPhaseAndCalmModeOnlyFades() {
+        XCTAssertEqual(JarPath.breath(4.6 / 4), 1, accuracy: 1e-9)          // full inhale
+        let full = JarPath.idleGlow(4.6 / 4, calm: false)
+        XCTAssertEqual(full.opacity, 0.47, accuracy: 1e-9)
+        XCTAssertEqual(full.radius, 0.34, accuracy: 1e-9)
+        for t in stride(from: 0.0, to: 16, by: 0.5) {
+            let g = JarPath.idleGlow(t, calm: true)
+            XCTAssertTrue((0.35...0.45).contains(g.opacity))
+            XCTAssertEqual(g.radius, 0.30)
+        }
     }
 }

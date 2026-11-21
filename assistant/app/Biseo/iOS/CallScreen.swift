@@ -11,8 +11,12 @@ struct CallScreen: View {
     @State private var askRecord = false
     @AppStorage("recordingNoticeShown") private var recordingNoticeShown = false
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
+    @AppStorage("noiseMode") private var noiseMode = "normal"
 
-    private var jarState: JarState { JarState(callState: call.state, inCall: call.inCall, held: call.held) }
+    /// The persona's glaze (§17.6); incoming calls come from the primary.
+    private var tint: Color { (call.activePersona ?? PersonaModel.shared.primary)?.glaze ?? Theme.glazeCeladon }
+
+    private var jarState: JarState { JarState(callState: call.displayState, inCall: call.inCall, held: call.held) }
 
     var body: some View {
         withFeedback
@@ -46,7 +50,7 @@ struct CallScreen: View {
 
     private var screen: some View {
         ZStack {
-            GlazeBackground(state: jarState)
+            GlazeBackground(state: jarState, tint: tint)
             VStack(spacing: Theme.l) {
                 topBar
                 if let banner {
@@ -58,7 +62,7 @@ struct CallScreen: View {
                 Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     .contentTransition(.opacity).animation(Theme.state, value: jarState)
                 GeometryReader { geo in
-                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: geo.size.width, height: geo.size.height)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt, tint: tint).frame(width: geo.size.width, height: geo.size.height)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
@@ -66,6 +70,9 @@ struct CallScreen: View {
                 }
                 .frame(maxHeight: typeSize >= .accessibility1 ? 140 : .infinity)
                 if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                if noiseMode == "noisy" && jarState == .speaking {
+                    Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
+                }
                 captions
                 dock
                 hangUp
@@ -86,7 +93,10 @@ struct CallScreen: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+            HStack(spacing: 6) {
+                if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { Circle().fill(p.tint).frame(width: 8, height: 8) }
+                Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+            }
             Group {
                 if let r = call.log.lastRoute { RouteChip(route: r) }
             }
@@ -102,7 +112,21 @@ struct CallScreen: View {
                 VStack(spacing: Theme.m) {
                     ForEach(Array(call.lines.enumerated()), id: \.element.id) { i, line in
                         let recent = i >= call.lines.count - 2
-                        Text(line.text + (line.interrupted ? " …" : ""))
+                        Group {
+                            if !line.mine && i == call.lines.count - 1 {
+                                // The paragraph being spoken: bright as it is heard, dimmed ahead.
+                                TimelineView(.animation(minimumInterval: 1 / 20, paused: !call.playing)) { _ in
+                                    let k = call.karaoke(stepped: reduceMotion)
+                                    if k.texts.joined(separator: " ") == line.text {
+                                        KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
+                                    } else {
+                                        Text(line.text + (line.interrupted ? " …" : ""))
+                                    }
+                                }
+                            } else {
+                                Text(line.text + (line.interrupted ? " …" : ""))
+                            }
+                        }
                             .font(line.mine ? .body : .title2.weight(.medium))
                             .lineSpacing(line.mine ? 4 : 6)
                             .foregroundStyle(line.mine ? Theme.text2 : (recent && !line.interrupted ? Theme.text : Theme.text3))

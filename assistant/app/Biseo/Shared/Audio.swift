@@ -40,6 +40,19 @@ enum PCM {
 }
 
 extension PCM {
+    /// Channel 0 of a multichannel mic buffer as a mono buffer. Mac mics come as 3 channels (9 with
+    /// voice processing, where channel 0 is the echo-cancelled voice), and AVAudioConverter's
+    /// downmix of those layouts produced pure silence (user bug, 2026-11-21).
+    static func firstChannel(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard buffer.format.channelCount > 1 else { return buffer }
+        guard let src = buffer.floatChannelData,
+              let format = AVAudioFormat(standardFormatWithSampleRate: buffer.format.sampleRate, channels: 1),
+              let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: buffer.frameLength) else { return nil }
+        out.frameLength = buffer.frameLength
+        out.floatChannelData![0].update(from: src[0], count: Int(buffer.frameLength))
+        return out
+    }
+
     /// PCM16 little-endian bytes → Float samples in -1…1 (trailing odd byte dropped).
     static func samples(fromPCM16 data: Data) -> [Float] {
         data.withUnsafeBytes { raw in
@@ -52,6 +65,8 @@ extension PCM {
 /// every frame by the jar's Canvas; deliberately not @Published.
 final class Levels: @unchecked Sendable {
     static let silent = Levels()
+
+    init(mic: Float = 0, out: Float = 0) { _mic = mic; _out = out }
     private let lock = NSLock()
     private var _mic: Float = 0, _out: Float = 0, _loudAt: Double = -.infinity
     var mic: Float { lock.lock(); defer { lock.unlock() }; return _mic }
@@ -98,6 +113,8 @@ final class AudioIO {
     private lazy var cueBuffers: [Cue: AVAudioPCMBuffer] = Dictionary(uniqueKeysWithValues: Cue.allCases.map { ($0, Earcon.buffer($0)) })
     private let speechLock = NSLock()
     private var speechEnd = 0.0      // monotonic time the queued speech runs out
+    private var scheduledSamples = 0 // reply samples scheduled since the last flush (24 kHz)
+    private var pausedAt: Double?    // playback paused: the clock stands still
     let levels = Levels()
     var onMic: ((Data) -> Void)?
     #if os(macOS)
@@ -116,13 +133,14 @@ final class AudioIO {
     func playCue(_ cue: Cue) {
         guard engine.isRunning, let buf = cueBuffers[cue] else { return }
         cuePlayer.volume = speechPlaying ? 0.4 : 1
-        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick ? [] : .interrupts)
+        cuePlayer.scheduleBuffer(buf, at: nil, options: cue == .tick || cue == .pulse ? [] : .interrupts) // a pulse never cuts another cue
         if !cuePlayer.isPlaying { cuePlayer.play() }
     }
 
-    private var speechPlaying: Bool {
+    /// Reply audio is still queued or playing.
+    var speechPlaying: Bool {
         speechLock.lock(); defer { speechLock.unlock() }
-        return ProcessInfo.processInfo.systemUptime < speechEnd
+        return (pausedAt ?? ProcessInfo.processInfo.systemUptime) < speechEnd
     }
 
     /// iOS: call after CallKit activated the audio session.
@@ -133,13 +151,23 @@ final class AudioIO {
         if let id = inputDevice { try? input.auAudioUnit.setDeviceID(id) }
         if let id = outputDevice { try? engine.outputNode.auAudioUnit.setDeviceID(id) }
         #endif
-        try? input.setVoiceProcessingEnabled(true) // echo cancellation on top of .voiceChat
+        // Voice processing = echo cancellation + noise suppression; AGC explicitly on, never bypassed.
+        try? input.setVoiceProcessingEnabled(true)
+        input.isVoiceProcessingBypassed = false
+        input.isVoiceProcessingAGCEnabled = true
+        // Duck other apps' audio as little as possible during the call (user bug, 2026-11-21).
+        input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
         let format = input.outputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: format, to: PCM.micFormat) else { throw AVError(.unknown) }
-        converter.downmix = true
+        guard format.channelCount > 0, format.sampleRate > 0,
+              let mono = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),
+              let converter = AVAudioConverter(from: format.channelCount == 1 ? format : mono, to: PCM.micFormat) else {
+            Log.call.error("mic format unusable: \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz")
+            throw AVError(.unknown)
+        }
+        Log.call.info("mic \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz, voice processing \(input.isVoiceProcessingEnabled, privacy: .public), agc \(input.isVoiceProcessingAGCEnabled, privacy: .public)")
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.levels.update(mic: buffer)
-            if let data = PCM.pcm16Data(from: buffer, converter: converter) { self?.onMic?(data) }
+            if let one = PCM.firstChannel(buffer), let data = PCM.pcm16Data(from: one, converter: converter) { self?.onMic?(data) }
         }
         let mixer = engine.mainMixerNode
         mixer.installTap(onBus: 0, bufferSize: 1024, format: mixer.outputFormat(forBus: 0)) { [weak self] buffer, _ in
@@ -159,27 +187,57 @@ final class AudioIO {
         guard engine.isRunning, let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
         player.scheduleBuffer(buf)
         let now = ProcessInfo.processInfo.systemUptime
-        speechLock.lock(); speechEnd = max(speechEnd, now) + Double(buf.frameLength) / buf.format.sampleRate; speechLock.unlock()
+        speechLock.lock()
+        speechEnd = max(speechEnd, pausedAt ?? now) + Double(buf.frameLength) / buf.format.sampleRate
+        scheduledSamples += Int(buf.frameLength)
+        speechLock.unlock()
     }
 
     /// `interrupt`: stop() drops every scheduled buffer; play() makes the node ready for the next reply.
     func flush() {
         player.stop()
         cuePlayer.stop() // interrupt silences cues too
-        speechLock.lock(); speechEnd = 0; speechLock.unlock()
+        speechLock.lock(); speechEnd = 0; scheduledSamples = 0; if pausedAt != nil { pausedAt = ProcessInfo.processInfo.systemUptime }; speechLock.unlock()
         if engine.isRunning { player.play() }
     }
 
     /// Hold: playback pauses where it is (queued replies wait); resume() continues them.
-    func pause() { player.pause() }
-    func resume() { if engine.isRunning { player.play() } }
+    func pause() {
+        player.pause()
+        speechLock.lock(); if pausedAt == nil { pausedAt = ProcessInfo.processInfo.systemUptime }; speechLock.unlock()
+    }
+
+    func resume() {
+        if engine.isRunning { player.play() }
+        speechLock.lock()
+        if let p = pausedAt { speechEnd += ProcessInfo.processInfo.systemUptime - p; pausedAt = nil }
+        speechLock.unlock()
+    }
+
+    /// Reply samples actually heard since the last flush: scheduled minus what is still queued.
+    /// Stands still while paused; gaps between replies don't count.
+    var playedSamples: Int {
+        speechLock.lock(); defer { speechLock.unlock() }
+        return Self.played(scheduled: scheduledSamples, speechEnd: speechEnd, now: pausedAt ?? ProcessInfo.processInfo.systemUptime, rate: 24_000)
+    }
+
+    static func played(scheduled: Int, speechEnd: Double, now: Double, rate: Double) -> Int {
+        max(0, scheduled - Int((max(0, speechEnd - now) * rate).rounded()))
+    }
+
+    /// True while the engine (and so the mic and voice processing) is running.
+    var isRunning: Bool { engine.isRunning }
+    var voiceProcessingOn: Bool { engine.inputNode.isVoiceProcessingEnabled }
 
     func stop() {
         player.stop()
         cuePlayer.stop()
+        speechLock.lock(); speechEnd = 0; scheduledSamples = 0; pausedAt = nil; speechLock.unlock()
         engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()
+        // Voice processing left on keeps ducking other audio after the call; it only runs in calls.
+        if engine.inputNode.isVoiceProcessingEnabled { try? engine.inputNode.setVoiceProcessingEnabled(false) }
         levels.reset()
     }
 }

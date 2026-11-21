@@ -362,7 +362,7 @@ device that created them.
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
   `{"id" (slug a-z0-9_-),"name" (1–12 Hangul/Latin/space, unique),"voice" (a TTS speaker),"voice_style"
-  (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb", orb tint),
+  (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb" or a tint name celadon|indigo|amber|azalea|sprout|sky|plum|ash; default celadon),
   "default_model" (null|haiku|sonnet|opus|nim),"user_title" (same rules as the setting; `""` = use the shared
   `user_title`; null on create or edit → `""`),"share_memory" (bool, default false),"created_at","primary",
   "deleted_at"}`. Stored in the shared settings as `personas`; settings without it migrate to one persona

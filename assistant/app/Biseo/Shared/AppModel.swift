@@ -7,6 +7,7 @@ final class AppModel: ObservableObject {
     @Published var status: ServerStatus?
     @Published var statusError: Error?
     @Published var approvals: [[String: Any]] = []
+    @Published private(set) var approvalsStatus: SectionStatus = .ok
     @Published var session: String
     let sessionPrefix: String
     private var timer: Timer?
@@ -26,9 +27,21 @@ final class AppModel: ObservableObject {
     func refresh() async {
         session = Session.current(sessionPrefix)
         guard configured else { return }
-        do { status = try await Gateway.get("/v1/status"); statusError = nil } catch { status = nil; statusError = error }
-        if let s: AppSettings = try? await Gateway.get("/v1/settings"), let name = s.assistant_name { AssistantName.current = name }
-        if let items = try? await Gateway.approvals() { approvals = items }
+        // Independent and parallel; a cancelled refresh changes nothing, other failures keep the old data.
+        async let statusResult = attempt { try await Gateway.get("/v1/status") as ServerStatus }
+        async let settingsResult = attempt { try await Gateway.get("/v1/settings") as AppSettings }
+        async let approvalsResult = attempt { try await Gateway.send("GET", "/v1/approvals") }
+        switch await statusResult {
+        case .success(let s): status = s; statusError = nil
+        case .failure(let e): if SectionStatus.from(e) != nil { statusError = e }
+        }
+        if case .success(let s) = await settingsResult, let name = s.assistant_name { AssistantName.current = name }
+        switch await approvalsResult {
+        case .success(let data):
+            if let items = try? Gateway.parseApprovals(data) { approvals = items }
+            approvalsStatus = .ok
+        case .failure(let e): approvalsStatus = SectionStatus.from(e) ?? approvalsStatus
+        }
     }
 
     func newConversation() { session = Session.rotate(sessionPrefix) }

@@ -91,3 +91,69 @@ final class EarconTests: XCTestCase {
         XCTAssertEqual(JarPath.workBoost(now: t0.addingTimeInterval(0.5), surge: nil, pulse: t0).glow, 0)
     }
 }
+
+final class ThinkingCueTests: XCTestCase {
+    func testAckThenPulsesUntilReplyAudio() {
+        var t = ThinkingCues()
+        XCTAssertEqual(t.event("state", value: "thinking", now: 0), .ack)
+        XCTAssertNil(t.event("state", value: "thinking", now: 0.5), "one ack per wait")
+        XCTAssertNil(t.tick(now: 2.9), "no pulse in the first 3 s")
+        XCTAssertEqual(t.tick(now: 3.0), .pulse)
+        XCTAssertNil(t.tick(now: 4.5))
+        XCTAssertEqual(t.tick(now: 6.0), .pulse, "every 3 s")
+        t.audioArrived()
+        XCTAssertNil(t.tick(now: 9.0), "the first reply audio stops it")
+        XCTAssertFalse(t.active)
+    }
+
+    func testErrorsAndInterruptsStopThePulse() {
+        for end in ["interrupt", "error", "turn_done"] {
+            var t = ThinkingCues()
+            _ = t.event("state", value: "thinking", now: 0)
+            _ = t.event(end, value: nil, now: 1)
+            XCTAssertNil(t.tick(now: 10), end)
+        }
+        var t = ThinkingCues()
+        _ = t.event("state", value: "thinking", now: 0)
+        _ = t.event("state", value: "speaking", now: 1)
+        XCTAssertNil(t.tick(now: 10))
+    }
+
+    func testPulseNeverOverTheUserAndUnderTheToggle() {
+        var gate = EarconGate()
+        XCTAssertEqual(gate.decide(.pulse, now: 10, listening: true, userLoudAt: 9.9), .drop)
+        XCTAssertEqual(gate.decide(.pulse, now: 10, listening: false, userLoudAt: 0), .play)
+        XCTAssertEqual(gate.decide(.ack, now: 10, listening: true, userLoudAt: 9.9), .wait)
+        XCTAssertEqual(gate.decide(.ack, now: 10, listening: false, userLoudAt: 0, enabled: false), .drop)
+        for cue in [Cue.ack, .pulse] {
+            let s = Earcon.render(cue)
+            XCTAssertEqual(20 * log10(Double(s.map(abs).max()!)), Earcon.spec(cue).peakDB, accuracy: 0.5)
+        }
+    }
+}
+
+final class PulseScheduleTests: XCTestCase {
+    func testPulseSlowsAfterThirtySecondsAndRestartsPerThinking() {
+        var t = ThinkingCues()
+        _ = t.event("state", value: "thinking", now: 0)
+        var pulses: [Double] = []
+        for i in 0...450 { let now = Double(i) / 10; if t.tick(now: now) == .pulse { pulses.append(now) } }
+        XCTAssertEqual(pulses.first, 3)
+        let early = zip(pulses, pulses.dropFirst()).filter { $0.1 <= 30 }.map { $1 - $0 }
+        let late = zip(pulses, pulses.dropFirst()).filter { $0.1 > 30 }.map { $1 - $0 }
+        XCTAssertTrue(early.allSatisfy { abs($0 - 3) < 0.11 }, "every 3 s at first")
+        XCTAssertTrue(!late.isEmpty && late.allSatisfy { abs($0 - 6) < 0.11 }, "every 6 s after 30 s")
+        _ = t.event("state", value: "speaking", now: 46)
+        XCTAssertEqual(t.event("state", value: "thinking", now: 50), .ack)
+        XCTAssertNil(t.tick(now: 52.9), "the clock restarts on each new thinking")
+        XCTAssertEqual(t.tick(now: 53), .pulse)
+    }
+
+    func testPulseSkippedRightAfterAnotherCue() {
+        var gate = EarconGate()
+        XCTAssertEqual(gate.decide(.working, now: 10, listening: false, userLoudAt: 0), .play)
+        XCTAssertEqual(gate.decide(.pulse, now: 11, listening: false, userLoudAt: 0), .drop, "within 1.5 s of working")
+        XCTAssertEqual(gate.decide(.pulse, now: 11.6, listening: false, userLoudAt: 0), .play)
+        XCTAssertEqual(gate.decide(.pulse, now: 12, listening: false, userLoudAt: 0), .play, "a pulse doesn't silence the next pulse")
+    }
+}

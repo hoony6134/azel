@@ -57,25 +57,29 @@ struct SetupFlow: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.l) {
                 Text("연결").font(.title.weight(.semibold)).foregroundStyle(Theme.text).padding(.top, Theme.xl)
-                Card("서버 주소") {
-                    field("음성 서버", $voice)
-                    field("게이트웨이", $gateway)
+                Card("토큰") {
+                    HStack {
+                        SecureField(Config.token == nil ? "토큰" : "저장됨 (바꿀 때만 입력)", text: $token)
+                            .textFieldStyle(.roundedBorder)
+                            .onChange(of: token) { let clean = Config.cleanToken(token); if clean != token { token = clean } }
+                        Button("붙여넣기") { if let s = SetupFlow.pasteboardString() { token = Config.cleanToken(s) } }
+                            .buttonStyle(.bordered).tint(Theme.celadon)
+                    }
+                    Text("키체인에만 저장돼요").font(.footnote).foregroundStyle(Theme.text3)
+                }
+                Card("서버") {
+                    Text(voice == Config.publicVoiceURL && gateway == Config.publicGatewayURL ? "azel.scian.xyz (기본)" : "\(voice)\n\(gateway)")
+                        .font(.footnote.monospaced()).foregroundStyle(Theme.text2)
                     DisclosureGroup("고급") {
                         VStack(alignment: .leading, spacing: Theme.s) {
-                            #if os(macOS)
-                            Button("Tailnet 주소 사용") { voice = Config.tailnetVoiceURL; gateway = Config.tailnetGatewayURL }
-                            #endif
+                            field("음성 서버", $voice)
+                            field("게이트웨이", $gateway)
                             Button("공개 주소 사용") { voice = Config.publicVoiceURL; gateway = Config.publicGatewayURL }
                         }
                         .padding(.top, Theme.s)
                     }
                     .tint(Theme.celadon)
                     Text(Config.addressNote).font(.footnote).foregroundStyle(Theme.text3)
-                }
-                Card("토큰") {
-                    SecureField(Config.token == nil ? "토큰" : "저장됨 (바꿀 때만 입력)", text: $token)
-                        .textFieldStyle(.roundedBorder)
-                    Text("키체인에만 저장돼요").font(.footnote).foregroundStyle(Theme.text3)
                 }
                 if !checks.isEmpty {
                     Card("연결 확인") {
@@ -129,9 +133,14 @@ struct SetupFlow: View {
     private func check() async {
         checking = true
         defer { checking = false }
-        Config.voiceURL = voice.trimmingCharacters(in: .whitespaces)
-        Config.gatewayURL = gateway.trimmingCharacters(in: .whitespaces)
-        if !token.isEmpty { Config.token = token.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let v = voice.trimmingCharacters(in: .whitespaces), g = gateway.trimmingCharacters(in: .whitespaces)
+        guard Config.isTLS(v), Config.isTLS(g) else {
+            checks = [Check(id: "서버 주소", ok: false, reason: "wss://, https:// 주소만 쓸 수 있어요")]
+            return
+        }
+        Config.voiceURL = v
+        Config.gatewayURL = g
+        if !token.isEmpty { Config.token = Config.cleanToken(token) }
         token = ""
         #if os(iOS)
         CallManager.shared.registerPush()
@@ -139,7 +148,7 @@ struct SetupFlow: View {
         do {
             let s: ServerStatus = try await Gateway.get("/v1/status")
             checks = [Check(id: "게이트웨이", ok: true, reason: nil), Check(id: "토큰", ok: true, reason: nil),
-                      Check(id: "스파크", ok: s.spark.ok, reason: s.spark.ok ? nil : "음성 서버가 응답하지 않아요")]
+                      Check(id: "spark", ok: s.spark.ok, reason: s.spark.ok ? nil : "음성 서버가 응답하지 않아요")]
         } catch GatewayError.http(let code) where code == 401 || code == 403 {
             checks = [Check(id: "게이트웨이", ok: true, reason: nil), Check(id: "토큰", ok: false, reason: "토큰이 맞지 않아요")]
         } catch {
@@ -164,6 +173,14 @@ struct SetupFlow: View {
         .padding(.bottom, Theme.l)
     }
 
+    static func pasteboardString() -> String? {
+        #if os(iOS)
+        UIPasteboard.general.string
+        #else
+        NSPasteboard.general.string(forType: .string)
+        #endif
+    }
+
     static var micAuthorized: Bool {
         #if os(iOS)
         AVAudioApplication.shared.recordPermission == .granted
@@ -183,10 +200,9 @@ struct SetupFlow: View {
 
 // MARK: - Settings (DESIGN §7.5): usage + status + settings as cards, auto-saved
 
-private let models = [("qwen", "로컬 Qwen"), ("haiku", "Haiku"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("auto", "자동")]
+private let models = [("qwen", "로컬 Qwen"), ("haiku", "Haiku"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("nim", "NIM"), ("auto", "자동")]
 private let paths = [("api", "API"), ("claude_code", "Claude Code"), ("auto", "자동")]
-private let tasks = [("chat", "잡담"), ("schedule", "일정"), ("code", "코드"), ("mac", "맥북 작업")]
-private let triggerNames = ["deadline": "마감 임박", "server_down": "서버 장애"]
+private let tasks = [("chat", "잡담"), ("schedule", "일정"), ("code", "코드"), ("mac", "macbook 작업")]
 
 struct SettingsScreen<Extra: View>: View {
     @ObservedObject var model: AppModel
@@ -196,15 +212,23 @@ struct SettingsScreen<Extra: View>: View {
     @State private var loaded: AppSettings?
     @State private var usage: [String: Any] = [:]
     @State private var loadError: Error?
+    @State private var usageStatus: SectionStatus = .ok
+    /// Server's default personality text (read-only, never sent back), shown as the placeholder.
+    @State private var personalityDefault: String?
     @State private var saveState: SaveState = .idle
     @State private var saveTask: Task<Void, Never>?
     @State private var showSetup = false
     @State private var showRecordings = false
     @State private var showPaths = false
     @State private var pendingDays: Int?
+    @State private var showProactiveLog = false
+    @ObservedObject private var personas = PersonaModel.shared
+    @State private var showConnectors = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
+    /// Cached so the call screen can show the tap-to-interrupt hint without a fetch.
+    @AppStorage("noiseMode") private var noiseMode = "normal"
 
     enum SaveState: Equatable { case idle, saving, saved, failed(String) }
 
@@ -216,6 +240,32 @@ struct SettingsScreen<Extra: View>: View {
                     EmptyState(title: f.title, message: f.message, detail: loadError.localizedDescription, action: ("다시 시도", { Task { await load() } }))
                 }
                 if let s = Binding($settings) { assistantCard(s) }
+                // The wake listener runs only on the Mac, so enrollment lives there.
+                #if os(macOS)
+                Card("호출어") { WakeEnrollRow() }
+                #else
+                Card("호출어") { Text("호출어는 Mac에서 등록해요").foregroundStyle(Theme.text2) }
+                #endif
+                Card("커넥터") {
+                    Button { showConnectors = true } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Claude가 쓸 커넥터").foregroundStyle(Theme.text)
+                                Text("적을수록 답이 빨라요").font(.footnote).foregroundStyle(Theme.text3)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(isPresented: $showConnectors) {
+                        NavigationStack { ConnectorsView() }
+                            #if os(macOS)
+                            .frame(width: 560, height: 640)
+                            #endif
+                    }
+                }
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
@@ -257,7 +307,39 @@ struct SettingsScreen<Extra: View>: View {
     }
 
     // 비서 (DESIGN §7.5 card 1)
-    private func assistantCard(_ s: Binding<AppSettings>) -> some View {
+    /// §17.4: with personas, the top card lists them (names and personalities are edited per
+    /// persona); an older gateway without /v1/personas keeps the single name and 성격 fields.
+    @ViewBuilder private func assistantCard(_ s: Binding<AppSettings>) -> some View {
+        if personas.status == .unavailable || personas.personas.isEmpty {
+            legacyAssistantCard(s)
+        } else {
+            PersonaListCard(model: personas)
+        }
+        Card("대화") {
+            row("답변 길이") {
+                Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
+                                                   set: { s.wrappedValue.reply_length = $0 })) {
+                    Text("간결").tag("brief"); Text("보통").tag("normal"); Text("자세히").tag("detailed")
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 220)
+            }
+            Toggle("시끄러운 곳 모드", isOn: Binding(get: { s.wrappedValue.noise_mode == "noisy" },
+                                                 set: { s.wrappedValue.noise_mode = $0 ? "noisy" : "normal"; noiseMode = $0 ? "noisy" : "normal" }))
+                .tint(Theme.celadon).foregroundStyle(Theme.text)
+            if s.wrappedValue.noise_mode == "noisy" {
+                Text("주변 소리에 말이 끊기지 않게 해요. 말을 끊으려면 통화 중에 구를 눌러 주세요.").font(.footnote).foregroundStyle(Theme.text3)
+            }
+        }
+        Card("소리") {
+            HStack {
+                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
+                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
+            }
+            .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
+        }
+    }
+
+    private func legacyAssistantCard(_ s: Binding<AppSettings>) -> some View {
         Card("비서") {
             HStack {
                 Text("이름").foregroundStyle(Theme.text)
@@ -270,12 +352,30 @@ struct SettingsScreen<Extra: View>: View {
                     .accessibilityHint("호출어는 바뀌지 않습니다")
             }
             if let nameError { Text(nameError).font(.footnote).foregroundStyle(Theme.danger) }
-            Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
-            HStack {
-                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
-                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
+            VStack(alignment: .leading, spacing: Theme.xs) {
+                HStack {
+                    Text("성격").foregroundStyle(Theme.text)
+                    Spacer()
+                    Text("\((s.wrappedValue.personality ?? "").count)/\(AssistantName.personalityLimit)")
+                        .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
+                }
+                TextField(personalityDefault ?? "기본 성격", text: Binding(
+                    get: { s.wrappedValue.personality ?? "" },
+                    set: { s.wrappedValue.personality = String($0.prefix(AssistantName.personalityLimit)) }), axis: .vertical)
+                    .lineLimit(3...8)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { s.wrappedValue.personality = AssistantName.personality(s.wrappedValue.personality ?? "") }
+                    .accessibilityLabel("성격")
+                HStack {
+                    Text("\(AssistantName.josa(AssistantName.current, "이", "가")) 말하는 성격이에요. 진지한 일에는 장난치지 않아요.")
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                    Spacer()
+                    Button("기본값으로 되돌리기") { s.wrappedValue.personality = "" }
+                        .font(.footnote).buttonStyle(.borderless).tint(Theme.celadon)
+                        .disabled((s.wrappedValue.personality ?? "").isEmpty)
+                }
             }
-                .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
+            Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
         }
     }
 
@@ -316,6 +416,7 @@ struct SettingsScreen<Extra: View>: View {
                 .accessibilityLabel("이번 달 사용량")
                 .accessibilityValue("\(Int(budget))달러 중 \(Int(cost))달러, \(Int(frac * 100))퍼센트")
             }
+            SectionNote(status: usageStatus) { Task { await load() } }
             breakdown(usage["by_model"])
             if usage["by_path"] is [String: Any] {
                 DisclosureGroup("경로별 보기", isExpanded: $showPaths) { breakdown(usage["by_path"]) }
@@ -360,9 +461,9 @@ struct SettingsScreen<Extra: View>: View {
     private var statusCard: some View {
         Card("상태", trailing: AnyView(Button("새로고침") { Task { await model.refresh() } }.font(.subheadline).tint(Theme.celadon))) {
             if let s = model.status {
-                statusRow("스파크", s.spark.ok, s.spark.ms)
+                statusRow("spark", s.spark.ok, s.spark.ms)
                 statusRow("게이트웨이", s.gateway.ok, s.gateway.ms)
-                ForEach(s.devices, id: \.name) { statusRow($0.name, $0.ok, $0.ms) }
+                ForEach(s.devices, id: \.name) { statusRow(DeviceID.normalize($0.name), $0.ok, $0.ms) }
             } else if let e = model.statusError {
                 Text(FriendlyError.describe(e).title).foregroundStyle(Theme.danger)
             } else {
@@ -402,6 +503,13 @@ struct SettingsScreen<Extra: View>: View {
             }
             row("기본 모델") { picker(models, s.default_model) }
             row("Claude 경로") { picker(paths, s.claude_path) }
+            Divider()
+            NIMRow(nim: Binding(get: { s.wrappedValue.providers?.nim ?? .init() },
+                                set: { n in
+                                    var p = s.wrappedValue.providers ?? .init()
+                                    p.nim = n
+                                    s.wrappedValue.providers = p
+                                }))
         }
     }
 
@@ -431,26 +539,75 @@ struct SettingsScreen<Extra: View>: View {
         }
     }
 
+    /// §7.5 먼저 전화하기 (new shape): master switch, briefing, deadline check, server alerts,
+    /// autonomous calls with limits, and the decision log. No quiet hours.
     private func proactiveCard(_ s: Binding<AppSettings>) -> some View {
-        Card("먼저 전화하기") {
-            row("아침 브리핑") { DatePicker("", selection: time(s.proactive.morning_briefing), displayedComponents: .hourAndMinute).labelsHidden() }
-            row("방해 금지") {
-                HStack(spacing: Theme.xs) {
-                    DatePicker("시작", selection: time(quiet(s, 0)), displayedComponents: .hourAndMinute).labelsHidden()
-                    Text("–").foregroundStyle(Theme.text2)
-                    DatePicker("끝", selection: time(quiet(s, 1)), displayedComponents: .hourAndMinute).labelsHidden()
+        let p = s.proactive
+        return Card("먼저 전화하기") {
+            Toggle("먼저 전화하기", isOn: p.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
+            if p.wrappedValue.enabled {
+                timedRow("아침 브리핑", p.morning_briefing)
+                timedRow("마감 확인", p.deadline_check)
+                Toggle("서버 장애 알림", isOn: p.server_alerts).tint(Theme.celadon).foregroundStyle(Theme.text)
+                Toggle("스스로 판단해서 전화", isOn: p.autonomous.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
+                if p.wrappedValue.autonomous.enabled {
+                    VStack(alignment: .leading, spacing: Theme.s) {
+                        Stepper("하루 최대 \(p.wrappedValue.autonomous.max_per_day)번", value: p.autonomous.max_per_day, in: 1...10)
+                        Stepper("최소 간격 \(gapLabel(p.wrappedValue.autonomous.min_gap_minutes))", value: p.autonomous.min_gap_minutes, in: 30...720, step: 30)
+                        row("허용 시간") {
+                            HStack(spacing: Theme.xs) {
+                                DatePicker("시작", selection: time(window(p, 0)), displayedComponents: .hourAndMinute).labelsHidden()
+                                Text("–").foregroundStyle(Theme.text2)
+                                DatePicker("끝", selection: time(window(p, 1)), displayedComponents: .hourAndMinute).labelsHidden()
+                            }
+                        }
+                    }
+                    .foregroundStyle(Theme.text)
+                    .padding(.leading, Theme.l)
                 }
             }
-            ForEach(s.wrappedValue.proactive.triggers.keys.sorted(), id: \.self) { key in
-                Toggle(triggerNames[key] ?? key, isOn: Binding(get: { s.wrappedValue.proactive.triggers[key] ?? false },
-                                                                set: { s.wrappedValue.proactive.triggers[key] = $0 }))
-                    .tint(Theme.celadon).foregroundStyle(Theme.text)
+            Button { showProactiveLog = true } label: {
+                HStack {
+                    Text("왜 전화했는지 보기").foregroundStyle(Theme.text)
+                    Spacer()
+                    Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+        }
+        .sheet(isPresented: $showProactiveLog) {
+            NavigationStack { ProactiveLogView() }
+                #if os(macOS)
+                .frame(width: 520, height: 560)
+                #endif
         }
     }
 
+    private func timedRow(_ title: String, _ t: Binding<AppSettings.Proactive.Timed>) -> some View {
+        HStack {
+            Toggle(title, isOn: t.enabled).tint(Theme.celadon).foregroundStyle(Theme.text).fixedSize()
+            Spacer()
+            DatePicker(title, selection: time(t.time), displayedComponents: .hourAndMinute).labelsHidden()
+                .disabled(!t.wrappedValue.enabled)
+        }
+    }
+
+    private func gapLabel(_ minutes: Int) -> String {
+        minutes % 60 == 0 ? "\(minutes / 60)시간" : "\(minutes / 60)시간 \(minutes % 60)분"
+    }
+
+    private func window(_ p: Binding<AppSettings.Proactive>, _ i: Int) -> Binding<String> {
+        Binding(get: { let w = p.wrappedValue.autonomous.window; return i < w.count ? w[i] : (i == 0 ? "08:00" : "23:00") },
+                set: { var w = p.wrappedValue.autonomous.window
+                       while w.count < 2 { w.append(w.isEmpty ? "08:00" : "23:00") }
+                       w[i] = $0
+                       p.wrappedValue.autonomous.window = w })
+    }
+
     private func deviceCard(_ s: Binding<AppSettings>) -> some View {
-        let known = (model.status?.devices.map(\.name) ?? []) + [s.wrappedValue.default_device] + s.wrappedValue.device_fallback
+        let known = (model.status?.devices.map { DeviceID.normalize($0.name) } ?? []) + DeviceID.known
+            + [s.wrappedValue.default_device] + s.wrappedValue.device_fallback
         let names = known.reduce(into: [String]()) { if !$0.contains($1) && !$1.isEmpty { $0.append($1) } }
         return Card("기기") {
             row("기본 기기") { picker(names.map { ($0, $0) }, s.default_device) }
@@ -532,14 +689,6 @@ struct SettingsScreen<Extra: View>: View {
             .pickerStyle(.menu).labelsHidden().tint(Theme.celadon).fixedSize()
     }
 
-    private func quiet(_ s: Binding<AppSettings>, _ i: Int) -> Binding<String> {
-        Binding(get: { let q = s.wrappedValue.proactive.quiet_hours; return i < q.count ? q[i] : "00:00" },
-                set: { var q = s.wrappedValue.proactive.quiet_hours
-                       while q.count < 2 { q.append("00:00") }
-                       q[i] = $0
-                       s.wrappedValue.proactive.quiet_hours = q })
-    }
-
     /// "HH:mm" string ⇄ Date for DatePicker.
     private func time(_ s: Binding<String>) -> Binding<Date> {
         let f = DateFormatter()
@@ -548,16 +697,32 @@ struct SettingsScreen<Extra: View>: View {
         return Binding(get: { f.date(from: s.wrappedValue) ?? Date() }, set: { s.wrappedValue = f.string(from: $0) })
     }
 
+    /// Settings, usage and the shared status load in parallel and independently; the old values
+    /// stay on screen until new ones arrive, and a cancelled pull-to-refresh changes nothing.
     private func load() async {
-        do {
-            let s: AppSettings = try await Gateway.get("/v1/settings")
+        async let settingsResult = attempt { try await Gateway.send("GET", "/v1/settings") }
+        async let usageResult = attempt { try await Gateway.send("GET", "/v1/usage") }
+        async let refreshed: Void = model.refresh()
+        switch await settingsResult {
+        case .success(let data):
+            guard let raw = try? JSONDecoder().decode(AppSettings.self, from: data) else { loadError = URLError(.cannotParseResponse); break }
+            personalityDefault = PersonalityDefault.read(data) ?? personalityDefault
+            // Device names migrate to their ids for display; nothing is saved until the user edits.
+            let s = DeviceID.normalize(raw)
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
+            noiseMode = s.noise_mode ?? "normal"
             loadError = nil
-        } catch { loadError = error }
-        usage = (try? await Gateway.getJSON("/v1/usage") as? [String: Any]) ?? usage
-        await model.refresh()
+        case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }
+        }
+        switch await usageResult {
+        case .success(let data):
+            usage = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? usage
+            usageStatus = .ok
+        case .failure(let e): usageStatus = SectionStatus.from(e) ?? usageStatus
+        }
+        await refreshed
     }
 
     /// Debounced auto-save: 600 ms after the last change (§7.5).
@@ -627,7 +792,8 @@ struct ApprovalsScreen: View {
         ScrollView {
             LazyVStack(spacing: Theme.l) {
                 if let error { Text(error).font(.footnote).foregroundStyle(Theme.danger) }
-                if model.approvals.isEmpty {
+                SectionNote(status: model.approvalsStatus) { Task { await model.refresh() } }
+                if model.approvals.isEmpty && model.approvalsStatus == .ok {
                     EmptyState(title: "모두 처리했어요", message: "승인이 필요하면 알려 드릴게요.")
                 }
                 ForEach(model.approvals.indices, id: \.self) { i in card(model.approvals[i]) }
@@ -759,5 +925,58 @@ extension View {
         #else
         self
         #endif
+    }
+}
+
+/// NVIDIA NIM provider: enable, model (server list or free text), and a write-only API key.
+struct NIMRow: View {
+    @Binding var nim: AppSettings.Providers.NIM
+    @State private var models: [String] = []
+    @State private var key = ""                 // cleared as soon as it is sent; never stored
+    @State private var keySaved = false
+    @State private var sending = false
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.s) {
+            Toggle("NVIDIA NIM", isOn: $nim.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
+            if nim.enabled {
+                HStack {
+                    TextField("모델 (예: meta/llama-3.1-70b-instruct)", text: Binding(get: { nim.model ?? "" },
+                                                                             set: { nim.model = $0.isEmpty ? nil : $0 }))
+                        .textFieldStyle(.roundedBorder).urlInput()
+                    if !models.isEmpty {
+                        Menu {
+                            ForEach(models, id: \.self) { m in Button(m) { nim.model = m } }
+                        } label: { Image(systemName: "chevron.down.circle") }
+                        .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("모델 목록")
+                    }
+                }
+                HStack {
+                    SecureField(nim.has_key == true || keySaved ? "키 등록됨 (바꿀 때만 입력)" : "API 키", text: $key)
+                        .textFieldStyle(.roundedBorder)
+                    Button(sending ? "등록 중…" : "등록") { Task { await sendKey() } }
+                        .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending)
+                        .tint(Theme.celadon)
+                }
+                if nim.has_key == true || keySaved { Label("키 등록됨", systemImage: "checkmark.seal").font(.footnote).foregroundStyle(Theme.celadon) }
+                Text("키는 게이트웨이로 한 번만 보내고 이 기기에는 남기지 않아요.").font(.footnote).foregroundStyle(Theme.text3)
+                if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
+            }
+        }
+        .task(id: nim.enabled) {
+            guard nim.enabled else { return }
+            if case .success(let m) = await attempt({ try await NIMAPI.models() }) { models = m }
+        }
+        .onDisappear { key = "" }
+    }
+
+    private func sendKey() async {
+        let value = Config.cleanToken(key)
+        key = ""
+        sending = true
+        defer { sending = false }
+        do { try await NIMAPI.putKey(value); keySaved = true; message = nil }
+        catch { message = "키를 등록하지 못했어요: " + FriendlyError.describe(error).title }
     }
 }

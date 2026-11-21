@@ -161,6 +161,7 @@ def persona_block(settings):
 # ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
 PERSONA_ID = re.compile(r"[a-z0-9_-]{1,32}")
 COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+TINTS = {"celadon", "indigo", "amber", "azalea", "sprout", "sky", "plum", "ash"}  # the app's orb tints
 MAX_PERSONAS = 8
 DEFAULT_TTS_VOICE = os.environ.get("BISEO_TTS_VOICE", "sohee")
 current_persona: contextvars.ContextVar = contextvars.ContextVar("persona", default=None)  # set per ask/call
@@ -1858,6 +1859,14 @@ async def check_persona(body, s, pid=None):
     unknown = set(body) - PERSONA_FIELDS - ({"id"} if pid is None else set())
     if unknown:
         raise HTTPException(400, f"unknown persona fields: {sorted(unknown)}")
+    if pid is not None and "voice" in body and body["voice"] is None:
+        del body["voice"]  # edit: null keeps the current voice (create still requires one)
+    for k in ("voice_style", "personality", "user_title", "color"):  # the app sends null for "unset"
+        if k in body and body[k] is None:
+            if pid is not None and k != "color":
+                body[k] = ""  # edit: clear the text; a null color keeps the current one
+            else:
+                del body[k]  # create: the defaults apply
     if "name" in body:
         if not (isinstance(body["name"], str) and NAME_RE.fullmatch(body["name"]) and body["name"].strip()):
             raise HTTPException(400, "name: 1-12 Hangul/Latin letters or spaces")
@@ -1868,14 +1877,15 @@ async def check_persona(body, s, pid=None):
         raise HTTPException(400, "voice: not a TTS speaker (GET /v1/voices)")
     if not isinstance(body.get("voice_style", ""), str) or len(body.get("voice_style", "")) > 200:
         raise HTTPException(400, "voice_style: text up to 200 characters")
-    if body.get("personality") is None and "personality" in body:
-        body["personality"] = ""
     if "user_title" in body:
         body["user_title"] = check_title(body["user_title"], "user_title")
     if not isinstance(body.get("personality", ""), str) or len(body.get("personality", "")) > 600:
         raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
-    if "color" in body and not (isinstance(body["color"], str) and COLOR_RE.fullmatch(body["color"])):
-        raise HTTPException(400, "color: #rrggbb")
+    if "color" in body:
+        c = body["color"]
+        if not (isinstance(c, str) and (COLOR_RE.fullmatch(c) or c.lower() in TINTS)):
+            raise HTTPException(400, f"color: #rrggbb or a tint name ({'|'.join(sorted(TINTS))})")
+        body["color"] = c if c.startswith("#") else c.lower()
     if body.get("default_model") not in (None, "nim", *MODELS):
         raise HTTPException(400, f"default_model: null, nim or one of {sorted(MODELS)}")
     if not isinstance(body.get("share_memory", False), bool):
@@ -1913,7 +1923,7 @@ async def personas_create(body: dict):
     pid = body.pop("id", None) or f"p{uuid.uuid4().hex[:7]}"
     if not (isinstance(pid, str) and PERSONA_ID.fullmatch(pid)) or persona_by_id(s, pid, include_deleted=True):
         raise HTTPException(400, "id: a new ASCII slug (a-z, 0-9, _ -)")
-    p = {"id": pid, "voice_style": "", "personality": "", "color": "#7C5CFF", "default_model": None,
+    p = {"id": pid, "voice_style": "", "personality": "", "color": "celadon", "default_model": None,
          "share_memory": False, "user_title": "", **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
     s["personas"].append(p)
     await save_personas(s)

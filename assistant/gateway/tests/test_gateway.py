@@ -247,6 +247,34 @@ def test_personas_migrate_from_one_assistant(gw):
     assert c.get("/v1/personas/azel").json()["name"] == "아젤"
 
 
+def test_personas_null_optional_fields(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    nulls = {"voice_style": None, "personality": None, "color": None, "default_model": None}
+    r = c.post("/v1/personas", json={"id": "nul", "name": "널이", "voice": "sohee", **nulls})
+    assert r.status_code == 201, r.text
+    assert (r.json()["voice_style"], r.json()["personality"], r.json()["color"]) == ("", "", "celadon")
+    assert r.json()["default_model"] is None
+    c.put("/v1/personas/nul", json={"voice_style": "차분함", "personality": "꼼꼼함", "color": "#112233"})
+    r = c.put("/v1/personas/nul", json=nulls)
+    assert r.status_code == 200, r.text
+    assert (r.json()["voice_style"], r.json()["personality"], r.json()["color"]) == ("", "", "#112233")
+
+
+def test_personas_tint_colors_like_the_app_sends(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    r = c.post("/v1/personas", json={"name": "미아", "voice": "sohee", "voice_style": "밝고 빠르게", "personality": "다정함",
+                                     "color": "Celadon", "default_model": None, "share_memory": True})
+    assert r.status_code == 201, r.text
+    assert r.json()["color"] == "celadon"
+    pid = r.json()["id"]
+    assert c.put(f"/v1/personas/{pid}", json={"color": "AZALEA", "voice": None}).json()["color"] == "azalea"
+    assert c.get(f"/v1/personas/{pid}").json()["voice"] == "sohee"  # null voice on edit keeps it
+    assert c.put(f"/v1/personas/{pid}", json={"color": "#112233"}).status_code == 200
+    assert c.put(f"/v1/personas/{pid}", json={"color": "red"}).status_code == 400
+
+
 def test_personas_crud_and_limits(gw, monkeypatch):
     g, c, _ = gw
     persona_gw(g, monkeypatch)
@@ -1505,6 +1533,8 @@ def test_user_title_shared_and_per_persona(gw, monkeypatch):
     g.current_persona.set("luna")
     assert "사용자를 '주인님'(이)라고 부른다." in g.persona_block(s)
     assert c.put("/v1/personas/luna", json={"user_title": None}).json()["user_title"] == ""  # null: unset
+    r = c.post("/v1/personas", json={"id": "nul", "name": "널", "voice": "sohee", "user_title": None, "color": None})
+    assert r.status_code == 201 and r.json()["user_title"] == "" and r.json()["color"] == "celadon"  # create: defaults
     assert "사용자를 '선생님'(이)라고 부른다." in g.persona_block(asyncio.run(g.load_settings()))
     g.current_persona.set(None)
     stored = g.fake.db["settings"]

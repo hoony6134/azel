@@ -44,10 +44,11 @@ enum JarState: Equatable {
         }
     }
 
-    var glaze: [Color] {
+    /// `tint`: the persona's glaze (§17.2); it only changes idle and listening.
+    func glaze(_ tint: Color = Theme.glazeCeladon) -> [Color] {
         switch self {
-        case .idle: return [Theme.glazeCeladon.opacity(0.25), Theme.porcelain.opacity(0.7)]
-        case .listening: return [Theme.glazeCeladon, Theme.porcelain]
+        case .idle: return [tint.opacity(0.25), Theme.porcelain.opacity(0.7)]
+        case .listening: return [tint, Theme.porcelain]
         case .thinking: return [Theme.glazeIndigo, Theme.porcelain.opacity(0.8)]
         case .speaking: return [Theme.porcelain, Theme.porcelain.opacity(0.88)]
         case .held: return [Theme.porcelain.opacity(0.5), Theme.porcelain.opacity(0.35)]
@@ -55,9 +56,9 @@ enum JarState: Equatable {
         }
     }
 
-    var glow: Color? {
+    func glow(_ tint: Color = Theme.glazeCeladon) -> Color? {
         switch self {
-        case .idle, .listening: return Theme.glazeCeladon
+        case .idle, .listening: return tint
         case .thinking: return Theme.glazeIndigo
         case .speaking: return Theme.glazeAmber
         case .held, .offline: return nil
@@ -74,7 +75,7 @@ enum JarPath {
 
     static func wobble(_ state: JarState, θ: Double, t: Double, level: Double) -> Double {
         switch state {
-        case .idle: return 0.008 * sin(θ * 2 + t * 0.6)
+        case .idle: return 0.018 * sin(2 * θ + 0.45 * t) + 0.010 * sin(3 * θ - 0.31 * t + 1.3) // §6.3 undulation
         case .listening: return level * (0.05 * sin(3 * θ + 2.1 * t) + 0.03 * sin(5 * θ - 3.3 * t))
         case .thinking: return 0.012 * sin(2 * θ + 1.2 * t)
         case .speaking: return level * (0.07 * sin(2 * θ + 2.8 * t) + 0.025 * sin(7 * θ + 5 * t))
@@ -121,6 +122,31 @@ enum JarPath {
         return (turns, glow)
     }
 
+    // MARK: Idle, "gently alive" (DESIGN §6.3)
+
+    /// The shared breath, period 4.6 s.
+    static func breath(_ t: Double) -> Double { sin(2 * .pi * t / 4.6) }
+
+    /// Idle glow (opacity, blur radius in units of R): in phase with the breath; when calm
+    /// (Reduce Motion / Low Power) only a slow 0.35 ↔ 0.45 fade over 8 s.
+    static func idleGlow(_ t: Double, calm: Bool) -> (opacity: Double, radius: Double) {
+        if calm { return (0.40 + 0.05 * sin(2 * .pi * t / 8), 0.30) }
+        let b = breath(t)
+        return (0.35 + 0.12 * b, 0.30 + 0.04 * b)
+    }
+
+    static let shimmerLength = 1.6
+
+    /// Shimmer progress 0…1 if one is running at `t`. One per 10 s slot, starting at a pseudo-random
+    /// offset of 0–2 s, so consecutive shimmers are 8–12 s apart and never overlap.
+    static func shimmer(at t: Double) -> Double? {
+        let slot = (t / 10).rounded(.down)
+        let r = (sin(slot * 12.9898) * 43_758.5453).truncatingRemainder(dividingBy: 1)
+        let start = slot * 10 + 2 * abs(r)
+        let p = (t - start) / shimmerLength
+        return (0..<1).contains(p) ? p : nil
+    }
+
     static func smoothstep(_ x: Double) -> Double { let c = max(0, min(1, x)); return c * c * (3 - 2 * c) }
 }
 
@@ -136,26 +162,80 @@ struct MoonJar: View {
     var surge: Date? = nil
     /// tool_end: one glow pulse, +0.25 opacity over 300 ms.
     var pulse: Date? = nil
+    /// The thinking pulse's twin (§14.3): one shimmer across the orb in any state.
+    var shimmerAt: Date? = nil
+    /// Mac popover only: an extra-slow sway (§6.3).
+    var sway = false
+    /// Persona glaze for idle/listening; thinking and speaking keep their own colours.
+    var tint: Color = Theme.glazeCeladon
+    /// Breath amplitude (mini orbs breathe at 0.5).
+    var breathAmplitude: Double = 1
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var phase
     @State private var previous: JarState = .idle
     @State private var changedAt = Date.distantPast
+    @State private var visible = false
+
+    /// Reduce Motion or Low Power: a static orb with only a slow glow fade.
+    private var calm: Bool { reduceMotion || ProcessInfo.processInfo.isLowPowerModeEnabled }
+    /// Idle runs at 30 fps and only while on screen in an active app; call states keep 60 fps.
+    private var interval: Double { state == .idle || state == .offline ? 1 / 30 : 1 / 60 }
+    private var isPaused: Bool {
+        if paused || !visible || phase == .background { return true }
+        return (state == .idle || state == .offline) && phase != .active
+    }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 60, paused: paused || phase == .background)) { tl in
-            let now = tl.date
-            let t = now.timeIntervalSinceReferenceDate
-            Canvas { ctx, size in
+        // The glow's blur and the water line reach well past the jar, so the canvas overscans its
+        // layout frame by `pad` on every side; drawing inside a tight frame cut them with hard
+        // edges (user screenshot, 2026-11-21). Layout and hit testing keep the original frame.
+        GeometryReader { geo in
+            let pad = max(geo.size.width, geo.size.height) * 0.6
+            TimelineView(.animation(minimumInterval: interval, paused: isPaused)) { tl in
+                canvas(now: tl.date, frame: CGRect(origin: CGPoint(x: pad, y: pad), size: geo.size))
+            }
+            .frame(width: geo.size.width + 2 * pad, height: geo.size.height + 2 * pad)
+            .offset(x: -pad, y: -pad)
+            .allowsHitTesting(false)
+        }
+        .onChange(of: state) { old, _ in previous = old; changedAt = Date() }
+        .onAppear { visible = true }
+        .onDisappear { visible = false }
+        .accessibilityElement()
+        .accessibilityLabel(name)
+        .accessibilityValue(state.spokenLabel)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    /// `frame` is the jar's layout frame inside the larger canvas.
+    private func canvas(now: Date, frame: CGRect) -> some View {
+        let t = now.timeIntervalSinceReferenceDate
+        return Canvas { ctx, _ in
                 let mix = JarPath.smoothstep(now.timeIntervalSince(changedAt) / 0.45)
                 let level = Double(state == .speaking ? levels.out : levels.mic)
-                let R = min(size.width, size.height) * 0.34
-                let center = CGPoint(x: size.width / 2, y: size.height * (state == .speaking ? 0.44 : 0.5))
-                let path = JarPath.make(center: center, R: R, t: reduceMotion ? 0 : t, level: level,
-                                        from: previous, to: state, mix: mix, reduceMotion: reduceMotion)
-                let boost = reduceMotion ? (0.0, 0.0) : JarPath.workBoost(now: now, surge: surge, pulse: pulse)
+                let R = min(frame.width, frame.height) * 0.34
+                let center = CGPoint(x: frame.midX, y: frame.minY + frame.height * (state == .speaking ? 0.44 : 0.5))
+                var ctx = ctx
+                // Idle breath: the whole orb scales ±2.5%, easing out as a call takes over.
+                let idleWeight = (state == .idle ? mix : 0) + (previous == .idle ? 1 - mix : 0)
+                let scale = calm ? 1 : 1 + 0.025 * breathAmplitude * JarPath.breath(t) * idleWeight
+                if sway && !calm && state == .idle {
+                    ctx.translateBy(x: center.x + 1.5 * sin(2 * .pi * t / 11), y: center.y)
+                    ctx.rotate(by: .degrees(1.5 * sin(2 * .pi * t / 9 + 0.8)))
+                    ctx.translateBy(x: -center.x, y: -center.y)
+                }
+                let path = JarPath.make(center: center, R: R, t: calm ? 0 : t, level: level,
+                                        from: previous, to: state, mix: mix, reduceMotion: calm)
+                    .applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: scale, y: scale)
+                        .translatedBy(x: -center.x, y: -center.y))
+                let boost = calm ? (0.0, 0.0) : JarPath.workBoost(now: now, surge: surge, pulse: pulse)
                 draw(state, path: path, opacity: mix, ctx: ctx, center: center, R: R, t: t, level: level, boost: boost)
                 if mix < 1 { draw(previous, path: path, opacity: 1 - mix, ctx: ctx, center: center, R: R, t: t, level: level, boost: boost) }
+                if state == .idle, !calm, let p = JarPath.shimmer(at: t) { shimmer(p, path: path, ctx: ctx, center: center, R: R) }
+                if !calm, let s = shimmerAt, case let p = now.timeIntervalSince(s) / JarPath.shimmerLength, (0..<1).contains(p) {
+                    shimmer(p, path: path, ctx: ctx, center: center, R: R)
+                }
                 if let ripple, case let e = now.timeIntervalSince(ripple), e >= 0, e < 0.4 {
                     let k = 1.05 + e * (reduceMotion ? 0 : 0.8)
                     let ring = path.applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: k, y: k)
@@ -163,12 +243,18 @@ struct MoonJar: View {
                     ctx.stroke(ring, with: .color(Theme.celadon.opacity(1 - e / 0.4)), lineWidth: 2)
                 }
             }
-        }
-        .onChange(of: state) { old, _ in previous = old; changedAt = Date() }
-        .accessibilityElement()
-        .accessibilityLabel(name)
-        .accessibilityValue(state.spokenLabel)
-        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    /// The idle shimmer: a soft white highlight (18% peak, radius 0.45R) crossing the body from the
+    /// upper left to the right, ease-in-out, opacity sin(πp), clipped to the orb.
+    private func shimmer(_ p: Double, path: Path, ctx: GraphicsContext, center: CGPoint, R: Double) {
+        var ctx = ctx
+        ctx.clip(to: path)
+        let e = p < 0.5 ? 2 * p * p : 1 - pow(-2 * p + 2, 2) / 2
+        let at = CGPoint(x: center.x + R * (-0.6 + 1.3 * e), y: center.y + R * (-0.5 + 0.5 * e))
+        ctx.opacity = sin(.pi * p)
+        ctx.fill(path, with: .radialGradient(Gradient(colors: [Color.white.opacity(0.18), .clear]), center: at,
+                                             startRadius: 0, endRadius: R * 0.45))
     }
 
     /// boost: (extra swirl turns, extra glow opacity) from tool activity.
@@ -178,17 +264,18 @@ struct MoonJar: View {
         ctx.opacity = opacity
         let box = path.boundingRect
         // 1. soft glow
-        if let glow = s.glow {
+        if let glow = s.glow(tint) {
             var strength = 0.55
             switch s {
-            case .idle: strength = reduceMotion ? 0.3 : 0.3 + 0.15 * sin(t * 2 * .pi / 6)
+            case .idle: strength = JarPath.idleGlow(t, calm: calm).opacity
             case .thinking: strength = 0.6 + 0.4 * (0.5 + 0.5 * sin(t * 2 * .pi / 1.4))
             case .speaking: strength = 0.4 + 0.5 * level
             default: break
             }
             strength += boost.1
             ctx.drawLayer { g in
-                g.addFilter(.blur(radius: s == .speaking ? R * (0.3 + 0.5 * level) : 28))
+                let radius = s == .speaking ? R * (0.3 + 0.5 * level) : s == .idle ? R * JarPath.idleGlow(t, calm: calm).radius : 28
+                g.addFilter(.blur(radius: radius))
                 g.fill(path, with: .color(glow.opacity(strength)))
             }
         }
@@ -197,7 +284,7 @@ struct MoonJar: View {
             let k = 1.12 + 0.1 * level
             let ring = path.applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: k, y: k)
                 .translatedBy(x: -center.x, y: -center.y))
-            ctx.stroke(ring, with: .color(Theme.celadon.opacity(0.25 + 0.5 * level)), lineWidth: 1)
+            ctx.stroke(ring, with: .color(tint.opacity(0.25 + 0.5 * level)), lineWidth: 1)
         }
         // 3. speaking water line: mirrored, squashed, blurred copy below the jar
         if s == .speaking {
@@ -212,14 +299,14 @@ struct MoonJar: View {
         }
         // 4. glazed body
         var bodyOpacity = 1.0
-        if s == .thinking && reduceMotion { bodyOpacity = 0.85 + 0.15 * (0.5 + 0.5 * sin(t * .pi)) }
+        if s == .thinking && calm { bodyOpacity = 0.85 + 0.15 * (0.5 + 0.5 * sin(t * .pi)) }
         ctx.opacity = opacity * bodyOpacity
-        ctx.fill(path, with: .radialGradient(Gradient(colors: s.glaze), center: CGPoint(x: box.midX, y: box.midY - box.height * 0.25),
+        ctx.fill(path, with: .radialGradient(Gradient(colors: s.glaze(tint)), center: CGPoint(x: box.midX, y: box.midY - box.height * 0.25),
                                              startRadius: 0, endRadius: box.width * 0.7))
         // 5. thinking swirl
         if s == .thinking {
             ctx.clip(to: path)
-            let angle = reduceMotion ? 0 : t * .pi / 2 + boost.0 * 2 * .pi
+            let angle = calm ? 0 : t * .pi / 2 + boost.0 * 2 * .pi
             ctx.fill(path, with: .conicGradient(Gradient(colors: [Theme.glazeIndigo.opacity(0.7), Theme.porcelain.opacity(0.1),
                                                                    Theme.glazeIndigo.opacity(0.4), Theme.glazeIndigo.opacity(0.7)]),
                                                 center: CGPoint(x: box.midX, y: box.midY), angle: .radians(angle)))
@@ -230,10 +317,11 @@ struct MoonJar: View {
 /// Full-bleed state glaze behind the call screen (§6.3): mesh on iOS 18 / macOS 15, radial fallback.
 struct GlazeBackground: View {
     var state: JarState
+    var tint: Color = Theme.glazeCeladon
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let c = state.glow ?? Theme.text3
+        let c = state.glow(tint) ?? Theme.text3
         ZStack {
             Theme.bg
             if #available(iOS 18, macOS 15, *) {

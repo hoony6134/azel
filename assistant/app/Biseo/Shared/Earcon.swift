@@ -26,6 +26,11 @@ enum Earcon {
                     .triangle, nil, 2000, -22, 0.300)
         case .wake:
             return ([Note(freq: 1174.66, start: 0, attack: 0.003, hold: 0, decay: 0.220)], .sine, (2.76, -20), nil, -20, 0.250)
+        // Provisional (designer to confirm): a soft single-note "들었어요" and a barely-there pulse.
+        case .ack:
+            return ([Note(freq: 783.99, start: 0, attack: 0.004, hold: 0, decay: 0.060)], .sine, (2, -20), nil, -30, 0.080)
+        case .pulse:
+            return ([Note(freq: 587.33, start: 0, attack: 0.040, hold: 0, decay: 0.200)], .sine, nil, nil, -38, 0.260)
         }
     }
 
@@ -87,47 +92,77 @@ struct EarconGate {
     static let tickInterval = 0.35, maxWait = 0.3, micHold = 0.25
 
     private var lastTick = -Double.infinity
+    /// Last time a cue other than the pulse played; a pulse within 1.5 s of one is skipped.
+    private var lastOther = -Double.infinity
+    static let pulseQuiet = 1.5
 
     /// - userLoudAt: last time the mic was above 0.25 while listening.
     /// - waited: how long this cue has already been held back.
     mutating func decide(_ cue: Cue, now: Double, listening: Bool, userLoudAt: Double, waited: Double = 0, enabled: Bool = true) -> Decision {
         guard enabled else { return .drop }
-        if cue == .wake { return .play }
+        if cue == .wake { lastOther = now; return .play }
         let userTalking = listening && now - userLoudAt < Self.micHold
+        if cue == .pulse { // never queued, never over the user, never right after another cue
+            return userTalking || now - lastOther < Self.pulseQuiet ? .drop : .play
+        }
         if cue == .tick {
             guard !userTalking, now - lastTick >= Self.tickInterval else { return .drop }
             lastTick = now
+            lastOther = now
             return .play
         }
         if userTalking { return waited + 0.05 > Self.maxWait ? .drop : .wait }
+        lastOther = now
         return .play
     }
 }
 
-/// "들어 보기": the five cues in a row outside a call. iOS uses an `.ambient` session so the
-/// silent switch is respected.
-enum EarconPreview {
-    private static let engine = AVAudioEngine()
-    private static let player = AVAudioPlayerNode()
-
-    static func play() {
+/// Outside a call, previews need an active audio session of their own (user bug, 2026-11-21:
+/// 들어보기 and 작업 효과음 previews were silent). `.playback` plays even with the ring switch off,
+/// as a preview the user just tapped should.
+enum PreviewAudio {
+    static func activate() {
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setCategory(.ambient)
+        guard !CallManager.shared.inCall else { return } // in a call the CallKit session already plays
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
-        if player.engine == nil {
-            engine.attach(player)
-            engine.connect(player, to: engine.mainMixerNode, format: PCM.speakerFormat)
+    }
+}
+
+/// "들어 보기": the five cues in a row outside a call, on a fresh engine each time (an engine kept
+/// across a call's session changes can come back silent).
+enum EarconPreview {
+    private static var engine: AVAudioEngine?
+    private static var player: AVAudioPlayerNode?
+    private static let lock = NSLock()
+    private static var _peak: Float = 0
+    /// Loudest output sample since the last play(); lets a test confirm sound actually came out.
+    static var peak: Float { lock.lock(); defer { lock.unlock() }; return _peak }
+
+    static func play() {
+        PreviewAudio.activate()
+        engine?.stop()
+        let e = AVAudioEngine(), p = AVAudioPlayerNode()
+        e.attach(p)
+        e.connect(p, to: e.mainMixerNode, format: PCM.speakerFormat)
+        lock.lock(); _peak = 0; lock.unlock()
+        e.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: e.mainMixerNode.outputFormat(forBus: 0)) { b, _ in
+            guard let d = b.floatChannelData else { return }
+            var m: Float = 0
+            for i in 0..<Int(b.frameLength) { m = max(m, abs(d[0][i])) }
+            lock.lock(); _peak = max(_peak, m); lock.unlock()
         }
-        guard (try? engine.start()) != nil else { return }
-        player.stop()
+        do { try e.start() } catch { Log.call.error("earcon preview start failed: \(error.localizedDescription, privacy: .public)"); return }
         let gap = AVAudioPCMBuffer(pcmFormat: PCM.speakerFormat, frameCapacity: 9600)!
         gap.frameLength = 9600 // 400 ms between cues
         gap.floatChannelData![0].update(repeating: 0, count: 9600)
         for cue in Cue.allCases {
-            player.scheduleBuffer(Earcon.buffer(cue))
-            player.scheduleBuffer(gap)
+            p.scheduleBuffer(Earcon.buffer(cue))
+            p.scheduleBuffer(gap)
         }
-        player.play()
+        p.play()
+        engine = e
+        player = p
     }
 }
