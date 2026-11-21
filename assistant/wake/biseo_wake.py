@@ -220,20 +220,21 @@ class Listener:
         pre, speech, silent = list(ring[-keep:]), [], 0
         self.vad.reset()
         for n, frame in enumerate(frames, 1):
-            if Path(c["mic_live_path"]).expanduser().exists():  # the app hears the rest itself
-                break
+            live = Path(c["mic_live_path"]).expanduser().exists()  # the app hears the rest itself; keep this frame, then stop
             voiced = any(self.vad(frame[i:i + VAD_CHUNK].tobytes()) >= c["vad_threshold"]
                          for i in range(0, FRAME, VAD_CHUNK))
-            if not speech:
-                if voiced:
-                    speech = pre + [frame]
-                elif n >= wait:
+            if speech:
+                speech.append(frame)
+                silent = 0 if voiced else silent + 1
+                if silent >= end or len(speech) >= cap:
                     break
+            elif voiced:
+                speech = pre + [frame]
+            elif n >= wait:
+                break
+            else:
                 pre = (pre + [frame])[-keep:]
-                continue
-            speech.append(frame)
-            silent = 0 if voiced else silent + 1
-            if silent >= end or len(speech) >= cap:
+            if live:
                 break
         return np.concatenate(speech) if speech else np.zeros(0, dtype=np.int16)
 

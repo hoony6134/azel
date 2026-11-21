@@ -406,7 +406,7 @@ def test_capture_ends_when_the_app_mic_is_live(tmp_path):
 
     lis.run(stream())
     pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
-    assert len(pcm) == 4 * FRAME  # wake frame as pre-roll + 3 speech
+    assert len(pcm) == 5 * FRAME  # wake frame as pre-roll + 3 speech + the frame that showed mic-live
 
 
 def test_stale_utterance_files_are_swept(tmp_path):
