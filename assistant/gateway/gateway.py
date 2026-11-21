@@ -2858,7 +2858,29 @@ bridge = tools_bridge.Bridge(
     schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
     state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
     in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME),
+    schedule_list_text=lambda: bridge_schedule_text(), schedule_items=lambda: bridge_schedule_items(),
+    schedule_cancel=lambda sid, at: schedule_cancel(sid=sid, at=at),
+    task_get=lambda tid: state.call("GET", task_key(tid)), task_recent=lambda n: bridge_recent_tasks(n),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
+
+
+async def bridge_schedule_items():
+    return [{**public_item(i), "spoken": spoken_when(i["at"], i["repeat"]), "note": i["note"]} for i in await schedule_list()]
+
+
+async def bridge_schedule_text():
+    items = await schedule_list()
+    return list_text(items) + ("\n" + "\n".join(f"- id {i['id']}: {spoken_when(i['at'], i['repeat'])} "
+                                                f"{'기상' if i['kind'] == 'wake' else i['note'][:40] or '알림'}" for i in items[:10])
+                               if items else "")
+
+
+async def bridge_recent_tasks(n):
+    out = []
+    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:n]:
+        if t := await state.call("GET", task_key(tid)):
+            out.append(t)
+    return out
 
 
 def google_status():

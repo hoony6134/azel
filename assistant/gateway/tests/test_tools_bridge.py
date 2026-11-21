@@ -67,8 +67,30 @@ class World:
         return TB.Bridge(fresh_devices=self.fresh_devices, device_tools=self.device_tools, run_tool=self.run_tool,
                          place_call=self.place_call, schedule_create=self.schedule_create,
                          task_create=self.task_create, state=self.state, in_call=lambda: self.in_call,
+                         schedule_list_text=self.schedule_text, schedule_items=self.schedule_items,
+                         schedule_cancel=self.schedule_cancel, task_get=self.task_get, task_recent=self.task_recent,
                          cygnus=lambda: ([{"name": "infra_health", "description": "x", "input_schema": {}}],
                                          self.cygnus_run))
+
+    async def schedule_items(self):
+        return [{"id": f"s{i}", "spoken": f"내일 {7 + i}시", "note": b.get("note", ""), **b}
+                for i, b in enumerate(self.schedule) if not b.get("cancelled")]
+
+    async def schedule_text(self):
+        return f"예약된 전화가 {len(await self.schedule_items())}개 있어요."
+
+    async def schedule_cancel(self, sid, at):
+        for i in await self.schedule_items():
+            if sid in (None, i["id"]):
+                self.schedule[int(i["id"][1:])]["cancelled"] = True
+                return i, f"{i['spoken']} 예약을 취소했어요."
+        return None
+
+    async def task_get(self, tid):
+        return {"id": tid, "status": "done", "goal": "정리", "result": "끝"} if tid == "t00000000001" else None
+
+    async def task_recent(self, n):
+        return [{"id": "t00000000001", "status": "running", "goal": "정리"}][:n]
 
     async def cygnus_run(self, name, args):
         return "albireo disk 15%"
@@ -157,7 +179,7 @@ def test_mcp_server_lists_and_calls_assistant_tools():
     init = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
     assert init["result"]["capabilities"] == {"tools": {}}
     listed = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))["result"]["tools"]
-    assert [t["name"] for t in listed] == ["call_user", "create_task"] and "inputSchema" in listed[0]
+    assert [t["name"] for t in listed] == [t["name"] for t in TB.OWN_TOOLS] and "inputSchema" in listed[0]
     out = run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                 "params": {"name": "create_task", "arguments": {"goal": "정리해서 전화해 줘"}}}))
     assert out["result"]["isError"] is False and w.tasks[0]["notify"] == "call"  # claude -p in a call: call back
@@ -242,3 +264,25 @@ def test_agent_loop_claude_backend_uses_web_tools_and_caching(monkeypatch):
     assert seen[0]["system"][-1]["cache_control"] == {"type": "ephemeral"}
     assert seen[2]["messages"][-1]["content"][0]["tool_use_id"] == "t1"
     assert evs[-1]["cost_usd"] >= agent_loop.WEB_SEARCH_USD  # the search is counted
+
+
+def test_schedule_task_and_approval_tools():
+    w = World()
+    b = w.bridge()
+    for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
+        run(b.call("call_user", {"when": when, "reason": note}))
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:9] == ["call_user", "schedule_list", "schedule_cancel",
+                                                                 "create_task", "task_status", "approval_status"]
+    assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
+    assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
+    assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"})) \
+        ["content"] + run(b.call("schedule_cancel", {"description": "약"}))["content"]  # two match: none cancelled
+    assert run(b.call("schedule_cancel", {"description": "없는것"}))["content"] == "그런 예약이 없어요."
+    assert run(b.call("call_user", {"when": "2026-11-23T07:00:00+09:00", "reason": "x", "kind": "wake",
+                                    "repeat": "weekdays"}))["is_error"] is False
+    assert w.schedule[-1]["kind"] == "wake" and w.schedule[-1]["repeat"] == "weekdays" and w.schedule[-1]["note"] == ""
+    assert "running" in run(b.call("task_status", {}))["content"]
+    assert run(b.call("task_status", {"id": "t00000000001"}))["content"].endswith("→ 끝")
+    w.approvals["a9"] = {"id": "a9", "status": "pending", "device": "macbook", "command": "open x"}
+    w.kv["/v1/state/approvals"] = None
+    assert "그런 승인 요청이 없어요." == run(b.call("approval_status", {"id": "zz"}))["content"]

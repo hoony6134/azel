@@ -33,8 +33,27 @@ CALL_USER = {
                     "예약 전화를 건다. reason은 전화를 받았을 때 첫마디로 말할 이유."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["reason"], "properties": {
         "when": {"type": ["string", "null"], "description": "예: 2026-11-22T10:00:00+09:00, 지금이면 null"},
-        "reason": {"type": "string", "maxLength": 200}, "persona_id": {"type": "string", "maxLength": 32}}},
+        "reason": {"type": "string", "maxLength": 200},
+        "kind": {"type": "string", "enum": ["reminder", "wake"], "description": "wake = 깨우는 전화"},
+        "repeat": {"type": ["string", "null"], "description": "daily, weekdays, weekly:0..6(0=월), 한 번이면 null"},
+        "persona_id": {"type": "string", "maxLength": 32}}},
 }
+SCHEDULE_LIST = {"name": "schedule_list", "description": "예약된 전화 목록(id 포함).",
+                 "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
+SCHEDULE_CANCEL = {
+    "name": "schedule_cancel",
+    "description": "예약된 전화 하나를 취소한다. id, 시각(at), 또는 설명(description: 메모나 '내일 7시' 같은 말)으로 고른다. "
+                   "여러 개가 맞으면 아무것도 취소하지 않고 어느 것인지 돌려준다. 아무것도 안 주면 가장 가까운 예약.",
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "id": {"type": "string", "maxLength": 40}, "at": {"type": "string", "description": "ISO 8601 KST"},
+        "description": {"type": "string", "maxLength": 100}}}}
+TASK_STATUS = {"name": "task_status", "description": "백그라운드 작업 상태. id가 없으면 최근 3개.",
+               "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+                   "id": {"type": "string", "pattern": "^[0-9a-f]{12}$"}}}}
+APPROVAL_STATUS = {"name": "approval_status", "description": "기기 명령 승인 상태. id가 없으면 기다리는 것들. 승인은 사용자가 앱에서만 한다.",
+                   "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+                       "id": {"type": "string", "maxLength": 64}}}}
+OWN_TOOLS = None  # set below: the assistant's own tools, in the order models see them
 CREATE_TASK = {
     "name": "create_task",
     "description": ("여러 단계가 필요한 일을 백그라운드 작업으로 맡긴다(정리, 조사, 기기에서 하는 작업). 끝나거나 실패하거나 승인이 "
@@ -62,7 +81,7 @@ class Bridge:
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
         g_defs, _ = self.d.get("google", lambda: ([], None))()
-        return [*dev_defs, CALL_USER, CREATE_TASK, *cyg_defs, *g_defs], where
+        return [*dev_defs, *OWN_TOOLS, *cyg_defs, *g_defs], where
 
     # ---------- one call ----------
     async def call(self, name, args, persona_id=None, caller="api", on_progress=None, where=None):
@@ -73,6 +92,14 @@ class Bridge:
                 return ok(await self.call_user(args, persona_id))
             if name == "create_task":
                 return ok(await self.create_task(args, persona_id, caller))
+            if name == "schedule_list":
+                return ok(await self.d["schedule_list_text"]())
+            if name == "schedule_cancel":
+                return ok(await self.schedule_cancel(args))
+            if name == "task_status":
+                return ok(await self.task_status(args))
+            if name == "approval_status":
+                return ok(await self.approval_status(args))
             for source in ("cygnus", "google"):  # read-only sources with their own allowlist and checks
                 defs, run = self.d.get(source, lambda: ([], None))()
                 if run and name in {t["name"] for t in defs}:
@@ -127,8 +154,10 @@ class Bridge:
             raise ValueError("reason")
         pid = args.get("persona_id") if isinstance(args.get("persona_id"), str) else persona_id
         when = args.get("when")
+        kind = args.get("kind") if args.get("kind") in ("reminder", "wake") else "reminder"
         if when:
-            item, say = await self.d["schedule_create"]({"at": when, "kind": "reminder", "note": reason,
+            item, say = await self.d["schedule_create"]({"at": when, "kind": kind, "note": "" if kind == "wake" else reason,
+                                                         "repeat": args.get("repeat") or None,
                                                          **({"persona_id": pid} if pid else {})}, "voice")
             await self.log_call(reason, item.get("at"), pid)
             return say
@@ -149,6 +178,42 @@ class Bridge:
         rows.append({"at": time.time(), "scheduled_for": at, "reason": reason, "persona": pid})
         await self.d["state"]("PUT", f"/v1/state/kv/user-calls-{today}", rows[-100:])
 
+    async def schedule_cancel(self, args):
+        """By id or time through the gateway's schedule_cancel; by description only when exactly one item matches."""
+        if args.get("id") or args.get("at"):
+            at = datetime.fromisoformat(args["at"]).timestamp() if args.get("at") else None
+            done = await self.d["schedule_cancel"](args.get("id"), at)
+            return done[1] if done else "그런 예약이 없어요."
+        items = await self.d["schedule_items"]()
+        desc = str(args.get("description") or "").strip()
+        if desc:
+            words = [w for w in re.split(r"\s+", desc) if len(w) > 1]
+            hits = [i for i in items if all(w in (i["note"] + " " + i["spoken"]) for w in words)]
+            if len(hits) != 1:
+                return ("그런 예약이 없어요." if not hits else
+                        "어느 것인지 골라 주세요: " + "; ".join(f"{i['spoken']}(id {i['id']})" for i in hits[:5]))
+            done = await self.d["schedule_cancel"](hits[0]["id"], None)
+            return done[1] if done else "그런 예약이 없어요."
+        done = await self.d["schedule_cancel"](None, None)  # the soonest, as the voice path always did
+        return done[1] if done else "취소할 예약이 없어요."
+
+    async def task_status(self, args):
+        ts = [t for t in [await self.d["task_get"](args["id"])] if t] if args.get("id") else await self.d["task_recent"](3)
+        if not ts:
+            return "그런 작업이 없어요." if args.get("id") else "맡긴 작업이 없어요."
+        return "\n".join(f"- {t['id']} {t['status']}: {t['goal'][:60]}" + (f" → {str(t.get('result') or t.get('error'))[:200]}"
+                                                                       if t.get("result") or t.get("error") else "")
+                         for t in ts)
+
+    async def approval_status(self, args):
+        if args.get("id"):
+            a = await self.d["state"]("GET", f"/v1/state/approvals/{args['id']}")
+            return f"{a.get('device', '')}의 '{str(a.get('command', ''))[:60]}': {a.get('status')}" if a else "그런 승인 요청이 없어요."
+        rows = await self.d["state"]("GET", "/v1/state/approvals") or []
+        pending = [a for a in rows if a.get("status") == "pending"]
+        return "\n".join(f"- {a['id']} {a.get('device', '')}: {str(a.get('command', ''))[:60]}" for a in pending[:5]) \
+            or "기다리는 승인 요청이 없어요."
+
     async def create_task(self, args, persona_id, caller):
         goal = str(args.get("goal") or "").strip()
         notify = args.get("notify") or ("call" if caller in ("voice", "qwen", "claude_code") else "push")
@@ -168,7 +233,8 @@ def err(text):
 
 
 # ---------- the same tools as an MCP server, for `claude -p` (POST /v1/mcp, stateless JSON-RPC) ----------
-MCP_TOOLS = (CALL_USER, CREATE_TASK)  # claude -p already has the daemons and Cygnus as its own MCP servers
+OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, CREATE_TASK, TASK_STATUS, APPROVAL_STATUS)
+MCP_TOOLS = OWN_TOOLS  # claude -p already has the daemons, Cygnus and the claude.ai connectors as its own MCP servers
 
 
 async def mcp_handle(bridge, msg, persona_id=None):
