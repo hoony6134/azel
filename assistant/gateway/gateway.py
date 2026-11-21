@@ -1028,6 +1028,9 @@ async def ask_stream(text, session, model=None, path=None, task=None):
         yield {"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}
         return
     token = requester_ctx.set(requester_id("ask", session))  # this ask's daemon calls carry it; reset below
+    # the API and NIM paths call create_task/call_user in this context: their tasks and calls continue this call,
+    # as claude -p's do through X-Azel-Origin (the same rule: the ask's session is the origin)
+    otoken = origin_ctx.set(session if ORIGIN_RE.fullmatch(session or "") else "")
     try:
         gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
         said = False
@@ -1052,6 +1055,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     finally:
         try:
             requester_ctx.reset(token)  # never leaks into later work in the same task
+            origin_ctx.reset(otoken)
         except ValueError:
             pass  # the generator was finalized from another context (garbage collected): nothing to undo
 
