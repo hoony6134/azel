@@ -3,7 +3,7 @@
     python3 assistant/design/icon/make_icons.py          # SVGs + PNGs
     python3 assistant/design/icon/make_icons.py --svg    # SVGs only
 
-The jar outline is the DESIGN.md §6.2 formula, so icon and in-app visualizer match.
+The orb outline is the DESIGN.md §6.2 jar(θ) formula, so icon and in-call orb match.
 """
 import math, pathlib, subprocess, sys, tempfile
 
@@ -11,62 +11,36 @@ OUT = pathlib.Path(__file__).resolve().parent
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 
-def jar_path(cx, cy, r, n=180):
-    pts = []
+def jar_radius(t):
+    """DESIGN.md §6.2 jar(θ), the in-call orb's outline (y down)."""
+    return 1 - 0.06 * math.sin(t) - 0.035 * math.cos(2 * t) + 0.015 * math.sin(3 * t + 0.6)
+
+
+def jar_path(cx, cy, r, n=48):
+    """Closed smooth outline: n samples of jar(θ) joined by Catmull-Rom → cubic Béziers,
+    so there are no polygon facets at any size."""
+    p = [(cx + r * jar_radius(t) * math.cos(t), cy + r * jar_radius(t) * math.sin(t))
+         for t in (i / n * 2 * math.pi for i in range(n))]
+    d = f"M{p[0][0]:.2f},{p[0][1]:.2f}"
     for i in range(n):
-        t = i / n * 2 * math.pi
-        k = 1 - 0.06 * math.sin(t) - 0.035 * math.cos(2 * t) + 0.015 * math.sin(3 * t + 0.6)
-        pts.append((cx + r * k * math.cos(t), cy + r * k * math.sin(t)))
-    return "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in pts) + " Z"
-
-
-def jar_with_lip(cx, cy, r, lip=1.0, n=240):
-    """One closed outline: the §6.2 body cut flat near top and bottom, with a short wide
-    mouth and a low foot ring stepped in, so it reads as a moon jar and not an egg."""
-    # lip > 1 exaggerates mouth and foot for tiny sizes (menu bar)
-    yt, yb = cy - r * (0.9 - 0.06 * (lip - 1)), cy + r * (0.88 - 0.06 * (lip - 1))
-    mw, fw, mh, fh = r * 0.66, r * 0.7, r * 0.16 * lip, r * 0.14 * lip
-    pts, foot_done, mouth_done = [], False, False
-    for i in range(n + 1):  # clockwise on screen (y down), starting at the right
-        t = i / n * 2 * math.pi
-        k = 1 - 0.06 * math.sin(t) - 0.035 * math.cos(2 * t) + 0.015 * math.sin(3 * t + 0.6)
-        x, y = cx + r * k * math.cos(t), cy + r * k * math.sin(t)
-        if y > yb:
-            if not foot_done:
-                pts += [(cx + fw / 2, yb), (cx + fw / 2 - r * 0.03, yb + fh),
-                        (cx - fw / 2 + r * 0.03, yb + fh), (cx - fw / 2, yb)]
-                foot_done = True
-            continue
-        if y < yt:
-            if not mouth_done:
-                pts += [(cx - mw / 2, yt), (cx - mw / 2 - r * 0.03, yt - mh),
-                        (cx + mw / 2 + r * 0.03, yt - mh), (cx + mw / 2, yt)]
-                mouth_done = True
-            continue
-        pts.append((x, y))
-    return "M" + " L".join(f"{x:.2f},{y:.2f}" for x, y in pts) + " Z"
-
-
-def opening(cx, cy, r):
-    """The mouth's opening seen slightly from above: (cx, cy, rx, ry)."""
-    return cx, cy - r * 1.06, r * 0.33, r * 0.045
+        p0, p1, p2, p3 = p[i - 1], p[i], p[(i + 1) % n], p[(i + 2) % n]
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6)
+        d += f" C{c1[0]:.2f},{c1[1]:.2f} {c2[0]:.2f},{c2[1]:.2f} {p2[0]:.2f},{p2[1]:.2f}"
+    return d + " Z"
 
 
 def art(cx, cy, r, mode):
-    """The jar, its glow, the mouth opening and the water-line reflection. mode: color | dark | tinted."""
-    jar = jar_with_lip(cx, cy, r)
-    ox, oy, orx, ory = opening(cx, cy, r)
-    hole_c = {"color": "#A9C7BA", "dark": "#7FB5A3", "tinted": "#7A7A7A"}[mode]
-    hole = f'<ellipse cx="{ox}" cy="{oy:.1f}" rx="{orx:.1f}" ry="{ory:.1f}" fill="{hole_c}"/>'
-    refl = f'<ellipse cx="{cx}" cy="{cy + r * 1.27:.1f}" rx="{r * 0.62:.1f}" ry="{r * 0.075:.1f}" fill="url(#refl)"/>'
+    """The orb, its glow and the soft floor shadow. mode: color | dark | tinted."""
+    jar = jar_path(cx, cy, r)
+    floor = f'<ellipse cx="{cx}" cy="{cy + r * 1.22:.1f}" rx="{r * 0.62:.1f}" ry="{r * 0.075:.1f}" fill="url(#refl)"/>'
     body = {"color": "url(#porcelain)", "dark": "url(#porcelainDark)", "tinted": "url(#gray)"}[mode]
     glow_c = {"color": "#E9F6EF", "dark": "#82CBB4", "tinted": "#FFFFFF"}[mode]
     return f"""
   <path d="{jar}" fill="{glow_c}" opacity="{0.45 if mode != 'tinted' else 0.25}" filter="url(#glow)"/>
   <path d="{jar}" fill="{body}"/>
   <path d="{jar}" fill="url(#shade)"/>
-  {hole}
-  {refl if mode != 'tinted' else ''}"""
+  {floor if mode != 'tinted' else ''}"""
 
 
 DEFS = """
@@ -97,24 +71,24 @@ def svg(w, h, inner):
 
 
 FILES = {
-    # iOS: full-bleed square, the system applies the mask. Jar ~58% of the canvas.
-    "azel-ios.svg": svg(1024, 1024, '<rect width="1024" height="1024" fill="url(#jade)"/>' + art(512, 482, 290, "color")),
+    # iOS: full-bleed square, the system applies the mask. Orb ~58% of the canvas.
+    "azel-ios.svg": svg(1024, 1024, '<rect width="1024" height="1024" fill="url(#jade)"/>' + art(512, 478, 300, "color")),
     # iOS 18 dark: transparent background, the system supplies the dark backdrop.
-    "azel-ios-dark.svg": svg(1024, 1024, art(512, 482, 290, "dark")),
+    "azel-ios-dark.svg": svg(1024, 1024, art(512, 478, 300, "dark")),
     # iOS 18 tinted: grayscale on transparent; the system tints by luminance.
-    "azel-ios-tinted.svg": svg(1024, 1024, art(512, 482, 290, "tinted")),
+    "azel-ios-tinted.svg": svg(1024, 1024, art(512, 478, 300, "tinted")),
     # macOS: 824 pt body on the 1024 grid (100 pt margin), continuous corners, drop shadow.
     "azel-macos.svg": svg(1024, 1024,
         '<clipPath id="body"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>'
         '<rect x="100" y="100" width="824" height="824" rx="185" fill="url(#jade)" filter="url(#mshadow)"/>'
-        f'<g clip-path="url(#body)">{art(512, 488, 235, "color")}</g>'),
+        f'<g clip-path="url(#body)">{art(512, 484, 245, "color")}</g>'),
 }
 
-# Menu-bar templates: black + alpha only (macOS recolors them). Outline when idle,
-# filled while a call is up (DESIGN.md §8.1).
+# Menu-bar templates: black + alpha only (macOS recolors them). The plain orb: outline
+# when idle, filled while a call is up (DESIGN.md §8.1).
 def template(size, filled):
     k = size / 18
-    jar = jar_with_lip(9 * k, 9.4 * k, 6.4 * k, lip=2.0)
+    jar = jar_path(9 * k, 9.3 * k, 7.0 * k)
     paint = 'fill="#000"' if filled else f'fill="none" stroke="#000" stroke-width="{1.5 * k:.2f}" stroke-linejoin="round"'
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">'
             f'<path d="{jar}" {paint}/></svg>\n')
