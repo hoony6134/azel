@@ -131,6 +131,12 @@ def user_title(settings, persona):
     return ""
 
 
+def local_prompt(text):
+    """Qwen's prompt in local mode: no hand-over tag to emit (there is no Claude to hand over to)."""
+    text = re.sub(r"[^.。]*" + re.escape(ROUTE_TAG) + r"[^.。]*[.。]\s*", "", text)
+    return text + " 할 수 없거나 모르는 건 짧게 모른다고 말하고, 지어내지 마."
+
+
 def system_prompt(name, length="normal", context="", persona="", title=""):
     """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
     at once. `context`: the brain's block, appended last; with it, Qwen answers personal questions from the context
@@ -215,6 +221,12 @@ history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
 # The conversation (persona:session) of the turn being answered: link requests that create a task or a reminder carry
 # it, and the call that later reports back is seeded with that conversation's recent turns.
 CALL_ORIGIN: contextvars.ContextVar = contextvars.ContextVar("call_origin", default="")
+# brain_mode for this call: auto | local (Qwen only, never Claude or a paid API) | claude_api | claude_code. From
+# /v1/call?mode=, else the shared setting; the app can switch it mid-call. Link requests carry it to the gateway.
+BRAIN_MODES = ("auto", "local", "claude_api", "claude_code")
+CALL_MODE: contextvars.ContextVar = contextvars.ContextVar("call_mode", default="")
+MODE_TYPES = ("ask", "tool_call", "schedule", "task")
+LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
 ORIGIN_TYPES = ("tool_call", "schedule", "task")
 ORIGIN_TURNS = 8
 ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
@@ -240,6 +252,8 @@ class Link:
     async def send(self, obj):
         if obj.get("type") in ORIGIN_TYPES and (origin := CALL_ORIGIN.get()) and "origin_session" not in obj:
             obj = {**obj, "origin_session": origin}  # the conversation a task or reminder will continue
+        if obj.get("type") in MODE_TYPES and (mode := CALL_MODE.get()) and "mode" not in obj:
+            obj = {**obj, "mode": mode}  # the gateway answers and runs tasks in this call's mode
         async with self.lock:
             await self.ws.send_text(json.dumps(obj, ensure_ascii=False))
 
@@ -1389,12 +1403,18 @@ async def respond(text, session, t0, timings, on_event=None):
     local = bool(ctx) or "memory_recall" in gw_names
     to_claude, model = (False, None) if sched or job else pre_route(
         bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
+    offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local"
+    if offline:
+        to_claude = False  # local mode: Qwen answers what it can and says plainly what it can't
     sentences: asyncio.Queue = asyncio.Queue()
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
     route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
     address = Address(user_title(settings, persona), hkey, not any(m["role"] == "assistant" for m in hist))
 
     async def via_claude():
+        if offline:  # never Claude in local mode: say so and offer the switch
+            await sentences.put(LOCAL_LINE)
+            return
         route["value"] = "claude"
         if on_event:
             await on_event(dict(ROUTING))  # before any filler
@@ -1458,7 +1478,8 @@ async def respond(text, session, t0, timings, on_event=None):
                 return await via_claude()
             length = reply_length(settings)
             gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
-            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) \
+            system = (local_prompt if offline else str)(system_prompt(
+                name, length, ctx, persona_text(persona, settings), user_title(settings, persona))) \
                 + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
@@ -1551,7 +1572,7 @@ async def respond(text, session, t0, timings, on_event=None):
                             return await via_claude()
                         nudged = True
                         messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
-                                     {"role": "user", "content": NUDGE}]
+                                     {"role": "user", "content": local_prompt(NUDGE) if offline else NUDGE}]
                         continue
                     break
             except Ungrounded:
@@ -1784,7 +1805,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = "", persona: str = ""):
+               intent: str = "", persona: str = "", mode: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -1804,6 +1825,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     # gen: the reply generation. Every reply claims a new one and an interrupt bumps it, so audio (and captions) a
     # superseded reply produces afterwards is dropped here: binary frames carry no id the app could check.
     current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set(), "side": set()}
+    # this call's brain mode: ?mode=, else the shared setting; replies spawned later copy the current value
+    current["mode"] = mode if mode in BRAIN_MODES else (links.settings.get("brain_mode") or "auto")
+    CALL_MODE.set(current["mode"])
 
     def spawn(coro):
         """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
@@ -1838,6 +1862,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 for i in range(0, len(audio), 9600):  # 200 ms chunks at 24 kHz
                     await ws.send_bytes(audio[i:i + 9600])
             else:
+                if obj.get("type") == "state":
+                    obj = {**obj, "mode": current["mode"]}  # every state frame says which brain is answering
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
     guard = OpeningGuard()
@@ -2051,6 +2077,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
                 current["task"] = spawn(speak_opening(op))
+        await send({"type": "mode", "value": current["mode"]})  # the app shows which brain answers
         await send({"type": "state", "value": "listening"})
         while True:
             msg = await ws.receive()
@@ -2062,6 +2089,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
                     side(tap_interrupt())
+                if kind == "mode" and (v := json.loads(msg["text"]).get("value")) in BRAIN_MODES:
+                    current["mode"] = v
+                    CALL_MODE.set(v)  # from the next reply on
+                    await send({"type": "mode", "value": v})
                 continue
             vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -2109,6 +2140,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
+        def nomode(f):  # state frames carry the call's brain mode; most checks don't care
+            return {k: v for k, v in f.items() if k != "mode"} if isinstance(f, dict) else f
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
 
@@ -2751,7 +2784,7 @@ if __name__ == "__main__":
                     types.append(f["type"])
                     if f["type"] == "reply":
                         replies.append(f["text"])
-                    if f == {"type": "state", "value": "listening"} and replies:
+                    if nomode(f) == {"type": "state", "value": "listening"} and replies:
                         break
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.05)
@@ -2923,7 +2956,7 @@ if __name__ == "__main__":
                     # the reply is 0.5 s of audio: still "speaking" until it has played, plus the tail
                     assert time.monotonic() - first_audio >= 0.5 + PLAY_TAIL_S - 0.05 and states[-1] == "speaking", states
                     assert ev["type"] == "turn_done" and ev["audio_ends_in_ms"] > 300, ev
-                    assert json.loads(w.receive_text()) == {"type": "state", "value": "listening"}
+                    assert nomode(json.loads(w.receive_text())) == {"type": "state", "value": "listening"}
                     w.send_text(json.dumps({"type": "hangup"}))
                 time.sleep(0.05)
             one_turn("/v1/call?session=ps&persona=luna")
@@ -2942,9 +2975,50 @@ if __name__ == "__main__":
                 await links.openings["cl"]["audio"]
             asyncio.run(placed())
             assert set(voices) == {"vivian"}
+            with tc.websocket_connect("/v1/call?session=pm&mode=local", headers={"Authorization": "Bearer app-tok"}) as w:
+                assert json.loads(w.receive_text()) == {"type": "mode", "value": "local"}  # on connect
+                assert json.loads(w.receive_text()) == {"type": "state", "value": "listening", "mode": "local"}
+                w.send_text(json.dumps({"type": "mode", "value": "bogus"}))  # ignored
+                w.send_text(json.dumps({"type": "mode", "value": "claude_api"}))
+                assert json.loads(w.receive_text()) == {"type": "mode", "value": "claude_api"}  # on each change
+                w.send_text(json.dumps({"type": "hangup"}))
             links.remove(full)
             links.settings = {}
             globals().update(tts=real[1], llm_stream=real_llm)
+        def local_mode_check():
+            """Local mode: Qwen has no hand-over tag, and anything that would go to Claude gets the can't-do line."""
+            prompts = []
+
+            async def qwen(messages, max_tokens=600):
+                prompts.append(messages[0]["content"])
+                yield ROUTE_TAG  # as if Qwen still tried to hand over
+
+            async def claude(*a, **k):
+                raise AssertionError("Claude in local mode")
+                yield ""
+
+            async def fake_tts(sentence, *a, **k):
+                return b"", 24000
+            globals().update(llm_stream=qwen, claude_stream=claude, tts=fake_tts, FILLER_AFTER_S=5)
+            ctx = contextvars.copy_context()
+            ctx.run(CALL_MODE.set, "local")
+            async def said_by(gen):
+                return [x async for x, *_ in gen]
+            out = ctx.run(asyncio.run, said_by(respond("오늘 코스피 어때?", "loc", time.perf_counter(), {})))
+            globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
+            return out, prompts
+        said, prompts = local_mode_check()
+        assert said == [LOCAL_LINE] and prompts and all(ROUTE_TAG not in p for p in prompts), (said, prompts)
+        assert ROUTE_TAG not in local_prompt(NUDGE) and ROUTE_TAG in NUDGE
+
+        class Rec(FakeWS):
+            pass
+        rec = Link(Rec())
+        ctx = contextvars.copy_context()
+        ctx.run(CALL_MODE.set, "claude_code")
+        ctx.run(asyncio.run, rec.send({"type": "ask", "id": "x"}))
+        ctx.run(asyncio.run, rec.send({"type": "call_log", "event": "end"}))
+        assert rec.ws.sent[0]["mode"] == "claude_code" and "mode" not in rec.ws.sent[1]  # requests only
         persona_check()
         logs = history_check()
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
@@ -3112,11 +3186,11 @@ if __name__ == "__main__":
                            "평일 오전 10시부터 오후 6시까지 2시간마다 전화드릴게요. 맞죠?", "알겠어요, 예약하지 않을게요.",
                            "지금은 예약을 받을 수 없어요."], replies
         at, after = tap_check(0.0)  # tapped during the first sentence: deferred until it has played
-        assert 0.25 <= at < 1.0 and after == {"type": "state", "value": "listening"}, (at, after)
+        assert 0.25 <= at < 1.0 and nomode(after) == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.4)  # after the first sentence: immediate
-        assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
+        assert at < 0.55 and nomode(after) == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.05, broken_tts=True)  # TTS failed: the protection is dropped, not held an hour
-        assert at < 0.5 and after == {"type": "state", "value": "listening"}, (at, after)
+        assert at < 0.5 and nomode(after) == {"type": "state", "value": "listening"}, (at, after)
 
         def stale_audio_check(queued):
             """A reply streams with slow TTS; the user taps interrupt mid-stream (queued=True: after a follow-up was
@@ -3161,7 +3235,7 @@ if __name__ == "__main__":
                     frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
                     if len([f for f in frames if f == "audio"]) > 40:
                         break
-                    if frames[-1] == {"type": "state", "value": "listening"} and {"type": "interrupt"} in frames:
+                    if nomode(frames[-1]) == {"type": "state", "value": "listening"} and {"type": "interrupt"} in frames:
                         time.sleep(1.0)  # anything still coming from the old reply arrives now
                         w.send_text(json.dumps({"type": "hangup"}))
                         break
@@ -3172,7 +3246,7 @@ if __name__ == "__main__":
         for queued in (False, True):
             after, frames = stale_audio_check(queued)
             assert "audio" not in after, (queued, frames)  # no old audio once the interrupt is out
-            assert after == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
+            assert [nomode(x) for x in after] == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
             starts = [f for f in frames if isinstance(f, dict) and f.get("type") == "reply_start"]
             assert starts and frames.index(starts[0]) < frames.index("audio"), frames  # reply_start precedes the audio
         globals().update(tts=real[1], llm_stream=real_llm)
@@ -3252,7 +3326,7 @@ if __name__ == "__main__":
         globals().update(tts=real[1], llm_stream=real_llm)
         assert frames.count({"type": "interrupt"}) == 1, frames  # tap A's late interrupt was skipped
         cut = frames.index({"type": "interrupt"})
-        assert frames[cut + 1] == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
+        assert nomode(frames[cut + 1]) == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
 
         def origin_call_check():
             """A task's finish call (origin_session) starts with the conversation it came from, then the opening."""
