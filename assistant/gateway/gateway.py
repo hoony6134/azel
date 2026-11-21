@@ -31,7 +31,9 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import agent_loop
 import connectors
+import tools_bridge
 import nim
 import wake_enroll
 import claude_api
@@ -87,6 +89,7 @@ DEFAULTS = {
     "assistant_name": "아젤",
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
+    "task_backend": "claude_code",  # background tasks: claude_code | claude_api | nim | qwen (agent_loop.py)
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
@@ -220,6 +223,8 @@ VOICE_BASE = (
     "내용으로 시작해. "
     "마크다운, 목록, 표, 이모지, URL, 코드 블록을 쓰지 마. '확인하지 않은 것' 같은 꼬리말도 붙이지 마. "
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
+    "사용자에게 전화를 걸어야 하면 call_user 도구로 지금 걸거나 시간을 정해 예약해. 여러 단계가 필요한 일은 create_task 도구로 "
+    "백그라운드 작업으로 맡겨. 전화를 걸 수 없다고 말하지 마. "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
     "기기 명령이 pending_approval을 돌려주면 먼저 '앱에서 허용해 주세요'라고 짧게 말한 다음, 같은 명령을 그 "
@@ -717,8 +722,18 @@ discovery = connectors.Discovery(CLAUDE)
 def run_args(settings, devices, requester=""):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
     custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
-    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME, device_tokens,
-                               {"X-Azel-Requester": requester} if requester else None)
+    servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
+                                                              TOKEN, HOME, device_tokens,
+                                                              {"X-Azel-Requester": requester} if requester else None)
+    if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
+        url = f"http://{HOST}:{PORT}/v1/mcp"
+        servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {"Authorization": f"Bearer {TOKEN}"}}}
+        allowed = [*allowed, "mcp__azel"]
+        rs = json.loads(run_settings)
+        if "allowedMcpServers" in rs:
+            rs["allowedMcpServers"].append({"serverUrl": url})
+        run_settings = json.dumps(rs, sort_keys=True)
+    return servers, allowed, run_settings, env
 
 
 async def resume_id(session):
@@ -846,19 +861,13 @@ async def ask_api(text, model, session):
 
 async def ask_api_full(text, model, settings, devices, dev_tools, where):
     """A full gateway's Messages API turn: Cygnus bridge tools plus the devices' tools, stable cached prefix."""
-    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)
-    by_name = {t["name"] for t in cyg_tools}
+    defs, where = await bridge.tools("api")  # devices, call_user, create_task, Cygnus: the same for every path
 
     async def run(name, args):
-        if name in by_name:
-            return await cyg_run(name, args)
-        r = await run_tool({"name": name, "input": args, "id": "x"}, where)
-        if r.get("is_error"):
-            raise RuntimeError("device tool failed")
-        return r["content"]
+        return (await bridge.call(name, args, current_persona.get(), caller="api", where=where))["content"]
     system = name_prompt(settings) + FULL_API_STYLE + device_prompt(settings, devices)
     yield activity("thinking")
-    async for kind, v in claude_api.ask(API_KEY, model, system, text, cyg_tools + dev_tools, run):
+    async for kind, v in claude_api.ask(API_KEY, model, system, text, defs, run):
         if kind == "text":
             yield v
         elif kind == "tool":
@@ -883,22 +892,19 @@ async def ask_nim(text, model, session):
         yield {"type": "error", "code": "nim_off", "message": "엔비디아 모델이 꺼져 있어요. 앱의 설정에서 켜 주세요."}
         return
     devices = await fresh_devices()
-    tools, where = await device_tools(devices)
-    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)  # the brain's read-only Cygnus tools, when this host has them
-    cyg = {t["name"] for t in cyg_tools}
+    tools, where = await bridge.tools("api")  # devices, call_user, create_task, Cygnus: the same for every path
     now = datetime.now(KST)
     system = (name_prompt(settings) + API_STYLE + device_prompt(settings, devices) + NIM_STYLE
               + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}(한국 시간)이야.")
 
     async def run(b):
-        if b["name"] in cyg:
-            return {"content": await cyg_run(b["name"], b["input"]), "is_error": False}
-        return await run_tool(b, where)
+        r = await bridge.call(b["name"], b["input"], current_persona.get(), caller="api", where=where)
+        return {"content": r["content"], "is_error": r["is_error"]}
 
     def act(phase, tool=""):
-        return activity(phase, tool if tool in cyg or not tool else f"mcp__{tool}")
+        return activity(phase, f"mcp__{tool}" if "__" in tool else tool)
     try:
-        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, cyg_tools + tools, run, act):
+        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, tools, run, act):
             yield SPOKEN_MARKDOWN.sub("", item) if isinstance(item, str) else item
     except nim.NimError as e:
         yield {"type": "error", "code": e.code, "message": e.message}
@@ -1568,6 +1574,8 @@ async def handle_link(ws):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
         elif m.get("type") == "task" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_task(m))
+        elif m.get("type") in ("tool_call", "tools_list") and isinstance(m.get("id"), str):
+            tasks[m["id"]] = asyncio.create_task(serve_tool(m))
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "call_answered":
@@ -1733,6 +1741,8 @@ async def put_settings(body: dict):
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
             raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
+    if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
+        raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -2507,16 +2517,20 @@ def check_task(body):
     persona = body.get("persona")
     if persona is not None and not (isinstance(persona, str) and PERSONA_ID.fullmatch(persona)):
         raise HTTPException(400, "persona: a persona id")
+    backend = body.get("backend")
+    if backend is not None and backend not in TASK_BACKENDS:
+        raise HTTPException(400, f"backend: one of {list(TASK_BACKENDS)}")
     return {"goal": goal.strip(), "notify": notify, "budget_usd": float(budget), "max_minutes": float(minutes),
-            "device": device, "persona": persona}
+            "device": device, "persona": persona, "backend": backend}
 
 
 async def task_create(body, source="api"):
     full_only()
-    if not CLAUDE_OK:
-        raise HTTPException(503, "Claude is not available on this gateway")
     spec = check_task(body)
     settings = await load_settings()
+    spec["backend"] = spec["backend"] or settings.get("task_backend", "claude_code")
+    if spec["backend"] == "claude_code" and not CLAUDE_OK:
+        raise HTTPException(503, "Claude is not available on this gateway")
     if spec["persona"] and not persona_by_id(settings, spec["persona"]):
         raise HTTPException(400, "persona: no such persona")
     t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
@@ -2645,6 +2659,9 @@ async def run_task(t):
             t.update(status="running", started=time.time())
             await task_save(t)
             deadline = time.monotonic() + t["max_minutes"] * 60
+            if t.get("backend", "claude_code") != "claude_code":
+                await run_task_api(t)
+                return
             session, prompt = None, None
             for _ in range(TASK_MAX_ROUNDS):
                 session, pending = await task_round(t, prompt, session, deadline)
@@ -2710,7 +2727,7 @@ async def fail_orphan_tasks():
 
 
 def task_view(t, steps=True):
-    keep = ("id", "goal", "status", "device", "persona", "notify", "budget_usd", "max_minutes", "created", "started",
+    keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "budget_usd", "max_minutes", "created", "started",
             "finished", "result", "error", "cost_usd", "owner")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
@@ -2821,3 +2838,102 @@ if __name__ == "__main__":
     import uvicorn
     assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"
     uvicorn.run(app, host=HOST, port=PORT)
+
+
+# ---------- one tool executor for every path (tools_bridge.py) and API-backed tasks (agent_loop.py) ----------
+TASK_BACKENDS = ("claude_code", *agent_loop.BACKENDS)
+TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로 요약해. "
+                  "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
+                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+bridge = tools_bridge.Bridge(
+    fresh_devices=lambda: fresh_devices(), device_tools=lambda d: device_tools(d), run_tool=lambda b, w: run_tool(b, w),
+    place_call=lambda reason, opening, pid: place_call(reason, opening=opening, persona_id=pid),
+    schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
+    state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
+    in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME))
+
+
+@app.get("/v1/tools")
+async def tools_list(caller: str = "api"):
+    """Every tool a model path may call (Messages-API shapes): devices, call_user, create_task, Cygnus."""
+    full_only()
+    return (await bridge.tools("qwen" if caller == "qwen" else "api"))[0]
+
+
+@app.post("/v1/tools/call")
+async def tools_call(body: dict):
+    """{name, args, persona_id?, caller?} -> {content, is_error, approval?}. Waits up to 5 min for an approval."""
+    full_only()
+    if not isinstance(body.get("name"), str):
+        raise HTTPException(400, "name required")
+    caller = "qwen" if body.get("caller") == "qwen" else "api"
+    return await bridge.call(body["name"], body.get("args") or {}, body.get("persona_id"), caller=caller)
+
+
+@app.post("/v1/mcp")
+async def mcp_server(request: Request):
+    """call_user and create_task as an MCP server (streamable HTTP, stateless JSON) for claude -p."""
+    full_only()
+    msg = await request.json()
+    out = await tools_bridge.mcp_handle(bridge, msg if isinstance(msg, dict) else {}, current_persona.get())
+    return Response(status_code=202) if out is None else JSONResponse(out)
+
+
+async def serve_tool(m):
+    """The voice server's Qwen asks for its tool list or runs a tool; an approval wait says so first."""
+    current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
+    try:
+        if m["type"] == "tools_list":
+            await link_send({"id": m["id"], "type": "tools", "tools": (await bridge.tools("qwen"))[0]})
+            return
+
+        async def progress(say):
+            await link_send({"id": m["id"], "type": "tool_progress", "say": say})
+        r = await bridge.call(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
+                              on_progress=progress)
+        await link_send({"id": m["id"], "type": "tool_result", "result": r["content"], "is_error": r["is_error"]})
+    except Exception as e:
+        print("tool over link failed:", type(e).__name__, flush=True)
+        await link_send({"id": m["id"], "type": "tool_result", "result": "도구를 쓰지 못했어요.", "is_error": True})
+
+
+def task_backend_cfg(backend, settings):
+    if backend == "claude_api":
+        if not API_KEY:
+            raise TaskLimit("error", "Claude API 키가 없어요.")
+        model = settings["task_defaults"].get("task", {}).get("model")
+        return {"api_key": API_KEY, "model": model if model in MODELS else "sonnet"}
+    if backend == "nim":
+        cfg = settings["providers"]["nim"]
+        if not cfg["enabled"] or not nim.has_key(HOME):
+            raise TaskLimit("error", "엔비디아 모델이 꺼져 있거나 키가 없어요.")
+        prices = (cfg.get("prices") or {}).get(cfg["model"]) or [0, 0]
+        return {"url": cfg["base_url"].rstrip("/") + "/chat/completions", "key": nim.read_key(HOME),
+                "model": cfg["model"], "prices": prices}
+    return {"url": LLM_URL, "model": LLM_MODEL, "prices": [0, 0]}
+
+
+async def run_task_api(t):
+    """One task on an API backend (agent_loop): same caps, steps, approvals and notification as claude_code."""
+    settings = await load_settings()
+    devices = await fresh_devices()
+    system = name_prompt(settings) + TASK_API_STYLE + device_prompt(settings, devices)
+
+    async def cancelled():
+        return bool((await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"))
+    async for ev in agent_loop.run(t["backend"], system, task_prompt(t, devices), bridge,
+                                   task_backend_cfg(t["backend"], settings), t["budget_usd"] - t["cost_usd"],
+                                   t["max_minutes"], cancelled, t.get("persona")):
+        if ev["type"] == "activity" and ev["phase"] == "tool_start":
+            task_step(t, "tool", tool=ev["tool"], label=tool_label(ev["tool"]))
+            await task_save(t)
+        elif ev["type"] == "activity" and ev["phase"].startswith("approval_"):
+            task_step(t, ev["phase"], tool=ev["tool"])
+        elif ev["type"] == "done":
+            t.update(status="done", finished=time.time(), result=ev["result"] or None,
+                     cost_usd=t["cost_usd"] + ev["cost_usd"])
+        elif ev["type"] == "failed":
+            t["cost_usd"] += ev["cost_usd"]
+            if ev["kind"] == "cancelled":
+                raise asyncio.CancelledError
+            raise TaskLimit(ev["kind"], ev["message"])

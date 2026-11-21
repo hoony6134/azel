@@ -1441,7 +1441,9 @@ def test_runs_load_only_enabled_connectors(gw):
     c.post("/v1/ask", json={"text": "a", "session": "s1"})
     args, st = run_settings(tmp)
     urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
-    assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp"}  # defaults
+    azel = "http://100.64.0.8:8892/v1/mcp"  # the gateway's own call_user / create_task server
+    assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp", azel}  # defaults
+    assert "mcp__azel" in args
     assert st["enabledPlugins"] == {"figma@official": False, "legal@x": False}
     assert "mcp__claude_ai_Gmail" in args and "mcp__claude_ai_Notion" not in args
     r = c.put("/v1/connectors", json={"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
@@ -1454,7 +1456,7 @@ def test_runs_load_only_enabled_connectors(gw):
     c.post("/v1/ask", json={"text": "b", "session": "s2"})
     args, st = run_settings(tmp)
     urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
-    assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp"}
+    assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp", azel}
     assert "mcp__claude_ai_Notion" in args and "mcp__wiki" not in args  # no secret yet: the server is skipped
 
 
@@ -1539,7 +1541,7 @@ def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatc
     monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))  # no PAT in tests
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         evs = events(c.post("/v1/ask", json={"text": "홈 폴더 봐 줘", "session": "s", "path": "api", "model": "haiku"}))
-    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir"]
+    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir", "call_user", "create_task"]
     assert "Cygnus 도구" in seen["system"] and g.PERSONAL_REFUSAL not in seen["system"] and seen["result"] == "a b c"
     assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
     done = evs[-1]
