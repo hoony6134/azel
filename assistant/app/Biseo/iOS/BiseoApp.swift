@@ -14,6 +14,7 @@ struct BiseoApp: App {
         Recordings.cleanup()
         Config.migrateAddresses()
         UNUserNotificationCenter.current().delegate = TaskNotificationHandler.shared
+        UNUserNotificationCenter.current().setNotificationCategories(PushAction.categories)
         LiveActivities.shared.start()
         #if DEBUG
         if CommandLine.arguments.contains("-liveActivityPreview") { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { LiveActivities.shared.debugPreview() } }
@@ -89,6 +90,11 @@ final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate 
     static let shared = TaskNotificationHandler()
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let action = response.actionIdentifier
+        if action != UNNotificationDefaultActionIdentifier && action != UNNotificationDismissActionIdentifier {
+            await PushAction.perform(action: action, userInfo: response.notification.request.content.userInfo)
+            return
+        }
         if let id = ApprovalCenter.approvalID(from: response.notification.request.content.userInfo) {
             await ApprovalCenter.shared.open(id: id)
             return
