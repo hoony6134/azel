@@ -4,6 +4,7 @@ import SwiftUI
 struct BiseoApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "iphone")
     @StateObject private var history = HistoryModel()
+    @StateObject private var schedule = ScheduleModel()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -15,7 +16,7 @@ struct BiseoApp: App {
         WindowGroup {
             Group {
                 if model.configured {
-                    RootView(model: model, history: history)
+                    RootView(model: model, history: history, schedule: schedule)
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
@@ -34,12 +35,13 @@ struct BiseoApp: App {
 struct RootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @ObservedObject private var call = CallManager.shared
     @State private var tab = 0
 
     var body: some View {
         TabView(selection: $tab) {
-            NavigationStack { HomeView(model: model, history: history, tab: $tab) }
+            NavigationStack { HomeView(model: model, history: history, schedule: schedule, tab: $tab) }
                 .tabItem { Label("홈", systemImage: "circle.circle") }.tag(0)
             NavigationStack {
                 HistoryList(model: history, onCall: { CallManager.shared.startCall() })

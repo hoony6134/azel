@@ -4,6 +4,7 @@ import SwiftUI
 struct HomeView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @Binding var tab: Int
     @ObservedObject private var call = CallManager.shared
     @State private var toast: String?
@@ -29,6 +30,7 @@ struct HomeView: View {
                 .padding(.horizontal, 60)
                 callButton
                 quickActions
+                ScheduleCard(schedule: schedule)
                 recents
             }
             .padding(.horizontal, 20)
@@ -52,7 +54,7 @@ struct HomeView: View {
             }
         }
         .navigationDestination(for: HistoryItem.self) { HistoryDetailView(item: $0, history: history) }
-        .refreshable { await model.refresh(); await history.refresh() }
+        .refreshable { await model.refresh(); await history.refresh(); await schedule.refresh() }
     }
 
     @ViewBuilder private var statusLine: some View {

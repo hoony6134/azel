@@ -6,6 +6,7 @@ struct BiseoMacApp: App {
     @StateObject private var model = AppModel(sessionPrefix: "mac")
     @StateObject private var wake = WakeModel()
     @StateObject private var history = HistoryModel()
+    @StateObject private var schedule = ScheduleModel()
     @ObservedObject private var call = MacCall.shared
 
     init() {
@@ -24,7 +25,7 @@ struct BiseoMacApp: App {
         .menuBarExtraStyle(.window)
 
         Window("Azel", id: "main") {
-            MainWindow(model: model, wake: wake, history: history)
+            MainWindow(model: model, wake: wake, history: history, schedule: schedule)
         }
         .defaultSize(width: 760, height: 720)
 
@@ -237,6 +238,7 @@ struct MainWindow: View {
     @ObservedObject var model: AppModel
     @ObservedObject var wake: WakeModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     @State private var section: String? = "home"
 
     var body: some View {
@@ -255,7 +257,7 @@ struct MainWindow: View {
                     case "approvals": ApprovalsScreen(model: model)
                     case "history": HistorySplit(history: history)
                     case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
-                    default: MacHome(model: model, history: history) { section = "history" }
+                    default: MacHome(model: model, history: history, schedule: schedule) { section = "history" }
                     }
                 }
             } else {
@@ -271,6 +273,7 @@ struct MainWindow: View {
 struct MacHome: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
+    @ObservedObject var schedule: ScheduleModel
     var showAll: () -> Void
     @ObservedObject private var call = MacCall.shared
     @State private var openItem: HistoryItem?
@@ -326,6 +329,7 @@ struct MacHome: View {
             }
             .buttonStyle(.plain).disabled(model.statusError != nil)
             Text("어디서든 \(HotKey.label)로 부를 수 있어요").font(.footnote).foregroundStyle(Theme.text3)
+            ScheduleCard(schedule: schedule)
             VStack(alignment: .leading, spacing: Theme.m) {
                 HStack {
                     Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
