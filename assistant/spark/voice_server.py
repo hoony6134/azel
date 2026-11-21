@@ -212,6 +212,12 @@ if not CHECK_ONLY:
     HASHES = load_hashes(open(HASH_FILE).read())
 asr_lock = asyncio.Lock()
 history: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
+# The conversation (persona:session) of the turn being answered: link requests that create a task or a reminder carry
+# it, and the call that later reports back is seeded with that conversation's recent turns.
+CALL_ORIGIN: contextvars.ContextVar = contextvars.ContextVar("call_origin", default="")
+ORIGIN_TYPES = ("tool_call", "schedule", "task")
+ORIGIN_TURNS = 8
+ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
 # Who each history was built as (persona name, user title). The app reuses one session id all day, so without this a
 # renamed persona or a new title would keep being contradicted by the earlier turns Qwen sees and imitates.
 history_sig: dict[str, tuple] = {}
@@ -232,6 +238,8 @@ class Link:
         self.tools: tuple = ()  # the tools a brain link serves (its hello), e.g. read-only Cygnus tools
 
     async def send(self, obj):
+        if obj.get("type") in ORIGIN_TYPES and (origin := CALL_ORIGIN.get()) and "origin_session" not in obj:
+            obj = {**obj, "origin_session": origin}  # the conversation a task or reminder will continue
         async with self.lock:
             await self.ws.send_text(json.dumps(obj, ensure_ascii=False))
 
@@ -336,6 +344,8 @@ class GatewayLinks:
                     old["audio"].cancel()
             self.openings[msg["call_id"]] = prepare_opening(msg.get("opening", ""), str(msg.get("reason", "")),
                                                             str(msg.get("persona") or ""))
+            origin = msg.get("origin_session")
+            self.openings[msg["call_id"]]["origin"] = origin if isinstance(origin, str) and ORIGIN_RE.fullmatch(origin) else ""
         elif isinstance(msg.get("id"), str) and isinstance(t, str) and msg["id"] in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
@@ -1292,6 +1302,7 @@ async def respond(text, session, t0, timings, on_event=None):
     settings = await gateway_settings()
     persona = current_persona(settings)
     hkey = f"{persona['id']}:{session}"  # history and the Claude session map are per persona
+    CALL_ORIGIN.set(hkey)
     hist = history[hkey]
     name = persona["name"]
     sig = (name, user_title(settings, persona))
@@ -1935,6 +1946,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             current["task"] = spawn(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
+                if op.get("origin") and op["origin"] != f"{pid}:{session}":  # a task's or reminder's call: continue there
+                    history[f"{pid}:{session}"].extend(list(history.get(op["origin"], ()))[-ORIGIN_TURNS:])
                 history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
                 current["task"] = spawn(speak_opening(op))
@@ -2877,6 +2890,7 @@ if __name__ == "__main__":
         globals()["tts"] = real[1]
         assert said == [("맥북에서 시작할게요.", "task"), ("끝나면 전화드릴게요.", "task")], said
         assert req["type"] == "task" and req["device"] == "macbook" and req["notify"] == "call" and req["goal"].startswith("맥북")
+        assert req["origin_session"] == "azel:tk"  # the finish call will continue this conversation
 
         async def schedule_check():
             """The fast path sends the user's words; the gateway resolves them and its result is what is said.
@@ -3096,6 +3110,30 @@ if __name__ == "__main__":
         assert frames.count({"type": "interrupt"}) == 1, frames  # tap A's late interrupt was skipped
         cut = frames.index({"type": "interrupt"})
         assert frames[cut + 1] == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
+
+        def origin_call_check():
+            """A task's finish call (origin_session) starts with the conversation it came from, then the opening."""
+            from fastapi.testclient import TestClient
+            history["azel:day"] = deque([{"role": "user", "content": "다운로드 폴더 정리해 줘"},
+                                         {"role": "assistant", "content": "맥북에서 시작할게요."}], maxlen=MAX_TURNS * 2)
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            links.receive(full, {"type": "call", "call_id": "cz", "opening": "정훈님, 맡기신 다운로드 정리 끝났어요.",
+                                 "origin_session": "azel:day"})
+            assert links.openings["cz"]["origin"] == "azel:day"
+            links.receive(full, {"type": "call", "call_id": "cw", "opening": "x", "origin_session": "bad id!"})
+            assert links.openings["cw"]["origin"] == ""  # only a session-shaped origin is kept
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?call_id=cz&session=cz", headers={"Authorization": "Bearer app-tok"}) as w:
+                time.sleep(0.3)
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.1)
+            links.remove(full)
+            return [m["content"] for m in history["azel:cz"]]
+        globals().update(tts=lambda s: asyncio.sleep(0, (b"", 24000)))
+        seeded = origin_call_check()
+        globals().update(tts=real[1])
+        assert seeded == ["다운로드 폴더 정리해 줘", "맥북에서 시작할게요.", "정훈님, 맡기신 다운로드 정리 끝났어요."], seeded
 
         asks, cancels = hangup_check()
         assert asks and [c["id"] for c in cancels] == [asks[0]["id"]], (asks, cancels)

@@ -1068,6 +1068,24 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
+# The conversation (voice persona:session) a request came from: a task's finish call and a reminder made during a
+# call continue it (the voice server seeds the new call with that conversation's recent turns).
+ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
+origin_ctx: contextvars.ContextVar = contextvars.ContextVar("origin_session", default="")
+
+
+def origin_of(m):
+    v = m.get("origin_session")
+    return v if isinstance(v, str) and ORIGIN_RE.fullmatch(v) else ""
+
+
+def served(coro, m):
+    """A link request served in its own context carrying the conversation it came from."""
+    ctx = contextvars.copy_context()
+    ctx.run(origin_ctx.set, origin_of(m))
+    return asyncio.create_task(coro, context=ctx)
+
+
 def with_title(opening, title):
     """The user's title at the start of an opening, whoever wrote it (a model may leave it out): "정훈님, …"."""
     if not opening or not title or title in opening[:len(title) + 12]:
@@ -1075,7 +1093,7 @@ def with_title(opening, title):
     return f"{title}, {opening}"
 
 
-async def place_call(reason, opening=None, call_id=None, persona_id=None):
+async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
@@ -1086,6 +1104,7 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None):
             "밤사이 서버 상태(Cygnus 인프라)를 확인해서 '좋은 아침이에요'로 시작하는 30초 안쪽 브리핑으로 말해.",
             session=f"briefing-{uuid.uuid4().hex[:8]}", model="sonnet", task="schedule")
     call_id = call_id or uuid.uuid4().hex
+    origin_session = origin_session if origin_session is not None else (origin_ctx.get() or None)  # call_user now
     settings = await load_settings()
     persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
     opening = with_title(opening, user_title(settings, persona))  # every placed call opens with the title
@@ -1095,7 +1114,7 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None):
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
     await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
-                     "persona": persona["id"]})
+                     "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {})})
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
                                  "persona": persona["id"]})
     return {"call_id": call_id, **push}
@@ -1516,6 +1535,8 @@ async def schedule_create(body, created_by, now=None):
     checked = check_schedule({**body, "purpose": purpose, "request": raw}, created_by, now,
                              upcoming(await schedule_list(), now))
     row = await state.call("POST", "/v1/state/schedule", {**checked, "persona_id": pid})
+    if origin := origin_ctx.get():  # made during a call: its call continues that conversation
+        await state.call("PUT", f"/v1/state/kv/origin-{row['id']}", {"session": origin})
     return public_item(row), confirm_text(row, now)
 
 
@@ -1705,7 +1726,9 @@ async def attempt(item, now):
                               schedule_id=item["id"])
         await finish(claimed, now, "answered")
         return
-    await place_call(item["kind"], opening, call_id=call_id, persona_id=item.get("persona_id"))
+    origin = (await state.call("GET", f"/v1/state/kv/origin-{item['id']}") or {}).get("session")
+    await place_call(item["kind"], opening, call_id=call_id, persona_id=item.get("persona_id"),
+                     **({"origin_session": origin} if origin else {}))
 
 
 async def finish(item, now, status):
@@ -1791,11 +1814,11 @@ async def handle_link(ws):
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
-            tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
+            tasks[m["id"]] = served(serve_schedule(m), m)
         elif m.get("type") == "task" and isinstance(m.get("id"), str):
-            tasks[m["id"]] = asyncio.create_task(serve_task(m))
+            tasks[m["id"]] = served(serve_task(m), m)
         elif m.get("type") in ("tool_call", "tools_list") and isinstance(m.get("id"), str):
-            tasks[m["id"]] = asyncio.create_task(serve_tool(m))
+            tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "call_answered":
@@ -2805,7 +2828,7 @@ async def task_create(body, source="api"):
         raise HTTPException(400, "persona: no such persona")
     t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
          "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
-         "cost_usd": 0.0, "cancel_requested": False}
+         "cost_usd": 0.0, "cancel_requested": False, "origin_session": origin_ctx.get() or None}
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
         await task_save(t)
@@ -3046,7 +3069,8 @@ async def task_notify(t, approval=False):
             settings = await load_settings()
             persona = persona_by_id(settings, t["persona"] or "") or primary_persona(settings)
             await place_call("task_approval" if approval else "task",
-                             opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"])
+                             opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"],
+                             **({"origin_session": t["origin_session"]} if t.get("origin_session") else {}))
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")

@@ -124,8 +124,17 @@ JSON text frames:
   would replace a link of the other mode is ignored),
   `{"type":"settings","value":{…}}` (on connect and every change; from any full-mode link, the last
   one wins, since all gateways read the same shared settings; ignored from limited links),
-  `{"type":"call","call_id","opening","reason"}` (sent before the VoIP push; accepted from any full-mode link,
-  ignored without a string `call_id`; the voice server synthesizes the opening on arrival),
+  `{"type":"call","call_id","opening","reason","persona","origin_session"?}` (sent before the VoIP push; accepted
+  from any full-mode link, ignored without a string `call_id`; the voice server synthesizes the opening on arrival).
+  Every placed call's opening starts with the user's title in effect ("정훈님, …"), whoever wrote it.
+  `origin_session` (`persona:session`, `[A-Za-z0-9_:.-]{1,120}`): the conversation this call continues. A task's
+  finish/approval call and a reminder made during a call carry it, and so does `call_user` now from a call. When the
+  call connects, its history starts with that conversation's last 8 turns, then the opening (which holds the task
+  result), so Qwen and Claude both answer with that context. (In memory on the voice server: a reminder that fires
+  after a voice-server restart starts without it.)
+- Requests the voice server sends over the link to create something (`tool_call`, `schedule`, `task`) carry
+  `origin_session` = the conversation being answered; the gateway keeps it on the task (`origin_session`) or on the
+  reminder (kv `origin-<schedule id>`).
   `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"call_log","event":"start"|"turn"|"end","log_id",…}` — call history, sent
   only to a full-mode link (dropped when none is up; the voice server stores no history):
@@ -256,7 +265,10 @@ device that created them.
   `user_title`: how the assistant addresses the user, 0–12 Hangul/Latin letters or spaces (whitespace collapsed,
   null → `""`); `""` = no fixed title, address the user naturally. A persona's own `user_title` overrides it. The
   title in effect goes into Claude's persona block and Qwen's prompt as "사용자를 '<title>'(이)라고 부른다." (left out
-  when empty). Persona and settings changes reach the voice server at once over the link (every change pushes the
+  when empty). A spoken briefing's first sentence also starts with the title.
+  Late at night (00:00–05:00 KST) every model prompt (Qwen's, Claude's voice style, the API/NIM paths, tasks) carries
+  `late_night.prompt_rule`: "내일" means today until 05:00, with a read-back for afternoon times and a question for
+  morning times, the same rule `when_from_words` applies to scheduling and spoken cancels. Persona and settings changes reach the voice server at once over the link (every change pushes the
   whole settings), and each call takes its persona snapshot when it starts. Because the app reuses one session id per
   day, a change of the persona's name or title also starts that conversation fresh: the voice server drops the
   persona+session history it built under the old name/title, and the gateway keys the resumed Claude session by

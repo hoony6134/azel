@@ -24,12 +24,13 @@ def tgw(tmp_path, monkeypatch):
     tgw_track(g)
     notes = []
 
-    async def place_call(reason, opening=None, call_id=None, persona_id=None):
+    async def place_call(reason, opening=None, call_id=None, persona_id=None, **kw):
         notes.append(("call", reason, opening, persona_id))
         return {"call_id": "c"}
 
     async def push(title, body, **extra):
         notes.append(("push", title, body, extra))
+    g.real_place_call = g.place_call  # tests that need the real one put it back
     g.place_call, g.send_alert_push = place_call, push
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         yield g, c, notes
@@ -262,3 +263,60 @@ def test_runner_crash_is_logged_and_marked_failed(tgw, monkeypatch, capsys):
     tid = c.post("/v1/tasks", json={"goal": "맥북 정리", "notify": "none"}).json()["id"]
     t = wait_for(c, tid, ("failed",))
     assert t["error"] == "작업이 실패했어요." and "task failed" in capsys.readouterr().out
+
+
+def test_finish_call_continues_the_conversation(tgw, monkeypatch):
+    """A task started during a call reports back on a call linked to that conversation (origin_session)."""
+    g, c, notes = tgw
+    sent, calls = [], []
+
+    async def link_send(obj):
+        sent.append(obj)
+        return True
+
+    async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None):
+        calls.append((reason, origin_session))
+        return {"call_id": "c"}
+    g.link_send, g.place_call = link_send, place_call
+
+    async def go():
+        m = {"type": "task", "id": "q1", "goal": "맥북 다운로드 정리해 줘", "notify": "call",
+             "origin_session": "azel:iphone-2026-11-22"}
+        await g.served(g.serve_task(m), m)  # how handle_link serves a task frame
+        await asyncio.sleep(0.2)
+        await asyncio.gather(*[r for r in g.task_runs.values() if r])
+    c.portal.call(go)
+    tid = sent[0]["task_id"]
+    assert c.get(f"/v1/tasks/{tid}").json()["status"] == "done"
+    assert g.fake.db["kv"][f"task-{tid}"]["origin_session"] == "azel:iphone-2026-11-22"
+    assert calls == [("task", "azel:iphone-2026-11-22")]
+
+
+def test_reminder_and_call_now_carry_their_origin(tgw, monkeypatch):
+    g, c, _ = tgw
+    sent = []
+
+    async def link_send(obj):
+        sent.append(obj)
+        return True
+
+    async def no_push(payload):
+        return {"sent": 0}
+    monkeypatch.setattr(g, "link_send", link_send)
+    monkeypatch.setattr(g, "send_voip_push", no_push)
+    monkeypatch.setattr(g, "place_call", g.real_place_call)
+
+    async def as_link(coro_fn, origin):  # what handle_link does for schedule / task / tool_call frames
+        return await g.served(coro_fn(), {"origin_session": origin})
+    at = (g.datetime.now(g.KST) + g.timedelta(hours=1)).replace(microsecond=0).isoformat()
+    item, _ = c.portal.call(as_link, lambda: g.schedule_create({"at": at, "kind": "reminder", "note": "약 먹기", "notify": "call"}, "voice"),
+                            "azel:iphone-2026-11-22")
+    assert g.fake.db["kv"][f"origin-{item['id']}"] == {"session": "azel:iphone-2026-11-22"}
+    row = g.fake.db["schedule"][item["id"]]
+    c.portal.call(g.attempt, row, time.time())  # the reminder fires
+    call = [m for m in sent if m.get("type") == "call"][-1]
+    assert call["origin_session"] == "azel:iphone-2026-11-22"
+    c.portal.call(as_link, lambda: g.place_call("user_request", "지금 전화드렸어요."), "luna:mac-2026-11-22")
+    assert [m for m in sent if m.get("type") == "call"][-1]["origin_session"] == "luna:mac-2026-11-22"
+    c.portal.call(g.place_call, "deadline", "마감이에요.")  # a proactive call has no conversation behind it
+    assert "origin_session" not in [m for m in sent if m.get("type") == "call"][-1]
