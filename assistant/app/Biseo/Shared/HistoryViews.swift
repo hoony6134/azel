@@ -70,7 +70,15 @@ struct HistoryRow: View {
             DirectionGlyph(incoming: item.incoming)
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.title ?? "제목 없음").foregroundStyle(Theme.text).lineLimit(1)
-                Text(HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(selected ? Theme.text2 : Theme.text3)
+                HStack(spacing: 4) {
+                    // §17.7: "● 소담 · 오전 8:02 · 4분 · 6턴"; a removed persona reads "삭제된 비서".
+                    if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id) {
+                        Circle().fill(who.tint).frame(width: 8, height: 8)
+                        Text(who.name + " ·").foregroundStyle(who.name == "삭제된 비서" ? Theme.text3 : Theme.text2)
+                    }
+                    Text(HistoryFormat.meta(item)).foregroundStyle(selected ? Theme.text2 : Theme.text3)
+                }
+                .font(.footnote.monospacedDigit())
                 if let match = item.match { Text(highlight(match)).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
                 if failed {
                     HStack(spacing: Theme.xs) {
@@ -83,7 +91,6 @@ struct HistoryRow: View {
             Spacer(minLength: Theme.s)
             if deleting { ProgressView().controlSize(.small) } else {
                 HStack(spacing: Theme.xs) {
-                    if PersonaModel.shared.personas.count > 1, let p = PersonaModel.shared.persona(id: item.persona_id) { PersonaChip(persona: p) }
                     ForEach(item.routeList, id: \.self) { RouteChip(route: $0) }
                     if !Recordings.matching(item).isEmpty { Image(systemName: "waveform").foregroundStyle(Theme.text3).accessibilityLabel("녹음 있음") }
                 }
@@ -211,21 +218,6 @@ struct HistoryList: View {
         .scrollContentBackground(.hidden)
         .background(Theme.bg.ignoresSafeArea())
         .searchable(text: $model.query, prompt: "기록 검색")
-        .toolbar {
-            if PersonaModel.shared.personas.count > 1 {
-                ToolbarItem(placement: .primaryAction) {
-                    Menu {
-                        Picker("비서", selection: $model.personaFilter) {
-                            Text("모든 비서").tag(String?.none)
-                            ForEach(PersonaModel.shared.personas) { Text($0.name).tag(Optional($0.id)) }
-                        }
-                    } label: {
-                        Label(PersonaModel.shared.persona(id: model.personaFilter)?.name ?? "모든 비서", systemImage: "line.3.horizontal.decrease.circle")
-                    }
-                    .accessibilityLabel("비서별로 보기")
-                }
-            }
-        }
         .refreshable { await model.refresh() }
         .overlay(alignment: .bottom) { UndoToast(model: model).animation(Theme.enter, value: model.pendingDelete) }
         .onDisappear { model.commitPendingDelete() }
@@ -234,6 +226,9 @@ struct HistoryList: View {
     @ViewBuilder private var list: some View {
         let sections = HistoryFormat.byDay(model.items)
         let rows = List(selection: selection) {
+            if PersonaModel.shared.personas.count > 1 {
+                PersonaFilterRow(selected: $model.personaFilter).listRowBackground(Color.clear).listRowSeparator(.hidden)
+            }
             if let since = model.offlineSince {
                 OfflineBanner(since: since) { Task { await model.refresh() } }.listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
@@ -380,6 +375,9 @@ struct HistoryDetailView: View {
             Text(item.title ?? "제목 없음").font(.title3.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(3)
             HStack(spacing: Theme.xs) {
                 DirectionGlyph(incoming: item.incoming).font(.footnote)
+                if PersonaModel.shared.personas.count > 1, let who = PersonaModel.shared.label(for: item.persona_id) {
+                    PersonaChip(name: who.name, tint: who.tint)
+                }
                 Text(HistoryFormat.dayTitle(item.start) + " " + HistoryFormat.meta(item)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text2)
                 ForEach(item.routeList, id: \.self) { RouteChip(route: $0) }
             }
@@ -579,5 +577,37 @@ struct InterruptedMark: View {
     var body: some View {
         Label("끊김", systemImage: "scissors").font(.footnote).foregroundStyle(Theme.text3)
             .accessibilityLabel("말이 끊김")
+    }
+}
+
+/// §17.7 filter: "전체" + one chip per existing persona; single select; accent fill when chosen.
+struct PersonaFilterRow: View {
+    @Binding var selected: String?
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.s) {
+                chip("전체", tint: Theme.celadon, on: selected == nil) { selected = nil }
+                ForEach(PersonaModel.shared.ordered) { p in
+                    chip(p.name, tint: p.tint, dot: p.tint, on: selected == p.id) { selected = p.id }
+                }
+            }
+        }
+        .accessibilityLabel("비서별로 보기")
+    }
+
+    private func chip(_ title: String, tint: Color, dot: Color? = nil, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let dot { Circle().fill(on ? Theme.onAccent : dot).frame(width: 8, height: 8) }
+                Text(title).font(.subheadline.weight(on ? .semibold : .regular))
+            }
+            .foregroundStyle(on ? Theme.onAccent : Theme.text)
+            .padding(.horizontal, Theme.m).frame(minHeight: 32)
+            .background(on ? tint : .clear, in: Capsule())
+            .overlay(Capsule().strokeBorder(on ? .clear : Theme.stroke))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 }

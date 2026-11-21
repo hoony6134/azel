@@ -17,8 +17,11 @@ final class PersonaTests: XCTestCase {
         XCTAssertTrue(p[0].primary)
         XCTAssertFalse(p[1].share_memory)
         XCTAssertTrue(p[2].share_memory, "share_memory defaults to true")
-        XCTAssertNotNil(Persona.color(hex: p[0].color))
-        XCTAssertNil(Persona.color(hex: p[1].color), "bad colors fall back to the accent")
+        XCTAssertEqual(p[0].tintKey, .celadon, "an older hex colour maps to its tint")
+        XCTAssertEqual(p[1].tintKey, .celadon, "unknown colours fall back to 청자")
+        XCTAssertEqual(Persona(name: "x", color: "azalea").tintKey, .azalea)
+        XCTAssertEqual(PersonaTint.allCases.count, 8)
+        XCTAssertEqual(Persona.palette.first, "celadon")
         let body = PersonaAPI.body(p[0])
         XCTAssertNil(body["id"]); XCTAssertNil(body["primary"])
         XCTAssertEqual(body["voice"] as? String, "sohee")
@@ -72,5 +75,32 @@ final class PersonaTests: XCTestCase {
         await model.refresh()
         XCTAssertEqual(model.status, .unavailable)
         XCTAssertEqual(model.personas.count, 3, "cached personas stay")
+    }
+
+    func testVoicesDeleteOrderAndDeletedLabel() throws {
+        let v = try JSONDecoder().decode([Voice].self, from: Data(#"[{"id":"sohee","label":"소희","desc":"차분한 여성","lang":"ko"},{"id":"x"}]"#.utf8))
+        XCTAssertEqual(v[0].desc, "차분한 여성")
+        XCTAssertEqual(v[1].label, "x", "label falls back to the id")
+        XCTAssertEqual(PersonaAPI.deletePath("p 2", deleteHistory: true), "/v1/personas/p%202?delete_history=true")
+        XCTAssertEqual(PersonaAPI.deletePath("p3", deleteHistory: false), "/v1/personas/p3?delete_history=false")
+
+        let store = UserDefaults(suiteName: "PersonaOrder")!
+        store.removePersistentDomain(forName: "PersonaOrder")
+        store.set(try JSONEncoder().encode(try personas()), forKey: "personasCache")
+        let model = PersonaModel(store: store)
+        XCTAssertEqual(model.ordered.first?.id, "p1", "primary first by default")
+        model.move(model.ordered[2], by: -1)
+        XCTAssertEqual(model.ordered.map(\.id), ["p1", "p3", "2"])
+        XCTAssertEqual(PersonaModel(store: store).ordered.map(\.id), ["p1", "p3", "2"], "order survives a relaunch")
+        XCTAssertEqual(model.label(for: "p3")?.name, "하나")
+        XCTAssertEqual(model.label(for: "gone")?.name, "삭제된 비서")
+        XCTAssertNil(model.label(for: nil))
+    }
+
+    func testSampleTextAndLimits() {
+        XCTAssertEqual(VoiceSampler.sampleText(name: "아젤"), "안녕하세요, 아젤이에요. 무엇을 도와드릴까요?")
+        XCTAssertEqual(VoiceSampler.sampleText(name: "하나"), "안녕하세요, 하나예요. 무엇을 도와드릴까요?")
+        XCTAssertLessThanOrEqual(VoiceSampler.sampleText(name: "아주긴이름아주긴이름이에").count, 60)
+        XCTAssertEqual(Persona.personalityLimit, 500)
     }
 }

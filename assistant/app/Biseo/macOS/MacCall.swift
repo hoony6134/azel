@@ -272,7 +272,8 @@ struct CallPanelView: View {
 
     var body: some View {
         HStack(spacing: Theme.m) {
-            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: 68, height: 68)
+            MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt,
+                    tint: call.activePersona?.glaze ?? Theme.glazeCeladon).frame(width: 68, height: 68)
                 .contentShape(Circle())
                 .onTapGesture { call.interrupt() }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
@@ -316,7 +317,11 @@ struct CallPanelView: View {
                     }
                     .buttonStyle(.plain).keyboardShortcut(.cancelAction).accessibilityLabel(call.inCall ? "통화 끊기" : "닫기")
                 }
-                if let r = call.log.lastRoute { RouteChip(route: r) }
+                HStack(spacing: Theme.xs) {
+                    // §17.8: the persona's name before the route chip.
+                    if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
+                    if let r = call.log.lastRoute { RouteChip(route: r) }
+                }
             }
         }
         .padding(.horizontal, Theme.l)

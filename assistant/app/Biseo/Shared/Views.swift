@@ -222,7 +222,7 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showPaths = false
     @State private var pendingDays: Int?
     @State private var showProactiveLog = false
-    @State private var showPersonas = false
+    @ObservedObject private var personas = PersonaModel.shared
     @State private var showConnectors = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
@@ -302,24 +302,40 @@ struct SettingsScreen<Extra: View>: View {
     }
 
     // 비서 (DESIGN §7.5 card 1)
-    private func assistantCard(_ s: Binding<AppSettings>) -> some View {
-        Card("비서") {
-            Button { showPersonas = true } label: {
-                HStack {
-                    Text("비서 관리").foregroundStyle(Theme.text)
-                    Spacer()
-                    Text("\(max(1, PersonaModel.shared.personas.count))명").foregroundStyle(Theme.text3)
-                    Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+    /// §17.4: with personas, the top card lists them (names and personalities are edited per
+    /// persona); an older gateway without /v1/personas keeps the single name and 성격 fields.
+    @ViewBuilder private func assistantCard(_ s: Binding<AppSettings>) -> some View {
+        if personas.status == .unavailable || personas.personas.isEmpty {
+            legacyAssistantCard(s)
+        } else {
+            PersonaListCard(model: personas)
+        }
+        Card("대화") {
+            row("답변 길이") {
+                Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
+                                                   set: { s.wrappedValue.reply_length = $0 })) {
+                    Text("간결").tag("brief"); Text("보통").tag("normal"); Text("자세히").tag("detailed")
                 }
-                .contentShape(Rectangle())
+                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 220)
             }
-            .buttonStyle(.plain)
-            .sheet(isPresented: $showPersonas) {
-                NavigationStack { PersonaListView(model: PersonaModel.shared) }
-                    #if os(macOS)
-                    .frame(width: 520, height: 620)
-                    #endif
+            Toggle("시끄러운 곳 모드", isOn: Binding(get: { s.wrappedValue.noise_mode == "noisy" },
+                                                 set: { s.wrappedValue.noise_mode = $0 ? "noisy" : "normal"; noiseMode = $0 ? "noisy" : "normal" }))
+                .tint(Theme.celadon).foregroundStyle(Theme.text)
+            if s.wrappedValue.noise_mode == "noisy" {
+                Text("주변 소리에 말이 끊기지 않게 해요. 말을 끊으려면 통화 중에 구를 눌러 주세요.").font(.footnote).foregroundStyle(Theme.text3)
             }
+        }
+        Card("소리") {
+            HStack {
+                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
+                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
+            }
+            .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
+        }
+    }
+
+    private func legacyAssistantCard(_ s: Binding<AppSettings>) -> some View {
+        Card("비서") {
             HStack {
                 Text("이름").foregroundStyle(Theme.text)
                 Spacer()
@@ -354,25 +370,7 @@ struct SettingsScreen<Extra: View>: View {
                         .disabled((s.wrappedValue.personality ?? "").isEmpty)
                 }
             }
-            Toggle("시끄러운 곳 모드", isOn: Binding(get: { s.wrappedValue.noise_mode == "noisy" },
-                                                 set: { s.wrappedValue.noise_mode = $0 ? "noisy" : "normal"; noiseMode = $0 ? "noisy" : "normal" }))
-                .tint(Theme.celadon).foregroundStyle(Theme.text)
-            if s.wrappedValue.noise_mode == "noisy" {
-                Text("주변 소리에 말이 끊기지 않게 해요. 말을 끊으려면 통화 중에 구를 눌러 주세요.").font(.footnote).foregroundStyle(Theme.text3)
-            }
-            row("답변 길이") {
-                Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
-                                                   set: { s.wrappedValue.reply_length = $0 })) {
-                    Text("간결").tag("brief"); Text("보통").tag("normal"); Text("자세히").tag("detailed")
-                }
-                .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 220)
-            }
             Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
-            HStack {
-                Toggle("작업 효과음", isOn: $workSounds).tint(Theme.celadon).foregroundStyle(Theme.text)
-                Button("들어 보기") { EarconPreview.play() }.font(.subheadline).tint(Theme.celadon).disabled(!workSounds)
-            }
-                .accessibilityHint("\(AssistantName.josa(AssistantName.current, "이", "가")) 일하는 동안 짧은 소리를 냅니다")
         }
     }
 

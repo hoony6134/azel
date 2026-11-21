@@ -20,7 +20,7 @@ struct BriefingIntent: AppIntent {
     static let openAppWhenRun = true
 
     @MainActor func perform() async throws -> some IntentResult {
-        CallManager.shared.startCall(prefix: "briefing")
+        CallManager.shared.startCall(prefix: "briefing", persona: PersonaModel.shared.primary)
         return .result()
     }
 }

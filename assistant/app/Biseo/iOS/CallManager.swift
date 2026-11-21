@@ -67,7 +67,8 @@ final class CallManager: NSObject, ObservableObject {
         let who = persona ?? PersonaModel.shared.selected
         activePersona = who
         callerName = who?.name
-        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: who?.name ?? AssistantName.current))
+        // §17.6: the handle is the persona id; the system UI and Recents show localizedCallerName.
+        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: who?.id ?? AssistantName.current))
         controller.request(CXTransaction(action: action)) { [weak self] err in
             if let err { DispatchQueue.main.async { self?.error = err.localizedDescription } }
         }
@@ -218,7 +219,14 @@ extension CallManager: CXProviderDelegate {
     func providerDidReset(_ provider: CXProvider) { teardown() }
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        let persona = activePersona, caller = callerName
         begin(action.callUUID, callID: nil)
+        activePersona = persona
+        callerName = caller
+        let named = CXCallUpdate()
+        named.localizedCallerName = caller ?? AssistantName.current
+        named.remoteHandle = action.handle
+        provider.reportCall(with: action.callUUID, updated: named)
         provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: nil)
         action.fulfill()
     }

@@ -13,6 +13,9 @@ struct CallScreen: View {
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @AppStorage("noiseMode") private var noiseMode = "normal"
 
+    /// The persona's glaze (§17.6); incoming calls come from the primary.
+    private var tint: Color { (call.activePersona ?? PersonaModel.shared.primary)?.glaze ?? Theme.glazeCeladon }
+
     private var jarState: JarState { JarState(callState: call.state, inCall: call.inCall, held: call.held) }
 
     var body: some View {
@@ -47,7 +50,7 @@ struct CallScreen: View {
 
     private var screen: some View {
         ZStack {
-            GlazeBackground(state: jarState)
+            GlazeBackground(state: jarState, tint: tint)
             VStack(spacing: Theme.l) {
                 topBar
                 if let banner {
@@ -59,7 +62,7 @@ struct CallScreen: View {
                 Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     .contentTransition(.opacity).animation(Theme.state, value: jarState)
                 GeometryReader { geo in
-                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt).frame(width: geo.size.width, height: geo.size.height)
+                    MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, tint: tint).frame(width: geo.size.width, height: geo.size.height)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")

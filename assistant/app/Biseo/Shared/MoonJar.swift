@@ -44,10 +44,11 @@ enum JarState: Equatable {
         }
     }
 
-    var glaze: [Color] {
+    /// `tint`: the persona's glaze (§17.2); it only changes idle and listening.
+    func glaze(_ tint: Color = Theme.glazeCeladon) -> [Color] {
         switch self {
-        case .idle: return [Theme.glazeCeladon.opacity(0.25), Theme.porcelain.opacity(0.7)]
-        case .listening: return [Theme.glazeCeladon, Theme.porcelain]
+        case .idle: return [tint.opacity(0.25), Theme.porcelain.opacity(0.7)]
+        case .listening: return [tint, Theme.porcelain]
         case .thinking: return [Theme.glazeIndigo, Theme.porcelain.opacity(0.8)]
         case .speaking: return [Theme.porcelain, Theme.porcelain.opacity(0.88)]
         case .held: return [Theme.porcelain.opacity(0.5), Theme.porcelain.opacity(0.35)]
@@ -55,9 +56,9 @@ enum JarState: Equatable {
         }
     }
 
-    var glow: Color? {
+    func glow(_ tint: Color = Theme.glazeCeladon) -> Color? {
         switch self {
-        case .idle, .listening: return Theme.glazeCeladon
+        case .idle, .listening: return tint
         case .thinking: return Theme.glazeIndigo
         case .speaking: return Theme.glazeAmber
         case .held, .offline: return nil
@@ -163,6 +164,10 @@ struct MoonJar: View {
     var pulse: Date? = nil
     /// Mac popover only: an extra-slow sway (§6.3).
     var sway = false
+    /// Persona glaze for idle/listening; thinking and speaking keep their own colours.
+    var tint: Color = Theme.glazeCeladon
+    /// Breath amplitude (mini orbs breathe at 0.5).
+    var breathAmplitude: Double = 1
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var phase
@@ -212,7 +217,7 @@ struct MoonJar: View {
                 var ctx = ctx
                 // Idle breath: the whole orb scales ±2.5%, easing out as a call takes over.
                 let idleWeight = (state == .idle ? mix : 0) + (previous == .idle ? 1 - mix : 0)
-                let scale = calm ? 1 : 1 + 0.025 * JarPath.breath(t) * idleWeight
+                let scale = calm ? 1 : 1 + 0.025 * breathAmplitude * JarPath.breath(t) * idleWeight
                 if sway && !calm && state == .idle {
                     ctx.translateBy(x: center.x + 1.5 * sin(2 * .pi * t / 11), y: center.y)
                     ctx.rotate(by: .degrees(1.5 * sin(2 * .pi * t / 9 + 0.8)))
@@ -254,7 +259,7 @@ struct MoonJar: View {
         ctx.opacity = opacity
         let box = path.boundingRect
         // 1. soft glow
-        if let glow = s.glow {
+        if let glow = s.glow(tint) {
             var strength = 0.55
             switch s {
             case .idle: strength = JarPath.idleGlow(t, calm: calm).opacity
@@ -274,7 +279,7 @@ struct MoonJar: View {
             let k = 1.12 + 0.1 * level
             let ring = path.applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: k, y: k)
                 .translatedBy(x: -center.x, y: -center.y))
-            ctx.stroke(ring, with: .color(Theme.celadon.opacity(0.25 + 0.5 * level)), lineWidth: 1)
+            ctx.stroke(ring, with: .color(tint.opacity(0.25 + 0.5 * level)), lineWidth: 1)
         }
         // 3. speaking water line: mirrored, squashed, blurred copy below the jar
         if s == .speaking {
@@ -291,7 +296,7 @@ struct MoonJar: View {
         var bodyOpacity = 1.0
         if s == .thinking && calm { bodyOpacity = 0.85 + 0.15 * (0.5 + 0.5 * sin(t * .pi)) }
         ctx.opacity = opacity * bodyOpacity
-        ctx.fill(path, with: .radialGradient(Gradient(colors: s.glaze), center: CGPoint(x: box.midX, y: box.midY - box.height * 0.25),
+        ctx.fill(path, with: .radialGradient(Gradient(colors: s.glaze(tint)), center: CGPoint(x: box.midX, y: box.midY - box.height * 0.25),
                                              startRadius: 0, endRadius: box.width * 0.7))
         // 5. thinking swirl
         if s == .thinking {
@@ -307,10 +312,11 @@ struct MoonJar: View {
 /// Full-bleed state glaze behind the call screen (§6.3): mesh on iOS 18 / macOS 15, radial fallback.
 struct GlazeBackground: View {
     var state: JarState
+    var tint: Color = Theme.glazeCeladon
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let c = state.glow ?? Theme.text3
+        let c = state.glow(tint) ?? Theme.text3
         ZStack {
             Theme.bg
             if #available(iOS 18, macOS 15, *) {

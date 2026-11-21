@@ -1,233 +1,439 @@
 import AVFoundation
 import SwiftUI
 
-/// Small name + colour dot for a persona (history rows, schedule, call screen).
+/// Persona dot + name (history meta, schedule rows, detail header).
 struct PersonaChip: View {
-    let persona: Persona
+    let name: String
+    let tint: Color
+    var outlined = true
+
+    init(persona: Persona) { name = persona.name; tint = persona.tint }
+    init(name: String, tint: Color, outlined: Bool = true) { self.name = name; self.tint = tint; self.outlined = outlined }
+
     var body: some View {
         HStack(spacing: 4) {
-            Circle().fill(persona.tint).frame(width: 8, height: 8)
-            Text(persona.name).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2).lineLimit(1)
+            Circle().fill(tint).frame(width: 8, height: 8)
+            Text(name).font(.footnote.weight(.semibold)).foregroundStyle(tint).lineLimit(1)
         }
-        .padding(.horizontal, Theme.s).padding(.vertical, 2)
-        .overlay(Capsule().strokeBorder(Theme.stroke))
+        .padding(.horizontal, outlined ? Theme.s : 0).padding(.vertical, outlined ? 2 : 0)
+        .background(outlined ? tint.opacity(0.12) : .clear, in: Capsule())
+        .overlay(Capsule().strokeBorder(outlined ? tint.opacity(0.6) : .clear, lineWidth: 1))
         .accessibilityElement(children: .combine)
     }
 }
 
-/// Who the next call goes to (home, Mac popover). Shown once there is more than one persona;
-/// with one, a quiet "비서 추가".
-struct PersonaSwitcher: View {
+/// §17.3 / §17.8: a row of breathing mini orbs, the selected one ringed. Hidden with one persona.
+struct MiniOrbRow: View {
     @ObservedObject var model: PersonaModel
-    @State private var managing = false
+    var size: CGFloat = 44
+    var showNames = true
+    @State private var editing: Persona?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: Theme.s) {
-                if model.personas.count > 1 {
-                    ForEach(model.personas) { p in
-                        let on = model.selected?.id == p.id
-                        Button { model.selectedID = p.id } label: {
-                            HStack(spacing: 6) {
-                                Circle().fill(p.tint).frame(width: 10, height: 10)
-                                Text(p.name).font(.subheadline.weight(on ? .semibold : .regular))
-                                    .foregroundStyle(on ? Theme.text : Theme.text2)
+        if model.personas.count > 1 {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Theme.m) {
+                    ForEach(Array(model.ordered.enumerated()), id: \.element.id) { index, p in
+                        orb(p, index: index)
+                    }
+                    if model.personas.count < Persona.limit && showNames {
+                        Button { editing = Persona(name: "", color: nextTint.rawValue) } label: {
+                            VStack(spacing: 4) {
+                                Circle().strokeBorder(Theme.text2, style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                                    .frame(width: size, height: size)
+                                    .overlay(Image(systemName: "plus").foregroundStyle(Theme.text2))
+                                Text(" ").font(.footnote)
                             }
-                            .padding(.horizontal, Theme.m).frame(minHeight: 36)
-                            .background(on ? p.tint.opacity(0.18) : .clear, in: Capsule())
-                            .overlay(Capsule().strokeBorder(on ? p.tint : Theme.stroke))
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel(p.name + (p.primary ? ", 기본 비서" : ""))
-                        .accessibilityAddTraits(on ? .isSelected : [])
+                        .accessibilityLabel("비서 추가")
                     }
                 }
-                Button { managing = true } label: {
-                    Label(model.personas.count > 1 ? "관리" : "비서 추가", systemImage: model.personas.count > 1 ? "slider.horizontal.3" : "plus")
-                        .font(.subheadline).foregroundStyle(Theme.text2)
-                        .padding(.horizontal, Theme.m).frame(minHeight: 36)
-                        .overlay(Capsule().strokeBorder(Theme.stroke))
+                .padding(.horizontal, 2)
+                .frame(maxWidth: .infinity)
+            }
+            .sheet(item: $editing) { p in PersonaEditorSheet(model: model, persona: p) }
+        }
+    }
+
+    private var nextTint: PersonaTint {
+        PersonaTint.allCases.first { t in !model.personas.contains { $0.tintKey == t } } ?? .celadon
+    }
+
+    private func orb(_ p: Persona, index: Int) -> some View {
+        let selected = model.selected?.id == p.id
+        return Button {
+            model.selectedID = p.id
+            AccessibilityNotification.Announcement("\(AssistantName.josa(p.name, "으로", "로")) 바꿨어요").post()
+        } label: {
+            VStack(spacing: 4) {
+                MoonJar(state: .idle, levels: .silent, paused: reduceMotion, tint: p.glaze, breathAmplitude: 0.5)
+                    .frame(width: size, height: size)
+                    .overlay(Circle().strokeBorder(selected ? p.tint : .clear, lineWidth: 2).padding(-3))
+                if showNames {
+                    Text(p.name).font(.footnote.weight(selected ? .semibold : .regular))
+                        .foregroundStyle(selected ? Theme.text : Theme.text2).lineLimit(1)
                 }
-                .buttonStyle(.plain)
             }
         }
-        .sheet(isPresented: $managing) {
-            NavigationStack { PersonaListView(model: model) }
-                #if os(macOS)
-                .frame(width: 520, height: 620)
-                #endif
+        .buttonStyle(.plain)
+        #if os(iOS)
+        .sensoryFeedback(.selection, trigger: model.selectedID)
+        #endif
+        #if os(macOS)
+        .help(p.name)
+        .keyboardShortcut(KeyEquivalent(Character("\(min(index + 1, 9))")), modifiers: .command) // ⌘1…⌘8 (8 personas max)
+        #endif
+        .contextMenu {
+            Button("편집") { editing = p }
+            if !p.primary { Button("기본 비서로 지정") { Task { try? await model.makePrimary(p) } } }
         }
+        .accessibilityLabel(p.name)
+        .accessibilityValue(selected ? "선택됨" : "")
+        .accessibilityHint("두 번 탭하면 이 비서로 바꿉니다")
+        .accessibilityAction(named: "편집") { editing = p }
     }
 }
 
-/// All personas: open to edit, make primary, delete, add (up to 8).
-struct PersonaListView: View {
+/// §17.4: the 비서 card in 설정.
+struct PersonaListCard: View {
     @ObservedObject var model: PersonaModel
-    @Environment(\.dismiss) private var dismiss
     @State private var editing: Persona?
-    @State private var error: String?
+    @State private var voices: [Voice] = []
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: Theme.m) {
-                SectionNote(status: model.status) { Task { await model.refresh() } }
-                if let error { Text(error).font(.footnote).foregroundStyle(Theme.danger) }
-                ForEach(model.personas) { p in
-                    Button { editing = p } label: {
-                        Card {
-                            HStack(spacing: Theme.m) {
-                                Circle().fill(p.tint).frame(width: 14, height: 14)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack {
-                                        Text(p.name).font(.headline).foregroundStyle(Theme.text)
-                                        if p.primary { Text("기본").font(.footnote.weight(.semibold)).foregroundStyle(Theme.celadon) }
-                                    }
-                                    Text([p.voice, p.share_memory ? "기억 공유" : "기억 따로"].compactMap { $0 }.joined(separator: " · "))
-                                        .font(.footnote).foregroundStyle(Theme.text3)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
-                            }
+        Card("비서") {
+            SectionNote(status: model.status) { Task { await model.refresh() } }
+            ForEach(Array(model.ordered.enumerated()), id: \.element.id) { i, p in
+                Button { editing = p } label: {
+                    HStack(spacing: Theme.m) {
+                        MoonJar(state: .idle, levels: .silent, paused: true, tint: p.glaze).frame(width: 24, height: 24)
+                        Text(p.name).foregroundStyle(Theme.text)
+                        if p.primary {
+                            Text("기본").font(.footnote.weight(.semibold)).foregroundStyle(p.tint)
+                                .padding(.horizontal, 6).padding(.vertical, 1).overlay(Capsule().strokeBorder(p.tint.opacity(0.6)))
                         }
+                        Spacer()
+                        Text(voices.first { $0.id == p.voice }?.label ?? p.voice ?? "").font(.subheadline).foregroundStyle(Theme.text2)
+                        Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
                     }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        if !p.primary { Button("기본 비서로") { act { try await model.makePrimary(p) } } }
-                        if !p.primary { Button("삭제", role: .destructive) { act { try await model.delete(p) } } }
-                    }
+                    .contentShape(Rectangle())
                 }
-                if model.personas.count < Persona.limit {
-                    Button { editing = Persona(name: "", color: Persona.palette[model.personas.count % Persona.palette.count]) } label: {
-                        Label("새 비서", systemImage: "plus").frame(maxWidth: .infinity).frame(height: 44)
-                    }
-                    .buttonStyle(.bordered).tint(Theme.celadon)
-                } else {
-                    Text("비서는 \(Persona.limit)명까지 만들 수 있어요").font(.footnote).foregroundStyle(Theme.text3)
+                .buttonStyle(.plain)
+                .contextMenu {
+                    if i > 0 { Button("위로") { model.move(p, by: -1) } }
+                    if i < model.personas.count - 1 { Button("아래로") { model.move(p, by: 1) } }
                 }
+                .accessibilityAction(named: "위로") { model.move(p, by: -1) }
+                .accessibilityAction(named: "아래로") { model.move(p, by: 1) }
             }
-            .padding(20)
-            .frame(maxWidth: 640).frame(maxWidth: .infinity)
+            if model.personas.count <= 1 {
+                Text("성격과 목소리가 다른 비서를 8명까지 만들 수 있어요.").font(.footnote).foregroundStyle(Theme.text3)
+            }
+            let full = model.personas.count >= Persona.limit
+            Button { editing = Persona(name: "", color: (PersonaTint.allCases.first { t in !model.personas.contains { $0.tintKey == t } } ?? .celadon).rawValue) } label: {
+                Label("비서 추가", systemImage: "plus").foregroundStyle(full ? Theme.text3 : Theme.celadon)
+            }
+            .buttonStyle(.plain)
+            .disabled(full || model.status == .unavailable)
+            if full { Text("비서는 8명까지예요. 하나를 지우면 새로 만들 수 있어요.").font(.footnote).foregroundStyle(Theme.text3) }
         }
-        .background(Theme.bg.ignoresSafeArea())
-        .navigationTitle("비서")
-        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("닫기") { dismiss() } } }
-        .task { await model.refresh() }
-        .sheet(item: $editing) { p in
-            NavigationStack { PersonaEditor(model: model, persona: p) }
-                #if os(macOS)
-                .frame(width: 520, height: 680)
-                #endif
+        .task {
+            await model.refresh()
+            if case .success(let v) = await attempt({ try await PersonaAPI.voices() }) { voices = v }
         }
-    }
-
-    private func act(_ op: @escaping () async throws -> Void) {
-        Task { do { try await op(); error = nil } catch { self.error = FriendlyError.describe(error).title } }
+        .sheet(item: $editing) { p in PersonaEditorSheet(model: model, persona: p) }
     }
 }
 
-/// Create or edit one persona, with a voice sample.
+/// §17.5 wrapped for both platforms.
+struct PersonaEditorSheet: View {
+    @ObservedObject var model: PersonaModel
+    let persona: Persona
+
+    var body: some View {
+        NavigationStack { PersonaEditor(model: model, original: persona) }
+            #if os(iOS)
+            .presentationDetents([.large])
+            #else
+            .frame(width: 540, height: 720)
+            #endif
+    }
+}
+
+/// §17.5: preview, 이름, 색, 목소리 (+들어보기), 말투, 성격, 기억 공유, 기본 비서, 지우기.
 struct PersonaEditor: View {
     @ObservedObject var model: PersonaModel
-    @State var persona: Persona
+    let original: Persona
+    @State private var p: Persona
     @Environment(\.dismiss) private var dismiss
+    @State private var voices: [Voice] = []
+    @State private var voicesStatus: SectionStatus = .ok
     @State private var message: String?
     @State private var saving = false
-    @State private var sampling = false
-    @State private var player: AVAudioPlayer?
+    @State private var confirmDiscard = false
+    @State private var confirmPrimary = false
+    @State private var confirmDelete = false
+    @StateObject private var sampler = VoiceSampler()
 
-    private static let models = [("", "기본"), ("qwen", "로컬 Qwen"), ("haiku", "Haiku"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("auto", "자동")]
+    init(model: PersonaModel, original: Persona) {
+        self.model = model
+        self.original = original
+        _p = State(initialValue: original)
+    }
+
+    private var trimmedName: String { p.name.trimmingCharacters(in: .whitespaces) }
+    private var nameProblem: String? {
+        if trimmedName.isEmpty { return "이름을 입력해 주세요" }
+        if AssistantName.validated(trimmedName) == nil { return "한글, 영문, 공백으로 12자까지예요" }
+        if model.personas.contains(where: { $0.id != p.id && $0.name == trimmedName }) { return "이미 있는 이름이에요" }
+        return nil
+    }
+    private var tooLong: Bool { (p.personality ?? "").count > Persona.personalityLimit }
+    private var valid: Bool { nameProblem == nil && !tooLong }
+    private var changed: Bool { p != original }
 
     var body: some View {
         ScrollView {
             VStack(spacing: Theme.l) {
+                // 1. preview
+                VStack(spacing: Theme.s) {
+                    MoonJar(state: .idle, levels: .silent, tint: p.glaze).frame(width: 96, height: 96)
+                    Text(trimmedName.isEmpty ? " " : trimmedName).font(.headline).foregroundStyle(Theme.text)
+                }
+                .animation(Theme.state, value: p.color)
+                // 2. 이름
                 Card("이름") {
-                    TextField(AssistantName.fallback, text: $persona.name).textFieldStyle(.roundedBorder)
-                    HStack(spacing: Theme.s) {
-                        ForEach(Persona.palette, id: \.self) { hex in
-                            Button { persona.color = hex } label: {
-                                Circle().fill(Persona.color(hex: hex)!).frame(width: 26, height: 26)
-                                    .overlay(Circle().strokeBorder(Theme.text, lineWidth: persona.color == hex ? 2 : 0))
+                    TextField("이름", text: $p.name).textFieldStyle(.roundedBorder)
+                    if let nameProblem, !p.name.isEmpty || p != original { Text(nameProblem).font(.footnote).foregroundStyle(Theme.danger) }
+                }
+                // 3. 색
+                Card("색") {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 4), spacing: Theme.m) {
+                        ForEach(PersonaTint.allCases) { t in
+                            let on = p.tintKey == t
+                            Button { p.color = t.rawValue } label: {
+                                Circle().fill(t.glaze).frame(width: 44, height: 44)
+                                    .overlay(Circle().strokeBorder(on ? t.accent : .clear, lineWidth: 2).padding(-3))
+                                    .overlay(on ? Image(systemName: "checkmark").font(.headline).foregroundStyle(Theme.onAccent) : nil)
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("색 \(hex)")
-                            .accessibilityAddTraits(persona.color == hex ? .isSelected : [])
+                            .accessibilityLabel(t.name)
+                            .accessibilityValue(on ? "선택됨" : "")
                         }
                     }
                 }
+                // 4. 목소리
                 Card("목소리") {
-                    TextField("목소리 (예: sohee)", text: optional($persona.voice)).textFieldStyle(.roundedBorder).urlInput()
-                    TextField("말투 (예: 차분하게, 밝게)", text: optional($persona.voice_style)).textFieldStyle(.roundedBorder)
-                    Button { Task { await sample() } } label: {
-                        Label(sampling ? "만드는 중…" : "목소리 들어보기", systemImage: "play.circle")
-                    }
-                    .disabled(sampling).tint(Theme.celadon)
-                }
-                Card("성격") {
-                    TextField("기본 성격", text: Binding(get: { persona.personality ?? "" },
-                                                     set: { persona.personality = String($0.prefix(AssistantName.personalityLimit)) }),
-                              axis: .vertical)
-                        .lineLimit(3...8).textFieldStyle(.roundedBorder)
-                    Text("\((persona.personality ?? "").count)/\(AssistantName.personalityLimit)")
-                        .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
-                }
-                Card("동작") {
-                    HStack {
-                        Text("기본 모델").foregroundStyle(Theme.text)
-                        Spacer()
-                        Picker("", selection: Binding(get: { persona.default_model ?? "" }, set: { persona.default_model = $0.isEmpty ? nil : $0 })) {
-                            ForEach(Self.models, id: \.0) { Text($0.1).tag($0.0) }
+                    SectionNote(status: voicesStatus) { Task { await loadVoices() } }
+                    ForEach(voices) { v in
+                        HStack(spacing: Theme.m) {
+                            Button { p.voice = v.id } label: {
+                                HStack(spacing: Theme.m) {
+                                    Image(systemName: p.voice == v.id ? "largecircle.fill.circle" : "circle")
+                                        .foregroundStyle(p.voice == v.id ? p.tint : Theme.text3)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(v.label).foregroundStyle(Theme.text)
+                                        if let d = v.desc { Text(d).font(.footnote).foregroundStyle(Theme.text3) }
+                                    }
+                                    Spacer()
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            sampleButton(v)
                         }
-                        .pickerStyle(.menu).labelsHidden().tint(Theme.celadon).fixedSize()
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(v.label)
+                        .accessibilityAction(named: "들어보기") { sampler.toggle(voice: v.id, style: p.voice_style, name: trimmedName) }
                     }
-                    Toggle("다른 비서와 기억 공유", isOn: $persona.share_memory).tint(Theme.celadon).foregroundStyle(Theme.text)
+                    if let m = sampler.message { Text(m).font(.footnote).foregroundStyle(Theme.amber) }
+                }
+                // 5. 말투
+                Card("말투") {
+                    TextField("예: 차분하고 천천히, 밝고 빠르게", text: Binding(get: { p.voice_style ?? "" },
+                                                                   set: { p.voice_style = $0.isEmpty ? nil : String($0.prefix(80)) }))
+                        .textFieldStyle(.roundedBorder)
+                    Text("목소리에 주는 짧은 지시예요.").font(.footnote).foregroundStyle(Theme.text3)
+                }
+                // 6. 성격
+                Card("성격") {
+                    ZStack(alignment: .topLeading) {
+                        TextEditor(text: Binding(get: { p.personality ?? "" }, set: { p.personality = $0.isEmpty ? nil : $0 }))
+                            .frame(minHeight: 96, maxHeight: 190).scrollContentBackground(.hidden)
+                            .padding(4).background(Theme.bg, in: RoundedRectangle(cornerRadius: Theme.rowRadius))
+                        if (p.personality ?? "").isEmpty {
+                            Text("예: 꼼꼼하고 다정하게, 결론부터 말해 줘").foregroundStyle(Theme.text3).padding(10).allowsHitTesting(false)
+                        }
+                    }
+                    Text("\((p.personality ?? "").count)/\(Persona.personalityLimit)").font(.footnote.monospacedDigit())
+                        .foregroundStyle(tooLong ? Theme.danger : Theme.text3)
+                }
+                // 7. 기억 공유
+                Card {
+                    Toggle("기억 공유", isOn: $p.share_memory).tint(p.tint).foregroundStyle(Theme.text)
+                    Text(p.share_memory ? "다른 비서와 같은 기억을 써요." : "이 비서만의 기억을 따로 가져요.").font(.footnote).foregroundStyle(Theme.text3)
+                }
+                // 8. 기본 비서
+                if !p.id.isEmpty {
+                    Card {
+                        if p.primary {
+                            Text("기본 비서예요").foregroundStyle(Theme.text2)
+                        } else {
+                            Button("기본 비서로 지정") { confirmPrimary = true }.tint(p.tint)
+                        }
+                    }
                 }
                 if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
-                if !persona.id.isEmpty && !persona.primary {
-                    Button("이 비서 삭제", role: .destructive) {
-                        Task { do { try await model.delete(persona); dismiss() } catch { message = FriendlyError.describe(error).title } }
-                    }
+                // 9. 지우기
+                if !p.id.isEmpty && !p.primary {
+                    Button("비서 지우기", role: .destructive) { confirmDelete = true }.padding(.top, Theme.s)
                 }
             }
             .padding(20)
             .frame(maxWidth: 640).frame(maxWidth: .infinity)
         }
         .background(Theme.bg.ignoresSafeArea())
-        .navigationTitle(persona.id.isEmpty ? "새 비서" : persona.name)
+        .navigationTitle(p.id.isEmpty ? "새 비서" : original.name)
         .toolbar {
-            ToolbarItem(placement: .cancellationAction) { Button("취소") { dismiss() } }
-            ToolbarItem(placement: .confirmationAction) { Button(saving ? "저장 중…" : "저장") { Task { await save() } }.disabled(saving) }
+            ToolbarItem(placement: .cancellationAction) { Button("취소") { changed ? (confirmDiscard = true) : dismiss() } }
+            ToolbarItem(placement: .confirmationAction) { Button(saving ? "저장 중…" : "저장") { Task { await save() } }.disabled(!valid || saving) }
         }
+        .interactiveDismissDisabled(changed)
+        .confirmationDialog("변경 사항을 버릴까요?", isPresented: $confirmDiscard, titleVisibility: .visible) {
+            Button("버리기", role: .destructive) { dismiss() }
+            Button("계속 편집", role: .cancel) {}
+        }
+        .confirmationDialog("\(AssistantName.josa(p.name, "을", "를")) 기본 비서로 할까요?", isPresented: $confirmPrimary, titleVisibility: .visible) {
+            Button("기본 비서로 지정") { Task { do { try await model.makePrimary(p); p.primary = true } catch { message = FriendlyError.describe(error).title } } }
+            Button("취소", role: .cancel) {}
+        } message: {
+            Text("아침 브리핑과 먼저 거는 전화를 \(AssistantName.josa(p.name, "이", "가")) 해요. 호출어는 ‘\(AssistantName.fallback)’ 그대로예요.")
+        }
+        .sheet(isPresented: $confirmDelete) {
+            PersonaDeleteSheet(persona: original) { deleteHistory in
+                Task {
+                    do { try await model.delete(original, deleteHistory: deleteHistory); confirmDelete = false; dismiss() }
+                    catch { message = "지우지 못했어요: " + FriendlyError.describe(error).title; confirmDelete = false }
+                }
+            }
+        }
+        .task { await loadVoices() }
+        .onDisappear { sampler.stop() }
     }
 
-    private func optional(_ b: Binding<String?>) -> Binding<String> {
-        Binding(get: { b.wrappedValue ?? "" }, set: { b.wrappedValue = $0.isEmpty ? nil : $0 })
+    private func sampleButton(_ v: Voice) -> some View {
+        Button { sampler.toggle(voice: v.id, style: p.voice_style, name: trimmedName) } label: {
+            ZStack {
+                if sampler.loading == v.id { ProgressView().controlSize(.small) }
+                else { Image(systemName: sampler.playing == v.id ? "stop.circle" : "play.circle").font(.title2).foregroundStyle(p.tint) }
+            }
+            .frame(width: 44, height: 44)
+        }
+        .buttonStyle(.plain)
+        .disabled(sampler.coolingDown && sampler.playing != v.id)
+        .accessibilityLabel(sampler.playing == v.id ? "멈춤" : "들어보기")
+    }
+
+    private func loadVoices() async {
+        switch await attempt({ try await PersonaAPI.voices() }) {
+        case .success(let v): voices = v; voicesStatus = .ok; if p.voice == nil { p.voice = v.first?.id }
+        case .failure(let e): voicesStatus = SectionStatus.from(e) ?? voicesStatus
+        }
     }
 
     private func save() async {
-        guard let name = AssistantName.validated(persona.name) else { message = "이름은 한글, 영문, 공백으로 12자까지예요"; return }
-        persona.name = name
-        persona.personality = persona.personality.map(AssistantName.personality)
+        p.name = trimmedName
         saving = true
         defer { saving = false }
-        do { try await model.save(persona); dismiss() } catch { message = "저장하지 못했어요: " + FriendlyError.describe(error).title }
+        do { try await model.save(p); dismiss() } catch { message = "저장하지 못했어요: " + FriendlyError.describe(error).title }
+    }
+}
+
+/// §17.5 delete confirm with the "통화 기록도 함께 삭제" checkbox (default off).
+struct PersonaDeleteSheet: View {
+    let persona: Persona
+    let onDelete: (Bool) -> Void
+    @State private var deleteHistory = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.l) {
+            Text("‘\(persona.name)’\(WakeEnrollModel.particle(persona.name, "을", "를")) 지울까요?").font(.headline).foregroundStyle(Theme.text)
+            Text("이 비서의 메모와 통화 요약이 지워져요. " + (deleteHistory ? "통화 기록도 모두 지워져요." : "통화 기록은 ‘삭제된 비서’로 남아요."))
+                .foregroundStyle(Theme.text2)
+            Toggle("통화 기록도 함께 삭제", isOn: $deleteHistory)
+                #if os(macOS)
+                .toggleStyle(.checkbox)
+                #endif
+                .tint(Theme.danger)
+            HStack {
+                Button("취소") { dismiss() }.buttonStyle(.bordered)
+                Spacer()
+                Button("지우기", role: .destructive) { onDelete(deleteHistory) }.buttonStyle(.borderedProminent).tint(Theme.danger)
+            }
+        }
+        .padding(24)
+        .background(Theme.bgRaised.ignoresSafeArea())
+        #if os(iOS)
+        .presentationDetents([.height(280)])
+        #else
+        .frame(width: 420)
+        #endif
+    }
+}
+
+/// 들어보기: one sample at a time, 2 s cooldown after each (the server's rate limit), 429 handled,
+/// .ambient session so the silent switch is respected.
+@MainActor
+final class VoiceSampler: ObservableObject {
+    @Published private(set) var loading: String?
+    @Published private(set) var playing: String?
+    @Published private(set) var coolingDown = false
+    @Published var message: String?
+    private var player: AVAudioPlayer?
+
+    /// "안녕하세요, {이름}이에요. 무엇을 도와드릴까요?" kept under 60 characters.
+    static func sampleText(name: String) -> String {
+        let n = name.isEmpty ? AssistantName.fallback : name
+        return String("안녕하세요, \(AssistantName.josa(n, "이에요", "예요")). 무엇을 도와드릴까요?".prefix(60))
     }
 
-    private func sample() async {
-        sampling = true
-        defer { sampling = false }
-        let name = AssistantName.validated(persona.name) ?? AssistantName.fallback
-        let voice = persona.voice, style = persona.voice_style
-        switch await attempt({ try await PersonaAPI.voiceSample(voice: voice, style: style, text: "안녕하세요, \(AssistantName.josa(name, "이에요", "예요")). 무엇을 도와드릴까요?") }) {
-        case .success(let wav):
-            #if os(iOS)
-            try? AVAudioSession.sharedInstance().setCategory(.playback)
-            #endif
-            player = try? AVAudioPlayer(data: wav)
-            player?.play()
-            message = player == nil ? "샘플을 재생할 수 없어요" : nil
-        case .failure(let e):
-            guard let s = SectionStatus.from(e) else { return }
-            message = s == .unavailable ? "목소리 샘플은 서버 업데이트 후 들을 수 있어요" : "샘플을 만들지 못했어요"
+    func toggle(voice: String, style: String?, name: String) {
+        if playing == voice { stop(); return }
+        guard !coolingDown, loading == nil else { return }
+        stop()
+        loading = voice
+        message = nil
+        Task {
+            let text = Self.sampleText(name: name)
+            let result = await attempt { try await PersonaAPI.voiceSample(voice: voice, style: style, text: text) }
+            loading = nil
+            cooldown()
+            switch result {
+            case .success(let wav):
+                #if os(iOS)
+                try? AVAudioSession.sharedInstance().setCategory(.ambient)
+                try? AVAudioSession.sharedInstance().setActive(true)
+                #endif
+                player = try? AVAudioPlayer(data: wav)
+                if player?.play() == true {
+                    playing = voice
+                    let length = player?.duration ?? 3
+                    Task { try? await Task.sleep(nanoseconds: UInt64(length * 1e9)); if playing == voice { playing = nil } }
+                } else { message = "샘플을 재생할 수 없어요" }
+            case .failure(let e):
+                if case GatewayError.http(429) = e { message = "잠시 후 다시 들어 보세요" }
+                else if let s = SectionStatus.from(e) { message = s == .unavailable ? "목소리 샘플은 서버 업데이트 후 들을 수 있어요" : "샘플을 만들지 못했어요" }
+            }
         }
+    }
+
+    func stop() { player?.stop(); player = nil; playing = nil }
+
+    private func cooldown() {
+        coolingDown = true
+        Task { try? await Task.sleep(nanoseconds: 2_000_000_000); coolingDown = false }
     }
 }

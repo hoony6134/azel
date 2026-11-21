@@ -20,7 +20,9 @@ struct HomeView: View {
                     Text(Date(), format: .dateTime.month().day().weekday(.wide)).font(.subheadline).foregroundStyle(Theme.text2)
                 }
                 GeometryReader { geo in
-                    MoonJar(state: model.statusError == nil ? .idle : .offline, levels: .silent)
+                    MoonJar(state: model.statusError == nil ? .idle : .offline, levels: .silent,
+                            tint: personas.selected?.glaze ?? Theme.glazeCeladon)
+                        .animation(Theme.state, value: personas.selectedID)
                         .frame(width: geo.size.width, height: geo.size.width)
                         .contentShape(Circle())
                         .onTapGesture { if model.statusError == nil { call.startCall() } }
@@ -29,7 +31,7 @@ struct HomeView: View {
                 }
                 .aspectRatio(1, contentMode: .fit)
                 .padding(.horizontal, 60)
-                PersonaSwitcher(model: personas)
+                MiniOrbRow(model: personas)
                 callButton
                 if let e = call.error, !call.inCall {
                     Label(e, systemImage: "exclamationmark.triangle.fill").font(.subheadline).foregroundStyle(Theme.danger)
@@ -100,7 +102,10 @@ struct HomeView: View {
 
     private var quickActions: some View {
         HStack(spacing: Theme.s) {
-            quick("오늘 브리핑", "sun.max", label: "오늘 브리핑 듣기") { call.startCall(prefix: "briefing") }
+            // §17.3: the briefing always comes from the primary.
+            let briefingTitle = personas.personas.count > 1 && personas.selected?.id != personas.primary?.id
+                ? "\(personas.primary?.name ?? name)의 오늘 브리핑" : "오늘 브리핑"
+            quick(briefingTitle, "sun.max", label: briefingTitle + " 듣기") { call.startCall(prefix: "briefing", persona: personas.primary) }
             quick("새 대화", "square.and.pencil", label: "새 대화 시작") {
                 model.newConversation()
                 withAnimation(Theme.quick) { toast = "새 대화를 시작해요" }
