@@ -76,11 +76,11 @@ def trim(x):
 
 def to_window(x, rng):
     """Left-pad with silence to 2 s, 0-200 ms of tail after the clip: how train.py's augment_clips lays out positives."""
-    x = x[-(TOTAL - 200):]
+    x = x[-(TOTAL - 3200):]  # keep the end of a too-long clip, leave room for the tail
     tail = rng.randint(0, 3200)
     w = np.zeros(TOTAL, np.float32)
     end = TOTAL - tail
-    w[end - len(x): end] = x[: end]
+    w[end - len(x): end] = x
     return w
 
 
@@ -229,6 +229,9 @@ def main():
         tmp = a.model.with_suffix(".new.onnx")
         save_onnx(net, str(a.model), str(tmp))
         tmp.chmod(0o600)
+        base = a.model.with_name(a.model.stem + ".base.onnx")
+        if not base.exists():  # the generic model, restored when the user deletes their voice data
+            shutil.copy2(a.model, base)
         shutil.copy2(a.model, a.model.with_name(a.model.stem + ".prev.onnx"))
         os.replace(tmp, a.model)  # the listener reloads on the file's mtime
     res = {"improved": improved, "threshold": a.threshold, "clips_train": len(train_f), "clips_held_out": len(held_f),

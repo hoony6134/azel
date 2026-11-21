@@ -174,9 +174,12 @@ def test_example_config_parses():
     assert cfg["model"] == "hey_jarvis"
 
 
-def test_verifier_mtime_tracks_file_and_toggle(tmp_path):
-    v = tmp_path / "v.pkl"
-    assert bw.verifier_mtime({"verifier": str(v)}) == 0  # absent
+def test_watch_key_tracks_model_and_verifier_files(tmp_path):
+    m, v = tmp_path / "m.onnx", tmp_path / "v.pkl"
+    cfg = {"model": str(m), "verifier": str(v)}
+    assert bw.watch_key(cfg) == (0, 0)  # absent
+    m.write_bytes(b"x")
     v.write_bytes(b"x")
-    assert bw.verifier_mtime({"verifier": str(v)}) > 0
-    assert bw.verifier_mtime({"verifier": ""}) == 0  # toggled off
+    k = bw.watch_key(cfg)
+    assert k[0] > 0 and k[1] > 0
+    assert bw.watch_key({"model": "hey_jarvis", "verifier": ""}) == (0, 0)  # built-in model, verifier off

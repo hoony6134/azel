@@ -7,7 +7,7 @@ threshold = 0.5
 
 # Personal voice verifier from enrollment (wakes only if base model and verifier both pass).
 # "" turns it off; the file is optional and reloaded when it changes.
-verifier = "~/.config/biseo/azel_verifier.pkl"
+verifier = ""
 verifier_gate = 0.3
 
 server = "http://100.64.0.11:8891"

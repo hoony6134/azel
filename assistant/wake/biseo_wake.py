@@ -32,7 +32,7 @@ CONFIG_PATH = Path.home() / ".config/biseo/wake.toml"
 DEFAULTS = {
     "model": "hey_jarvis",  # built-in openWakeWord name, or a path to an .onnx (azel.onnx)
     "threshold": 0.5,
-    "verifier": "~/.config/biseo/azel_verifier.pkl",  # personal voice verifier; "" turns it off
+    "verifier": "",  # optional personal voice verifier (.pkl); off: it rejected the user's own voice too often
     "verifier_gate": 0.3,  # base score that makes the verifier run; wake needs both gate and threshold
     "server": "http://100.64.0.11:8891",
     "tts_url": "http://100.64.0.11:8890/v1/audio/speech",
@@ -97,10 +97,10 @@ class Listener:
     # --- main loop ------------------------------------------------------------------------
     def run(self, frames):
         frames = iter(frames)
-        seen = verifier_mtime(self.cfg)
+        seen = watch_key(self.cfg)
         for n, frame in enumerate(self.live(frames)):
-            if n % 30 == 0 and verifier_mtime(self.cfg) != seen:  # ~every 5 s
-                seen = verifier_mtime(self.cfg)
+            if n % 30 == 0 and watch_key(self.cfg) != seen:  # ~every 5 s
+                seen = watch_key(self.cfg)
                 self.oww = load_oww(self.cfg)
             self.ring = (self.ring + [frame])[-int(2 / FRAME_S):]
             score = max(self.oww.predict(frame).values())
@@ -224,12 +224,16 @@ def load_oww(cfg):
     return Model(wakeword_models=[m], inference_framework="onnx")
 
 
-def verifier_mtime(cfg):
-    """mtime of the verifier file (0 when absent or off): a change means enrollment finished or was deleted."""
-    try:
-        return Path(cfg["verifier"]).expanduser().stat().st_mtime if cfg["verifier"] else 0
-    except OSError:
-        return 0
+def watch_key(cfg):
+    """mtimes of the model and the verifier (0 when absent or off): a change means a retrain finished, enrollment
+    was deleted, or the verifier was toggled."""
+    def mtime(path):
+        try:
+            return Path(path).expanduser().stat().st_mtime if path else 0
+        except OSError:
+            return 0
+    m = cfg["model"]
+    return mtime(m if m.endswith(".onnx") else ""), mtime(cfg["verifier"])
 
 
 class Mic:

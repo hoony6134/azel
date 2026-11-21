@@ -1,17 +1,23 @@
-"""Wake-word enrollment ("Siri-style"): the user's own 아젤 clips train a personal verifier on the Mac.
+"""Wake-word voice retraining: the user's own 아젤 clips retrain the wake model on the Mac (CPU only).
 
 Mount in gateway.py (full mode only; the global bearer dependency applies):
     import wake_enroll
     app.include_router(wake_enroll.router)
 
-  POST   /v1/wake/enroll   multipart clips[] (WAV, 16 kHz mono 16-bit, 0.4-2.5 s)
+  POST   /v1/wake/enroll   multipart clips[] (WAV, 16 kHz mono 16-bit, 0.4-2.5 s, up to 60 per request and in total)
                            -> {"accepted": n, "rejected": [{"index", "reason"}], "training": bool}
-  GET    /v1/wake/enroll   -> {"clips": n, "trained_at": ISO|null, "status": "none"|"training"|"ready"|"failed"}
-  DELETE /v1/wake/enroll   -> 204 (clips, verifier and status gone)
+                           training starts once at least MIN_CLIPS (20) clips are stored
+  GET    /v1/wake/enroll   -> {"clips": n, "min_clips": 20, "trained_at": ISO|null,
+                               "status": "none"|"training"|"ready"|"failed",
+                               "improved": bool|null, "metrics": {...}|null, "error": str|null}
+  DELETE /v1/wake/enroll   -> 204 (clips and status gone, the generic model restored)
 
-Clips never leave the Mac: ~/.config/biseo/wake-enroll/ (0700, files 0600). Training runs the wake venv's
-python on assistant/wakeword/train_verifier.py in a background thread and writes azel_verifier.pkl; the wake
-listener picks the file up by mtime. Needs python-multipart in the gateway venv.
+Clips never leave the Mac: ~/.config/biseo/wake-enroll/ (0700, files 0600). Training runs
+assistant/wakeword/retrain.py (the wakeword venv, nice'd) in a background thread. It replaces
+~/.config/biseo/azel.onnx only when held-out recall goes up without more false accepts, keeps azel.prev.onnx
+and azel.base.onnx, and the wake listener reloads the model when the file changes. status "ready" with
+"improved": false means the old model stayed. Needs python-multipart in the gateway venv; one-time setup in
+assistant/wakeword/RETRAIN.md.
 """
 import array
 import io
@@ -30,8 +36,8 @@ from fastapi import APIRouter, HTTPException, Response, UploadFile
 HOME = Path(os.environ.get("BISEO_HOME", Path.home() / ".config/biseo"))
 ROOT = Path(__file__).resolve().parents[1]  # .../assistant
 DIR = HOME / "wake-enroll"
-VERIFIER = HOME / "azel_verifier.pkl"
-MIN_CLIPS, MAX_CLIPS = 5, 20
+MODEL = HOME / "azel.onnx"
+MIN_CLIPS, MAX_CLIPS = 20, 60
 MIN_S, MAX_S = 0.4, 2.5
 MAX_BYTES = int(MAX_S * 32000) + 1024  # a valid clip is never bigger
 
@@ -77,7 +83,9 @@ def status():
     n = len(list((DIR / "clips").glob("*.wav")))
     if state["running"]:
         s["status"] = "training"
-    return {"clips": n, "trained_at": s.get("trained_at"), "status": s.get("status", "none") if n else "none"}
+    return {"clips": n, "min_clips": MIN_CLIPS, "trained_at": s.get("trained_at"),
+            "status": s.get("status", "none") if n else "none", "improved": s.get("improved"),
+            "metrics": s.get("metrics"), "error": s.get("error")}
 
 
 def write_status(**s):
@@ -86,30 +94,33 @@ def write_status(**s):
     f.chmod(0o600)
 
 
-TRAIN_TIMEOUT_S = int(os.environ.get("BISEO_WAKE_TRAIN_TIMEOUT_S", "900"))
+TRAIN_TIMEOUT_S = int(os.environ.get("BISEO_WAKE_TRAIN_TIMEOUT_S", "1800"))
 
 
 def wake_python():
-    return os.environ.get("BISEO_WAKE_PY", str(ROOT / "wake/.venv/bin/python"))
+    return os.environ.get("BISEO_WAKE_PY", str(ROOT / "wakeword/.venv/bin/python"))
 
 
 def train_once():
     py = wake_python()
-    if not Path(py).is_file():  # no wake venv on this host: say so instead of failing silently
-        write_status(status="failed", error=f"wake venv python not found: {py}")
+    if not Path(py).is_file():  # no wakeword venv on this host: say so instead of failing silently
+        write_status(status="failed", error=f"wakeword venv python not found: {py}")
         return
-    cmd = [py, str(ROOT / "wakeword/train_verifier.py"), "--clips", str(DIR / "clips"), "--out", str(VERIFIER),
-           "--model", str(HOME / "azel.onnx"), "--negatives", str(HOME / "wake-negatives")]
+    cmd = [py, str(ROOT / "wakeword/retrain.py"), "--clips", str(DIR / "clips"), "--model", str(MODEL),
+           "--data", str(HOME / "wake-train")]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TRAIN_TIMEOUT_S)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TRAIN_TIMEOUT_S,
+                           preexec_fn=lambda: os.nice(10))  # the Mac stays usable while it trains
     except subprocess.TimeoutExpired:
         write_status(status="failed", error=f"training took longer than {TRAIN_TIMEOUT_S} s")
         return
     except OSError as e:
         write_status(status="failed", error=f"could not start training: {e}")
         return
-    if r.returncode == 0:
-        write_status(status="ready", trained_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    result = next((json.loads(line[7:]) for line in r.stdout.splitlines() if line.startswith("RESULT ")), None)
+    if r.returncode == 0 and result:
+        write_status(status="ready", trained_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     improved=result["improved"], metrics=result)
     else:
         write_status(status="failed", error=r.stderr[-500:])
 
@@ -176,6 +187,9 @@ def get_enroll():
 def delete_enroll():
     if state["running"]:
         raise HTTPException(409, "training in progress")
-    for f in [*(DIR / "clips").glob("*.wav"), DIR / "status.json", VERIFIER]:
+    for f in [*(DIR / "clips").glob("*.wav"), DIR / "status.json", MODEL.with_name("azel.prev.onnx")]:
         f.unlink(missing_ok=True)
+    base = MODEL.with_name("azel.base.onnx")
+    if base.exists():  # forget the user's voice: back to the generic model
+        os.replace(base, MODEL)
     return Response(status_code=204)
