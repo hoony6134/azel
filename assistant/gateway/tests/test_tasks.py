@@ -24,12 +24,13 @@ def tgw(tmp_path, monkeypatch):
     tgw_track(g)
     notes = []
 
-    async def place_call(reason, opening=None, call_id=None, persona_id=None):
+    async def place_call(reason, opening=None, call_id=None, persona_id=None, **kw):
         notes.append(("call", reason, opening, persona_id))
         return {"call_id": "c"}
 
     async def push(title, body, **extra):
         notes.append(("push", title, body, extra))
+    g.real_place_call = g.place_call  # tests that need the real one put it back
     g.place_call, g.send_alert_push = place_call, push
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         yield g, c, notes
@@ -56,7 +57,8 @@ def test_task_runs_logs_steps_and_calls(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:  # the status is saved a moment before the call goes out
         time.sleep(0.02)
-    assert notes == [("call", "task", "맡기신 작업 끝났어요. 파일 세 개를 정리했어요.", "azel")]
+    assert notes == [("call", "task", "맡기신 맥북 다운로드 폴더 정리 끝났어요. 파일 세 개를 정리했어요.", "azel")]
+    assert t["backend"] == "claude_code" and t["fallback_reason"] == "API 키가 없어 Claude Code로 했어요."  # no key here
     assert [x["id"] for x in c.get("/v1/tasks").json()] == [t["id"]]
     row = g.fake.db["usage"][-1]  # a task runs on claude -p: counted as the subscription path, labelled as a task
     assert (row["path"], row["task"], row["model"]) == ("claude_code", "task", "sonnet")
@@ -200,9 +202,16 @@ def test_call_mode_rings_on_failure(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:
         time.sleep(0.02)
-    assert t["status"] == "failed" and notes == [("call", "task", "맡기신 작업이 끝나지 못했어요. " + t["error"], "azel")]
+    assert t["status"] == "failed" and notes == [("call", "task", "맡기신 TASK-SPEND 큰 작업이 끝나지 못했어요. " + t["error"],
+                                                  "azel")]
 
 
+def test_spoken_results_lose_markdown_and_emoji(tgw):
+    g, c, notes = tgw
+    assert g.spoken_text("## 결과 ✅\n- **세 개** 정리 🎉\n1. `a.txt`") == "결과 세 개 정리 a.txt"
+    assert g.strip_marks("**오늘** 맑아요 ☀️") == "오늘 맑아요 "
+    t = {"status": "done", "goal": "다운로드 정리해 줘", "result": "- **3개** 옮겼어요 👍"}
+    assert g.task_summary(t, "정훈님") == "정훈님, 맡기신 다운로드 정리 끝났어요. 3개 옮겼어요"
 def test_list_carries_steps_for_the_apps_detail(tgw):
     """The app's task sheet renders the list item: without steps it said "아직 시작 전이에요" while the task ran."""
     g, c, _ = tgw
@@ -254,3 +263,95 @@ def test_runner_crash_is_logged_and_marked_failed(tgw, monkeypatch, capsys):
     tid = c.post("/v1/tasks", json={"goal": "맥북 정리", "notify": "none"}).json()["id"]
     t = wait_for(c, tid, ("failed",))
     assert t["error"] == "작업이 실패했어요." and "task failed" in capsys.readouterr().out
+
+
+def test_finish_call_continues_the_conversation(tgw, monkeypatch):
+    """A task started during a call reports back on a call linked to that conversation (origin_session)."""
+    g, c, notes = tgw
+    sent, calls = [], []
+
+    async def link_send(obj):
+        sent.append(obj)
+        return True
+
+    async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, **kw):
+        calls.append((reason, origin_session))
+        return {"call_id": "c"}
+    g.link_send, g.place_call = link_send, place_call
+
+    async def go():
+        m = {"type": "task", "id": "q1", "goal": "맥북 다운로드 정리해 줘", "notify": "call",
+             "origin_session": "azel:iphone-2026-11-22"}
+        await g.served(g.serve_task(m), m)  # how handle_link serves a task frame
+        await asyncio.sleep(0.2)
+        await asyncio.gather(*[r for r in g.task_runs.values() if r])
+    c.portal.call(go)
+    tid = sent[0]["task_id"]
+    assert c.get(f"/v1/tasks/{tid}").json()["status"] == "done"
+    assert g.fake.db["kv"][f"task-{tid}"]["origin_session"] == "azel:iphone-2026-11-22"
+    assert calls == [("task", "azel:iphone-2026-11-22")]
+
+
+def test_reminder_and_call_now_carry_their_origin(tgw, monkeypatch):
+    g, c, _ = tgw
+    sent = []
+
+    async def link_send(obj):
+        sent.append(obj)
+        return True
+
+    async def no_push(payload):
+        return {"sent": 0}
+    monkeypatch.setattr(g, "link_send", link_send)
+    monkeypatch.setattr(g, "send_voip_push", no_push)
+    monkeypatch.setattr(g, "place_call", g.real_place_call)
+
+    async def as_link(coro_fn, origin):  # what handle_link does for schedule / task / tool_call frames
+        return await g.served(coro_fn(), {"origin_session": origin})
+    at = (g.datetime.now(g.KST) + g.timedelta(hours=1)).replace(microsecond=0).isoformat()
+    item, _ = c.portal.call(as_link, lambda: g.schedule_create({"at": at, "kind": "reminder", "note": "약 먹기", "notify": "call"}, "voice"),
+                            "azel:iphone-2026-11-22")
+    assert g.fake.db["kv"][f"origin-{item['id']}"] == {"session": "azel:iphone-2026-11-22"}
+    row = g.fake.db["schedule"][item["id"]]
+    c.portal.call(g.attempt, row, time.time())  # the reminder fires
+    call = [m for m in sent if m.get("type") == "call"][-1]
+    assert call["origin_session"] == "azel:iphone-2026-11-22"
+    c.portal.call(as_link, lambda: g.place_call("user_request", "지금 전화드렸어요."), "luna:mac-2026-11-22")
+    assert [m for m in sent if m.get("type") == "call"][-1]["origin_session"] == "luna:mac-2026-11-22"
+    c.portal.call(g.place_call, "deadline", "마감이에요.")  # a proactive call has no conversation behind it
+    assert "origin_session" not in [m for m in sent if m.get("type") == "call"][-1]
+
+
+def test_call_context_and_notify_change(tgw, monkeypatch):
+    """The app's call screen chip: task and reminder calls carry context {kind, label, id} in the VoIP push and on
+    the link (the voice server sends it as the call's first message). PATCH /v1/tasks/{id} changes notify."""
+    g, c, _ = tgw
+    pushes, frames = [], []
+
+    async def push(payload):
+        pushes.append(payload)
+        return {"sent": 1}
+
+    async def link_send(obj):
+        frames.append(obj)
+        return True
+    monkeypatch.setattr(g, "send_voip_push", push)
+    monkeypatch.setattr(g, "link_send", link_send)
+    monkeypatch.setattr(g, "place_call", g.real_place_call)
+    tid = c.post("/v1/tasks", json={"goal": "TASK-SLOW 역사학특강 최신 과제해줘", "notify": "push"}).json()["id"]
+    wait_for(c, tid, ("running",))
+    assert c.patch(f"/v1/tasks/{tid}", json={"notify": "call"}).json()["notify"] == "call"
+    assert c.patch(f"/v1/tasks/{tid}", json={"notify": "sms"}).status_code == 400
+    assert c.patch(f"/v1/tasks/{tid}", json={"goal": "x"}).status_code == 400
+    assert g.task_live[tid]["notify"] == "call"  # the runner's own copy changed
+    asyncio.run(g.task_notify({**g.task_live[tid], "status": "done", "result": "끝"}))  # as the runner would at the end
+    ctx = pushes[-1]["context"]
+    assert ctx["kind"] == "task" and ctx["id"] == tid and "과제" in ctx["label"] and "해줘" not in ctx["label"]
+    assert [f for f in frames if f.get("type") == "call"][-1]["context"] == ctx
+    c.post(f"/v1/tasks/{tid}/cancel")
+    assert c.patch(f"/v1/tasks/{tid}", json={"notify": "push"}).status_code == 409  # finished: nothing to change
+    at = (g.datetime.now(g.KST) + g.timedelta(hours=1)).replace(microsecond=0).isoformat()
+    item, _ = c.portal.call(g.schedule_create, {"at": at, "kind": "reminder", "note": "약 먹으라고 전화해줘",
+                                                "notify": "call"}, "app")
+    c.portal.call(g.attempt, g.fake.db["schedule"][item["id"]], time.time())
+    assert pushes[-1]["context"] == {"kind": "schedule", "label": "약 먹기", "id": item["id"]}

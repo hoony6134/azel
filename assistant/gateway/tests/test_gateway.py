@@ -23,6 +23,7 @@ def start(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("BISEO_CLAUDE", str(HERE / "fake_claude.py"))
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("BISEO_LLM_URL", "http://127.0.0.1:9/v1/chat/completions")  # never the real Qwen in tests
     monkeypatch.setenv("BISEO_WARM_CLAUDE", "0")  # the one-shot fake; test_warm_claude covers the warm path
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -210,7 +211,7 @@ def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypa
     c.put("/v1/settings", json={"proactive": {"enabled": False}})
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append(reason)
         return {"call_id": f"c{len(placed)}"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -494,7 +495,7 @@ def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append((reason, opening))
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -758,7 +759,9 @@ def test_schedule_api_validates_and_confirms(gw):
     assert r.status_code == 201
     item = r.json()
     assert item == {"id": item["id"], "at": tomorrow10.isoformat(), "repeat": None, "kind": "wake", "note": "",
-                    "status": "pending", "attempts": 0, "created_by": "app", "persona_id": "azel"}
+                    "status": "pending", "attempts": 0, "created_by": "app", "persona_id": "azel",
+                    "next_at": tomorrow10.isoformat(), "cron": None, "rule_text": None, "start_date": None,
+                    "end_date": None, "notify": "call", "purpose": ""}
     iso = lambda t: datetime.fromtimestamp(t, g.KST).isoformat()  # noqa: E731
     for bad in [{"at": iso(now - 60)}, {"at": iso(now + 31 * 86400)}, {"at": "2026-12-01T10:00:00"},  # no offset
                 {"at": now + 3600}, {"at": iso(now + 3600), "repeat": "hourly"},
@@ -790,10 +793,10 @@ def test_spoken_times(gw):
         (kst(2026, 11, 22, 0, 5), None, "내일 밤 12시 5분"), (kst(2026, 11, 21, 12, 30), None, "오늘 낮 12시 30분")]:
         assert g.spoken_when(at.timestamp(), repeat, now) == want, want
     fri7 = kst(2026, 11, 27, 7, 0).timestamp()  # a Friday
-    assert g.next_at(fri7, "weekdays", fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
-    assert g.next_at(fri7, "daily", fri7) == kst(2026, 11, 28, 7, 0).timestamp()
-    assert g.next_at(fri7, "weekly:4", fri7) == kst(2026, 12, 4, 7, 0).timestamp()
-    assert g.next_at(fri7, "daily", fri7 + 3 * 86400) == kst(2026, 12, 1, 7, 0).timestamp()  # skips missed days
+    assert g.next_fire_of({"at": fri7, "repeat": "weekdays"}, fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
+    assert g.next_fire_of({"at": fri7, "repeat": "daily"}, fri7) == kst(2026, 11, 28, 7, 0).timestamp()
+    assert g.next_fire_of({"at": fri7, "repeat": "weekly:4"}, fri7) == kst(2026, 12, 4, 7, 0).timestamp()
+    assert g.next_fire_of({"at": fri7, "repeat": "daily"}, fri7 + 3 * 86400) == kst(2026, 12, 1, 7, 0).timestamp()  # skips missed days
 
 
 def test_schedule_over_the_link(gw):
@@ -817,7 +820,8 @@ def test_schedule_over_the_link(gw):
     assert by["r1"]["say"] == "내일 오전 7시 30분에 깨워 드릴게요." and by["r1"]["ok"]
     assert by["r1"]["item"]["at"] == at.isoformat() and by["r1"]["item"]["created_by"] == "voice"
     assert set(by["r1"]["item"]) == {"id", "at", "repeat", "kind", "note", "status", "attempts", "created_by",
-                                     "persona_id"}
+                                     "persona_id", "next_at", "cron", "rule_text", "start_date", "end_date", "notify",
+                                     "purpose"}
     assert by["r2"]["say"] == "예약된 전화는 내일 오전 7시 30분 기상이에요."
     assert by["r3"]["say"] == "내일 오전 7시 30분 예약을 취소했어요."
     assert by["r4"]["say"] == "취소할 예약이 없어요."
@@ -828,7 +832,7 @@ def test_schedule_over_the_link(gw):
 def fire_setup(g, monkeypatch, **item):
     placed, alerts = [], []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append((reason, opening))
         assert g.fake.db["schedule"]["s1"]["call_id"] == call_id  # claimed with the attempt, before ringing
         return {"call_id": call_id}
@@ -853,7 +857,9 @@ def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
     for dt, n in [(0, 1), (60, 1), (120, 2), (180, 2), (240, 3), (290, 3)]:
         asyncio.run(g.fire_scheduled(at + dt))
         assert len(placed) == n and item["attempts"] == n, (dt, n)
-    assert placed[0] == ("wake", "일어나실 시간이에요.") and item["status"] == "fired" and len(item["call_id"]) == 32
+    t = datetime.fromtimestamp(at, g.KST)  # the opening: composed from the time, never the request (openings.py)
+    assert placed[0] == ("wake", g.openings.template("wake", "", t.hour, t.minute)) and item["status"] == "fired" \
+        and len(item["call_id"]) == 32
     asyncio.run(g.fire_scheduled(at + 300))  # 60 s after the third attempt
     assert item["status"] == "missed" and len(placed) == 3
     assert alerts == ["오늘 오전 7시 기상 전화를 받지 않으셨어요."]
@@ -864,7 +870,10 @@ def test_answered_call_stops_retries_and_repeat_reschedules(gw, monkeypatch):
     at, placed, _ = fire_setup(g, monkeypatch, repeat="daily", kind="reminder", note="약 드실 시간이에요.")
     item = g.fake.db["schedule"]["s1"]
     asyncio.run(g.fire_scheduled(at))
-    assert placed == [("reminder", "말씀하신 시간이에요. 약 드실 시간이에요.")]
+    t = datetime.fromtimestamp(at, g.KST)
+    purpose = g.openings.purpose_rule("약 드실 시간이에요.")
+    assert placed == [("reminder", g.openings.template("reminder", "", t.hour, t.minute, purpose))]
+    assert "약 드실 시간이에요." not in placed[0][1]  # the note is not read back verbatim
     asyncio.run(g.handle_link(LinkWS([{"type": "call_answered", "call_id": item["call_id"]}])))
     assert item["status"] == "pending" and item["attempts"] == 0 and item["at"] > at  # tomorrow, same time
     assert datetime.fromtimestamp(item["at"], g.KST).strftime("%H:%M") == "07:00"
@@ -917,7 +926,7 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
         assert ev == [{"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}]
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         ran.append(reason)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -951,7 +960,7 @@ def test_guardrails(gw):
 def auto_setup(g, monkeypatch, verdict):
     placed, asked = [], []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
@@ -1145,7 +1154,7 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
     g, _, _ = gw
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         ran.append(g.INSTANCE)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -1167,7 +1176,7 @@ def test_alert_limits(gw, monkeypatch):
     g, c, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append(opening)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -1442,7 +1451,9 @@ def test_runs_load_only_enabled_connectors(gw):
     c.post("/v1/ask", json={"text": "a", "session": "s1"})
     args, st = run_settings(tmp)
     urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
-    assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp"}  # defaults
+    azel = "http://100.64.0.8:8892/v1/mcp"  # the gateway's own call_user / create_task server
+    assert urls == {"https://mcp.example/cygnus", "https://gmail.example/mcp", "https://cal.example/mcp", azel}  # defaults
+    assert "mcp__azel" in args
     assert st["enabledPlugins"] == {"figma@official": False, "legal@x": False}
     assert "mcp__claude_ai_Gmail" in args and "mcp__claude_ai_Notion" not in args
     r = c.put("/v1/connectors", json={"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
@@ -1455,7 +1466,7 @@ def test_runs_load_only_enabled_connectors(gw):
     c.post("/v1/ask", json={"text": "b", "session": "s2"})
     args, st = run_settings(tmp)
     urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
-    assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp"}
+    assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp", azel}
     assert "mcp__claude_ai_Notion" in args and "mcp__wiki" not in args  # no secret yet: the server is skipped
 
 
@@ -1540,7 +1551,7 @@ def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatc
     monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))  # no PAT in tests
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         evs = events(c.post("/v1/ask", json={"text": "홈 폴더 봐 줘", "session": "s", "path": "api", "model": "haiku"}))
-    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir"]
+    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "web_search", "web_fetch"]
     assert "Cygnus 도구" in seen["system"] and g.PERSONAL_REFUSAL not in seen["system"] and seen["result"] == "a b c"
     assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
     done = evs[-1]
@@ -1603,3 +1614,58 @@ def test_persona_change_reaches_the_voice_server_and_restarts_the_conversation(g
     assert "--resume" in ask("또")  # nothing changed: resumed
     c.put("/v1/settings", json={"user_title": "대표님"})  # the shared title (azel has none of its own)
     assert "--resume" not in ask("다시")  # title changed: a fresh conversation
+
+
+def test_web_tools_only_on_full_gateways(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
+    _, allowed, _, _ = g.run_args(asyncio.run(g.load_settings()), [])
+    assert {"WebSearch", "WebFetch"} <= set(allowed)
+    for name, text in (("anthropic_api_key", "sk-test\n"), ("state_token_limited", "l1m\n")):
+        (tmp_path / name).write_text(text)
+        (tmp_path / name).chmod(0o600)
+    lim = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
+    _, allowed, _, _ = lim.run_args(asyncio.run(lim.load_settings()), [])
+    assert not {"WebSearch", "WebFetch"} & set(allowed)
+    args = lim.base_cmd("m", "s", allowed)
+    assert "WebSearch" not in args[args.index("--allowedTools"):]
+
+
+def test_night_rule_reaches_every_prompt(gw, monkeypatch):
+    """name_prompt builds every Claude/API/NIM/task prompt: at night they all read "내일" as today."""
+    g, c, _ = gw
+    s = asyncio.run(g.load_settings())
+    monkeypatch.setattr(g, "night_rule", lambda: "\nNIGHT-RULE\n")
+    assert "NIGHT-RULE" in g.name_prompt(s) and "NIGHT-RULE" in g.task_api_system(s, [])
+    monkeypatch.undo()
+    night = g.datetime(2026, 11, 22, 1, 30, tzinfo=g.KST)
+    assert "'내일'은 오늘(11월 22일)" in g.late_night.prompt_rule(night)
+
+
+def test_every_placed_call_opens_with_the_title(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+
+    async def no_push(payload):
+        return {"sent": 0}
+    monkeypatch.setattr(g, "link_send", capture)
+    monkeypatch.setattr(g, "send_voip_push", no_push)
+    c.put("/v1/settings", json={"user_title": "정훈님"})
+    c.post("/v1/personas", json={"id": "mia", "name": "미아", "voice": "sohee", "user_title": "오빠"})
+    asyncio.run(g.place_call("deadline", "마감이 다가오는 게 있어요. 과제가 내일까지예요."))  # a model-written opening
+    asyncio.run(g.place_call("user_request", "약 드실 시간이에요.", persona_id="mia"))
+    asyncio.run(g.place_call("task", "정훈님, 맡기신 정리 끝났어요."))  # already has it: unchanged
+    openings = [m["opening"] for m in sent if m.get("type") == "call"]
+    assert openings == ["정훈님, 마감이 다가오는 게 있어요. 과제가 내일까지예요.", "오빠, 약 드실 시간이에요.",
+                        "정훈님, 맡기신 정리 끝났어요."], openings
+
+
+def test_speech_style_follows_the_persona(gw):
+    """A persona whose personality asks for 반말 is not overruled by a fixed 존댓말 line (존댓말 stays the default)."""
+    g, c, _ = gw
+    for text in (g.VOICE_STYLE, g.FULL_API_STYLE, g.NIM_STYLE):
+        assert "말투(존댓말/반말)는 비서 성격을 따르고" in text and "반드시 존댓말" not in text and "한국어 존댓말로" not in text
