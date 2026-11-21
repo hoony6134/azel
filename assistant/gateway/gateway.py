@@ -7,7 +7,7 @@ One gateway runs on every device. Shared state lives behind the memory service's
                                     personal-data tasks refused. No scheduler, no calls.
 
 Contract: ../PROTOCOL.md section 3. Run: uv run gateway.py  (binds the Tailscale IP only)
-           uv run gateway.py --migrate  (one-off: copy the old local gateway.db/settings.json into ruchba)
+           uv run gateway.py --migrate  (copy the old local gateway.db into ruchba; also runs once on first start)
 """
 import asyncio
 import copy
@@ -666,6 +666,8 @@ async def lifespan(app):
     tasks = [asyncio.create_task(voice_link())]
     if MODE == "full":  # scheduled jobs need personal data
         tasks.append(asyncio.create_task(scheduler()))
+        if OLD_DB.exists() and not MIGRATED.exists():
+            tasks.append(asyncio.create_task(migrate_once()))
     yield
     for t in tasks:
         t.cancel()
@@ -828,30 +830,47 @@ async def decide(aid: str, body: dict):
     return await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": bool(body.get("approve"))})
 
 
-def migrate():
-    """One-off: copy the old per-host gateway.db (this month's usage, push tokens) into ruchba."""
-    import sqlite3
+OLD_DB = HOME / "gateway.db"  # the per-host SQLite of the single-gateway era
+MIGRATED = HOME / "migrated_from_sqlite"
 
-    async def run():
-        await load_settings()  # seeds ruchba from settings.json if ruchba has none
-        con = sqlite3.connect(HOME / "gateway.db")
-        con.row_factory = sqlite3.Row
-        rows = con.execute("select * from usage where ts>=?", (month_start(),)).fetchall()
-        for r in rows:
-            await state.call("POST", "/v1/state/usage", {**dict(r), "device": DEVICE})
-        print(f"{len(rows)} usage rows of this month copied")
-        toks = con.execute("select * from push_tokens").fetchall()
-        for t in toks:
-            await state.call("PUT", f"/v1/state/push_tokens/{quote(t['token'], safe='')}",
-                             {"bundle_id": t["bundle_id"], "env": t["env"]})
-        print(f"{len(toks)} push tokens copied")
-    asyncio.run(run())
+
+async def migrate_sqlite():
+    """Copy the old gateway.db into ruchba: settings (if ruchba has none), this month's usage, push tokens and
+    pending approvals (same ids, so daemons waiting on them still match). Idempotent: usage rows carry an
+    import key and approvals keep their id, so running it again adds nothing."""
+    import sqlite3
+    await load_settings()  # seeds ruchba from settings.json if ruchba has none
+    con = sqlite3.connect(OLD_DB)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("select rowid, * from usage where ts>=?", (month_start(),)).fetchall()
+    for r in rows:
+        row = {k: r[k] for k in r.keys() if k != "rowid"}
+        await state.call("POST", "/v1/state/usage",
+                         {**row, "device": DEVICE, "import_key": f"sqlite:{DEVICE}:{r['rowid']}"})
+    toks = con.execute("select * from push_tokens").fetchall()
+    for t in toks:
+        await state.call("PUT", f"/v1/state/push_tokens/{quote(t['token'], safe='')}",
+                         {"bundle_id": t["bundle_id"], "env": t["env"]})
+    pend = con.execute("select * from approvals where status='pending'").fetchall()
+    for a in pend:
+        await state.call("POST", "/v1/state/approvals", {k: a[k] for k in ("id", "device", "tool", "command", "cwd")})
+    con.close()
+    write_private(MIGRATED, datetime.now(KST).isoformat())
+    print(f"migrated {len(rows)} usage rows, {len(toks)} push tokens, {len(pend)} pending approvals", flush=True)
+
+
+async def migrate_once():
+    """On a full gateway's first start next to an old gateway.db; retried on later starts until it succeeds."""
+    try:
+        await migrate_sqlite()
+    except Exception as e:  # ruchba down or refusing: the old file stays, the next start tries again
+        print("migration from gateway.db failed, will retry on next start:", type(e).__name__, e, flush=True)
 
 
 if __name__ == "__main__":
     import sys
-    if "--migrate" in sys.argv:
-        migrate()
+    if "--migrate" in sys.argv:  # by hand; safe to repeat
+        asyncio.run(migrate_sqlite())
         raise SystemExit
     import uvicorn
     assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"

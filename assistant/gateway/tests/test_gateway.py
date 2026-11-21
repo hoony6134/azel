@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -332,6 +333,49 @@ def test_rejected_usage_row_does_not_block_the_queue(gw):
     assert [u["model"] for u in g.fake.db["usage"]] == ["haiku"] and g.pending_usage == []
     dead = [json.loads(line) for line in (tmp / "usage_rejected.jsonl").read_text().splitlines()]
     assert dead[0]["status"] == 422 and dead[0]["row"]["model"] == "bad"
+
+
+def old_gateway_db(path):
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.executescript("""
+        create table usage(ts real, model text, path text, task text, input_tokens int, output_tokens int, cost_usd real);
+        create table push_tokens(token text primary key, bundle_id text, env text, ts real);
+        create table approvals(id text primary key, device text, tool text, command text, cwd text, status text,
+            created real, decided real);""")
+    now = datetime.now().timestamp()
+    con.executemany("insert into usage values(?,?,?,?,?,?,?)", [(now - 60, "opus", "claude_code", "", 1, 1, 2.5),
+                                                               (now - 86400 * 70, "opus", "claude_code", "", 1, 1, 9)])
+    con.execute("insert into push_tokens values('tokA','xyz.scian.azel','production',0)")
+    con.executemany("insert into approvals values(?,?,?,?,?,?,?,?)", [
+        ("aaaaaaaaaaaa", "macbook", "run_command", "git push", "~/dev/x", "pending", now, None),
+        ("bbbbbbbbbbbb", "macbook", "run_command", "rm x", "~", "approved", now, now)])
+    con.commit()
+    con.close()
+
+
+def test_old_gateway_db_migrates_once_and_idempotently(tmp_path, monkeypatch):
+    old_gateway_db(tmp_path / "gateway.db")
+    g = start(tmp_path, monkeypatch)
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        for _ in range(50):  # runs in the background on start
+            if (tmp_path / "migrated_from_sqlite").exists():
+                break
+            time.sleep(0.05)
+        assert (tmp_path / "migrated_from_sqlite").exists()
+        assert c.get("/v1/usage").json()["cost_usd"] == 2.5  # this month only
+    assert list(g.fake.db["approvals"]) == ["aaaaaaaaaaaa"]  # pending only, same id
+    assert [t["token"] for t in g.fake.db["push"].values()] == ["tokA"]
+    asyncio.run(g.migrate_sqlite())  # by hand again: nothing doubles
+    assert len(g.fake.db["usage"]) == 1 and len(g.fake.db["approvals"]) == 1
+
+
+def test_migration_retries_when_ruchba_is_down(tmp_path, monkeypatch):
+    old_gateway_db(tmp_path / "gateway.db")
+    g = start(tmp_path, monkeypatch)
+    g.fake.state.down = True
+    asyncio.run(g.migrate_once())
+    assert not (tmp_path / "migrated_from_sqlite").exists()  # tried again on the next start
 
 
 def test_resume_only_on_the_device_that_made_the_session(gw):

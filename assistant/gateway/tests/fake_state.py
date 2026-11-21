@@ -79,8 +79,8 @@ def make():
 
     @app.post("/v1/state/approvals")
     def add_approval(body: dict):
-        aid = uuid.uuid4().hex[:12]
-        db["approvals"][aid] = {"id": aid, **body, "status": "pending", "created": time.time(), "decided": None}
+        aid = body.pop("id", None) or uuid.uuid4().hex[:12]
+        db["approvals"].setdefault(aid, {"id": aid, **body, "status": "pending", "created": time.time(), "decided": None})
         return {"approval_id": aid}
 
     @app.get("/v1/state/approvals")

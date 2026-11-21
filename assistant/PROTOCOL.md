@@ -224,7 +224,8 @@ records, search, contacts and context, answers 403) when either:
 
 - `GET /v1/state/settings` *limited* → the settings document (`{}` if none); `PUT` replaces it.
 - `POST /v1/state/usage` *limited* `{"device","model","path","task","input_tokens","output_tokens",
-  "cost_usd","ts"?}`; `GET /v1/state/usage?since=<epoch>` *limited* → rows, oldest first.
+  "cost_usd","ts"?,"import_key"?}` (a row whose `import_key` is already stored is skipped: replays from the
+  old gateway.db are idempotent); `GET /v1/state/usage?since=<epoch>` *limited* → rows, oldest first.
 - `PUT /v1/state/devices/{id}` *limited* `{"name","url","harness","gateway"}` (upsert, sets
   `last_seen` and `writer` = the caller's role, `full` or `limited`). A limited caller may not overwrite a
   row whose writer is `full` (403). `GET /v1/state/devices` *limited* →
@@ -233,7 +234,8 @@ records, search, contacts and context, answers 403) when either:
 - `PUT /v1/state/push_tokens/{token}` `{"bundle_id","env"}`; `GET /v1/state/push_tokens`.
 - `POST /v1/state/calls` `{"id","reason","opening"}`; `POST /v1/state/calls/{id}/answer` → the row,
   marked answered (404 if missing).
-- `POST /v1/state/approvals` *limited* `{"device","tool","command","cwd"}` → `{"approval_id"}`;
+- `POST /v1/state/approvals` *limited* `{"id"?,"device","tool","command","cwd"}` → `{"approval_id"}` (`id`,
+  12 hex chars, only from full callers, for migrated approvals; an existing id is left unchanged);
   `GET /v1/state/approvals?status=pending`; `GET /v1/state/approvals/{id}` *limited*;
   `POST /v1/state/approvals/{id}` `{"approve":bool}` → `{"id","status"}`, 409 unless pending.
 - `GET|PUT /v1/state/sessions/{voice_session}` `{"claude_session","device"}` (404 if unknown).
