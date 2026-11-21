@@ -74,6 +74,7 @@ DEFAULTS = {
     "task_defaults": {"chat": {"model": "qwen"}, "schedule": {"model": "sonnet"},
                       "code": {"model": "opus", "path": "claude_code"}, "mac": {"model": "sonnet"}},
     "monthly_budget_usd": 500, "budget_warn_pct": 80,
+    "budget_paths": ["api", "nim"],  # which usage paths count toward the budget; claude_code is the subscription
     # "먼저 전화하기": proactive calls. User-created scheduled calls are not proactive and always fire.
     "proactive": {"enabled": True, "morning_briefing": {"enabled": True, "time": "08:00"},
                   "deadline_check": {"enabled": True, "time": "20:00"}, "server_alerts": True,
@@ -390,8 +391,29 @@ async def month_rows():
     return await state.get("/v1/state/usage", [], since=since) + [u for u in pending_usage if u["ts"] >= since]
 
 
-async def month_cost():
-    return sum(r["cost_usd"] for r in await month_rows())
+async def month_cost(settings=None):
+    """This month's spend on the paths that count toward the budget (`budget_paths`)."""
+    paths = (settings or await load_settings())["budget_paths"]
+    return sum(r["cost_usd"] for r in await month_rows() if r["path"] in paths)
+
+
+claude_quota: dict[str, dict] = {}  # latest subscription windows from `claude -p` rate_limit_event, by "5h" / "weekly"
+QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "weekly"}
+
+
+def note_quota(event):
+    for key, w in (event.get("rate_limit_info", {}).get("unifiedWindows") or {}).items():
+        if key in QUOTA_WINDOWS and isinstance(w.get("utilization"), (int, float)) and w.get("resetsAt"):
+            claude_quota[QUOTA_WINDOWS[key]] = {"utilization_pct": round(w["utilization"] * 100, 1), "resets_at": w["resetsAt"]}
+
+
+def quota_view():
+    """The fullest live window (a window past its reset is stale and dropped), plus all of them; None before any run."""
+    live = {k: v for k, v in claude_quota.items() if v["resets_at"] > time.time()}
+    if not live:
+        return None
+    k = max(live, key=lambda k: live[k]["utilization_pct"])
+    return {"window": k, **live[k], "windows": live}
 
 
 async def record_usage(row):
@@ -558,6 +580,8 @@ async def ask_claude_code(text, model, session):
                 for block in content if isinstance(content, list) else []:
                     if block.get("type") == "tool_result" and block.get("tool_use_id") in open_tools:
                         yield activity("tool_end", open_tools.pop(block["tool_use_id"]))
+            elif e.get("type") == "rate_limit_event":
+                note_quota(e)
             elif e.get("type") == "result":
                 u = e.get("usage", {})
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
@@ -711,7 +735,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
         return
     settings = await load_settings()
     budget = settings["monthly_budget_usd"]
-    if await month_cost() >= budget:
+    if await month_cost(settings) >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}
         return
     model, path = resolve(settings, model, path, task, text)
@@ -730,7 +754,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
             if item.get("error") and not said:  # e.g. the subscription's usage limit: say so instead of silence
                 yield claude_failure(item.get("result", ""))
                 return
-            spent = await month_cost()
+            spent = await month_cost(settings)
             yield {"type": "done", **{k: v for k, v in item.items() if k != "result"},
                    "budget_warning": spent >= budget * settings["budget_warn_pct"] / 100}
 
@@ -1468,6 +1492,11 @@ async def put_settings(body: dict):
             body["connectors"] = connectors.check(body["connectors"])
         except ValueError as e:
             raise HTTPException(400, str(e))
+    if "budget_paths" in body:
+        bp = body["budget_paths"]
+        if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
+            raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
+        body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -1481,11 +1510,18 @@ async def put_settings(body: dict):
 
 @app.get("/v1/usage")
 async def usage():
-    rows = await month_rows()
-    by = lambda k: {v: round(sum(r["cost_usd"] for r in rows if r[k] == v), 4) for v in {r[k] for r in rows}}  # noqa: E731
+    rows, settings = await month_rows(), await load_settings()
+    by = lambda k, rs=rows: {v: round(sum(r["cost_usd"] for r in rs if r[k] == v), 4) for v in {r[k] for r in rs}}  # noqa: E731
+    paid = [r for r in rows if r["path"] in settings["budget_paths"]]  # cost_usd and the budget mean this paid part
+    cc = [r for r in rows if r["path"] == "claude_code"]
     return {"month": datetime.now(KST).strftime("%Y-%m"), "calls": len(rows), "by_model": by("model"),
-            "by_path": by("path"), "by_device": by("device"), "cost_usd": round(sum(r["cost_usd"] for r in rows), 4),
-            "budget_usd": (await load_settings())["monthly_budget_usd"]}
+            "by_path": by("path"), "by_device": by("device"), "cost_usd": round(sum(r["cost_usd"] for r in paid), 4),
+            "budget_usd": settings["monthly_budget_usd"],
+            "paid": {"cost_usd": round(sum(r["cost_usd"] for r in paid), 4), "by_path": by("path", paid)},
+            "subscription": {"claude_code": {
+                "turns": len(cc), "input_tokens": sum(r.get("input_tokens") or 0 for r in cc),
+                "output_tokens": sum(r.get("output_tokens") or 0 for r in cc),
+                "equivalent_usd": round(sum(r["cost_usd"] for r in cc), 4), "quota": quota_view()}}}
 
 
 async def probe(url, token=False):

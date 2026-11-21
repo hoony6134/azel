@@ -75,15 +75,45 @@ def test_ask_streams_and_records_usage(gw):
     c.post("/v1/ask", json={"text": "또", "session": "s1"})  # same voice session resumes
     args = json.loads((tmp / "args.json").read_text())
     assert args[args.index("--resume") + 1] == "sess-1"
-    assert c.get("/v1/usage").json()["cost_usd"] == 1.0
+    assert c.get("/v1/usage").json()["cost_usd"] == 0  # claude_code is the subscription: not counted
+    assert c.get("/v1/usage").json()["subscription"]["claude_code"]["equivalent_usd"] == 1.0
 
 
 def test_budget_blocks(gw):
     g, c, _ = gw
-    c.put("/v1/settings", json={"monthly_budget_usd": 0.4})
+    c.put("/v1/settings", json={"monthly_budget_usd": 0.4, "budget_paths": ["claude_code"]})
     c.post("/v1/ask", json={"text": "a"})
     ev = events(c.post("/v1/ask", json={"text": "b"}))
     assert ev == [{"type": "error", "code": "budget", "message": "이번 달 Claude 한도를 다 썼습니다."}]
+
+
+def test_budget_ignores_the_subscription_by_default(gw):
+    g, c, _ = gw
+    assert c.get("/v1/settings").json()["budget_paths"] == ["api", "nim"]
+    c.put("/v1/settings", json={"monthly_budget_usd": 0.4})
+    for _ in range(3):  # 1.5 equivalent USD of claude_code: over the budget, yet never blocked
+        ev = events(c.post("/v1/ask", json={"text": "a"}))
+        assert ev[-1]["type"] == "done" and not ev[-1]["budget_warning"]
+    asyncio.run(g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.5}))  # paid: counts
+    assert events(c.post("/v1/ask", json={"text": "b"}))[0]["code"] == "budget"
+
+
+def test_budget_paths_validated_and_usage_shape(gw):
+    g, c, _ = gw
+    for bad in ("api", ["gpt"], [1], None):
+        assert c.put("/v1/settings", json={"budget_paths": bad}).status_code == 400, bad
+    assert c.put("/v1/settings", json={"budget_paths": ["nim", "api", "api"]}).json()["budget_paths"] == ["api", "nim"]
+    c.post("/v1/ask", json={"text": "a"})
+    asyncio.run(g.record_usage({"model": "haiku", "path": "api", "cost_usd": 0.25, "input_tokens": 3}))
+    u = c.get("/v1/usage").json()
+    assert u["calls"] == 2 and u["by_path"] == {"claude_code": 0.5, "api": 0.25}
+    assert u["cost_usd"] == 0.25 and u["paid"] == {"cost_usd": 0.25, "by_path": {"api": 0.25}}
+    cc = u["subscription"]["claude_code"]
+    assert (cc["turns"], cc["input_tokens"], cc["output_tokens"], cc["equivalent_usd"]) == (1, 10, 5, 0.5)
+    assert cc["quota"]["window"] == "5h" and cc["quota"]["utilization_pct"] == 41.0
+    assert cc["quota"]["windows"]["weekly"]["utilization_pct"] == 30.0
+    g.claude_quota["5h"]["resets_at"] = 1  # a window past its reset is dropped
+    assert c.get("/v1/usage").json()["subscription"]["claude_code"]["quota"]["window"] == "weekly"
 
 
 def test_assistant_name(gw, monkeypatch):
@@ -620,7 +650,7 @@ def test_old_gateway_db_migrates_once_and_idempotently(tmp_path, monkeypatch):
                 break
             time.sleep(0.05)
         assert (tmp_path / "migrated_from_sqlite").exists()
-        assert c.get("/v1/usage").json()["cost_usd"] == 2.5  # this month only
+        assert c.get("/v1/usage").json()["subscription"]["claude_code"]["equivalent_usd"] == 2.5  # this month only
     assert list(g.fake.db["approvals"]) == ["aaaaaaaaaaaa"]  # pending only, same id
     assert [t["token"] for t in g.fake.db["push"].values()] == ["tokA"]
     asyncio.run(g.migrate_sqlite())  # by hand again: nothing doubles

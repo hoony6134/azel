@@ -18,4 +18,6 @@ if "도구" in sys.argv[2]:  # one tool call, with arguments and a result that m
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": "SECRET-RESULT"}]}}))
 for t in ["네, ", "확인했어요."]:
     print(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": t}}}))
+print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
+    "five_hour": {"utilization": 0.41, "resetsAt": 4102444800}, "seven_day": {"utilization": 0.3, "resetsAt": 4102444800}}}}))
 print(json.dumps({"type": "result", "total_cost_usd": 0.5, "usage": {"input_tokens": 10, "output_tokens": 5}, "session_id": "sess-1"}))
