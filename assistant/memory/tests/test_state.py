@@ -259,6 +259,28 @@ def test_scheduled_calls(client):
     assert limited_client("100.64.0.8", "l1m").get("/v1/state/schedule").status_code == 403
 
 
+def test_scheduled_cron_columns(client):
+    """Batch 5: cron rules ride on the same table; rows without them read back with the defaults."""
+    at = time.time() + 3600
+    old = client.post("/v1/state/schedule", json={"at": at, "repeat": "daily"}).json()
+    assert old["cron"] is None and old["notify"] == "call" and old["purpose"] == "" and old["skips"] == [] \
+        and old["start_date"] is None
+    r = client.post("/v1/state/schedule", json={"at": at, "kind": "reminder", "cron": "0 10-18/2 * * 1-5",
+                                                "start_date": "2026-12-01", "end_date": "2026-12-31", "notify": "push",
+                                                "purpose": "스트레칭", "request": "평일 10시부터 6시까지 2시간마다 스트레칭하라고 알림으로"})
+    item = r.json()
+    assert item["cron"] == "0 10-18/2 * * 1-5" and item["start_date"] == "2026-12-01" and item["notify"] == "push"
+    for bad in [{"at": at, "cron": "rm -rf /"}, {"at": at, "notify": "sms"}, {"at": at, "purpose": "x" * 61},
+                {"at": at, "start_date": "내일"}]:
+        assert client.post("/v1/state/schedule", json=bad).status_code == 422
+    u = client.post(f"/v1/state/schedule/{item['id']}", json={"cron": "0 9 * * 1-5", "end_date": None,
+                                                              "skips": [at], "purpose": "물 마시기"}).json()
+    assert u["cron"] == "0 9 * * 1-5" and u["end_date"] is None and u["start_date"] == "2026-12-01" \
+        and u["skips"] == [at] and u["purpose"] == "물 마시기"
+    for sid in (old["id"], item["id"]):
+        client.delete(f"/v1/state/schedule/{sid}")
+
+
 def test_proactive_log_and_kv(client):
     t0 = time.time()
     client.post("/v1/state/proactive_log", json={"call": True, "urgency": 5, "reason": "서버 다운", "reason_hash": "ab",

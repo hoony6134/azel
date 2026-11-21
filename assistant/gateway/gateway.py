@@ -14,6 +14,7 @@ import contextvars
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -31,7 +32,14 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import agent_loop
+import cron
+import late_night
+import web
+import openings
 import connectors
+import google_tools
+import tools_bridge
 import nim
 import wake_enroll
 import claude_api
@@ -87,6 +95,7 @@ DEFAULTS = {
     "assistant_name": "아젤",
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
+    "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
@@ -204,9 +213,15 @@ def active_persona(s):
     return (persona_by_id(s, pid) if pid else None) or primary_persona(s)
 
 
+def night_rule():
+    """late_night.prompt_rule for now: "내일" between 00:00 and 05:00 KST is today (empty in the day)."""
+    return late_night.prompt_rule(datetime.now(KST))
+
+
 def name_prompt(settings):
-    """Persona and reply length, from the shared settings."""
-    return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"])
+    """Persona and reply length, from the shared settings, plus the late-night day rule (every Claude, API, NIM and
+    task prompt is built from this, so all of them read "내일" the same way as the schedule path)."""
+    return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"]) + night_rule()
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)"
@@ -216,10 +231,12 @@ PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|�
                       re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
-    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 하되 '네'가 아니라 "
+    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어로 말하고(말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해.), 첫 문장은 짧게 하되 '네'가 아니라 "
     "내용으로 시작해. "
     "마크다운, 목록, 표, 이모지, URL, 코드 블록을 쓰지 마. '확인하지 않은 것' 같은 꼬리말도 붙이지 마. "
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
+    "사용자에게 전화를 걸어야 하면 call_user 도구로 지금 걸거나 시간을 정해 예약해. 여러 단계가 필요한 일은 create_task 도구로 "
+    "백그라운드 작업으로 맡겨. 전화를 걸 수 없다고 말하지 마. "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
     "기기 명령이 pending_approval을 돌려주면 먼저 '앱에서 허용해 주세요'라고 짧게 말한 다음, 같은 명령을 그 "
@@ -533,6 +550,41 @@ async def record_call_log(m):
     await history_outbox.put({k: v for k, v in m.items() if k != "type"})
 
 
+POST_CALL_DELAY_S = 20  # the call's turns reach ruchba through the history outbox first
+AUTO_FACTS = ("아래 통화에서 오래 기억해 둘 만한 사용자에 대한 사실이나 취향만 최대 3개 뽑아. 사용자가 직접 말한 것만. "
+              "인사, 날씨, 한 번 물어본 정보 같은 사소한 것과 건강·돈·연애·비밀번호·계좌 같은 민감한 것은 빼. "
+              "각 사실은 '사용자는 …' 같은 짧은 한 문장. 없으면 빈 목록. JSON 하나만: {\"facts\": [\"...\"]}")
+SENSITIVE = re.compile(r"병|질환|약 ?먹|진단|우울|임신|연봉|대출|빚|월급|계좌|연애|이혼|종교|정치", re.I)
+
+
+async def post_call_facts(log_id, persona_id):
+    """After a call: at most 3 durable facts into Azel memory, marked auto (never Cygnus: only "기억해" goes there).
+    The app's memory list shows them and can delete them."""
+    try:
+        await asyncio.sleep(POST_CALL_DELAY_S)
+        row = await state.call("GET", f"/v1/state/history/{quote(log_id, safe='')}")
+        turns = (row or {}).get("turns") or []
+        said = "\n".join(f"사용자: {t.get('user', '')}\n비서: {' '.join(t.get('assistant') or [])[:200]}"
+                         for t in turns)[-4000:]
+        if sum(len(t.get("user", "")) for t in turns) < 20:
+            return  # nothing worth reading
+        d = await llm_json(AUTO_FACTS, said)
+        facts = [f.strip() for f in (d or {}).get("facts", []) if isinstance(f, str) and 4 <= len(f.strip()) <= 200][:3]
+        settings = await load_settings()
+        persona = persona_by_id(settings, persona_id) or primary_persona(settings)
+        import cygnus  # the same secret rule as explicit "기억해"
+        for f in facts:
+            if cygnus.SECRET.search(f) or SENSITIVE.search(f):
+                continue
+            near = await memory_search(f, 1)
+            if near and near[0].get("score", 0) >= 0.85:
+                continue  # already known
+            await memory_add(f, {"memory": True, "source": "auto", "call": log_id,
+                                 "persona": None if persona.get("share_memory", True) else persona["id"]})
+    except Exception as e:  # a background nicety: never crash the link
+        print("post-call facts failed:", type(e).__name__, flush=True)
+
+
 async def push_tokens():
     return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
 
@@ -543,10 +595,32 @@ async def take_lease(name, ttl_s, priority=100, holder=None):
                              {"holder": holder or INSTANCE, "ttl_s": ttl_s, "priority": priority}))["held"]
 
 
+EXTERNAL_TOKEN_PATH = HOME / "mcp_external_token"  # the user's own Claude Code: /v1/mcp's external scope only
+EXTERNAL_PER_HOUR = 60
+_external_calls: list[float] = []
+
+
+def external_token():
+    """Read on every request, so deleting or rotating the file revokes at once. Ignored unless chmod 600."""
+    try:
+        if EXTERNAL_TOKEN_PATH.stat().st_mode & 0o077:
+            return ""
+        return EXTERNAL_TOKEN_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
 def auth(request: Request):
     got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(got.encode(), TOKEN.encode()):
-        raise HTTPException(401, "bad token")
+    if hmac.compare_digest(got.encode(), TOKEN.encode()):
+        request.state.scope = "full"
+        return
+    ext = external_token()
+    if ext and len(ext) >= 32 and hmac.compare_digest(got.encode(), ext.encode()) \
+            and request.method == "POST" and request.url.path == "/v1/mcp":
+        request.state.scope = "external"
+        return
+    raise HTTPException(401, "bad token")
 
 
 # ---------- Claude ----------
@@ -717,8 +791,34 @@ discovery = connectors.Discovery(CLAUDE)
 def run_args(settings, devices, requester=""):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
     custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
-    return connectors.run_args(settings.get("connectors") or {}, discovery, devices, TOKEN, HOME, device_tokens,
-                               {"X-Azel-Requester": requester} if requester else None)
+    servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
+                                                              TOKEN, HOME, device_tokens,
+                                                              {"X-Azel-Requester": requester} if requester else None)
+    deny = []
+    if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
+        deny = [f"mcp__{d['id']}__delegate" for d in devices]
+    elif requester.startswith("task:"):  # a task never starts another task (no task chains)
+        deny = ["mcp__azel__create_task"]
+    if deny:
+        rs = json.loads(run_settings)
+        rs.setdefault("permissions", {}).setdefault("deny", [])
+        rs["permissions"]["deny"] = sorted({*rs["permissions"]["deny"], *deny})
+        run_settings = json.dumps(rs, sort_keys=True)
+    if MODE == "full":  # live web lookups: never on limited gateways (Bash, Edit and Write stay disallowed)
+        allowed = [*allowed, "WebSearch", "WebFetch"]
+    if MODE == "full":  # call_user and create_task, served by this gateway (tools_bridge.mcp_handle)
+        url = f"http://{HOST}:{PORT}/v1/mcp"
+        origin = requester[4:] if requester.startswith("ask:") and ORIGIN_RE.fullmatch(requester[4:]) else ""
+        servers = {**(servers or {}), "azel": {"type": "http", "url": url, "headers": {
+            "Authorization": f"Bearer {TOKEN}",
+            **({"X-Azel-Origin": origin} if origin else {}),  # its create_task / call_user continue this call
+            **({"X-Azel-Requester": requester} if requester else {})}}}
+        allowed = [*allowed, "mcp__azel"]
+        rs = json.loads(run_settings)
+        if "allowedMcpServers" in rs:
+            rs["allowedMcpServers"].append({"serverUrl": url})
+        run_settings = json.dumps(rs, sort_keys=True)
+    return servers, allowed, run_settings, env
 
 
 def session_key(session, settings):
@@ -855,21 +955,16 @@ async def ask_api(text, model, session):
 
 async def ask_api_full(text, model, settings, devices, dev_tools, where):
     """A full gateway's Messages API turn: Cygnus bridge tools plus the devices' tools, stable cached prefix."""
-    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)
-    by_name = {t["name"] for t in cyg_tools}
+    defs, where = await bridge.tools("voice")  # devices (no delegate), call_user, create_task, Cygnus
 
     async def run(name, args):
-        if name in by_name:
-            return await cyg_run(name, args)
-        r = await run_tool({"name": name, "input": args, "id": "x"}, where)
-        if r.get("is_error"):
-            raise RuntimeError("device tool failed")
-        return r["content"]
-    system = name_prompt(settings) + FULL_API_STYLE + device_prompt(settings, devices)
+        return (await bridge.call(name, args, current_persona.get(), caller="voice", where=where))["content"]
+    system = name_prompt(settings) + (FULL_API_STYLE if google_status() != "connected" else FULL_API_STYLE.replace(
+        "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해.", GOOGLE_STYLE)) + device_prompt(settings, devices)
     yield activity("thinking")
-    async for kind, v in claude_api.ask(API_KEY, model, system, text, cyg_tools + dev_tools, run):
+    async for kind, v in claude_api.ask(API_KEY, model, system, text, defs, run):
         if kind == "text":
-            yield v
+            yield strip_marks(v)
         elif kind == "tool":
             yield activity("tool_start", v)
         else:
@@ -879,7 +974,7 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
 
 # Measured on the cost eval (brain session): NIM models put markdown and 반말 into spoken replies, misdated
 # weekdays without the date, and doubted data the tools had already given.
-NIM_STYLE = (" 반드시 존댓말로만 말해. 별표(**), 샵(#), 번호 목록 같은 마크다운은 절대 쓰지 마. 날짜와 요일은 아래의 지금"
+NIM_STYLE = (" 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. 별표(**), 샵(#), 번호 목록 같은 마크다운은 절대 쓰지 마. 날짜와 요일은 아래의 지금"
              " 날짜를 기준으로 계산하고, 도구 결과에 나온 상태(완료 여부 등)는 그대로 믿고 다시 묻지 마.")
 SPOKEN_MARKDOWN = re.compile(r"\*\*|__|^#{1,6}\s*|`", re.M)
 
@@ -892,23 +987,20 @@ async def ask_nim(text, model, session):
         yield {"type": "error", "code": "nim_off", "message": "엔비디아 모델이 꺼져 있어요. 앱의 설정에서 켜 주세요."}
         return
     devices = await fresh_devices()
-    tools, where = await device_tools(devices)
-    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)  # the brain's read-only Cygnus tools, when this host has them
-    cyg = {t["name"] for t in cyg_tools}
+    tools, where = await bridge.tools("voice")  # devices (no delegate), call_user, create_task, Cygnus
     now = datetime.now(KST)
     system = (name_prompt(settings) + API_STYLE + device_prompt(settings, devices) + NIM_STYLE
               + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}(한국 시간)이야.")
 
     async def run(b):
-        if b["name"] in cyg:
-            return {"content": await cyg_run(b["name"], b["input"]), "is_error": False}
-        return await run_tool(b, where)
+        r = await bridge.call(b["name"], b["input"], current_persona.get(), caller="voice", where=where)
+        return {"content": r["content"], "is_error": r["is_error"]}
 
     def act(phase, tool=""):
-        return activity(phase, tool if tool in cyg or not tool else f"mcp__{tool}")
+        return activity(phase, f"mcp__{tool}" if "__" in tool else tool)
     try:
-        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, cyg_tools + tools, run, act):
-            yield SPOKEN_MARKDOWN.sub("", item) if isinstance(item, str) else item
+        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, tools, run, act):
+            yield strip_marks(item) if isinstance(item, str) else item
     except nim.NimError as e:
         yield {"type": "error", "code": e.code, "message": e.message}
     except httpx.HTTPError as e:
@@ -1028,7 +1120,34 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
-async def place_call(reason, opening=None, call_id=None, persona_id=None):
+# The conversation (voice persona:session) a request came from: a task's finish call and a reminder made during a
+# call continue it (the voice server seeds the new call with that conversation's recent turns).
+ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
+origin_ctx: contextvars.ContextVar = contextvars.ContextVar("origin_session", default="")
+
+
+def origin_of(m):
+    v = m.get("origin_session")
+    return v if isinstance(v, str) and ORIGIN_RE.fullmatch(v) else ""
+
+
+def served(coro, m):
+    """A link request served in its own context carrying the conversation it came from."""
+    ctx = contextvars.copy_context()
+    ctx.run(origin_ctx.set, origin_of(m))
+    if origin_of(m):
+        ctx.run(requester_ctx.set, requester_id("ask", origin_of(m)))  # Qwen's tool calls belong to that ask
+    return asyncio.create_task(coro, context=ctx)
+
+
+def with_title(opening, title):
+    """The user's title at the start of an opening, whoever wrote it (a model may leave it out): "정훈님, …"."""
+    if not opening or not title or title in opening[:len(title) + 12]:
+        return opening
+    return f"{title}, {opening}"
+
+
+async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
@@ -1039,17 +1158,20 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None):
             "밤사이 서버 상태(Cygnus 인프라)를 확인해서 '좋은 아침이에요'로 시작하는 30초 안쪽 브리핑으로 말해.",
             session=f"briefing-{uuid.uuid4().hex[:8]}", model="sonnet", task="schedule")
     call_id = call_id or uuid.uuid4().hex
+    origin_session = origin_session if origin_session is not None else (origin_ctx.get() or None)  # call_user now
+    settings = await load_settings()
+    persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
+    opening = with_title(opening, user_title(settings, persona))  # every placed call opens with the title
     try:
         await state.call("POST", "/v1/state/calls", {"id": call_id, "reason": reason, "opening": opening or ""})
     except StateDown:
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
-    settings = await load_settings()
-    persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
     await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
-                     "persona": persona["id"]})
+                     "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {}),
+                     **({"context": context} if context else {})})
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
-                                 "persona": persona["id"]})
+                                 "persona": persona["id"], **({"context": context} if context else {})})
     return {"call_id": call_id, **push}
 
 
@@ -1124,7 +1246,7 @@ DECIDE_PROMPT = (
     "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
     "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
-    '"opening": "전화 첫마디, 이유를 한두 문장으로, 존댓말"}'
+    '"opening": "전화 첫마디, 이유를 한두 문장으로, 비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
 )
 
 
@@ -1330,45 +1452,98 @@ MAX_DAYS, MAX_ATTEMPTS, RETRY_EVERY_S, ANSWER_WAIT_S = 30, 3, 120, 60
 LATE_S = 600  # a scheduled call more than 10 min late (gateway down) becomes missed instead of ringing
 
 
-def check_schedule(body, created_by, now=None):
-    """Validate a new scheduled call from the app or the voice server (a trust boundary)."""
+def item_cron(row):
+    """An item's rule as cron: its own, or its legacy repeat at its time of day; None for a one-off."""
+    if row.get("cron"):
+        return row["cron"]
+    return cron.legacy(row["repeat"], datetime.fromtimestamp(row["at"], KST)) if row.get("repeat") else None
+
+
+def item_dates(row):
+    return cron.as_date(row.get("start_date")), cron.as_date(row.get("end_date"))
+
+
+def item_fires(row, after, until):
+    """The item's fire times in (after, until] as epoch seconds (a one-off: its own time)."""
+    expr = item_cron(row)
+    if not expr:
+        return [row["at"]] if after < row["at"] <= until else []
+    start, end = item_dates(row)
+    a, u = datetime.fromtimestamp(after, KST), datetime.fromtimestamp(until, KST)
+    return [t.timestamp() for t in cron.fires(expr, a, u, start, end, row.get("skips") or ())]
+
+
+def upcoming(items, now, skip_id=None, until=None):
+    """Every active item's fires from now over cron's horizon (or to `until`), as KST datetimes (for the daily cap)."""
+    until = until or now + cron.HORIZON_DAYS * 86400
+    return [datetime.fromtimestamp(t, KST) for i in items if i["id"] != skip_id
+            for t in item_fires(i, now, until)]
+
+
+def check_schedule(body, created_by, now=None, others=()):
+    """Validate a new scheduled call from the app, a model or the voice server (a trust boundary).
+    A one-off needs `at` (ISO with an offset); a rule needs `cron` (cron.py), with optional start/end dates."""
     now = now or time.time()
-    try:
-        dt = datetime.fromisoformat(body.get("at"))
-        if dt.tzinfo is None:
-            raise ValueError("no offset")
-        at = dt.timestamp()
-    except (TypeError, ValueError):
-        raise HTTPException(400, "at: an ISO 8601 string with an offset, e.g. 2026-11-22T10:00:00+09:00")
-    if not now + 30 <= at <= now + MAX_DAYS * 86400 + 60:
-        raise HTTPException(400, f"at must be ahead and within {MAX_DAYS} days")
-    repeat = body.get("repeat") or None
-    if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
-        raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<0-6> (0 = Monday)")
-    if repeat and repeat.startswith("weekly:") and datetime.fromtimestamp(at, KST).weekday() != int(repeat[7:]):
-        raise HTTPException(400, "repeat weekly:<dow> must match the weekday of at (0 = Monday)")
+    nowdt = datetime.fromtimestamp(now, KST)
+    expr = " ".join(str(body.get("cron") or "").split()) or None
+    start = end = None
+    if expr:
+        start, end = cron.as_date(body.get("start_date")), cron.as_date(body.get("end_date"))
+        cron.check(expr, nowdt, start, end, others)
+        first = cron.next_fire(expr, nowdt + timedelta(seconds=30), start, end)
+        at, repeat = first.timestamp(), None
+    else:
+        try:
+            dt = datetime.fromisoformat(body.get("at"))
+            if dt.tzinfo is None:
+                raise ValueError("no offset")
+            at = dt.timestamp()
+        except (TypeError, ValueError):
+            raise HTTPException(400, "at: an ISO 8601 string with an offset, e.g. 2026-11-22T10:00:00+09:00")
+        if not now + 30 <= at <= now + MAX_DAYS * 86400 + 60:
+            raise HTTPException(400, f"{MAX_DAYS}일 안의 앞으로의 시각만 예약할 수 있어요.")
+        repeat = body.get("repeat") or None
+        if repeat is not None and not (isinstance(repeat, str) and REPEAT_RE.fullmatch(repeat)):
+            raise HTTPException(400, "repeat: null, daily, weekdays or weekly:<0-6> (0 = Monday)")
+        if repeat and repeat.startswith("weekly:") and datetime.fromtimestamp(at, KST).weekday() != int(repeat[7:]):
+            raise HTTPException(400, "repeat weekly:<dow> must match the weekday of at (0 = Monday)")
+        day = datetime.fromtimestamp(at, KST).date()
+        if callable(others):  # that day's fires of the other items
+            begin = datetime.combine(day, datetime.min.time(), KST)
+            others = others(begin, begin + timedelta(days=1))
+        if sum(o.date() == day for o in others) + 1 > cron.DAY_CAP:
+            raise HTTPException(400, f"하루 전화가 {cron.DAY_CAP}번을 넘게 돼요.")
     kind = body.get("kind") or "wake"
-    note = body.get("note") or ""
-    if kind not in ("wake", "reminder") or not isinstance(note, str) or len(note) > 200:
-        raise HTTPException(400, "kind: wake|reminder; note: up to 200 characters")
-    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": created_by}
+    note, purpose, request = (body.get(k) or "" for k in ("note", "purpose", "request"))
+    notify = body.get("notify") or "call"
+    if kind not in ("wake", "reminder") or notify not in ("call", "push") or \
+            not all(isinstance(x, str) for x in (note, purpose, request)) or len(note) > 200 or len(purpose) > 60:
+        raise HTTPException(400, "kind: wake|reminder; notify: call|push; note up to 200, purpose up to 60 characters")
+    return {"at": at, "repeat": repeat, "kind": kind, "note": note.strip(), "created_by": created_by, "cron": expr,
+            "start_date": start and start.isoformat(), "end_date": end and end.isoformat(), "notify": notify,
+            "purpose": purpose.strip(), "request": request.strip()[:300]}
 
 
 def public_item(row):
     """The /v1/schedule item shape (app and voice alike): `at` as ISO 8601 in KST, no internal fields."""
+    expr, (start, end) = item_cron(row), item_dates(row)
     return {"id": row["id"], "at": datetime.fromtimestamp(row["at"], KST).isoformat(), "repeat": row["repeat"],
             "kind": row["kind"], "note": row["note"], "status": row["status"], "attempts": row["attempts"],
-            "created_by": row["created_by"], "persona_id": row.get("persona_id", "azel")}
+            "created_by": row["created_by"], "persona_id": row.get("persona_id", "azel"),
+            "next_at": datetime.fromtimestamp(row["at"], KST).isoformat(), "cron": expr,
+            "rule_text": cron.rule_text(expr, start, end) if expr else None, "start_date": row.get("start_date"),
+            "end_date": row.get("end_date"), "notify": row.get("notify") or "call",
+            "purpose": row.get("purpose") or openings.purpose_rule(row["note"])}
 
 
-def next_at(at, repeat, now=None):
-    """The next occurrence of a repeating call after `now`."""
-    now, dt = now or time.time(), datetime.fromtimestamp(at, KST)
-    step = timedelta(days=7 if repeat.startswith("weekly") else 1)
-    while True:
-        dt += step
-        if dt.timestamp() > now and (repeat != "weekdays" or dt.weekday() < 5):
-            return dt.timestamp()
+def next_fire_of(row, now):
+    """The rule's next fire after `now` (and after this one), or None when it has ended."""
+    expr = item_cron(row)
+    if not expr:
+        return None
+    start, end = item_dates(row)
+    t = cron.next_fire(expr, datetime.fromtimestamp(max(now, row["at"]), KST), start, end, row.get("skips") or ())
+    return t.timestamp() if t else None
 
 
 def day_part(hour):
@@ -1391,42 +1566,152 @@ def spoken_when(at, repeat=None, now=None):
     return f"{day} {clock}"
 
 
+def spoken_item(row, now=None):
+    """A rule by its rule text, a legacy repeat or a one-off by its time."""
+    if row.get("cron"):
+        return cron.rule_text(row["cron"], *item_dates(row))
+    return spoken_when(row["at"], row["repeat"], now)
+
+
 def confirm_text(item, now=None):
-    verb = "깨워 드릴게요" if item["kind"] == "wake" else "전화드릴게요"
-    return f"{spoken_when(item['at'], item['repeat'], now)}에 {verb}."
+    verb = "알림 드릴게요" if item.get("notify") == "push" else "깨워 드릴게요" if item["kind"] == "wake" else "전화드릴게요"
+    when = spoken_item(item, now)
+    return f"{when}{'' if when.endswith('마다') else '에'} {verb}."
 
 
 async def schedule_create(body, created_by, now=None):
-    """(public item, sentence to speak)."""
+    """(public item, sentence to speak). The purpose is normalized here, once, for every surface."""
     settings = await load_settings()
     pid = body.get("persona_id") or primary_persona(settings)["id"]
     if not persona_by_id(settings, pid):
         raise HTTPException(400, "persona_id: no such persona")
-    row = await state.call("POST", "/v1/state/schedule", {**check_schedule(body, created_by, now), "persona_id": pid})
+    now = now or time.time()
+    raw = str(body.get("request") or body.get("note") or "")
+    if body.get("interpretation"):
+        raw = f"{raw} [{body['interpretation']}]".strip()
+    purpose = body.get("purpose") or (await openings.purpose(raw.split(" [")[0], llm_json) if raw else "")
+    items = await schedule_list()
+    expr = " ".join(str(body.get("cron") or "").split())
+    if expr and any(item_cron(i) == expr and i.get("persona_id", pid) == pid and i.get("kind") == (body.get("kind") or "wake")
+                    and (i.get("purpose") or "") == (purpose or "") for i in items):
+        raise HTTPException(409, "이미 같은 반복 예약이 있어요.")  # the same rule twice would ring twice
+    checked = check_schedule({**body, "purpose": purpose, "request": raw}, created_by, now,
+                             lambda a, b: upcoming(items, a.timestamp(), until=b.timestamp()))
+    row = await state.call("POST", "/v1/state/schedule", {**checked, "persona_id": pid})
+    if origin := origin_ctx.get():  # made during a call: its call continues that conversation
+        await state.call("PUT", f"/v1/state/kv/origin-{row['id']}", {"session": origin})
     return public_item(row), confirm_text(row, now)
 
 
-async def schedule_list():
-    return await state.call("GET", "/v1/state/schedule") or []
+async def schedule_list(include=None, persona=None):
+    status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
+    return await state.call("GET", "/v1/state/schedule", status=status, **({"persona": persona} if persona else {})) or []
 
 
 def list_text(items, now=None):
     if not items:
         return "예약된 전화가 없어요."
-    parts = [spoken_when(i["at"], i["repeat"], now) + (" 기상" if i["kind"] == "wake" else " 알림") for i in items[:3]]
+    parts = [spoken_item(i, now) + (" 기상" if i["kind"] == "wake" else f" {i.get('purpose') or '알림'}")
+             for i in items[:3]]
     more = f" 외 {len(items) - 3}개" if len(items) > 3 else ""
     return f"예약된 전화는 {', '.join(parts)}{more}이에요."
 
 
-async def schedule_cancel(sid=None, at=None, now=None):
-    """Cancel by id, else the item at `at` (within a minute), else the soonest one."""
+async def find_item(sid):
+    item = next((i for i in await schedule_list() if i["id"] == sid), None)
+    if not item:
+        raise HTTPException(404, "그런 예약이 없어요.")
+    return item
+
+
+def changed_text(before, after, now=None):
+    """'오늘 오후 10시 → 오후 6시로 바꿨어요.': the day is said again only when it changes."""
+    if before.split(" ")[0] == after.split(" ")[0] and after.split(" ")[0] in ("오늘", "내일", "모레"):
+        after = after.split(" ", 1)[1]
+    return f"{before} → {after}로 바꿨어요."
+
+
+async def schedule_update(sid, changes, occurrence=None, now=None):
+    """(public item, sentence): one fire moved (skip it + a one-off), or the item/rule changed in place."""
+    now = now or time.time()
+    item = await find_item(sid)
+    items = await schedule_list()
+    if occurrence:
+        occ = datetime.fromisoformat(occurrence).timestamp()
+        if not item_cron(item) or occ not in item_fires(item, occ - 1, occ):
+            raise HTTPException(404, "그 시각에는 이 예약이 없어요.")
+        when = changes.get("when") or occurrence
+        one = check_schedule({"at": when, "kind": item["kind"], "note": item["note"],
+                              "purpose": changes.get("purpose") or item.get("purpose") or "",
+                              "notify": changes.get("notify") or item.get("notify") or "call",
+                              "request": item.get("request") or ""}, "voice", now,
+                             [o for o in upcoming(items, now) if o.timestamp() != occ])
+        skips = [*(item.get("skips") or []), occ]
+        fields = {"skips": skips}
+        if abs(item["at"] - occ) < 1:  # it was the next one: the rule now waits for the one after
+            nxt = next_fire_of({**item, "skips": skips}, occ)
+            fields.update({"at": nxt} if nxt else {"status": "cancelled"})
+        await update_item(item, **fields)
+        row = await state.call("POST", "/v1/state/schedule", {**one, "persona_id": item.get("persona_id", "azel")})
+        return public_item(row), changed_text(spoken_when(occ, None, now), spoken_when(row["at"], None, now), now)
+    fields, says = {}, []
+    expr = item_cron(item)
+    if changes.get("repeat_cron") or (expr and changes.get("when")) or "start_date" in changes or "end_date" in changes:
+        new = changes.get("repeat_cron") or expr
+        if changes.get("when") and not changes.get("repeat_cron"):  # "매일 7시 → 8시": the rule's time of day
+            t = datetime.fromisoformat(changes["when"]).astimezone(KST)
+            new = " ".join([str(t.minute), str(t.hour), *new.split()[2:]])
+        start = cron.as_date(changes["start_date"]) if "start_date" in changes else item_dates(item)[0]
+        end = cron.as_date(changes["end_date"]) if "end_date" in changes else item_dates(item)[1]
+        cron.check(new, datetime.fromtimestamp(now, KST), start, end,
+                   lambda a, b: upcoming(items, a.timestamp(), skip_id=sid, until=b.timestamp()))
+        first = cron.next_fire(new, datetime.fromtimestamp(now + 30, KST), start, end, item.get("skips") or ())
+        fields.update(cron=new, start_date=start and start.isoformat(), end_date=end and end.isoformat(),
+                      at=first.timestamp())
+    elif changes.get("when"):
+        fields["at"] = check_schedule({"at": changes["when"], "kind": item["kind"]}, "voice", now,
+                                      upcoming(items, now, skip_id=sid))["at"]
+    for k in ("purpose", "notify"):
+        if changes.get(k):
+            fields[k] = changes[k]
+    if not fields:
+        raise HTTPException(400, "무엇을 바꿀지 말씀해 주세요.")
+    row = await update_item(item, **fields)
+    if row is None:
+        raise HTTPException(409, "방금 다른 곳에서 바뀌었어요. 다시 해 주세요.")
+    before, after = spoken_item(item, now), spoken_item(row, now)
+    if before != after:
+        says.append(changed_text(before, after, now))
+    if changes.get("purpose"):
+        says.append(f"내용은 '{row['purpose']}'(으)로 바꿨어요.")
+    if changes.get("notify"):
+        says.append("이제 알림으로 알려 드릴게요." if row["notify"] == "push" else "이제 전화로 알려 드릴게요.")
+    return public_item(row), " ".join(says) or "바꿨어요."
+
+
+async def schedule_cancel(sid=None, at=None, now=None, occurrence=None):
+    """Cancel by id, else the item at `at` (within a minute), else the soonest one. `occurrence` (ISO) skips one
+    fire of a rule and keeps the rule."""
     items = await schedule_list()
     pick = next((i for i in items if i["id"] == sid), None) if sid else \
         next((i for i in items if abs(i["at"] - float(at)) < 60), None) if at else (items[0] if items else None)
     if not pick:
         return None
+    if occurrence and item_cron(pick):
+        occ = datetime.fromisoformat(occurrence).timestamp()
+        if occ not in item_fires(pick, occ - 1, occ):
+            raise HTTPException(404, "그 시각에는 이 예약이 없어요.")
+        skips = [*(pick.get("skips") or []), occ]
+        fields = {"skips": skips}
+        if abs(pick["at"] - occ) < 1:
+            nxt = next_fire_of({**pick, "skips": skips}, occ)
+            fields.update({"at": nxt} if nxt else {"status": "cancelled"})
+        row = await update_item(pick, **fields)
+        if row is None:
+            raise HTTPException(409, "방금 다른 곳에서 바뀌었어요. 다시 해 주세요.")
+        return public_item(row), f"{spoken_when(occ, None, now)} 한 번만 건너뛸게요."
     row = await state.call("DELETE", f"/v1/state/schedule/{quote(pick['id'], safe='')}")
-    return (public_item(row), f"{spoken_when(row['at'], row['repeat'], now)} 예약을 취소했어요.") if row else None
+    return (public_item(row), f"{spoken_item(row, now)} 예약을 취소했어요.") if row else None
 
 
 async def serve_schedule(m):
@@ -1454,10 +1739,16 @@ async def serve_schedule(m):
     await link_send(reply)
 
 
-def opening_for(item):
-    if item["kind"] == "wake":  # shortcut: no day summary yet (it would need cached calendar data without Claude)
-        return "일어나실 시간이에요." + (f" {item['note']}" if item["note"] else "")
-    return f"말씀하신 시간이에요. {item['note']}" if item["note"] else "말씀하신 시간이 돼서 전화드렸어요."
+async def opening_for(item):
+    """The first words of a scheduled call: title, time, purpose; never the raw request (openings.py). Items made
+    before purposes existed get one from their note now."""
+    settings = await load_settings()
+    persona = persona_by_id(settings, item.get("persona_id") or "") or primary_persona(settings)
+    dt = datetime.fromtimestamp(item["at"], KST)
+    purpose = item.get("purpose") or openings.purpose_rule(item["note"])
+    return await openings.compose(item["kind"], user_title(settings, persona), dt.hour, dt.minute, purpose,
+                                  raw=item.get("request") or item["note"], persona=persona_block(settings),
+                                  llm=llm_json)
 
 
 async def update_item(item, **fields):
@@ -1489,20 +1780,38 @@ async def fire_scheduled(now):
 async def attempt(item, now):
     call_id = uuid.uuid4().hex  # in the claim itself, so call_answered always finds this attempt
     claimed = await update_item(item, status="fired", attempts=item["attempts"] + 1, last_attempt=now, call_id=call_id)
-    if claimed:
-        await place_call(item["kind"], opening_for(item), call_id=call_id, persona_id=item.get("persona_id"))
+    if not claimed:
+        return
+    opening = await opening_for(item)
+    if item.get("notify") == "push":  # a reminder by notification: delivered is done, nothing to answer
+        settings = await load_settings()
+        persona = persona_by_id(settings, item.get("persona_id") or "") or primary_persona(settings)
+        await send_alert_push(persona.get("name") or settings["assistant_name"], opening, type="schedule",
+                              schedule_id=item["id"])
+        await finish(claimed, now, "answered")
+        return
+    origin = (await state.call("GET", f"/v1/state/kv/origin-{item['id']}") or {}).get("session")
+    label = item.get("purpose") or openings.purpose_rule(item.get("note") or "") or str(item.get("note") or "")[:30]
+    await place_call(item["kind"], opening, call_id=call_id, persona_id=item.get("persona_id"),
+                     **({"origin_session": origin} if origin else {}),
+                     context={"kind": "schedule", "label": label, "id": item["id"]})  # the call screen's chip
+
+
+async def finish(item, now, status):
+    """After a fire: a rule waits for its next time (or ends); a one-off takes `status`."""
+    nxt = next_fire_of(item, now) if item_cron(item) else None
+    if nxt:
+        return await update_item(item, status="pending", attempts=0, at=nxt)
+    return await update_item(item, status=status)
 
 
 async def missed(item, now, late=False):
-    if item["repeat"]:  # the next one still happens
-        done = await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"], now))
-    else:
-        done = await update_item(item, status="missed")
+    done = await finish(item, now, "missed")
     if done:
         what = "기상 전화" if item["kind"] == "wake" else "예약 전화"
         how = "를 제때 걸지 못했어요" if late else "를 받지 않으셨어요"
         await send_alert_push((await load_settings())["assistant_name"],
-                              f"{spoken_when(item['at'], item['repeat'], now)} {what}{how}.")
+                              f"{spoken_when(item['at'], None, now)} {what}{how}.")
 
 
 async def call_answered(call_id):
@@ -1511,10 +1820,7 @@ async def call_answered(call_id):
         return
     for item in await schedule_list():
         if item["status"] == "fired" and item["call_id"] == call_id:
-            if item["repeat"]:
-                await update_item(item, status="pending", attempts=0, at=next_at(item["at"], item["repeat"]))
-            else:
-                await update_item(item, status="answered")
+            await finish(item, time.time(), "answered")
 
 
 async def scheduler():
@@ -1572,11 +1878,14 @@ async def handle_link(ws):
                 asyncio.create_task(prewarm(warm_key, pid))
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
+                asyncio.create_task(post_call_facts(m["log_id"], warm_key.split(":", 1)[0]))
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
-            tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
+            tasks[m["id"]] = served(serve_schedule(m), m)
         elif m.get("type") == "task" and isinstance(m.get("id"), str):
-            tasks[m["id"]] = asyncio.create_task(serve_task(m))
+            tasks[m["id"]] = served(serve_task(m), m)
+        elif m.get("type") in ("tool_call", "tools_list") and isinstance(m.get("id"), str):
+            tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "call_answered":
@@ -1751,6 +2060,12 @@ async def put_settings(body: dict):
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
             raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
+    if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
+        raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
+    if body.get("task_backend") == "nim":  # the shared default must be able to run
+        nim_cfg = (body.get("providers") or (await load_settings())["providers"])["nim"]
+        if not nim_cfg.get("enabled") or not nim.has_key(HOME):
+            raise HTTPException(400, "task_backend: nim needs the NIM provider on and its key set")
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -1798,6 +2113,7 @@ async def status():
                                   probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
+            "google": google_status(),  # connected | expired (the app shows "Google 다시 연결") | none
             "devices": [{"id": d["id"], "name": d["name"], "limited": bool(d.get("limited")), **p,
                          "fresh": time.time() - d["last_seen"] < DEVICE_FRESH_S} for d, p in zip(devs, probes[3:])]}
 
@@ -2117,28 +2433,81 @@ async def connectors_secret(name: str, body: dict):
     return Response(status_code=204)
 
 
+@app.get("/v1/memories")
+async def memories_get(request: Request, limit: int = 50):
+    return await act("memory_list", {"limit": limit}, request=request)
+
+
+@app.post("/v1/memories")
+async def memories_post(request: Request, body: dict):
+    return await act("remember", body, created=True, request=request)
+
+
+@app.delete("/v1/memories/{mid}")
+async def memories_delete(request: Request, mid: str):
+    return await act("forget", {"id": mid, "confirmed": True}, request=request)  # the app asked before deleting
+
+
+@app.post("/v1/memories/recall")
+async def memories_recall(request: Request, body: dict):
+    return await act("memory_recall", body, request=request)
+
+
+@app.post("/v1/memories/people")
+async def memories_people(request: Request, body: dict):
+    return await act("people_lookup", body, request=request)
+
+
+# ---------- REST adapters: each route is one action (ACTIONS.md); no checks or logic of their own ----------
+RESULT_V2 = "x-azel-result"  # "2": the whole {ok, spoken, data, needs, error}; else the pre-batch-5 bodies
+
+
+async def act(name, args, created=False, request=None, full=True):
+    """Run an action for the app. With `X-Azel-Result: 2` the answer is the whole result (needs on 200). Without it
+    (app builds before batch 5) the same result is shaped as before: the resource on success, an HTTP error with
+    `detail` otherwise (needs as 409 with the question). Same action, same checks either way."""
+    if full:
+        full_only()
+    r = await bridge.run(name, args, args.get("persona_id"), caller="app", surface="rest")
+    if request is not None and request.headers.get(RESULT_V2) == "2":
+        status = (201 if created else 200) if r["ok"] or r["needs"] else tools_bridge.HTTP_OF[r["error"]["code"]]
+        return JSONResponse(tools_bridge.public(r) | ({"detail": r["error"]["message"]} if r["error"] else {}),
+                            status if r["ok"] or not r["needs"] else 200)
+    if r["ok"]:
+        return JSONResponse(r["data"], 201 if created else 200)
+    if r["needs"]:
+        return JSONResponse({"detail": r["needs"]["question"], "needs": r["needs"]}, 409)
+    return JSONResponse({"detail": r["error"]["message"]}, tools_bridge.HTTP_OF[r["error"]["code"]])
+
+
 @app.get("/v1/schedule")
-async def schedule_get(include: str = "", persona: str | None = None):
+async def schedule_get(request: Request, include: str = "", persona: str | None = None):
     """Pending and fired items, soonest first; `include=all` adds answered, missed and cancelled ones."""
-    full_only()
-    status = "pending,fired,answered,missed,cancelled" if include == "all" else "pending,fired"
-    params = {"status": status} | ({"persona": persona} if persona else {})
-    return [public_item(i) for i in await state.call("GET", "/v1/state/schedule", **params) or []]
+    return await act("schedule_list", {**({"include": include} if include else {}),
+                                       **({"persona_id": persona} if persona else {})}, request=request)
 
 
-@app.post("/v1/schedule", status_code=201)
-async def schedule_post(body: dict):
-    full_only()
-    return (await schedule_create(body, "app"))[0]
+@app.post("/v1/schedule")
+async def schedule_post(request: Request, body: dict):
+    if "at" in body and "when" not in body:  # the field's name before batch 5
+        body = {**{k: v for k, v in body.items() if k != "at"}, "when": body["at"]}
+    if "reason" not in body:
+        body = {**body, "reason": body.get("purpose") or body.get("note") or "예약 전화"}
+    return await act("schedule_create", {k: v for k, v in body.items() if k != "note"}, created=True, request=request)
+
+
+@app.put("/v1/schedule/{sid}")
+async def schedule_put(request: Request, sid: str, body: dict, occurrence: str | None = None):
+    scope = "occurrence" if occurrence else body.get("scope") or "rule"
+    return await act("schedule_update", {**body, "id": sid, "scope": scope, **({"at": occurrence} if occurrence else {})},
+                     request=request)
 
 
 @app.delete("/v1/schedule/{sid}")
-async def schedule_delete(sid: str):
-    full_only()
-    done = await schedule_cancel(sid=sid)
-    if done is None:
-        raise HTTPException(404, "no such scheduled call")
-    return done[0]
+async def schedule_delete(request: Request, sid: str, occurrence: str | None = None):
+    # the app deletes the item it shows: the whole rule unless one occurrence is named
+    return await act("schedule_cancel", {"id": sid, **({"scope": "occurrence", "at": occurrence} if occurrence else
+                                                       {"scope": "rule"})}, request=request)
 
 
 @app.get("/v1/history")
@@ -2202,8 +2571,9 @@ async def push_register(body: dict):
 
 
 @app.post("/v1/calls")
-async def calls(body: dict):
-    return await place_call(body.get("reason", "manual"), body.get("opening"))
+async def calls(request: Request, body: dict):
+    """Ring the user now (call_user): the same daily cap and in-call refusal as when a model asks."""
+    return await act("call_user", {k: body[k] for k in ("reason", "persona_id") if k in body}, request=request)
 
 
 @app.get("/v1/calls/{call_id}")
@@ -2376,6 +2746,10 @@ async def create_approval(body: dict):
 
 
 @app.get("/v1/approvals")
+async def approvals_get(request: Request):
+    return await act("approval_status", {}, request=request, full=False)  # daemons on limited devices too
+
+
 async def list_approvals():
     now, out = time.time(), []
     for row in await state.call("GET", "/v1/state/approvals") or []:
@@ -2406,6 +2780,10 @@ async def approval_audit(limit: int = 50):
 
 
 @app.get("/v1/approvals/{aid}")
+async def approval_get(request: Request, aid: str):
+    return await act("approval_status", {"id": aid}, request=request, full=False)
+
+
 async def get_approval(aid: str):
     row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
     if row is None:
@@ -2525,21 +2903,25 @@ def check_task(body):
     persona = body.get("persona")
     if persona is not None and not (isinstance(persona, str) and PERSONA_ID.fullmatch(persona)):
         raise HTTPException(400, "persona: a persona id")
+    backend = body.get("backend")
+    if backend is not None and backend not in TASK_BACKENDS:
+        raise HTTPException(400, f"backend: one of {list(TASK_BACKENDS)}")
     return {"goal": goal.strip(), "notify": notify, "budget_usd": float(budget), "max_minutes": float(minutes),
-            "device": device, "persona": persona}
+            "device": device, "persona": persona, "backend": backend}
 
 
 async def task_create(body, source="api"):
     full_only()
-    if not CLAUDE_OK:
-        raise HTTPException(503, "Claude is not available on this gateway")
     spec = check_task(body)
     settings = await load_settings()
+    spec["backend"], spec["fallback_reason"] = await task_backend_for(spec, settings)
+    if spec["backend"] == "claude_code" and not CLAUDE_OK:
+        raise HTTPException(503, "Claude is not available on this gateway")
     if spec["persona"] and not persona_by_id(settings, spec["persona"]):
         raise HTTPException(400, "persona: no such persona")
     t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
          "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
-         "cost_usd": 0.0, "cancel_requested": False}
+         "cost_usd": 0.0, "cancel_requested": False, "origin_session": origin_ctx.get() or None}
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
         await task_save(t)
@@ -2549,6 +2931,22 @@ async def task_create(body, source="api"):
         raise
     start_task(t)
     return t
+
+
+async def task_backend_for(spec, settings):
+    """(backend actually used, why it differs from the one asked for or None). Falls back to claude_code only
+    where that can run: mail/calendar without a live Google grant, no API key, or the API budget spent."""
+    want = spec["backend"] or settings.get("task_backend", "claude_api")
+    if want == "claude_code" or not CLAUDE_OK:
+        return want, None
+    if MAIL_CAL.search(spec["goal"]) and google_status() != "connected":
+        return "claude_code", "구글이 연결되지 않아 Claude Code로 했어요."
+    if want == "claude_api" and not API_KEY:
+        return "claude_code", "API 키가 없어 Claude Code로 했어요."
+    if want == "claude_api" and "api" in settings["budget_paths"] and \
+            await month_cost(settings) >= settings["monthly_budget_usd"]:
+        return "claude_code", "API 예산을 다 써서 Claude Code로 했어요."
+    return want, None
 
 
 def task_prompt(t, devices):
@@ -2632,6 +3030,10 @@ async def task_round(t, prompt, resume, deadline):
     return session, pending
 
 
+class ApiAuth(Exception):
+    """The API refused the key (401/403)."""
+
+
 class TaskLimit(Exception):
     def __init__(self, kind, message):
         super().__init__(message)
@@ -2660,7 +3062,11 @@ async def wait_approval(t, aid):
 TASK_APPROVAL_POLL_S = 3
 
 
+task_live: dict[str, dict] = {}  # the task dicts this gateway's runners hold (a notify change must reach them)
+
+
 def start_task(t):
+    task_live[t["id"]] = t
     run = task_runs[t["id"]] = asyncio.create_task(run_task(t))
     run.add_done_callback(_task_settled)
     return run
@@ -2683,6 +3089,16 @@ async def run_task(t):
             t.update(status="running", started=time.time(), note=None)
             await task_save(t)
             deadline = time.monotonic() + t["max_minutes"] * 60
+            if t.get("backend", "claude_code") != "claude_code":
+                try:
+                    await run_task_api(t)
+                    return
+                except ApiAuth:  # 401/403 mid-run: the same goal on claude_code, recorded
+                    if not CLAUDE_OK:
+                        raise TaskLimit("error", "API 키가 맞지 않아요.")
+                    t.update(backend="claude_code", fallback_reason="API 키가 맞지 않아 Claude Code로 했어요.")
+                    task_step(t, "fallback", reason="auth")
+                    await task_save(t)
             session, prompt = None, None
             for _ in range(TASK_MAX_ROUNDS):
                 session, pending = await task_round(t, prompt, session, deadline)
@@ -2704,6 +3120,7 @@ async def run_task(t):
         t.update(status="failed", finished=time.time(), error="작업이 실패했어요.")
     finally:
         task_runs.pop(t["id"], None)
+        task_live.pop(t["id"], None)
         try:
             await task_save(t)
             # a task runs on `claude -p`: the subscription path, so it counts like any claude_code ask
@@ -2715,12 +3132,31 @@ async def run_task(t):
             await task_notify(t)
 
 
-def task_summary(t):
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\u2B50\u2B55\u2705\u274C]")
+LIST_MARK = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+", re.M)
+
+
+def strip_marks(text):
+    """Markdown and emoji out of anything spoken or pushed (every backend writes some)."""
+    return EMOJI.sub("", SPOKEN_MARKDOWN.sub("", text))
+
+
+def spoken_text(text):
+    """A whole result as one spoken paragraph: no markdown, list marks or emoji; lines joined."""
+    return re.sub(r"\s*\n\s*", " ", LIST_MARK.sub("", strip_marks(text or ""))).strip()
+
+
+def task_summary(t, title=""):
+    """What a task's call says: the goal as a purpose (never the request read back), then the result."""
+    hi = f"{title}, " if title else ""
     if t["status"] == "waiting_approval":
-        return "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요."
+        return f"{hi}맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요."
+    goal = openings.purpose_rule(t["goal"]) or "작업"
     if t["status"] == "done":
-        return f"맡기신 작업 끝났어요. {t['result'] or '결과는 앱에서 확인해 주세요.'}"[:600]
-    return f"맡기신 작업이 끝나지 못했어요. {t['error'] or ''}"[:600]
+        first = openings.template("task", title, 0, 0, goal=goal)
+        return f"{first} {spoken_text(t['result']) or '결과는 앱에서 확인해 주세요.'}"[:600]
+    what = goal if goal.endswith("작업") else f"{goal} 작업"
+    return f"{hi}맡기신 {what}이 끝나지 못했어요. {spoken_text(t['error'])}".strip()[:600]
 
 
 async def task_notify(t, approval=False):
@@ -2728,12 +3164,18 @@ async def task_notify(t, approval=False):
     as azel://task/<id>."""
     try:
         if t["notify"] == "call":
-            await place_call("task_approval" if approval else "task", opening=task_summary(t), persona_id=t["persona"])
+            settings = await load_settings()
+            persona = persona_by_id(settings, t["persona"] or "") or primary_persona(settings)
+            await place_call("task_approval" if approval else "task",
+                             opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"],
+                             **({"origin_session": t["origin_session"]} if t.get("origin_session") else {}),
+                             context={"kind": "task", "id": t["id"],
+                                      "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]})
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
             goal = t["goal"] if len(t["goal"]) <= 40 else t["goal"][:39] + "…"
-            await send_alert_push(title, f"{what}: {goal}", type="task", task_id=t["id"])  # no model output
+            await send_alert_push(title, spoken_text(f"{what}: {goal}"), type="task", task_id=t["id"])  # no model output
     except Exception as e:
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 
@@ -2756,50 +3198,67 @@ async def fail_orphan_tasks(startup=True):
 
 
 def task_view(t, steps=True):
-    keep = ("id", "goal", "status", "device", "persona", "notify", "budget_usd", "max_minutes", "created", "started",
-            "finished", "result", "error", "cost_usd", "owner", "note")
+    keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
+            "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
-@app.post("/v1/tasks", status_code=201)
-async def tasks_post(body: dict):
-    return task_view(await task_create(body))
+@app.post("/v1/tasks")
+async def tasks_post(request: Request, body: dict):
+    return await act("create_task", body, created=True, request=request)
 
 
 @app.get("/v1/tasks")
-async def tasks_list(limit: int = 20):
-    full_only()
-    out = []
-    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:max(1, min(limit, 100))]:
-        if t := await state.call("GET", task_key(tid)):
-            out.append({**task_view(t, steps=False), "steps": t["steps"][-30:]})  # the app's detail renders this
-    return out
+async def tasks_list(request: Request, limit: int = 20):
+    return await act("task_status", {"limit": max(1, min(limit, 100))}, request=request)
 
 
 @app.get("/v1/tasks/{tid}")
-async def tasks_get(tid: str):
+async def tasks_get(request: Request, tid: str):
+    return await act("task_status", {"id": tid}, request=request)
+
+
+async def task_set_notify(tid, notify):
+    """Change how a queued or running task reports back (call | push | none)."""
     full_only()
-    t = await state.call("GET", task_key(quote(tid, safe=""))) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
+    if notify not in ("call", "push", "none"):
+        raise HTTPException(400, "notify: call, push or none")
+    t = task_live.get(tid) or (await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None)
     if not t:
         raise HTTPException(404, "no such task")
-    return task_view(t)
+    if t["status"] not in ("queued", "running", "waiting_approval"):
+        raise HTTPException(409, f"task already {t['status']}")
+    t["notify"] = notify  # the runner's own dict when it runs here, so its finish uses the new choice
+    await task_save(t)
+    return task_view(t, steps=False)
+
+
+@app.patch("/v1/tasks/{tid}")
+async def tasks_patch(tid: str, body: dict):
+    if set(body) - {"notify"}:
+        raise HTTPException(400, "only notify can be changed")
+    return await task_set_notify(tid, body.get("notify"))
 
 
 @app.post("/v1/tasks/{tid}/cancel")
-async def tasks_cancel(tid: str):
-    full_only()
+async def tasks_cancel(request: Request, tid: str):
+    return await act("task_cancel", {"id": tid}, request=request)
+
+
+async def task_cancel(tid):
+    """(task view, sentence): stop a task; another gateway's sees the flag within seconds."""
     t = await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None
     if not t:
-        raise HTTPException(404, "no such task")
+        raise HTTPException(404, "그런 작업이 없어요.")
     if t["status"] in ("done", "failed", "cancelled"):
-        raise HTTPException(409, f"task already {t['status']}")
+        raise HTTPException(409, "이미 끝난 작업이에요.")
     if run := task_runs.get(tid):  # ours: stop it now (the claude process is killed on the way out)
         run.cancel()
         await asyncio.gather(run, return_exceptions=True)
     else:  # another gateway's: it sees the flag within seconds
         t["cancel_requested"] = True
         await task_save(t)
-    return task_view(await state.call("GET", task_key(tid)) or t, steps=False)
+    return task_view(await state.call("GET", task_key(tid)) or t, steps=False), "작업을 멈췄어요."
 
 
 DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크"}
@@ -2867,3 +3326,249 @@ if __name__ == "__main__":
     import uvicorn
     assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"
     uvicorn.run(app, host=HOST, port=PORT)
+
+
+# ---------- one tool executor for every path (tools_bridge.py) and API-backed tasks (agent_loop.py) ----------
+TASK_BACKENDS = ("claude_code", *agent_loop.BACKENDS)
+GOOGLE_STYLE = ("메일과 캘린더는 calendar_events, gmail_search, gmail_read 도구로 확인하고, 도구 결과에 없는 일정이나 메일은 "
+                "말하지 마.")
+TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로 요약해. "
+                  "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
+                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+bridge = tools_bridge.Bridge(
+    who=lambda: requester_ctx.get(),  # the run (ask:<session> | task:<id>): the prompt-injection guard's key
+    fresh_devices=lambda: fresh_devices(), device_tools=lambda d: device_tools(d), run_tool=lambda b, w: run_tool(b, w),
+    place_call=lambda reason, opening, pid: place_call(reason, opening=opening, persona_id=pid),
+    schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
+    state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
+    in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME),
+    schedule_list_text=lambda: bridge_schedule_text(), schedule_items=lambda **kw: bridge_schedule_items(**kw),
+    schedule_cancel=lambda sid, at, occurrence=None: schedule_cancel(sid=sid, at=at, occurrence=occurrence),
+    schedule_update=lambda sid, changes, occ: schedule_update(sid, changes, occ),
+    task_get=lambda tid: state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else none(),
+    task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t) if full else {**task_view(t, steps=False), "steps": t["steps"][-30:]},
+    task_cancel=lambda tid: task_cancel(tid),
+    approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
+    llm=lambda system, user: llm_json(system, user),
+    memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),
+    memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
+    memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
+    cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
+    web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
+
+
+async def none():
+    return None
+
+
+async def web_search(query, n):
+    """Haiku with the server-side search (path api, held to the paid budget); a spent budget or no key: the
+    daemon's browse on a search page instead."""
+    settings = await load_settings()
+    spent = "api" in settings["budget_paths"] and await month_cost(settings) >= settings["monthly_budget_usd"]
+    if API_KEY and not spent:
+        r = await web.search(API_KEY, query, n)
+        u = r["usage"]
+        await record_usage({"model": "haiku", "path": "api", "task": "web_search",
+                            "input_tokens": u.get("input_tokens", 0), "output_tokens": u.get("output_tokens", 0),
+                            "cost_usd": r["cost_usd"]})
+        return r
+    _, where = await bridge.tools("api")
+    browse = next((n for n, (_, tool) in where.items() if tool == "browse"), None)
+    if not browse:
+        raise HTTPException(503, "지금은 웹을 볼 수 없어요.")
+    url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+    res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
+    return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def persona_shares(pid):
+    settings = await load_settings()
+    p = persona_by_id(settings, pid or "") or primary_persona(settings)
+    return p["id"] == primary_persona(settings)["id"] or bool(p.get("share_memory"))
+
+
+def cygnus_can_write():
+    """The memory-scoped write PAT: full gateways only (the Mac); never a limited or team device."""
+    if MODE != "full" or not (HOME / "cygnus_pat_rw").is_file():
+        return False
+    os.environ.setdefault("BISEO_HOME", str(HOME))
+    import cygnus
+    return cygnus.can_write()
+
+
+async def cygnus_write(name, args):
+    import cygnus
+    return await cygnus.write(name, args)
+
+
+async def none_list():
+    return []
+
+
+async def memory_search(q, n):
+    return await state.call("POST", "/v1/search", {"query": q, "kinds": ["note", "transcript"], "limit": n}) or []
+
+
+async def memory_add(text, meta):
+    return await state.call("POST", "/v1/records", {"kind": "note", "text": text, "device": DEVICE,
+                                                     "meta": {k: v for k, v in meta.items() if v is not None}})
+
+
+async def bridge_schedule_items(include=None, persona_id=None):
+    return [{**public_item(i), "spoken": spoken_item(i), "note": i["note"]}
+            for i in await schedule_list(include, persona_id)]
+
+
+async def bridge_schedule_text():
+    items = await schedule_list()
+    return list_text(items) + ("\n" + "\n".join(
+        f"- id {i['id']}: {spoken_item(i)}" + (f" (다음: {spoken_when(i['at'])})" if item_cron(i) else "")
+        + f" {'기상' if i['kind'] == 'wake' else public_item(i)['purpose'] or '알림'}"
+        + (" [알림]" if i.get("notify") == "push" else "") for i in items[:10]) if items else "")
+
+
+async def bridge_recent_tasks(n):
+    out = []
+    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:n]:
+        if t := await state.call("GET", task_key(tid)):
+            out.append(t)
+    return out
+
+
+def google_status():
+    return google_tools.status(HOME) if MODE == "full" else "none"
+
+
+MAIL_CAL = re.compile(r"메일|편지함|답장|캘린더|일정(?!한)|약속|회의|스케줄", re.I)
+
+
+TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def tailnet_only(request: Request):
+    """/v1/tools*, /v1/mcp: never through the public proxy (it is a tailnet peer, so its headers give it away)."""
+    host = request.client.host if request.client else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise HTTPException(403, "tailnet only")
+    if any(h in request.headers for h in ("x-forwarded-for", "forwarded", "x-real-ip")) or \
+            not (ip in TAILNET or ip.is_loopback):
+        raise HTTPException(403, "tailnet only")
+
+
+@app.get("/v1/tools")
+async def tools_list(request: Request, caller: str = "api"):
+    """Every tool a model path may call (Messages-API shapes): devices, call_user, create_task, Cygnus."""
+    full_only()
+    tailnet_only(request)
+    return (await bridge.tools("qwen" if caller == "qwen" else "api"))[0]
+
+
+@app.post("/v1/tools/call")
+async def tools_call(request: Request, body: dict):
+    """{name, args, persona_id?, caller?} -> {content, is_error, approval?}. Waits up to 5 min for an approval."""
+    full_only()
+    tailnet_only(request)
+    if not isinstance(body.get("name"), str):
+        raise HTTPException(400, "name required")
+    caller = "qwen" if body.get("caller") == "qwen" else "api"
+    return await bridge.call(body["name"], body.get("args") or {}, body.get("persona_id"), caller=caller)
+
+
+@app.post("/v1/mcp")
+async def mcp_server(request: Request):
+    """The assistant's own tools as an MCP server (streamable HTTP, stateless JSON) for claude -p."""
+    full_only()
+    tailnet_only(request)
+    msg = await request.json()
+    msg = msg if isinstance(msg, dict) else {}
+    scope = getattr(request.state, "scope", "full")
+    if scope == "external" and msg.get("method") == "tools/call":
+        now = time.time()
+        _external_calls[:] = [t for t in _external_calls if now - t < 3600]
+        if len(_external_calls) >= EXTERNAL_PER_HOUR:
+            return JSONResponse({"jsonrpc": "2.0", "id": msg.get("id"),
+                                 "error": {"code": -32000, "message": "한 시간에 60번까지만 쓸 수 있어요."}})
+        _external_calls.append(now)
+        print("external mcp:", str((msg.get("params") or {}).get("name"))[:40], flush=True)  # the name only
+    if scope == "full" and ORIGIN_RE.fullmatch(origin := request.headers.get("x-azel-origin", "")):
+        origin_ctx.set(origin)  # claude -p's create_task/call_user: the call it runs in (never from the external token)
+    if scope == "full" and REQUESTER_RE.fullmatch(req := request.headers.get("x-azel-requester", "")):
+        requester_ctx.set(req)
+    out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope)
+    return Response(status_code=202) if out is None else JSONResponse(out)
+
+
+async def serve_tool(m):
+    """The voice server's Qwen asks for its tool list or runs a tool; an approval wait says so first."""
+    current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
+    try:
+        if m["type"] == "tools_list":
+            await link_send({"id": m["id"], "type": "tools", "tools": (await bridge.tools("qwen"))[0]})
+            return
+
+        async def progress(say):
+            await link_send({"id": m["id"], "type": "tool_progress", "say": say})
+        r = await bridge.run(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
+                             surface="voice", on_progress=progress)
+        # result: what Qwen reads; spoken and needs: what the voice fast path says and holds (ACTIONS.md §2)
+        await link_send({"id": m["id"], "type": "tool_result", "result": tools_bridge.for_model(r),
+                         "is_error": not r["ok"], "spoken": r["spoken"], "needs": r["needs"]})
+    except Exception as e:
+        print("tool over link failed:", type(e).__name__, flush=True)
+        await link_send({"id": m["id"], "type": "tool_result", "result": "도구를 쓰지 못했어요.", "is_error": True})
+
+
+def task_api_system(settings, devices):
+    """The API backends' task prompt; the clock comes last (claude -p knows the date from its environment)."""
+    now = datetime.now(KST)
+    return name_prompt(settings) + TASK_API_STYLE + device_prompt(settings, devices) + \
+        f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M} (KST)야."
+
+
+def task_backend_cfg(backend, settings):
+    if backend == "claude_api":
+        if not API_KEY:
+            raise TaskLimit("error", "Claude API 키가 없어요.")
+        model = settings["task_defaults"].get("task", {}).get("model")
+        return {"api_key": API_KEY, "model": model if model in MODELS else "sonnet"}
+    if backend == "nim":
+        cfg = settings["providers"]["nim"]
+        if not cfg["enabled"] or not nim.has_key(HOME):
+            raise TaskLimit("error", "엔비디아 모델이 꺼져 있거나 키가 없어요.")
+        prices = (cfg.get("prices") or {}).get(cfg["model"]) or [0, 0]
+        return {"url": cfg["base_url"].rstrip("/") + "/chat/completions", "key": nim.read_key(HOME),
+                "model": cfg["model"], "prices": prices}
+    return {"url": LLM_URL, "model": LLM_MODEL, "prices": [0, 0]}
+
+
+async def run_task_api(t):
+    """One task on an API backend (agent_loop): same caps, steps, approvals and notification as claude_code."""
+    requester_ctx.set(requester_id("task", t["id"]))  # its tool calls are this task's (approvals, injection guard)
+    settings = await load_settings()
+    devices = await fresh_devices()
+    system = task_api_system(settings, devices)
+
+    async def cancelled():
+        return bool((await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"))
+    async for ev in agent_loop.run(t["backend"], system, task_prompt(t, devices), bridge,
+                                   task_backend_cfg(t["backend"], settings), t["budget_usd"] - t["cost_usd"],
+                                   t["max_minutes"], cancelled, t.get("persona")):
+        if ev["type"] == "activity" and ev["phase"] == "tool_start":
+            task_step(t, "tool", tool=ev["tool"], label=tool_label(ev["tool"]))
+            await task_save(t)
+        elif ev["type"] == "activity" and ev["phase"].startswith("approval_"):
+            task_step(t, ev["phase"], tool=ev["tool"])
+        elif ev["type"] == "done":
+            t.update(status="done", finished=time.time(), result=ev["result"] or None,
+                     cost_usd=t["cost_usd"] + ev["cost_usd"])
+        elif ev["type"] == "failed":
+            t["cost_usd"] += ev["cost_usd"]
+            if ev["kind"] == "cancelled":
+                raise asyncio.CancelledError
+            if ev["kind"] == "auth" and t["backend"] == "claude_api":
+                raise ApiAuth()
+            raise TaskLimit(ev["kind"], ev["message"])

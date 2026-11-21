@@ -44,6 +44,10 @@ answering a call the assistant placed; the server then speaks that call's openin
     played every byte sent (the server tracks that from the audio length, pauses included) plus 300 ms
     (`PLAY_TAIL_MS`), not just until generation ends; only then come `turn_done` and `listening`. Speech in
     that window is a barge-in (`pause`/check), never a new turn.
+  - `{"type":"context","context":{"kind":"task"|"schedule","label":"<short purpose>","id":"<task or schedule id>"}}` —
+    the first message of a call the assistant placed for a task (its finish or approval) or a reminder; nothing else
+    comes before it. The same object rides in that call's VoIP push as `context`. For the call screen's
+    "맡긴 작업: …" / "예약: …" chip. Absent on other calls.
   - `{"type":"transcript","text":"…"}` — what the user said
   - `{"type":"reply_start","reply_id":N}` — sent right before the first audio frame of each reply (an answer, a
     briefing, a placed call's opening); `N` increases per reply. Binary frames carry no id, so the app treats every
@@ -124,8 +128,18 @@ JSON text frames:
   would replace a link of the other mode is ignored),
   `{"type":"settings","value":{…}}` (on connect and every change; from any full-mode link, the last
   one wins, since all gateways read the same shared settings; ignored from limited links),
-  `{"type":"call","call_id","opening","reason"}` (sent before the VoIP push; accepted from any full-mode link,
-  ignored without a string `call_id`; the voice server synthesizes the opening on arrival),
+  `{"type":"call","call_id","opening","reason","persona","origin_session"?}` (sent before the VoIP push; accepted
+  from any full-mode link, ignored without a string `call_id`; the voice server synthesizes the opening on arrival).
+  Every placed call's opening starts with the user's title in effect ("정훈님, …"), whoever wrote it.
+  `context` `{"kind","label","id"}` (task and reminder calls): passed on to the app as the call's first message.
+  `origin_session` (`persona:session`, `[A-Za-z0-9_:.-]{1,120}`): the conversation this call continues. A task's
+  finish/approval call and a reminder made during a call carry it, and so does `call_user` now from a call. When the
+  call connects, its history starts with that conversation's last 8 turns, then the opening (which holds the task
+  result), so Qwen and Claude both answer with that context. (In memory on the voice server: a reminder that fires
+  after a voice-server restart starts without it.)
+- Requests the voice server sends over the link to create something (`tool_call`, `schedule`, `task`) carry
+  `origin_session` = the conversation being answered; the gateway keeps it on the task (`origin_session`) or on the
+  reminder (kv `origin-<schedule id>`).
   `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"call_log","event":"start"|"turn"|"end","log_id",…}` — call history, sent
   only to a full-mode link (dropped when none is up; the voice server stores no history):
@@ -197,6 +211,10 @@ Body: 16 kHz mono WAV. Response: NDJSON (`transcript`, `audio` with base64 `pcm1
 
 ## 3. Gateway API (`http://<host>:8892`, every device)
 
+Everything the assistant *does* (calls, schedules, tasks, approvals' status, device and read tools) is an action defined
+once in the gateway's registry, with the same contract on every surface: see [ACTIONS.md](ACTIONS.md). The schedule,
+task and call routes below are thin adapters onto those actions.
+
 Config (env; Linux: `~/.config/biseo/gateway.env`, Mac: the launchd plist): `BISEO_DEVICE` (ASCII
 slug, unique), `BISEO_HOST` (Tailscale IP), `BISEO_MODE` `full`|`limited`, `BISEO_PRIORITY`,
 `BISEO_STATE_URL` (default `http://100.64.0.10:8894`), `BISEO_VOICE_URL`, `BISEO_NO_CLAUDE=1` (this
@@ -252,7 +270,12 @@ device that created them.
   `user_title`: how the assistant addresses the user, 0–12 Hangul/Latin letters or spaces (whitespace collapsed,
   null → `""`); `""` = no fixed title, address the user naturally. A persona's own `user_title` overrides it. The
   title in effect goes into Claude's persona block and Qwen's prompt as "사용자를 '<title>'(이)라고 부른다." (left out
-  when empty). Persona and settings changes reach the voice server at once over the link (every change pushes the
+  when empty). A spoken briefing's first sentence also starts with the title.
+  Speech style: every prompt says "말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해." instead of a
+  fixed 존댓말, so a persona whose personality asks for 반말 speaks 반말 (Qwen, Claude, NIM, openings).
+  Late at night (00:00–05:00 KST) every model prompt (Qwen's, Claude's voice style, the API/NIM paths, tasks) carries
+  `late_night.prompt_rule`: "내일" means today until 05:00, with a read-back for afternoon times and a question for
+  morning times, the same rule `when_from_words` applies to scheduling and spoken cancels. Persona and settings changes reach the voice server at once over the link (every change pushes the
   whole settings), and each call takes its persona snapshot when it starts. Because the app reuses one session id per
   day, a change of the persona's name or title also starts that conversation fresh: the voice server drops the
   persona+session history it built under the old name/title, and the gateway keys the resumed Claude session by
@@ -353,6 +376,14 @@ device that created them.
     "steps":[{"at","kind":"tool","tool","label"} | {"kind":"approval"|"approval_approved"|"approval_rejected",
     "approval_id"} | {"kind":"killed","reason":"time"|"budget"|"error"}]}`. Steps never carry tool arguments or results.
     `status`: `queued|running|waiting_approval|done|failed|cancelled`.
+  - Deploy order: the memory service before the gateways (an older memory service drops a schedule item's `cron`).
+  - Tasks started by claude -p (`mcp__azel__create_task`) get the call's `origin_session` too: an ask's run sends
+    `X-Azel-Origin` and `X-Azel-Requester` on the azel MCP server entry (accepted on the full scope only).
+  - The external MCP token (`~/.config/biseo/mcp_external_token`, ACTIONS.md) cannot create, read or cancel tasks:
+    a task runs with the whole bridge and its results hold personal data. That scope is call_user and schedule_*.
+  - `PATCH /v1/tasks/{id}` `{"notify":"call"|"push"|"none"}` → the task without steps; only `notify` may change, only
+    while `queued|running|waiting_approval` (409 once finished, 400 for anything else). Takes effect for the finish of
+    a task already running on this gateway.
   - `POST /v1/tasks/{id}/cancel` → the task without steps (`cancelled`; 409 once finished). Another gateway's task is
     flagged and stops within about 5 s.
   - Approvals: when a device tool answers `pending_approval`, the run stops, the task shows `waiting_approval` with
