@@ -811,16 +811,23 @@ tools); `icon/icon-preview.html` shows them on home screens, in the Dock and the
 
 Up to **8 assistants**, each with a name, a voice, a personality and an orb colour. One is
 **primary** (default 아젤): it places briefings and assistant-initiated calls and answers the
-wake word. `assistant_name` (§0) becomes "the primary persona's name"; every "아젤" in this
-spec means "the current persona's name" unless it says primary.
+wake word. `assistant_name` (§0) stays in `/v1/settings` only as an alias that mirrors the
+primary persona's name (read and write) for old clients; the new UI edits names only through
+personas, and the old 이름 row is gone. Every "아젤" in this spec means "the current
+persona's name" unless it says primary.
 
-### 17.1 Data (assumed; see §17.10)
+### 17.1 Data (PM, 2026-11-21)
 
-Persona: `id`, `name` (1–12 chars, unique), `voice` (one of the TTS server's speakers),
-`style` (optional TTS instruction, ≤ 80 chars), `personality` (≤ 500 chars), `color` (a key
-from §17.2), `share_memory` (bool), plus `primary_persona` (id). The app remembers the
-**selected** persona locally (per device); a call carries it (`persona=<id>` on `/v1/call`),
-and history items carry `persona`.
+- `GET/POST /v1/personas`, `GET/PUT/DELETE /v1/personas/{id}`, `POST /v1/personas/{id}/primary`
+  (not in `/v1/settings`). Persona: `id`, `name` (1–12 chars, unique), `voice` (a voice `id`),
+  `voice_style` (optional TTS instruction, ≤ 80 chars), `personality` (≤ 500 chars), `color`
+  (a key from §17.2), `share_memory` (bool); the primary is set with the `/primary` call.
+- `/v1/call?persona=<id>` (omitted → primary). History, schedule and proactive-log items carry
+  `persona_id`, and their lists take `?persona=` filters.
+- `GET /v1/voices` → `[{"id":"sohee","label":"소희","desc":"따뜻한 한국어 여성 목소리","lang":"ko"}…]`.
+- `POST /v1/personas/voice-sample` `{"voice","voice_style","text"}` → `audio/wav`; rate-limited to
+  one per 2 s, `text` ≤ 60 chars.
+- The app remembers the **selected** persona locally (per device).
 
 ### 17.2 Orb colours
 
@@ -885,11 +892,14 @@ A `.sheet` with large detent, title "새 비서" / the persona's name, toolbar �
    "이름을 입력해 주세요".
 3. **색**: 8 swatches (44 pt circles in the glaze, 2 pt accent ring + `checkmark` when
    selected), 4 per row; VoiceOver labels "청자", "쪽빛"…
-4. **목소리**: a list of the TTS speakers (radio rows, voice name + short descriptor if the
-   server gives one); each row has a trailing **들어보기** button (`play.circle`, 44 pt hit
-   area) that speaks "안녕하세요, {이름}이에요. 무엇을 도와드릴까요?" in that voice with the
-   current style. While playing it becomes `stop.circle` with a progress ring; only one sample
-   plays at a time; respects the silent switch (`.ambient` session, §14.2).
+4. **목소리**: the `/v1/voices` list (radio rows: `label` in body, `desc` in
+   footnote text2); each row has a trailing **들어보기** button (`play.circle`, 44 pt hit area)
+   that posts to `voice-sample` with "안녕하세요, {이름}이에요. 무엇을 도와드릴까요?" (always
+   ≤ 60 chars) and the current 말투, then plays the WAV. While loading it shows a spinner,
+   while playing `stop.circle` with a progress ring; only one sample plays at a time. After a
+   sample every 들어보기 button is disabled for 2 s (the server's rate limit), so the user never
+   sees a 429; if one still comes back, the row shows "잠시 후 다시 들어 보세요" (footnote).
+   Samples respect the silent switch (`.ambient` session, §14.2).
 5. **말투** (style): one-line field, placeholder "예: 차분하고 천천히, 밝고 빠르게"; footnote
    "목소리에 주는 짧은 지시예요." Changing it re-enables 들어보기.
 6. **성격** (personality): `TextEditor`, 4–8 lines, placeholder "예: 꼼꼼하고 다정하게, 결론부터
@@ -899,10 +909,12 @@ A `.sheet` with large detent, title "새 비서" / the persona's name, toolbar �
 8. **기본 비서로 지정** (non-primary only): a row button; confirm "{이름}을(를) 기본 비서로
    할까요? 아침 브리핑과 먼저 거는 전화를 {이름}이(가) 해요. 호출어는 ‘아젤’ 그대로예요."
    On the primary this row is a static note "기본 비서예요".
-9. **비서 지우기** (non-primary only): destructive text button at the bottom → alert
-   "‘{이름}’을(를) 지울까요?", body "통화 기록은 남아요. 이 비서만의 기억은 지워져요." (the
-   second sentence only when `share_memory` is off), buttons 지우기 (destructive) / 취소. Deleting
-   the selected persona selects the primary.
+9. **비서 지우기** (non-primary only): destructive text button at the bottom → a confirm
+   dialog (custom sheet, since it has a checkbox) titled "‘{이름}’을(를) 지울까요?", body "이
+   비서의 메모와 통화 요약이 지워져요. 통화 기록은 ‘삭제된 비서’로 남아요.", a checkbox row
+   **통화 기록도 함께 삭제** (default off; when on, the body's second sentence changes to "통화 기록도
+   모두 지워져요."), and buttons 지우기 (destructive) / 취소. Deleting the selected persona
+   selects the primary. The primary has no delete.
 
 Unsaved changes + 취소 → "변경 사항을 버릴까요?" confirmation.
 
@@ -918,11 +930,11 @@ Unsaved changes + 취소 → "변경 사항을 버릴까요?" confirmation.
 
 - Each row gets the persona: an 8 pt dot in its accent before the meta line and the name as
   its first item: "● 소담 · 오전 8:02 · 4분 · 6턴". The detail header shows a persona chip
-  (accent outline, like route chips). Calls from a deleted persona show "지운 비서" in `text3`
-  with an `ash` dot.
+  (accent outline, like route chips). Calls from a deleted persona show "삭제된 비서" in
+  `text3` with an `ash` dot; it is not in the filter row.
 - **Filter**: a horizontal chip row under the search field (only with ≥ 2 personas): "전체" +
-  one chip per persona (dot + name). Single select; filters the list (and the `?q=` search) by
-  `persona`. Selected chip: accent fill with `onAccent` text.
+  one chip per persona (dot + name). Single select; filters the list (and the `?q=` search) with
+  `?persona=<id>`. Selected chip: accent fill with `onAccent` text.
 
 ### 17.8 Mac
 
@@ -941,13 +953,9 @@ Unsaved changes + 취소 → "변경 사항을 버릴까요?" confirmation.
 - Persona changes are announced: "{이름}(으)로 바꿨어요".
 - Reduce Motion: mini orbs are static; the big orb's tint crossfades without scaling.
 
-### 17.10 Open questions (for the PM)
+### 17.10 Resolved (PM)
 
-1. API: where do personas live (`/v1/settings` `personas` array, or `GET/PUT /v1/personas`)?
-   Does `/v1/call` take `persona=<id>`, and do history items carry `persona`?
-2. Voice list and samples: can the gateway expose the TTS speaker list (`GET /v1/voices`,
-   with optional Korean descriptors) and a sample endpoint (`POST /v1/voices/sample`
-   `{voice, style, text}` → audio)? The app can't reach the TTS server directly.
-3. With `share_memory` off, what happens to that persona's memory when it is deleted
-   (deleted with it, as the copy assumes)?
-4. `assistant_name` in settings: replaced by the primary persona's name, or kept as an alias?
+Personas have their own endpoints; calls and history items carry the persona; the voice
+list and a rate-limited sample endpoint exist; deleting a persona always deletes its own
+memory and keeps its call history unless the user ticks the checkbox; `assistant_name`
+is a read/write alias of the primary's name (§17.1).
