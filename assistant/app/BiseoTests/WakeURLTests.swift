@@ -45,11 +45,15 @@ final class WakeURLTests: XCTestCase {
         try FileManager.default.createDirectory(at: AzelFiles.folder, withIntermediateDirectories: true)
         let pcm = Data((0..<3201).map { UInt8($0 % 251) })      // an odd byte at the end
         try pcm.write(to: AzelFiles.utterance("u1"))
-        let got = await AzelFiles.takeUtterance("u1", timeout: 0.5)
+        let got = await AzelFiles.takeUtterance("u1", appear: 0.5)
         XCTAssertEqual(got?.count, 3200, "whole samples only")
         XCTAssertFalse(FileManager.default.fileExists(atPath: AzelFiles.utterance("u1").path))
-        let missing = await AzelFiles.takeUtterance("nope", timeout: 0.2)
+        let missing = await AzelFiles.takeUtterance("nope", appear: 0.2)
         XCTAssertNil(missing)
+        try Data().write(to: AzelFiles.utterance("empty"))
+        let empty = await AzelFiles.takeUtterance("empty", appear: 0.2)
+        XCTAssertNil(empty, "zero bytes: nobody spoke after the name")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: AzelFiles.utterance("empty").path))
     }
 
     func testUtteranceArrivingLateIsWaitedFor() async throws {
@@ -57,10 +61,10 @@ final class WakeURLTests: XCTestCase {
         let url = AzelFiles.utterance("late")
         try Data(count: 640).write(to: url.appendingPathExtension("part"))
         Task {
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? await Task.sleep(nanoseconds: 700_000_000)              // longer than `appear`: the .part keeps it waiting
             try? FileManager.default.moveItem(at: url.appendingPathExtension("part"), to: url)   // the listener finishes
         }
-        let got = await AzelFiles.takeUtterance("late", timeout: 2)
+        let got = await AzelFiles.takeUtterance("late", appear: 0.3, partLimit: 3)
         XCTAssertEqual(got?.count, 640)
     }
 }

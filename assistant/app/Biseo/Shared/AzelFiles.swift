@@ -35,17 +35,22 @@ enum AzelFiles {
 
     static func utterance(_ id: String) -> URL { folder.appendingPathComponent("wake-utterance-\(id).pcm") }
 
-    /// Waits up to `timeout` for the listener to finish the file (it renames `.pcm.part` to `.pcm`),
-    /// reads it and deletes both. nil when it never came or is empty.
-    static func takeUtterance(_ id: String, timeout: TimeInterval = 5) async -> Data? {
-        let url = utterance(id)
-        let deadline = Date().addingTimeInterval(timeout)
-        while !FileManager.default.fileExists(atPath: url.path) && Date() < deadline {
+    /// The listener's capture (claude/wake-utterance): `.pcm.part` exists while it records (it stops
+    /// at end of speech, when `mic-live` appears, or after 10 s), then it is renamed to `.pcm`; zero
+    /// bytes = nothing was said. Waits while the `.part` exists (up to `partLimit`), or `appear` for
+    /// either file to show up at all; reads the `.pcm` once and deletes both. nil = go live without it.
+    static func takeUtterance(_ id: String, appear: TimeInterval = 5, partLimit: TimeInterval = 12) async -> Data? {
+        let url = utterance(id), part = url.appendingPathExtension("part")
+        let fm = FileManager.default
+        let start = Date()
+        while !fm.fileExists(atPath: url.path) {
+            let waited = Date().timeIntervalSince(start)
+            if fm.fileExists(atPath: part.path) ? waited >= partLimit : waited >= appear { break }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         let data = try? Data(contentsOf: url)
         try? FileManager.default.removeItem(at: url)
-        try? FileManager.default.removeItem(at: url.appendingPathExtension("part"))
+        try? FileManager.default.removeItem(at: part)
         guard let data, data.count >= 2 else { return nil }
         return data.count % 2 == 0 ? data : data.dropLast()   // whole 16-bit samples only
     }
