@@ -19,8 +19,8 @@ CHUNK = 640  # 20 ms of 16 kHz PCM16
 
 
 async def main(files, barge_in, call_id=""):
-    url = f"{SERVER}?token={TOKEN}&session=calltest-{int(time.time())}" + (f"&call_id={call_id}" if call_id else "")
-    async with websockets.connect(url, max_size=None) as ws:
+    url = f"{SERVER}?session=calltest-{int(time.time())}" + (f"&call_id={call_id}" if call_id else "")
+    async with websockets.connect(url, max_size=None, additional_headers={"Authorization": f"Bearer {TOKEN}"}) as ws:
         t0 = time.perf_counter()
         spoke = asyncio.Event()
         audio_bytes = 0
