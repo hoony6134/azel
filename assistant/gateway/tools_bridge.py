@@ -280,6 +280,11 @@ class Bridge:
     async def mac(self, name, args, where, caller):
         """music_play / music_control / home_scene: the Mac daemon's narrow `music` / `home` tool (its own checks apply)."""
         tool = MAC_ACTIONS[name]
+        if name == "home_scene" and RISKY_SCENE.search(str(args.get("name") or "")) and args.get("confirmed") is not True \
+                and caller != "app":
+            q = f"'{str(args['name'])[:40]}' 장면은 문이나 보안과 관계될 수 있어서 확인할게요. 실행할까요?"
+            raise Need("confirm", q, f"아직 아무것도 하지 않았어요. 사용자에게 '{q}'라고 묻고, 맞다고 하면 같은 내용에 "
+                       "confirmed=true를 더해 다시 불러.", resend={**args, "confirmed": True})
         if where is None:
             _, where = await self.tools(caller)
         macs = sorted(n for n, (_, t) in where.items() if t == tool)
@@ -863,6 +868,8 @@ HOME_SCENE = {
 # so they are hidden as `<device>__music` and every model path gets the same two names.
 MAC_ACTIONS = {"music_play": "music", "music_control": "music", "home_scene": "home"}
 MAC_TOOL_NAMES = set(MAC_ACTIONS.values())
+# A scene that sounds like a lock, a door, the garage or security always needs the user's spoken yes, read or no read.
+RISKY_SCENE = re.compile(r"lock|unlock|door|garage|alarm|security|arm|disarm|잠금|잠궈|도어락|문|현관|차고|경보|보안|방범", re.I)
 WEB_NAMES = {"web_search", "web_fetch"}  # the Claude API path has native server tools by these names
 # schedule_create: call_user that must have a time (the app's "new schedule" form); same handler, same checks.
 SCHEDULE_CREATE = {"name": "schedule_create",

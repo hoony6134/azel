@@ -542,3 +542,13 @@ def test_home_scene_after_a_web_read_needs_the_user_to_confirm():
     r = run(b.call("home_scene", {"name": "azel-movie"}))
     assert "확인할게요" in r["content"] and w.run == []
     assert not run(b.call("home_scene", {"name": "azel-movie", "confirmed": True}))["is_error"] and len(w.run) == 1
+
+
+def test_risky_home_scene_names_always_need_a_confirmed_yes():
+    w = MacWorld()
+    b = w.bridge()
+    for scene in ("front door unlock", "garage-open", "보안 해제", "azel-alarm-off"):
+        assert "확인할게요" in run(b.call("home_scene", {"name": scene}))["content"], scene
+    assert w.run == []
+    assert not run(b.call("home_scene", {"name": "garage-open", "confirmed": True}))["is_error"] and len(w.run) == 1
+    assert not run(b.call("home_scene", {"name": "azel-lights-off"}))["is_error"]  # an ordinary scene: no extra step
