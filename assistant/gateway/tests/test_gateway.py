@@ -1662,3 +1662,10 @@ def test_every_placed_call_opens_with_the_title(gw, monkeypatch):
     openings = [m["opening"] for m in sent if m.get("type") == "call"]
     assert openings == ["정훈님, 마감이 다가오는 게 있어요. 과제가 내일까지예요.", "오빠, 약 드실 시간이에요.",
                         "정훈님, 맡기신 정리 끝났어요."], openings
+
+
+def test_speech_style_follows_the_persona(gw):
+    """A persona whose personality asks for 반말 is not overruled by a fixed 존댓말 line (존댓말 stays the default)."""
+    g, c, _ = gw
+    for text in (g.VOICE_STYLE, g.FULL_API_STYLE, g.NIM_STYLE):
+        assert "말투(존댓말/반말)는 비서 성격을 따르고" in text and "반드시 존댓말" not in text and "한국어 존댓말로" not in text

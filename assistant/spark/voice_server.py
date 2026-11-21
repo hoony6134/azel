@@ -57,7 +57,7 @@ LENGTH_STYLE = {
 LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해. "
+    "한국어로 자연스럽게 말해. 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해. "
     "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
     "없으니, 도구가 없으면 할 수 없다고 하고 다시 물어봐. "
@@ -1005,7 +1005,7 @@ BRIEFING_QWEN = (
     "너는 개인 비서 '{name}'야. 사용자가 오늘 브리핑을 요청했어. 아래 메모와 사실만 근거로 30~40초 분량, "
     "여섯에서 여덟 문장의 음성 브리핑을 해. '오늘 브리핑이에요.'로 시작하고 오늘 날짜를 말한 뒤 수업·회의, 마감, 할 일, "
     "서버 상태, 승인 대기, 다음 예약 전화 순으로 말하고, 없는 항목은 건너뛰어. 메모에 없는 건 지어내지 마. "
-    "한국어 존댓말, 마크다운·목록·이모지 금지."
+    "한국어(말투는 비서 성격대로, 정해져 있지 않으면 존댓말), 마크다운·목록·이모지 금지."
 )
 BRIEFING_CLAUDE = (  # the morning-briefing call's prompt, for when no situation note exists yet
     "사용자가 오늘 브리핑을 요청했어. 오늘 수업과 마감(GISTRA), 오늘 할 일(Planit), 캘린더 일정, 서버 상태(Cygnus "
@@ -2388,12 +2388,14 @@ if __name__ == "__main__":
         assert system_prompt("아젤", "normal", "내일 9시 회의").endswith("참고할 상황:\n내일 9시 회의")
         assert personality({"personality": "  ", "personality_default": "기본 성격"}) == "기본 성격"
         assert personality({"personality": "까칠함", "personality_default": "기본 성격"}) == "까칠함"
-        assert personality({}) == "" and "성격" not in system_prompt("아젤")  # no settings yet: no persona line
+        assert personality({}) == "" and "의 성격과 말투" not in system_prompt("아젤")  # no settings yet: no persona line
         assert "너(아젤)의 성격과 말투: 까칠함. 이것은 너 자신의 성격이야." in system_prompt("아젤", "normal", "", "까칠함")
         assert "사용자를 '주인님'(이)라고 부른다." in system_prompt("아젤", "normal", "", "까칠함", "주인님")
         assert "'내일'은 오늘(11월 22일)" in late_night.prompt_rule(datetime(2026, 11, 22, 1, 30, tzinfo=KST))
         assert late_night.prompt_rule(datetime(2026, 11, 22, 9, 0, tzinfo=KST)) == ""  # only between 00:00 and 05:00
         assert with_title("좋은 아침이에요.", "정훈님") == "정훈님, 좋은 아침이에요." and with_title("x", "") == "x"
+        hp = system_prompt("하린", "normal", "", "다정한 여자친구, 반말로 편하게")
+        assert "말투(존댓말/반말)는 비서 성격을 따르고" in hp and "한국어 존댓말로" not in hp  # a 반말 persona is not overruled
         assert with_title("정훈님 좋은 아침이에요.", "정훈님") == "정훈님 좋은 아침이에요."  # already there: unchanged
         assert "부른다" not in system_prompt("아젤", "normal", "", "까칠함", "")  # no title: no line
         cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")

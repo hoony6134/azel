@@ -231,7 +231,7 @@ PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|�
                       re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
-    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 하되 '네'가 아니라 "
+    "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어로 말하고(말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해.), 첫 문장은 짧게 하되 '네'가 아니라 "
     "내용으로 시작해. "
     "마크다운, 목록, 표, 이모지, URL, 코드 블록을 쓰지 마. '확인하지 않은 것' 같은 꼬리말도 붙이지 마. "
     "커밋이나 파일에 AI 작성자 표시를 절대 남기지 마. "
@@ -960,7 +960,7 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
 
 # Measured on the cost eval (brain session): NIM models put markdown and 반말 into spoken replies, misdated
 # weekdays without the date, and doubted data the tools had already given.
-NIM_STYLE = (" 반드시 존댓말로만 말해. 별표(**), 샵(#), 번호 목록 같은 마크다운은 절대 쓰지 마. 날짜와 요일은 아래의 지금"
+NIM_STYLE = (" 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. 별표(**), 샵(#), 번호 목록 같은 마크다운은 절대 쓰지 마. 날짜와 요일은 아래의 지금"
              " 날짜를 기준으로 계산하고, 도구 결과에 나온 상태(완료 여부 등)는 그대로 믿고 다시 묻지 마.")
 SPOKEN_MARKDOWN = re.compile(r"\*\*|__|^#{1,6}\s*|`", re.M)
 
@@ -1229,7 +1229,7 @@ DECIDE_PROMPT = (
     "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
     "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
-    '"opening": "전화 첫마디, 이유를 한두 문장으로, 존댓말"}'
+    '"opening": "전화 첫마디, 이유를 한두 문장으로, 비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
 )
 
 

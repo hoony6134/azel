@@ -108,7 +108,7 @@ async def compose(kind, title, hour, minute, purpose_text="", goal="", raw="", p
     base = template(kind, title, hour, minute, purpose_text, goal)
     if llm:
         try:
-            d = await llm(f"너는 이 비서야: {persona}\n예약된 전화를 걸어 첫마디를 해. 한두 문장, {MAX_OPENING}자 이내, 해요체('-예요', '-드렸어요'). "
+            d = await llm(f"너는 이 비서야: {persona}\n예약된 전화를 걸어 첫마디를 해. 한두 문장, {MAX_OPENING}자 이내, 말투는 네 성격을 따르고 정해져 있지 않으면 해요체('-예요', '-드렸어요'). "
                           "사용자가 부탁한 말을 그대로 읽지 말고, '-하라고', '-해줘', '-라고' 같은 말투를 쓰지 마. "
                           f"호칭이 있으면 그 호칭으로 불러. 이 문장을 네 말투로 자연스럽게 바꿔: {base}\n"
                           'JSON 하나만: {"opening": "..."}',
