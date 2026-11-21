@@ -11,7 +11,7 @@ now, kept in a 0600 file (`~/.config/biseo/token` on the Mac), never in code or 
 | Qwen3-TTS | vd-spark | `http://100.64.0.11:8890` | `spark/tts/` |
 | Claude gateway (Claude, settings, usage, devices, push, scheduler) | Mac now, deneb later | `http://100.64.0.8:8892` | `gateway/` |
 | Agent daemon | Mac (later every host) | `http://100.64.0.8:8893/mcp` | `daemon/` |
-| iPhone app | iPhone | — | `ios/` |
+| iPhone / Mac app | iPhone, Mac | — | `app/` |
 
 ## 1. Live call — `WS /v1/call` on the voice server
 

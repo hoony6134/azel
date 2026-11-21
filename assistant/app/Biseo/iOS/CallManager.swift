@@ -17,13 +17,12 @@ final class CallManager: NSObject, ObservableObject {
     private let provider: CXProvider
     private let controller = CXCallController()
     private let pushRegistry = PKPushRegistry(queue: .main)
-    private let audio = AudioIO()
+    private let client = CallClient()
     private var voipToken: Data?
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
     private var incoming: [UUID: (callID: String?, reason: String?)] = [:]
-    private var socket: URLSessionWebSocketTask?
 
     private override init() {
         let config = CXProviderConfiguration()
@@ -33,6 +32,8 @@ final class CallManager: NSObject, ObservableObject {
         provider = CXProvider(configuration: config)
         super.init()
         provider.setDelegate(self, queue: nil)
+        client.onEvent = { [weak self] in self?.handle($0) }
+        client.onClose = { [weak self] in self?.fail(nil) }
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
     }
@@ -83,42 +84,11 @@ final class CallManager: NSObject, ObservableObject {
 
     /// Runs from `didActivate`: the audio session is ours now.
     private func connect() {
-        guard let uuid = callUUID, let token = Config.token,
-              var url = URLComponents(string: Config.voiceURL + "/v1/call") else { return fail("서버 설정이 없습니다") }
-        url.queryItems = [URLQueryItem(name: "token", value: token), URLQueryItem(name: "session", value: callID ?? Session.current(sessionPrefix))]
-        if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
-        guard let wsURL = url.url else { return fail("잘못된 음성 서버 주소") }
-
-        let task = URLSession.shared.webSocketTask(with: wsURL)
-        socket = task
-        task.resume()
-        audio.onMic = { [weak self, weak task] data in
-            if self?.muted == false { task?.send(.data(data)) { _ in } }
+        guard let uuid = callUUID else { return fail("서버 설정이 없습니다") }
+        do { try client.start(session: callID ?? Session.current(sessionPrefix), callID: callID) } catch {
+            return fail(error.localizedDescription)
         }
-        do { try audio.start() } catch { return fail("오디오 시작 실패") }
-        receive(task)
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
-    }
-
-    private func receive(_ task: URLSessionWebSocketTask) {
-        task.receive { [weak self] result in
-            guard let self else { return }
-            // Audio and interrupts are handled right here, in arrival order; UI hops to main.
-            switch result {
-            case .success(.data(let pcm)):
-                audio.play(pcm)
-            case .success(.string(let text)):
-                guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { break }
-                if event.type == "interrupt" { audio.flush() }
-                DispatchQueue.main.async { self.handle(event) }
-            case .failure:
-                DispatchQueue.main.async { if task === self.socket { self.fail(nil) } }
-                return
-            @unknown default:
-                break
-            }
-            receive(task)
-        }
     }
 
     private func handle(_ event: CallEvent) {
@@ -139,12 +109,7 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     private func teardown() {
-        if let task = socket {
-            task.send(.string(#"{"type":"hangup"}"#)) { _ in task.cancel(with: .normalClosure, reason: nil) }
-        }
-        socket = nil
-        audio.onMic = nil
-        audio.stop()
+        client.stop()
         callUUID = nil
         callID = nil
         sessionPrefix = "iphone"
@@ -177,13 +142,13 @@ extension CallManager: CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
-        if action.callUUID == callUUID { muted = action.isMuted }
+        if action.callUUID == callUUID { muted = action.isMuted; client.muted = muted }
         action.fulfill()
     }
 
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) { connect() }
 
-    func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) { audio.stop() }
+    func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) { client.stopAudio() }
 }
 
 extension CallManager: PKPushRegistryDelegate {

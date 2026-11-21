@@ -20,7 +20,7 @@ enum PCM {
             return input
         }
         guard error == nil, out.frameLength > 0, let samples = out.int16ChannelData else { return nil }
-        return Data(bytes: samples[0], count: Int(out.frameLength) * 2) // iOS is little-endian
+        return Data(bytes: samples[0], count: Int(out.frameLength) * 2) // Apple platforms are little-endian
     }
 
     /// Server PCM16 bytes → Float32 buffer the player node can schedule.
@@ -50,7 +50,7 @@ final class AudioIO {
         engine.connect(player, to: engine.mainMixerNode, format: PCM.speakerFormat)
     }
 
-    /// Call after CallKit activated the audio session.
+    /// iOS: call after CallKit activated the audio session.
     func start() throws {
         let input = engine.inputNode
         try? input.setVoiceProcessingEnabled(true) // echo cancellation on top of .voiceChat

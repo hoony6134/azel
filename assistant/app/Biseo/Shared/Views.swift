@@ -10,11 +10,17 @@ struct SetupView: View {
 
     var body: some View {
         Form {
-            Section("서버 주소") {
+            Section {
                 TextField("음성 서버", text: $voice)
                 TextField("게이트웨이", text: $gateway)
-            }
-            .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                DisclosureGroup("고급") {
+                    #if os(macOS)
+                    Button("Tailnet 주소 사용") { voice = Config.tailnetVoiceURL; gateway = Config.tailnetGatewayURL }
+                    #endif
+                    Button("공개 주소 사용") { voice = Config.publicVoiceURL; gateway = Config.publicGatewayURL }
+                }
+            } header: { Text("서버 주소") } footer: { Text(Config.addressNote) }
+            .urlInput()
             Section {
                 SecureField(Config.token == nil ? "토큰" : "저장됨 (바꿀 때만 입력)", text: $token)
             } header: { Text("토큰") } footer: { Text("토큰은 키체인에만 저장됩니다.") }
@@ -23,72 +29,15 @@ struct SetupView: View {
                 Config.gatewayURL = gateway.trimmingCharacters(in: .whitespaces)
                 if !token.isEmpty { Config.token = token.trimmingCharacters(in: .whitespacesAndNewlines) }
                 token = ""
+                #if os(iOS)
                 CallManager.shared.registerPush()
+                #endif
                 onDone()
             }
             .disabled(Config.token == nil && token.isEmpty)
         }
+        .formStyle(.grouped)
         .navigationTitle("박비서 연결")
-    }
-}
-
-// MARK: - Call
-
-struct CallView: View {
-    @ObservedObject private var call = CallManager.shared
-    @State private var session = Session.current()
-
-    private var stateText: String {
-        ["listening": "듣는 중", "thinking": "생각 중", "speaking": "말하는 중"][call.state] ?? "연결 중"
-    }
-
-    var body: some View {
-        VStack(spacing: 16) {
-            if call.inCall {
-                Text(stateText).font(.title2.bold())
-                ScrollViewReader { proxy in
-                    List(call.lines) { line in
-                        HStack(alignment: .firstTextBaseline) {
-                            if line.mine { Spacer(minLength: 0) }
-                            Text(line.text).foregroundStyle(line.mine ? .primary : Color.accentColor)
-                            if let route = line.route {
-                                Text(route).font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(route == "claude" ? Color.orange.opacity(0.2) : Color.blue.opacity(0.2), in: Capsule())
-                                    .accessibilityLabel("\(route) 응답")
-                            }
-                            if !line.mine { Spacer(minLength: 0) }
-                        }
-                        .id(line.id)
-                    }
-                    .listStyle(.plain)
-                    .onChange(of: call.lines.count) { if let last = call.lines.last { proxy.scrollTo(last.id) } }
-                }
-                HStack {
-                    Button { call.toggleMute() } label: {
-                        Label(call.muted ? "음소거 해제" : "음소거", systemImage: call.muted ? "mic.slash.fill" : "mic.fill")
-                            .frame(maxWidth: .infinity).padding()
-                    }
-                    .buttonStyle(.bordered).tint(call.muted ? .orange : .primary)
-                    Button(role: .destructive) { call.hangUp() } label: {
-                        Label("끊기", systemImage: "phone.down.fill").frame(maxWidth: .infinity).padding()
-                    }
-                    .buttonStyle(.borderedProminent).tint(.red)
-                }
-            } else {
-                Spacer()
-                Button { call.startCall() } label: {
-                    Label("박비서에게 전화", systemImage: "phone.fill")
-                        .font(.title2.bold()).frame(maxWidth: .infinity).padding(.vertical, 28)
-                }
-                .buttonStyle(.borderedProminent).tint(.green)
-                Button { session = Session.rotate() } label: { Label("새 대화", systemImage: "square.and.pencil") }
-                Text(session).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-            }
-            if let error = call.error { Text(error).font(.footnote).foregroundStyle(.red) }
-        }
-        .padding()
-        .onAppear { session = Session.current() }
     }
 }
 
@@ -111,8 +60,8 @@ struct SettingsView: View {
             }
             .navigationTitle("설정")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("서버") { showSetup = true } }
-                ToolbarItem(placement: .topBarTrailing) { Button("저장", action: save).disabled(settings == nil) }
+                ToolbarItem(placement: .leading) { Button("서버") { showSetup = true } }
+                ToolbarItem(placement: .trailing) { Button("저장", action: save).disabled(settings == nil) }
             }
             .navigationDestination(isPresented: $showSetup) { SetupView { showSetup = false } }
             .task { await load() }
@@ -138,7 +87,7 @@ struct SettingsView: View {
             }
             Section("예산") {
                 LabeledContent("월 예산 (USD)") {
-                    TextField("500", value: s.monthly_budget_usd, format: .number).keyboardType(.decimalPad).multilineTextAlignment(.trailing)
+                    TextField("500", value: s.monthly_budget_usd, format: .number).decimalInput().multilineTextAlignment(.trailing)
                 }
                 Stepper("경고: \(s.wrappedValue.budget_warn_pct)%", value: s.budget_warn_pct, in: 0...100, step: 5)
             }
@@ -158,6 +107,7 @@ struct SettingsView: View {
                     set: { s.wrappedValue.device_fallback = $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }))
             } header: { Text("기기") } footer: { Text("기본 기기가 안 되면 대체 순서대로 시도합니다.") }
         }
+        .formStyle(.grouped)
     }
 
     private func picker(_ title: String, _ options: [(String, String)], _ value: Binding<String>) -> some View {
@@ -317,5 +267,33 @@ struct ApprovalsView: View {
             do { _ = try await Gateway.send("POST", path, json: ["approve": approve]) } catch { message = error.localizedDescription }
             await load()
         }
+    }
+}
+
+// MARK: - Platform shims
+
+private extension ToolbarItemPlacement {
+    #if os(iOS)
+    static let leading = topBarLeading, trailing = topBarTrailing
+    #else
+    static let leading = navigation, trailing = primaryAction
+    #endif
+}
+
+private extension View {
+    func urlInput() -> some View {
+        #if os(iOS)
+        textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+        #else
+        autocorrectionDisabled()
+        #endif
+    }
+
+    func decimalInput() -> some View {
+        #if os(iOS)
+        keyboardType(.decimalPad)
+        #else
+        self
+        #endif
     }
 }
