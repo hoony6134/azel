@@ -37,8 +37,9 @@ surface fails CI.
 - `spoken`: always present. One or two plain Korean sentences with no markdown or emoji, safe to speak or push as is.
 - `data`: the structured result (the item, the list, the task), or null.
 - `needs`: set when the action did nothing because the user must answer first. `ok` is then false.
-  - `{"kind": "confirm", "question": "평일 오전 10시부터 오후 6시까지 2시간마다 전화드릴게요. 맞죠?"}`: resend with
-    `confirmed: true` once the user says yes.
+  - `{"kind": "confirm", "question": "평일 오전 10시부터 오후 6시까지 2시간마다 전화드릴게요. 맞죠?", "args": {…}}`:
+    once the user says yes, resend `args` exactly. They are the resolved rule with `confirmed: true`, so nothing is
+    guessed a second time.
   - `{"kind": "clarify", "question": "11월 24일 아침 7시요, 저녁 7시요?"}`: resend with the answer (`when_text`, `scope`, …).
   - `{"kind": "choose", "question": "어느 것인지 골라 주세요.", "options": [{"id": "…", "spoken": "오늘 오후 10시 약 먹기"}]}`:
     resend with `id`.
@@ -50,8 +51,9 @@ How each surface renders it:
 | surface | ok | needs | error |
 |---|---|---|---|
 | model tool loops (API, NIM, Qwen), `claude -p`, `/v1/mcp` | `spoken` (+ compact `data` JSON) as the tool result | `spoken` with the question and how to resend; `is_error: true` | `spoken`; `is_error: true` |
-| REST (app) | 200/201, the whole JSON | 200, the whole JSON (the app shows the question, then resends) | 400 invalid, 404 not_found, 409 conflict, 429 limit, 503 unavailable; body `{"detail": message, …result}` |
-| voice fast path | speaks `spoken` | speaks the question and holds the request for the answer | speaks `spoken` |
+| REST (app), with the request header `X-Azel-Result: 2` | 200/201, the whole JSON | 200, the whole JSON (the app shows the question, then resends) | 400 invalid, 404 not_found, 409 conflict, 429 limit, 503 unavailable, 502 failed; body `{"detail": message, …result}` |
+| REST without that header (app builds before batch 5) | 200/201, `data` alone (the old body) | 409 `{"detail": question, "needs": …}` | the same codes, `{"detail": message}` |
+| voice fast path (link `tool_result` frame: `result` for Qwen, plus `spoken` and `needs`) | speaks `spoken` | speaks the question and holds the request for the answer | speaks `spoken` |
 | push action | silent on ok; a local notification with `spoken` | opens the app on the question | a local notification with `spoken` |
 
 ## 3. Scopes and callers
@@ -108,7 +110,8 @@ the tool name only.
 
 | action | purpose | dedicated REST route (app) | tools (internal, qwen) | external | voice fast path | push action |
 |---|---|---|---|---|---|---|
-| `call_user` | ring now, at a time, or on a rule | `POST /v1/calls` (now), `POST /v1/schedule` (at a time / rule) | ✓ | ✓ | "N시에 전화해줘", "매일 …" | — |
+| `call_user` | ring now, at a time, or on a rule | `POST /v1/calls` (now) | ✓ | ✓ | "N시에 전화해줘", "매일 …" | — |
+| `schedule_create` | `call_user` that must have a time (the app's form); the same handler and checks | `POST /v1/schedule` | internal only (models use call_user) | ✓ | — | — |
 | `schedule_list` | scheduled calls with rule text and next fire | `GET /v1/schedule` | ✓ | ✓ | "예약 뭐 있어?" | — |
 | `schedule_update` | change time, purpose, notify, rule, dates; one fire or the rule | `PUT /v1/schedule/{id}[?occurrence=ISO]` | ✓ | ✓ | "10시 알림 6시로 바꿔줘" | `SNOOZE_10` → occurrence, `when_text: "10분 뒤"` |
 | `schedule_cancel` | cancel an item, a rule, or skip one fire | `DELETE /v1/schedule/{id}[?occurrence=ISO]` | ✓ | ✓ | "취소해줘", "내일 거만 빼줘" | `SKIP` → occurrence |
@@ -124,11 +127,12 @@ Not actions: `POST /v1/approvals/{id}` (human only); `POST /v1/approvals` (daemo
 history, connectors, push registration (configuration, not things the assistant does).
 
 ### Inputs (abridged; the registry holds the full schemas)
-- `call_user`:
+- `call_user` / `schedule_create`:
   - `reason` (required);
   - time: `when_text` from models, `when` from the app;
+  - a rule: `repeat_cron`, or `repeat_text` (the user's words; turned into a checked rule by `cron.from_words`);
   - `kind`: reminder | wake;
-  - `repeat_cron`, `start_date`, `end_date`, `notify`: call | push;
+  - `start_date`, `end_date`, `notify`: call | push;
   - `confirmed`, `persona_id`.
 - `schedule_update`:
   - target: `id` | `at` | `description`;
