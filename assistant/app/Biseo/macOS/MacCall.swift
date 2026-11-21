@@ -14,6 +14,11 @@ final class MacCall: ObservableObject {
     @Published private(set) var playing = false
     /// The state the UI shows: 말하는 중 while reply audio is still playing.
     var displayState: String { CallClient.displayState(server: state, playing: playing) }
+    /// The reply paragraph being heard (sentences, characters heard, sentence being spoken).
+    func karaoke(stepped: Bool) -> (texts: [String], spoken: Double, current: Int?) {
+        let k = client.karaokeState()
+        return (k.texts, stepped ? k.stepped : k.spoken, k.current)
+    }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }
@@ -43,7 +48,11 @@ final class MacCall: ObservableObject {
 
     private init() {
         client.onEvent = { [weak self] in self?.handle($0) }
-        client.onPlayback = { [weak self] in self?.playing = $0 }
+        client.onPlayback = { [weak self] playing in
+            guard let self else { return }
+            self.playing = playing
+            if playing { fadeTask?.cancel(); drainedAt = nil } else { drainedAt = Date(); scheduleFade() }
+        }
         client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date() } }
         client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
         client.onWarning = { [weak self] in self?.error = $0 }
@@ -76,6 +85,8 @@ final class MacCall: ObservableObject {
     private func pressBegan() {
         fadeTask?.cancel(); idleTask?.cancel()
         talking = true
+        turnDone = false
+        drainedAt = nil
         if inCall {
             client.sending = true
             client.cue(.wake, listening: false)
@@ -108,13 +119,24 @@ final class MacCall: ObservableObject {
     }
 
     /// The panel fades 4 s after `turn_done` unless the pointer is over it.
+    /// The server finished this turn; the panel waits for the audio to finish playing.
+    private var turnDone = false
+    private var drainedAt: Date?
+
+    /// Closes the push-to-talk panel only once the last chunk has played and 1.5 s have passed
+    /// (user request, 2026-11-21: it closed while the reply was still being spoken). A new turn
+    /// or the user's dismissal (Esc, ×) cancels it.
     private func scheduleFade() {
         guard pttCall else { return }
         fadeTask?.cancel()
+        guard turnDone, !playing else { return }
+        let since = drainedAt ?? Date()
+        drainedAt = since
         fadeTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(CallOverlay.linger * 1e9))
             guard let self, !Task.isCancelled, !self.talking, let p = self.panel else { return }
-            if NSPointInRect(NSEvent.mouseLocation, p.frame) { return self.scheduleFade() }
+            guard CallOverlay.shouldClose(turnDone: turnDone, playing: playing, drainedFor: Date().timeIntervalSince(since)) else { return }
+            if NSPointInRect(NSEvent.mouseLocation, p.frame) { drainedAt = nil; return self.scheduleFade() }
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 }) { p.orderOut(nil) }
         }
     }
@@ -202,7 +224,11 @@ final class MacCall: ObservableObject {
     private func handle(_ event: CallEvent) {
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         scheduleIdle()
-        if event.type == "turn_done" { scheduleFade() }
+        switch event.type {
+        case "turn_done": turnDone = true; scheduleFade()
+        case "transcript", "state" where event.value == "thinking": turnDone = false; drainedAt = nil; fadeTask?.cancel()
+        default: break
+        }
         switch event.type {
         case "state": state = event.value ?? ""
         case "activity" where event.phase == "tool_start":
@@ -268,7 +294,7 @@ final class MacCall: ObservableObject {
 }
 
 /// Esc (cancelOperation) hangs up; Space toggles mute.
-private final class CallPanel: NSPanel {
+final class CallPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override func cancelOperation(_ sender: Any?) { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
     override func close() { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
@@ -306,10 +332,7 @@ struct CallPanelView: View {
                     .lineLimit(1)
                     .accessibilityElement(children: .combine)
                 } else if let user { Text(user).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
-                if let reply {
-                    Text(reply.text + (reply.interrupted ? " …" : "")).font(.title3.weight(.medium))
-                        .foregroundStyle(reply.interrupted ? Theme.text3 : Theme.text).lineLimit(2)
-                }
+                if let reply { PanelReply(call: call, reply: reply) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .animation(Theme.caption, value: call.lines)
@@ -364,5 +387,60 @@ struct DeviceMenu: View {
         } label: { Image(systemName: "hifispeaker.and.homepod") }
         .menuStyle(.borderlessButton).fixedSize()
         .help("오디오 장치").accessibilityLabel("오디오 장치")
+    }
+}
+
+/// The reply in the push-to-talk panel: scrolls instead of truncating, highlights what has been
+/// heard, follows the sentence being spoken, and stops following once the user scrolls (until the
+/// next reply).
+struct PanelReply: View {
+    @ObservedObject var call: MacCall
+    let reply: CallLine
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var following = true
+    @State private var paragraph = ""
+    @State private var monitor: Any?
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: true) {
+                TimelineView(.animation(minimumInterval: 1 / 20, paused: !call.playing)) { _ in
+                    let k = call.karaoke(stepped: reduceMotion)
+                    VStack(alignment: .leading, spacing: 2) {
+                        if k.texts.joined(separator: " ") == reply.text {
+                            ForEach(Array(k.texts.enumerated()), id: \.offset) { i, t in
+                                KaraokeText(text: t, heard: KaraokeText.heard(in: k.texts, index: i, spoken: k.spoken),
+                                            color: reply.interrupted ? Theme.text3 : Theme.text)
+                                    .id("seg-\(i)")
+                            }
+                        } else {
+                            Text(reply.text + (reply.interrupted ? " …" : "")).foregroundStyle(reply.interrupted ? Theme.text3 : Theme.text)
+                        }
+                    }
+                    .font(.title3.weight(.medium))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onChange(of: k.current) { _, current in
+                        guard following, let current else { return }
+                        if reduceMotion { proxy.scrollTo("seg-\(current)", anchor: .center) }
+                        else { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("seg-\(current)", anchor: .center) } }
+                    }
+                }
+            }
+            .frame(maxHeight: 56)
+        }
+        .onChange(of: reply.text.prefix(24)) { _, start in
+            // A new reply paragraph: follow again.
+            if String(start) != paragraph { paragraph = String(start); following = true }
+        }
+        .onAppear {
+            // Trackpad or wheel scrolling over the panel pauses auto-follow until the next reply.
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+                if event.window is CallPanel { following = false }
+                return event
+            }
+        }
+        .onDisappear { if let monitor { NSEvent.removeMonitor(monitor) } }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(reply.text)
     }
 }

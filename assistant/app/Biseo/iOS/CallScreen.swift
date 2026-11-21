@@ -112,7 +112,21 @@ struct CallScreen: View {
                 VStack(spacing: Theme.m) {
                     ForEach(Array(call.lines.enumerated()), id: \.element.id) { i, line in
                         let recent = i >= call.lines.count - 2
-                        Text(line.text + (line.interrupted ? " …" : ""))
+                        Group {
+                            if !line.mine && i == call.lines.count - 1 {
+                                // The paragraph being spoken: bright as it is heard, dimmed ahead.
+                                TimelineView(.animation(minimumInterval: 1 / 20, paused: !call.playing)) { _ in
+                                    let k = call.karaoke(stepped: reduceMotion)
+                                    if k.texts.joined(separator: " ") == line.text {
+                                        KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
+                                    } else {
+                                        Text(line.text + (line.interrupted ? " …" : ""))
+                                    }
+                                }
+                            } else {
+                                Text(line.text + (line.interrupted ? " …" : ""))
+                            }
+                        }
                             .font(line.mine ? .body : .title2.weight(.medium))
                             .lineSpacing(line.mine ? 4 : 6)
                             .foregroundStyle(line.mine ? Theme.text2 : (recent && !line.interrupted ? Theme.text : Theme.text3))

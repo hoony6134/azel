@@ -13,6 +13,11 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var playing = false
     /// The state the UI shows: 말하는 중 while reply audio is still playing.
     var displayState: String { CallClient.displayState(server: state, playing: playing) }
+    /// The reply paragraph being heard (sentences, characters heard, sentence being spoken).
+    func karaoke(stepped: Bool) -> (texts: [String], spoken: Double, current: Int?) {
+        let k = client.karaokeState()
+        return (k.texts, stepped ? k.stepped : k.spoken, k.current)
+    }
     @Published private(set) var log = CallLog()
     var lines: [CallLine] { log.lines }
     var levels: Levels { client.audio.levels }

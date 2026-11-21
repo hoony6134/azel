@@ -142,6 +142,7 @@ final class CallClient {
             switch result {
             case .success(.data(let pcm)):
                 audio.play(pcm)
+                karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
                 DispatchQueue.main.async { self.thinking.audioArrived() }
                 statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
                 recorder?.assistant(pcm)
@@ -150,8 +151,10 @@ final class CallClient {
                 if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
                 if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
                 // Event order matters for audio, so these run here, before the UI hop.
+                karaokeLock.lock(); karaoke.apply(type: event.type, text: event.text); karaokeLock.unlock()
                 switch event.type {
                 case "interrupt":
+                    freezeKaraoke()
                     audio.flush()
                     playback.apply(event.type)
                     if !playback.playing { audio.pause() }
@@ -185,6 +188,18 @@ final class CallClient {
     /// Main thread only.
     private var thinking = ThinkingCues()
     private var pulseTimer: Timer?
+    /// Which part of the current reply has been heard; fed on the receive queue, read by the UI.
+    private var karaoke = KaraokeTimeline()
+    private let karaokeLock = NSLock()
+
+    /// Sentences of the current reply paragraph, characters heard (smooth and per-chunk), and
+    /// the sentence being spoken.
+    func karaokeState() -> (texts: [String], spoken: Double, stepped: Double, current: Int?) {
+        let played = audio.playedSamples
+        karaokeLock.lock(); defer { karaokeLock.unlock() }
+        return (karaoke.texts, karaoke.spoken(played: played, stepped: false), karaoke.spoken(played: played, stepped: true),
+                karaoke.currentSegment(played: played))
+    }
     /// Playback started or drained (main queue): the UI keeps 말하는 중 until the queue is empty.
     var onPlayback: ((Bool) -> Void)?
     /// A cue actually played (main queue): the UI shows its visual twin (§14.3).
@@ -211,6 +226,12 @@ final class CallClient {
         }
     }
 
+    /// Before a flush resets the playback clock, keep what was heard.
+    private func freezeKaraoke() {
+        let played = audio.playedSamples
+        karaokeLock.lock(); karaoke.flush(heard: played); karaokeLock.unlock()
+    }
+
     /// Push-to-talk key-up: ~700 ms of zero PCM so the server VAD closes the turn (DESIGN §12.5).
     func sendSilence(milliseconds: Int = 700) {
         socket?.send(.data(Self.silence(milliseconds: milliseconds))) { _ in }
@@ -223,6 +244,7 @@ final class CallClient {
     /// waiting for its `interrupt` echo.
     func interrupt() {
         socket?.send(.string(#"{"type":"interrupt"}"#)) { _ in }
+        freezeKaraoke()
         audio.flush()
         playback.apply("interrupt")
         if !playback.playing { audio.pause() }
@@ -254,6 +276,7 @@ final class CallClient {
         pulseTimer?.invalidate()
         pulseTimer = nil
         thinking = ThinkingCues()
+        karaokeLock.lock(); karaoke = KaraokeTimeline(); karaokeLock.unlock()
         if wasPlaying { wasPlaying = false; onPlayback?(false) }
         if socket != nil {
             statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()

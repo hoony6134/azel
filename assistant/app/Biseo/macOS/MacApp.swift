@@ -225,6 +225,31 @@ struct HistorySplit: View {
     }
 }
 
+/// History inside the main window: list and detail side by side without a second split view.
+struct HistoryPane: View {
+    @ObservedObject var history: HistoryModel
+    @State private var selection: HistoryItem?
+
+    var body: some View {
+        HStack(spacing: 0) {
+            HistoryList(model: history, selection: $selection, onCall: { MacCall.shared.start(panel: true) })
+                .frame(width: 280)
+                .onDeleteCommand { if let s = selection { history.delete(s); selection = nil } }
+            Divider()
+            Group {
+                if let selection {
+                    NavigationStack { HistoryDetailView(item: selection, history: history) }.id(selection.id)
+                } else {
+                    Text("기록을 고르세요").foregroundStyle(Theme.text3)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.bg)
+        }
+        .task { await history.refresh() }
+    }
+}
+
 @MainActor @ViewBuilder func wakeButton(_ wake: WakeModel) -> some View {
     switch wake.state {
     case .running, .loaded: Button("끄기") { wake.toggle() }.font(.footnote)
@@ -263,12 +288,19 @@ struct MainWindow: View {
                     }
                     .navigationSplitViewColumnWidth(min: 160, ideal: 180)
                 } detail: {
-                    switch section {
-                    case "approvals": ApprovalsScreen(model: model)
-                    case "history": HistorySplit(history: history)
-                    case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
-                    default: MacHome(model: model, history: history, schedule: schedule) { section = "history" }
+                    // A fixed minimum size: a detail whose min size moved with its (animated)
+                    // content made the split view re-measure inside a layout pass and AppKit
+                    // aborted (crash report 2026-11-21 23:55).
+                    Group {
+                        switch section {
+                        case "approvals": ApprovalsScreen(model: model)
+                        case "history": HistoryPane(history: history)   // no split view nested in this one
+                        case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
+                        default: MacHome(model: model, history: history, schedule: schedule) { section = "history" }
+                        }
                     }
+                    .frame(minWidth: 460, maxWidth: .infinity, minHeight: 420, maxHeight: .infinity)
+                    .navigationSplitViewColumnWidth(min: 460, ideal: 640)
                 }
             } else {
                 SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
@@ -281,6 +313,7 @@ struct MainWindow: View {
 
 /// Home with the call in place: the jar grows and the dock appears when a call is up.
 struct MacHome: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryModel
     @ObservedObject var schedule: ScheduleModel
@@ -372,7 +405,20 @@ struct MacHome: View {
     private var captions: some View {
         VStack(alignment: .leading, spacing: Theme.m) {
             ForEach(call.lines.suffix(4)) { line in
-                Text(line.text + (line.interrupted ? " …" : ""))
+                Group {
+                    if !line.mine && line.id == call.lines.last?.id {
+                        TimelineView(.animation(minimumInterval: 1 / 20, paused: !call.playing)) { _ in
+                            let k = call.karaoke(stepped: reduceMotion)
+                            if k.texts.joined(separator: " ") == line.text {
+                                KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
+                            } else {
+                                Text(line.text + (line.interrupted ? " …" : ""))
+                            }
+                        }
+                    } else {
+                        Text(line.text + (line.interrupted ? " …" : ""))
+                    }
+                }
                     .font(line.mine ? .body : .title2.weight(.medium))
                     .foregroundStyle(line.mine ? Theme.text2 : line.interrupted ? Theme.text3 : Theme.text)
                     .frame(maxWidth: .infinity, alignment: .leading)
