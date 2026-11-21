@@ -25,7 +25,9 @@ The voice server stores **no plaintext token**: it compares SHA-256 digests (`hm
 
 ## 1. Live call — `WS /v1/call` on the voice server
 
-Query: `token` (a `client` token), `session` (stable per conversation), optional `call_id` (set when
+Auth: `Authorization: Bearer <client token>` header (preferred); the `?token=` query is a fallback
+for old clients only (it can end up in proxy logs). Both are checked against the `client` hashes.
+Query: `session` (stable per conversation), optional `call_id` (set when
 answering a call the assistant placed; the server then speaks that call's opening first).
 
 - Client → server **binary**: mono PCM16 little-endian, 16 kHz, any frame size
@@ -47,8 +49,10 @@ answering a call the assistant placed; the server then speaks that call's openin
 The **gateway dials the voice server**, never the reverse: under the Headscale ACL the
 Spark (`tag:vujade`) may not open connections to jh hosts, and the Spark is shared team
 hardware that must not hold personal Claude credentials. Auth: `Authorization: Bearer <link token>`
-header (not query): a `link` token, or a `link_limited` token, whose link is always limited whatever
-its hello says. **Every gateway keeps its own link**; the voice server holds all of them at once.
+header only (never the query): a `link` token, or a `link_limited` token, whose link is always limited
+whatever its hello says. Tailnet only, never proxied: the voice server closes the socket (4403) when the
+peer is not in 100.64.0.0/10 or the request carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP`
+(the public proxy is itself a tailnet peer, so the header check is what stops it). **Every gateway keeps its own link**; the voice server holds all of them at once.
 JSON text frames:
 
 - gateway → voice: `{"type":"hello","device","mode":"full"|"limited","priority"}` first on every
@@ -70,6 +74,16 @@ personal (calendar, mail, memory, contacts, GISTRA courses/assignments, Planit, 
 "지금 Claude 게이트웨이에 연결이 안 돼요." A dropped link fails only its own pending asks. Limited links
 get only the current utterance, never the call's earlier turns (which may be personal).
 `GET /health` lists the connected gateways.
+
+## 1c. Public entry — `https://azel.scian.xyz` (Caddy on deneb → tailnet)
+
+For the phone without Tailscale. Exposed paths only; everything else is blocked at the proxy:
+- voice server: `WS /v1/call`, `POST /v1/turn` (client token, header preferred);
+- gateway: `GET|PUT /v1/settings`, `GET /v1/usage`, `GET /v1/status`, `GET /v1/approvals`,
+  `POST /v1/approvals/{id}`, `POST /v1/push/register` (bearer header).
+
+Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
+`/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
 
 ## 2. One-shot turn — `POST /v1/turn` on the voice server (testing, benchmark)
 

@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -205,8 +206,32 @@ def check_token(got: str, labels=("client",)):
     return label
 
 
+def bearer(headers) -> str:
+    return headers.get("authorization", "").removeprefix("Bearer ").strip()
+
+
 def auth(request: Request):
-    check_token(request.headers.get("authorization", "").removeprefix("Bearer ").strip())
+    check_token(bearer(request.headers))
+
+
+def call_token(headers, query_token: str) -> str:
+    """The client token for /v1/call: the Authorization header, else the legacy ?token= query."""
+    return bearer(headers) or query_token
+
+
+TAILNET = ipaddress.ip_network("100.64.0.0/10")
+PROXY_HEADERS = ("x-forwarded-for", "forwarded", "x-real-ip")
+
+
+def link_peer_ok(host: str, headers) -> bool:
+    """/v1/gateway-link is tailnet-only and never proxied. Fail closed: a non-tailnet peer, a non-IP peer,
+    or any proxy header (the public proxy on deneb is itself a tailnet peer) is refused."""
+    if any(h in headers for h in PROXY_HEADERS):
+        return False
+    try:
+        return ipaddress.ip_address(host) in TAILNET
+    except ValueError:
+        return False
 
 
 def decode_wav(data: bytes) -> np.ndarray:
@@ -467,9 +492,11 @@ class Turn:
 
 @app.websocket("/v1/gateway-link")
 async def gateway_link(ws: WebSocket):
+    if not link_peer_ok(ws.client.host if ws.client else "", ws.headers):
+        await ws.close(code=4403)
+        return
     try:
-        label = check_token(ws.headers.get("authorization", "").removeprefix("Bearer ").strip(),
-                            ("link", "link_limited"))
+        label = check_token(bearer(ws.headers), ("link", "link_limited"))
     except HTTPException:
         await ws.close(code=4401)
         return
@@ -487,7 +514,7 @@ async def gateway_link(ws: WebSocket):
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = ""):
     try:
-        check_token(token)
+        check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
     except HTTPException:
         await ws.close(code=4401)
         return
@@ -703,6 +730,36 @@ if __name__ == "__main__":
                 raise AssertionError(f"accepted {bad!r}")
             except HTTPException:
                 pass
+        assert call_token({"authorization": "Bearer app-tok"}, "") == "app-tok"
+        assert call_token({"authorization": "Bearer app-tok"}, "old") == "app-tok"  # header wins
+        assert call_token({}, "app-tok") == "app-tok" and check_token(call_token({}, "app-tok")) == "client"
+        assert link_peer_ok("100.64.0.8", {}) and link_peer_ok("100.127.255.1", {})
+        for host, hdrs in [("172.19.0.1", {}), ("127.0.0.1", {}), ("10.0.0.2", {}), ("8.8.8.8", {}), ("", {}),
+                           ("testclient", {}), ("100.64.0.9", {"x-forwarded-for": "1.2.3.4"}),
+                           ("100.64.0.9", {"forwarded": "for=1.2.3.4"}), ("100.64.0.9", {"x-real-ip": "1.2.3.4"})]:
+            assert not link_peer_ok(host, hdrs), (host, hdrs)
+        from fastapi.testclient import TestClient
+
+        def ws_close_code(tc, path, **kw):
+            try:
+                with tc.websocket_connect(path, **kw):
+                    return None
+            except WebSocketDisconnect as e:
+                return e.code
+        off_net = TestClient(app)  # peer "testclient": not a tailnet address
+        assert ws_close_code(off_net, "/v1/gateway-link", headers={"Authorization": "Bearer link-tok"}) == 4403
+        on_net = TestClient(app, client=("100.64.0.9", 1))
+        assert ws_close_code(on_net, "/v1/gateway-link", headers={"Authorization": "Bearer link-tok",
+                                                                   "X-Forwarded-For": "1.2.3.4"}) == 4403
+        assert ws_close_code(on_net, "/v1/gateway-link", headers={"Authorization": "Bearer app-tok"}) == 4401
+        assert ws_close_code(on_net, "/v1/gateway-link?token=link-tok") == 4401  # header-only
+        with on_net.websocket_connect("/v1/gateway-link", headers={"Authorization": "Bearer link-tok"}) as w:
+            w.send_text(json.dumps({"type": "hello", "device": "t", "mode": "full", "priority": 1}))
+            w.send_text(json.dumps({"type": "settings", "value": {"k": 1}}))
+            w.close()
+        assert links.settings == {"k": 1}
+        assert ws_close_code(off_net, "/v1/call", headers={"Authorization": "Bearer nope"}) == 4401
+        assert ws_close_code(off_net, "/v1/call?token=link-tok") == 4401  # a link token is not a client token
         for broken in ["client abc", f"admin {h['app-tok']}", f"link {h['link-tok']}"]:
             try:
                 load_hashes(broken)
