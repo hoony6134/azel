@@ -226,6 +226,8 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showConnectors = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
+    @State private var titleDraft = ""
+    @State private var titleError: String?
     @AppStorage("workSounds") private var workSounds = true
     /// Cached so the call screen can show the tap-to-interrupt hint without a fetch.
     @AppStorage("noiseMode") private var noiseMode = "normal"
@@ -266,6 +268,7 @@ struct SettingsScreen<Extra: View>: View {
                             #endif
                     }
                 }
+                ApprovalRulesCard()
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
@@ -316,6 +319,17 @@ struct SettingsScreen<Extra: View>: View {
             PersonaListCard(model: personas)
         }
         Card("대화") {
+            if AppSettings.supportsUserTitle { VStack(alignment: .leading, spacing: Theme.xs) {
+                row("호칭") {
+                    TextField("예: 정훈님, 오빠, 대표님", text: $titleDraft)
+                        .multilineTextAlignment(.trailing).frame(maxWidth: 180)
+                        .onChange(of: titleDraft) { commitTitle(s) }
+                        .onAppear { titleDraft = s.wrappedValue.user_title ?? "" }
+                        .accessibilityLabel("나를 부르는 말")
+                }
+                if let titleError { Text(titleError).font(.footnote).foregroundStyle(Theme.danger) }
+                else { Text("나를 부르는 말이에요. 비우면 호칭 없이 불러요.").font(.footnote).foregroundStyle(Theme.text3) }
+            } }
             row("답변 길이") {
                 Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
                                                    set: { s.wrappedValue.reply_length = $0 })) {
@@ -377,6 +391,13 @@ struct SettingsScreen<Extra: View>: View {
             }
             Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
         }
+    }
+
+    /// "" = 호칭 없이; anything else must pass the 0–12 character check before it is saved.
+    private func commitTitle(_ s: Binding<AppSettings>) {
+        guard let t = AssistantName.validatedTitle(titleDraft) else { titleError = "한글, 영문, 공백으로 12자까지 쓸 수 있어요"; return }
+        titleError = nil
+        if (s.wrappedValue.user_title ?? "") != t { s.wrappedValue.user_title = t }
     }
 
     /// Empty → the default name; anything else must pass validation before it is saved.
@@ -515,6 +536,31 @@ struct SettingsScreen<Extra: View>: View {
 
     private func taskCard(_ s: Binding<AppSettings>) -> some View {
         Card("작업별") {
+            if let current = s.wrappedValue.task_backend {
+                VStack(alignment: .leading, spacing: Theme.s) {
+                    Text("작업 기본 엔진").foregroundStyle(Theme.text)
+                    ForEach(TaskBackend.options(nimEnabled: s.wrappedValue.providers?.nim?.enabled == true, current: current)) { b in
+                        Button { s.wrappedValue.task_backend = b.rawValue } label: {
+                            HStack(spacing: Theme.m) {
+                                Image(systemName: current == b.rawValue ? "largecircle.fill.circle" : "circle")
+                                    .foregroundStyle(current == b.rawValue ? Theme.celadon : Theme.text3)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(b.label).foregroundStyle(Theme.text)
+                                    Text(b.detail).font(.footnote).foregroundStyle(Theme.text3)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(b.label), \(b.detail)")
+                        .accessibilityAddTraits(current == b.rawValue ? .isSelected : [])
+                    }
+                    Text("메일·캘린더는 Google 연결이 끊기면, 예산을 다 쓰면 Claude Code로 대신 처리해요")
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                }
+                Divider()
+            }
             ForEach(tasks, id: \.0) { key, name in
                 let task = Binding(get: { s.wrappedValue.task_defaults[key] ?? .init(model: "auto") },
                                    set: { s.wrappedValue.task_defaults[key] = $0 })
@@ -709,9 +755,11 @@ struct SettingsScreen<Extra: View>: View {
             personalityDefault = PersonalityDefault.read(data) ?? personalityDefault
             // Device names migrate to their ids for display; nothing is saved until the user edits.
             let s = DeviceID.normalize(raw)
+            AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)   // before the 호칭 row renders
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
+            titleDraft = s.user_title ?? ""
             noiseMode = s.noise_mode ?? "normal"
             loadError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }
@@ -781,101 +829,73 @@ private struct FlowChips: View {
 
 struct ApprovalsScreen: View {
     @ObservedObject var model: AppModel
-    @State private var confirm: [String: Any]?
-    @State private var done: Set<String> = []
-    @State private var error: String?
-    @State private var succeeded = 0
-
-    private static let risky = ["rm ", "rm\t", "git push", "sudo", ">"]
+    @ObservedObject private var center = ApprovalCenter.shared
 
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: Theme.l) {
-                if let error { Text(error).font(.footnote).foregroundStyle(Theme.danger) }
-                SectionNote(status: model.approvalsStatus) { Task { await model.refresh() } }
-                if model.approvals.isEmpty && model.approvalsStatus == .ok {
+            LazyVStack(alignment: .leading, spacing: Theme.l) {
+                SectionNote(status: center.status) { Task { await center.refresh() } }
+                if center.pending.isEmpty && center.status == .ok {
                     EmptyState(title: "모두 처리했어요", message: "승인이 필요하면 알려 드릴게요.")
                 }
-                ForEach(model.approvals.indices, id: \.self) { i in card(model.approvals[i]) }
+                ForEach(center.pending) { a in
+                    Button { center.show(a) } label: { PendingApprovalRow(request: a) }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("열어서 허용하거나 거부해요")
+                }
+                if !center.history.isEmpty {
+                    Text("지난 요청").font(.headline).foregroundStyle(Theme.text2).padding(.top, Theme.s)
+                    ForEach(center.history) { ApprovalHistoryRow(request: $0) }
+                }
             }
             .padding(.horizontal, 20).padding(.vertical, Theme.l)
             .frame(maxWidth: 640).frame(maxWidth: .infinity)
         }
         .background(Theme.bg.ignoresSafeArea())
         .navigationTitle("승인")
-        .refreshable { await model.refresh() }
-        .task { await model.refresh() }
-        #if os(iOS)
-        .sensoryFeedback(.success, trigger: succeeded)
-        #endif
-        .confirmationDialog("이 명령을 승인할까요?", isPresented: Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } }),
-                            titleVisibility: .visible, presenting: confirm) { item in
-            Button("승인") { decide(item, true) }
-            Button("취소", role: .cancel) {}
-        } message: { item in Text(describe(item["command"] ?? "")) }
+        .refreshable { await center.refresh(); await model.refresh() }
+        .task { await center.refresh() }
     }
+}
 
-    private func card(_ item: [String: Any]) -> some View {
-        let id = describe(item["id"] ?? "")
-        let command = item["command"].map(describe) ?? ""
-        let known: Set = ["id", "device", "tool", "command", "cwd", "created", "status", "decided"]
-        return Card {
-            if done.contains(id) {
-                Label("처리했어요", systemImage: "checkmark").foregroundStyle(Theme.celadon)
-            } else {
-                HStack(spacing: Theme.s) {
-                    Text(item["device"].map(describe) ?? "기기").font(.headline).foregroundStyle(Theme.text)
-                    if let tool = item["tool"] {
-                        Text(describe(tool)).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2)
-                            .padding(.horizontal, Theme.s).padding(.vertical, 2).overlay(Capsule().strokeBorder(Theme.stroke))
-                    }
-                    Spacer()
-                    if let created = (item["created"] as? NSNumber)?.doubleValue {
-                        Text(Date(timeIntervalSince1970: created), style: .relative).font(.footnote).foregroundStyle(Theme.text3)
+private struct PendingApprovalRow: View {
+    let request: ApprovalRequest
+
+    var body: some View {
+        Card {
+            HStack {
+                Text(request.device.isEmpty ? "기기" : request.device).font(.headline).foregroundStyle(Theme.text)
+                Spacer()
+                if request.expires != nil {
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(ApprovalRequest.countdown(request.secondsLeft(now: ctx.date) ?? 0)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
                     }
                 }
-                if !command.isEmpty {
-                    ScrollView(.horizontal) {
-                        Text(command).font(.callout.monospaced()).foregroundStyle(Theme.text).textSelection(.enabled).padding(Theme.m)
-                    }
-                    .background(Theme.bg, in: RoundedRectangle(cornerRadius: Theme.rowRadius, style: .continuous))
-                }
-                if let cwd = item["cwd"] {
-                    Label(describe(cwd), systemImage: "folder").font(.footnote).foregroundStyle(Theme.text2)
-                }
-                ForEach(item.keys.filter { !known.contains($0) }.sorted(), id: \.self) { key in
-                    Text("\(key): \(describe(item[key]!))").font(.footnote).foregroundStyle(Theme.text2)
-                }
-                HStack(spacing: Theme.m) {
-                    Button { decide(item, false) } label: { Text("거절").frame(maxWidth: .infinity).frame(height: 44) }
-                        .buttonStyle(.bordered).foregroundStyle(Theme.danger)
-                    Button { Self.risky.contains { command.contains($0) } ? (confirm = item) : decide(item, true) } label: {
-                        Text("승인").frame(maxWidth: .infinity).frame(height: 44)
-                    }
-                    .buttonStyle(.borderedProminent).tint(Theme.celadon).foregroundStyle(Theme.onAccent)
-                }
+                Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
             }
+            Text(request.command).font(.callout.monospaced()).foregroundStyle(Theme.text).lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let cwd = request.cwd { Label(cwd, systemImage: "folder").font(.footnote).foregroundStyle(Theme.text2).lineLimit(1) }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel([item["device"], item["tool"], item["command"].map { "명령: \(describe($0))" }, item["cwd"].map { "위치: \(describe($0))" }]
-            .compactMap { $0.map(describe) }.joined(separator: ", "))
-        .accessibilityAction(named: "승인") { decide(item, true) }
-        .accessibilityAction(named: "거절") { decide(item, false) }
+        .contentShape(Rectangle())
     }
+}
 
-    private func decide(_ item: [String: Any], _ approve: Bool) {
-        let id = describe(item["id"] ?? "")
-        Task {
-            do {
-                withAnimation(Theme.enter) { _ = done.insert(id) }
-                try await model.decide(item, approve)
-                succeeded += 1
-                error = nil
-            } catch {
-                done.remove(id)
-                self.error = FriendlyError.describe(error).title
+private struct ApprovalHistoryRow: View {
+    let request: ApprovalRequest
+
+    var body: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(request.command).font(.footnote.monospaced()).foregroundStyle(Theme.text).lineLimit(2)
+                Text([request.device, request.created.map { $0.formatted(date: .abbreviated, time: .shortened) }].compactMap { $0 }.joined(separator: " · "))
+                    .font(.footnote).foregroundStyle(Theme.text3)
             }
+            Spacer()
+            Text(ApprovalRequest.outcome(request)).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2)
         }
+        .padding(.vertical, Theme.xs)
+        .accessibilityElement(children: .combine)
     }
 }
 

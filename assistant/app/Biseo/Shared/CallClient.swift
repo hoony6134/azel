@@ -97,7 +97,7 @@ final class CallClient {
                                                                          session: session, callID: callID, intent: intent, persona: persona))
         socket = task
         receivedAny = false
-        statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; statsLock.unlock()
+        statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
         Log.call.info("call start session=\(session, privacy: .public) intent=\(intent ?? "-", privacy: .public) host=\(task.originalRequest?.url?.host ?? "?", privacy: .public)")
         task.resume()
         audio.onMic = { [weak self, weak task] data in
@@ -137,51 +137,93 @@ final class CallClient {
     private func receive(_ task: URLSessionWebSocketTask) {
         task.receive { [weak self] result in
             guard let self else { return }
-            // Audio and interrupts are handled right here, in arrival order; UI hops to main.
-            if case .success = result, !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
             switch result {
-            case .success(.data(let pcm)):
-                audio.play(pcm)
-                karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
-                DispatchQueue.main.async { self.thinking.audioArrived() }
-                statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
-                recorder?.assistant(pcm)
-            case .success(.string(let text)):
-                guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { break }
-                if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
-                if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
-                // Event order matters for audio, so these run here, before the UI hop.
-                karaokeLock.lock(); karaoke.apply(type: event.type, text: event.text); karaokeLock.unlock()
-                switch event.type {
-                case "interrupt":
-                    freezeKaraoke()
-                    audio.flush()
-                    playback.apply(event.type)
-                    if !playback.playing { audio.pause() }
-                    recorder?.interrupt()
-                case "pause", "resume":
-                    playback.apply(event.type)   // tentative barge-in: stop playback, keep the queue
-                    applyGate()
-                default: break
-                }
-                recorder?.note(event)
-                DispatchQueue.main.async {
-                    if let cue = self.thinking.event(event.type, value: event.value, now: ProcessInfo.processInfo.systemUptime) {
-                        self.cue(cue, listening: false)
-                    }
-                    self.onEvent?(event)
-                }
+            case .success(let message):
+                if !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
+                process(message)
             case .failure:
                 let status = (task.response as? HTTPURLResponse)?.statusCode
                 let message = Self.closeMessage(status: status, receivedAny: receivedAny)
                 Log.call.error("call socket closed: status=\(status ?? -1, privacy: .public) code=\(task.closeCode.rawValue, privacy: .public)")
                 DispatchQueue.main.async { if task === self.socket { self.onClose?(message) } }
                 return
-            @unknown default:
-                break
             }
             receive(task)
         }
+    }
+
+    /// One socket message, in arrival order. Audio and interrupts are handled right here; the UI
+    /// hops to main. Internal (not private) so tests can feed a scripted server.
+    func process(_ message: URLSessionWebSocketTask.Message) {
+        switch message {
+        case .data(let pcm):
+            // After an interrupt, frames of the old reply may still arrive: drop them.
+            admissionLock.lock(); let admit = admission.admits; admissionLock.unlock()
+            guard admit else { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock(); return }
+            audio.play(pcm)
+            karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
+            DispatchQueue.main.async { self.thinking.audioArrived() }
+            statsLock.lock(); receivedAudioBytes += pcm.count; statsLock.unlock()
+            recorder?.assistant(pcm)
+        case .string(let text):
+            guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { return }
+            if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
+            if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
+            // Event order matters for audio, so these run here, before the UI hop.
+            admissionLock.lock()
+            let newReply = event.type == "reply_start" && admission.replyStart(event.reply_id)
+            admission.apply(type: event.type, value: event.value)
+            admissionLock.unlock()
+            // A new reply while the previous one is still playing (the server's playback estimate
+            // ended early): drop the rest of the old one. Its text events already arrived, so the
+            // karaoke keeps them and only restarts its clock.
+            if newReply && audio.speechPlaying {
+                audio.flush()
+                karaokeLock.lock(); karaoke.restartClock(); karaokeLock.unlock()
+            }
+            switch event.type {
+            case "interrupt":
+                cutPlayback()
+                recorder?.interrupt()
+            case "pause", "resume":
+                playback.apply(event.type)   // tentative barge-in: stop playback, keep the queue
+                applyGate()
+            default: break
+            }
+            karaokeLock.lock(); karaoke.apply(type: event.type, text: event.text); karaokeLock.unlock()
+            recorder?.note(event)
+            DispatchQueue.main.async {
+                if let cue = self.thinking.event(event.type, value: event.value, now: ProcessInfo.processInfo.systemUptime) {
+                    self.cue(cue, listening: false)
+                }
+                self.onEvent?(event)
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// Interrupt (server or tap): stop the player now (a stopped node drops every scheduled
+    /// buffer; pausing would keep them), reset the karaoke paragraph, and refuse audio until the
+    /// next reply starts.
+    private func cutPlayback() {
+        freezeKaraoke()
+        audio.flush()
+        playback.apply("interrupt")
+        if !playback.playing { audio.pause() }
+        admissionLock.lock(); admission.interrupt(); admissionLock.unlock()
+    }
+
+    /// Which incoming audio belongs to the reply being played (user bug, 2026-11-22: after an
+    /// interrupt the old answer's audio kept playing over the new one).
+    private var admission = AudioAdmission()
+    private let admissionLock = NSLock()
+    private var droppedAudioBytes = 0
+
+    /// Reply audio accepted for playback and dropped as stale, in bytes (for tests and logs).
+    var audioCounts: (accepted: Int, dropped: Int) {
+        statsLock.lock(); defer { statsLock.unlock() }
+        return (receivedAudioBytes, droppedAudioBytes)
     }
 
     private var gate = EarconGate()
@@ -244,10 +286,7 @@ final class CallClient {
     /// waiting for its `interrupt` echo.
     func interrupt() {
         socket?.send(.string(#"{"type":"interrupt"}"#)) { _ in }
-        freezeKaraoke()
-        audio.flush()
-        playback.apply("interrupt")
-        if !playback.playing { audio.pause() }
+        cutPlayback()
         recorder?.interrupt()
     }
 
@@ -277,6 +316,7 @@ final class CallClient {
         pulseTimer = nil
         thinking = ThinkingCues()
         karaokeLock.lock(); karaoke = KaraokeTimeline(); karaokeLock.unlock()
+        admissionLock.lock(); admission = AudioAdmission(); admissionLock.unlock()
         if wasPlaying { wasPlaying = false; onPlayback?(false) }
         if socket != nil {
             statsLock.lock(); let bytes = sentBytes, got = receivedAudioBytes; statsLock.unlock()
@@ -311,6 +351,30 @@ struct PlaybackGate: Equatable {
         switch eventType {
         case "pause": serverPaused = true
         case "resume", "interrupt": serverPaused = false
+        default: break
+        }
+    }
+}
+
+/// Audio frames are accepted unless an interrupt happened; then nothing is accepted until the next
+/// `reply_start` (or, from a server that doesn't send it, the next `state: speaking`).
+struct AudioAdmission: Equatable {
+    private(set) var admits = true
+    private(set) var replyID: Int?
+
+    mutating func interrupt() { admits = false }
+
+    /// `reply_start`: true when it starts a different reply than the last one (no id counts as new).
+    mutating func replyStart(_ id: Int?) -> Bool {
+        defer { replyID = id }
+        return id == nil || id != replyID
+    }
+
+    mutating func apply(type: String, value: String?) {
+        switch type {
+        case "interrupt": admits = false
+        case "reply_start": admits = true
+        case "state" where value == "speaking": admits = true
         default: break
         }
     }

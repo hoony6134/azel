@@ -21,8 +21,13 @@ targets:
       - path: Biseo/Shared
       - path: Biseo/iOS
         destinationFilters: [iOS]
+      - path: Biseo/LiveActivity
+        destinationFilters: [iOS]
       - path: Biseo/macOS
         destinationFilters: [macOS]
+    dependencies:
+      - target: AzelWidgets
+        destinationFilters: [iOS]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo
@@ -44,6 +49,8 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIBackgroundModes: [audio, voip]
+        NSSupportsLiveActivities: true
+        NSSupportsLiveActivitiesFrequentUpdates: true
         # macOS (ignored on iOS): menu-bar only, no Dock icon
         LSUIElement: true
         # azel://task/<id> opens a task (finish notifications deep-link here)
@@ -57,6 +64,24 @@ targets:
         # 100.64.0.11 → -1022; iOS refuses both), so the app offers only the TLS addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+  # Lock Screen / Dynamic Island Live Activities (call, running tasks). iPhone only.
+  AzelWidgets:
+    type: app-extension
+    platform: iOS
+    sources: [Biseo/Widgets, Biseo/LiveActivity]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.widgets
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: Biseo/Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: Azel
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
   BiseoTests:
     type: bundle.unit-test
     supportedDestinations: [iOS, macOS]

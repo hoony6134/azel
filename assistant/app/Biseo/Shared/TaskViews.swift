@@ -110,6 +110,12 @@ struct TaskDetailView: View {
                     TaskBadgeView(status: t.status)
                 }
                 if let d = t.device { Label(d, systemImage: "laptopcomputer").font(.footnote).foregroundStyle(Theme.text2) }
+                if let b = t.backend {
+                    Label("엔진: " + TaskBackend.label(b), systemImage: "cpu").font(.footnote).foregroundStyle(Theme.text2)
+                    if let why = t.fallback_reason, !why.isEmpty {
+                        Text("대신 처리한 이유: " + why).font(.footnote).foregroundStyle(Theme.amber).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 if t.status == "waiting_approval" {
                     Card("승인이 필요해요") {
                         if approvals.isEmpty { Text("승인 탭에서 확인해 주세요").foregroundStyle(Theme.text2) }
