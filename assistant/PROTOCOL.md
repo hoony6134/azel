@@ -406,13 +406,13 @@ asks, call_logs or schedule requests.
 - brain → voice `{"type":"context","session"?,"value"}`: the Korean context block (≤ 2400 chars: profile,
   situation, recent calls), pushed on connect and whenever it changes (situation refresh every 5 min). With
   `session`: that call only (a placed call adds its reason). The voice server uses a block younger than 15 min, only
-  in Qwen's SYSTEM, and as "알고 있는 것" ahead of a Claude ask on a full link. Never to a limited link.
-- voice → brain `{"type":"call_event","event":"start"|"end","session","reason"?}`; the brain answers a start with
+  in Qwen's SYSTEM; it is never sent to any link.
+- voice → brain `{"type":"call_event","event":"start"|"end","session","reason"?,"opening"?}` (a placed call's); the brain answers a start with
   that session's context.
 - voice → brain `{"type":"tool","id","name","args"}` → `{"id","type":"tool_result","result":"…"}` (Korean, for Qwen).
   Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
   `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
-  schedule list). Timeout 4 s.
+  schedule list). Timeout 3 s.
 - voice → brain `{"type":"recall","id","text"}` → `{"id","type":"recall_result","hits":["…"]}` (≤ 2 memory hits);
   the voice server waits at most 400 ms, then answers without them.
 

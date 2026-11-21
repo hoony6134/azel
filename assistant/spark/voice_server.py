@@ -73,8 +73,11 @@ def reply_length(settings):
 
 def system_prompt(name, length="normal", context=""):
     """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
-    at once. `context`: extra situation text from the brain, appended last."""
-    return f"너는 사용자의 개인 비서 '{name}'야. " + SYSTEM_BODY + " " + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
+    at once. `context`: the brain's block, appended last; with it, Qwen answers personal questions from the context
+    or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
+    endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
+    body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
+    return f"너는 사용자의 개인 비서 '{name}'야. " + body + " " + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
 
@@ -269,7 +272,7 @@ links = GatewayLinks()
 # ---------- brain: context and local tools for Qwen (PROTOCOL.md section 6) ----------
 BRAIN_FRESH_S = 900  # an older context block is ignored (the brain pushes one at least every 5 min while it changes)
 RECALL_WAIT_S = 0.4  # per-turn memory retrieval may delay the answer this much at most
-TOOL_WAIT_S = 4.0
+TOOL_WAIT_S = 3.0  # a slow brain never stalls a turn
 TOOL_TAG = "[TOOL]"
 MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|우리|네가)|했었|했던|라고 했|물어봤")
 BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")
@@ -323,23 +326,19 @@ GatewayLinks.take_context, GatewayLinks.context_for, GatewayLinks.brain_link = _
 GatewayLinks.brain_request, GatewayLinks.brain_event = _brain_request, _brain_event
 
 BRAIN_BODY = (
-    "아래 [아는 것]은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
+    "아래 '참고할 상황'은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
     "여기에 답이 있으면 Claude 없이 네가 바로 답해. 없는 내용은 절대 지어내지 마. "
     f"더 찾아봐야 하면 다른 말 없이 한 줄로 {TOOL_TAG} {{\"name\": 도구, \"args\": {{…}}}} 만 출력해. 도구: "
     "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
     "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
-    "[아는 것]과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
+    "참고할 상황과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
     f"최신 정보, 서버 진단, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해."
 )
 
 
-def brain_system(name, ctx, hits=(), length="normal"):
-    """Qwen's SYSTEM when the brain is up: voice style, the routing and tool rules, then what the brain knows."""
-    body = SYSTEM_BODY.split("중요:")[0] + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) + " "  # voice style + length
-    mem = ("\n[이번 말과 관련된 기록]\n" + "\n".join(f"- {h}" for h in hits)) if hits else ""
-    # Stable parts first, the clock and this turn's hits last, so the endpoint's prefix cache covers the context.
-    return f"너는 사용자의 개인 비서 '{name}'야. " + body + BRAIN_BODY + f"\n\n[아는 것]\n{ctx}\n" + now_kst().strip() + mem
+def memory_hits(hits):
+    return ("\n[이번 말과 관련된 기록]\n" + "\n".join(f"- {h}" for h in hits)) if hits else ""
 
 
 async def run_tool(raw, session):
@@ -919,8 +918,7 @@ async def respond(text, session, t0, timings, on_event=None):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            known = f"비서가 알고 있는 것(참고만):\n{ctx}\n\n" if ctx else ""  # full links only, like the turns
-            async for delta in claude_stream(text, session, model, task, personal, known + recent_context(hist),
+            async for delta in claude_stream(text, session, model, task, personal, recent_context(hist),
                                              on_event=on_event):
                 got_text.set()
                 buf += delta
@@ -945,8 +943,7 @@ async def respond(text, session, t0, timings, on_event=None):
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = brain_system(name, ctx, await recall(bare, timings), length) if ctx \
-                else system_prompt(name, length) + now_kst()
+            system = system_prompt(name, length, ctx) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
@@ -1261,7 +1258,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
         await links.brain_event({"type": "call_event", "event": "start", "session": session,
-                                 "reason": (op or {}).get("reason", "") and (op or {}).get("text", "")})
+                                 "reason": (op or {}).get("reason", ""), "opening": (op or {}).get("text", "")})
         start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started,
                          # the user's point of view, like a phone's call log: the assistant calling = incoming
                          direction="incoming" if call_id else "outgoing",
