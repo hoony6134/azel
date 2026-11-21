@@ -956,7 +956,7 @@ def claude_failure(result):
         hint = ""
         if when:
             h = int(when.group(1)) % 12 + (12 if when.group(3).lower() == "pm" else 0)
-            hint = f" {'오전' if h < 12 else '오후'} {h % 12 or 12}시{' ' + when.group(2) + '분' if when.group(2) and when.group(2) != '00' else ''}쯤 풀려요."
+            hint = f" {day_part(h)} {h % 12 or 12}시{' ' + when.group(2) + '분' if when.group(2) and when.group(2) != '00' else ''}쯤 풀려요."
         return {"type": "error", "code": "limit",
                 "message": "지금은 Claude 사용 한도에 걸려서 답할 수 없어요." + (hint or " 조금 뒤에 다시 물어봐 주세요.")}
     return {"type": "error", "code": "claude_error", "message": "지금은 Claude가 답하지 못했어요. 조금 뒤에 다시 물어봐 주세요."}
@@ -1353,10 +1353,14 @@ def next_at(at, repeat, now=None):
             return dt.timestamp()
 
 
+def day_part(hour):
+    return "밤" if hour == 0 else "낮" if hour == 12 else "오전" if hour < 12 else "오후"  # not "오전 12시"
+
+
 def spoken_when(at, repeat=None, now=None):
     """'내일 오전 10시', '매일 오전 7시', '평일 오전 6시 40분', '매주 월요일 오전 9시'."""
     dt, today = datetime.fromtimestamp(at, KST), datetime.fromtimestamp(now or time.time(), KST).date()
-    clock = f"{'오전' if dt.hour < 12 else '오후'} {dt.hour % 12 or 12}시" + (f" {dt.minute}분" if dt.minute else "")
+    clock = f"{day_part(dt.hour)} {dt.hour % 12 or 12}시" + (f" {dt.minute}분" if dt.minute else "")
     if repeat == "daily":
         day = "매일"
     elif repeat == "weekdays":

@@ -787,7 +787,7 @@ def test_spoken_times(gw):
         (kst(2026, 11, 30, 9, 0), None, "11월 30일 오전 9시"), (kst(2026, 11, 22, 7, 0), "daily", "매일 오전 7시"),
         (kst(2026, 11, 23, 6, 40), "weekdays", "평일 오전 6시 40분"), (kst(2026, 11, 23, 9, 0), "weekly:0", "매주 월요일 오전 9시"),
         (kst(2026, 11, 29, 9, 0), "weekly:6", "매주 일요일 오전 9시"),
-        (kst(2026, 11, 22, 0, 5), None, "내일 오전 12시 5분")]:
+        (kst(2026, 11, 22, 0, 5), None, "내일 밤 12시 5분"), (kst(2026, 11, 21, 12, 30), None, "오늘 낮 12시 30분")]:
         assert g.spoken_when(at.timestamp(), repeat, now) == want, want
     fri7 = kst(2026, 11, 27, 7, 0).timestamp()  # a Friday
     assert g.next_at(fri7, "weekdays", fri7) == kst(2026, 11, 30, 7, 0).timestamp()  # skips the weekend
