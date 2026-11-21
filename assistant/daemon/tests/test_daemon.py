@@ -338,9 +338,12 @@ def test_unlisted_becomes_an_approval_only_where_enabled(cfg, gw, tmp_path):
         assert res["status"] == "ok" and res["stdout"] == "bye\n"
         assert calls[-1] == ("POST", "/v1/approvals/ap1/ran", {"exit_code": 0, "status": "ok"})  # audited, no output
         assert d.run_command(command="echo bye", cwd="proj", approval_id="ap1")["status"] == "refused"  # used
-        home_dir = d.Path.home()  # approved runs may use any existing directory under $HOME
-        approvals["h"] = {"device": "testbox", "status": "approved", "command": "echo home", "cwd": str(home_dir.resolve())}
-        assert d.run_command(command="echo home", cwd=str(home_dir), approval_id="h")["status"] == "ok"
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=d.Path.home()) as sub:  # any existing directory under $HOME …
+            approvals["h"] = {"device": "testbox", "status": "approved", "command": "echo home", "cwd": str(d.Path(sub).resolve())}
+            assert d.run_command(command="echo home", cwd=sub, approval_id="h")["status"] == "ok"
+        approvals["hh"] = {"device": "testbox", "status": "approved", "command": "echo home", "cwd": str(d.Path.home().resolve())}
+        assert d.run_command(command="echo home", cwd=str(d.Path.home()), approval_id="hh")["status"] == "refused"  # … not ~
         assert d.run_command(command="echo bye", cwd="/tmp")["status"] == "refused"  # not under $HOME
     finally:
         d.CFG["approve_unlisted"] = False
@@ -429,7 +432,7 @@ def test_hard_deny_symlink_into_secrets(cfg, gw, tmp_path):
 
 
 @pytest.mark.parametrize("cmd", ['open -a "Google Chrome"', "open https://example.com", "python3 tool.py",
-                                 "mkdir -p reports", "make build"])
+                                 "mkdir -p reports", "cp a.txt b.txt"])
 def test_ordinary_commands_still_reach_approval(cfg, gw, cmd):
     d.CFG["approve_unlisted"] = True
     try:
@@ -437,3 +440,98 @@ def test_ordinary_commands_still_reach_approval(cfg, gw, cmd):
     finally:
         d.CFG["approve_unlisted"] = False
     assert res["status"] == "pending_approval", (cmd, res)
+
+
+ROUND3 = [
+    # 2: attached short-option values are always path-checked, and -C moves where later relative paths land
+    "tar -czf /tmp/o.tgz -C ~ .config", "tar -czf /tmp/o.tgz --directory=/Users/x/.. jh",
+    "rg -uuu BEGIN -g.ssh", "head -n1 -T" + "../" * 20,
+    # 3: inline-code tools and command-running options
+    "awk BEGIN{system(1)}", "gawk 1", "nawk 1", "expect -c x", "sqlite3 x .shell", "vim -c q", "vi x", "nvim x",
+    "emacs --batch", "tmux new", "screen -dm x", "bun x.js", "deno run x.ts", "php x.php", "make", "make build",
+    "xcrun simctl", "git -c core.pager=x log", "git -ccore.pager=x log", "git --config-env=x=y log",
+    "git --exec-path=/tmp log", "git fetch --upload-pack=x", "git push --receive-pack=x", "git config core.sshCommand x",
+    "env GIT_SSH_COMMAND=x git fetch", "env PAGER=x git log", "env LD_PRELOAD=x ls", "env DYLD_INSERT_LIBRARIES=x ls",
+    "ssh -o ProxyCommand=x host", "ssh -oProxyCommand=x host", "ssh -F cfg host", "scp -S prog a b:c", "scp -o x a b:c",
+    "rsync -e prog a b:", "rsync --rsh=prog a b:", "sftp -o x host", "zip -TT x a.zip a", "zip --unzip-command=x a.zip a",
+    "tar -I prog -cf a.tar x", "tar -cIprog -f a.tar x", "tar --use-compress-program=x -cf a x", "tar --to-command=x -xf a",
+    "tar --checkpoint-action=exec=x -cf a x", "less +!x file", "less !x",
+    # 4: persistence
+    "cp x ~/.zshrc", "tee ~/.zprofile", "cat ~/.zshenv", "cp x ~/.bashrc", "cp x ~/.bash_profile", "cp x ~/.profile",
+    "cp x.plist ~/Library/LaunchAgents/", "cp x ~/.gitconfig", "cp x ~/.config/git/config", "launchctl load x",
+    "crontab x", "defaults write com.apple.x k v", "at now", "periodic daily", "ls ~/Library",
+    # 5: disks
+    "diskutil unmountDisk disk2", "diskutil mount disk2", "diskutil apfs list", "dd if=x of=//dev/disk2",
+    "dd if=x of=/dev/../dev/disk2",
+    # 9: symlinks resolve from the link's directory
+    "ln -s ../../.config/biseo proj/k", "ln -s ~/.ssh k", "ln -sf " + "../" * 20 + " k",
+    "ln --symbolic ~/.config x",
+]
+
+
+@pytest.mark.parametrize("cmd", ROUND3)
+def test_hard_deny_round3(cfg, gw, cmd):
+    d.CFG["approve_unlisted"] = True
+    cfg["roots"].append(d.Path.home().resolve())
+    try:
+        res = d.run_command(command=cmd, cwd=str(cfg["roots"][0] / "proj"))
+    finally:
+        cfg["roots"].pop()
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", (cmd, res)
+    assert not [c for c in gw[0] if c[1] == "/v1/approvals"], cmd
+
+
+@pytest.mark.parametrize("cwd", ["~", "~/.config", "/Users", "/"])
+def test_cwd_above_secrets_refused(cfg, gw, cwd):
+    d.CFG["approve_unlisted"] = True
+    try:
+        res = d.run_command(command="rg -uuu BEGIN", cwd=cwd)
+    finally:
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", (cwd, res)
+
+
+def test_ln_target_relative_to_the_link_dir(cfg, gw, tmp_path, monkeypatch):
+    """`ln -s ../x deep/link`: ../x is resolved from deep/, so a target that only looks harmless from the cwd is caught."""
+    deep = cfg["roots"][0] / "proj" / "a" / "b"
+    deep.mkdir(parents=True)
+    home = d.Path.home().resolve()
+    rel = os.path.relpath(home / ".config", deep)  # harmless-looking from proj, ~/.config from deep/
+    d.CFG["approve_unlisted"] = True
+    try:
+        res = d.run_command(command=f"ln -s {rel} a/b/link", cwd="proj")
+    finally:
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", res
+
+
+def test_requester_header_reaches_the_approval(live, gw):
+    calls, approvals = gw
+    d.CFG["approve_unlisted"] = True
+
+    async def go():
+        http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}", "X-Azel-Requester": "task:abc123abc123"})
+        async with Client(streamable_http_client(live, http_client=http)) as c:
+            return await c.call_tool("run_command", {"command": "printf requester", "cwd": "proj"})
+    try:
+        res = anyio.run(go)
+    finally:
+        d.CFG["approve_unlisted"] = False
+    assert "pending_approval" in json.dumps(res.structured_content or [c.model_dump() for c in res.content])
+    post = [c for c in calls if c[1] == "/v1/approvals"]
+    assert post and post[-1][2]["requester"] == "task:abc123abc123", post
+
+
+@pytest.mark.parametrize("cmd", ["tar -czf /tmp/o.tgz -Cx/../.. .config", "tar -czf /tmp/o.tgz -C .. .config",
+                                 "tar -czf /tmp/o.tgz --directory=.. .ssh", "rg -uuu BEGIN -C2 .."])
+def test_dash_c_moves_the_base(cfg, gw, cmd):
+    """From a directory just under ~, `-C..` makes `.config` mean ~/.config."""
+    import tempfile
+    d.CFG["approve_unlisted"] = True
+    try:
+        with tempfile.TemporaryDirectory(dir=d.Path.home()) as sub:
+            res = d.run_command(command=cmd, cwd=sub)
+    finally:
+        d.CFG["approve_unlisted"] = False
+    assert res["status"] == "refused", (cmd, res)

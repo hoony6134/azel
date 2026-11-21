@@ -6,6 +6,7 @@ See ../PROTOCOL.md section 4. Run: `uv run python biseo_daemon.py [--config PATH
 import argparse
 import asyncio
 import concurrent.futures
+import contextvars
 import functools
 import hmac
 import ipaddress
@@ -128,8 +129,21 @@ INLINE_LONG = {"--eval", "--print", "--command"}
 TERMINALS = {"terminal", "terminal.app", "iterm", "iterm.app", "iterm2", "iterm2.app", "com.apple.terminal",
              "com.googlecode.iterm2"}
 SCRIPT_EXT = (".command", ".tool", ".sh", ".scpt", ".scptd", ".applescript", ".workflow")
-SECRET_DIRS = ("~/.config/biseo", "~/.ssh", "~/.claude", "~/Library/Keychains")
-SECRET_WORDS = (".config/biseo", ".ssh/", "/.ssh", ".claude", "Keychains", ".keychain")  # also inside flag values
+SECRET_DIRS = ("~/.config/biseo", "~/.ssh", "~/.claude", "~/Library/Keychains",
+               # persistence: shell start-up files, login items, git hooks and config
+               "~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.zlogin", "~/.bashrc", "~/.bash_profile", "~/.profile",
+               "~/Library/LaunchAgents", "~/.gitconfig", "~/.config/git")
+SECRET_WORDS = (".config/biseo", ".ssh/", "/.ssh", ".claude", "Keychains", ".keychain", ".zshrc", ".zprofile",
+                ".zshenv", ".bashrc", ".bash_profile", "LaunchAgents", ".gitconfig", ".config/git")  # also in flag values
+# Programs that run code from their arguments or start sessions, never allowed (macOS ships most of them).
+DENY_PROGRAMS = {"awk", "gawk", "nawk", "mawk", "expect", "sqlite3", "vim", "vi", "nvim", "view", "emacs", "tmux",
+                 "screen", "bun", "deno", "php", "make", "gmake", "xcrun", "launchctl", "crontab", "at", "batch",
+                 "periodic", "osascript", "security"}
+# Variables that make an innocent program run something else (via env VAR=… or a leading assignment).
+DENY_VARS = {"git_ssh", "git_ssh_command", "git_exec_path", "git_pager", "git_editor", "git_askpass", "pager",
+             "editor", "visual", "lessopen", "lessclose", "ld_preload", "dyld_insert_libraries", "bash_env", "env",
+             "pythonstartup", "node_options", "perl5opt", "rsync_rsh", "ssh_askpass"}
+DISKUTIL_OK = {"list", "info"}
 
 
 def _expand(tokens: list[str]) -> list[str]:
@@ -167,8 +181,8 @@ def _path_values(t: str) -> list[str]:
     vals = [t]
     if t.startswith("-") and "=" in t:
         vals.append(t.split("=", 1)[1])
-    if t.startswith("-") and not t.startswith("--") and len(t) > 2 and t[2] in "/~.":
-        vals.append(t[2:])
+    if t.startswith("-") and not t.startswith("--") and len(t) > 2:
+        vals.append(t[2:])  # every attached short-option value (`-Cbiseo/../..`, `-T~/x`), resolved by the caller
     return vals
 
 
@@ -184,8 +198,28 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
         rest, low = tokens[i + 1:], [r.lower() for r in tokens[i + 1:]]
         if n in SHELLS and any(r == "-c" or "c" in _short_flags(r) or r == "--command" for r in rest):
             raise Refused("shell -c is never allowed (run the command itself)")
-        if n == "osascript" or n == "security":
+        if n in DENY_PROGRAMS:
             raise Refused(f"{n} is never allowed")
+        if "=" in tokens[i] and not tokens[i].startswith("-") and tokens[i].split("=", 1)[0].lower() in DENY_VARS:
+            raise Refused(f"{tokens[i].split('=', 1)[0]} is never allowed")
+        if n == "git" and any(r in ("-c", "--exec-path") or r.startswith(("-c", "--config", "--exec-path", "--upload-pack",
+                                                                           "--receive-pack")) or "sshcommand" in r
+                              for r in low):
+            raise Refused("git options that run commands are never allowed")
+        bad = ("-e", "--rsh") if n == "rsync" else ("-o", "-f", "-s", "-e") if n in ("ssh", "scp", "sftp") else None
+        if bad and any(r.startswith(bad) or "proxycommand" in r or "localcommand" in r or "proxyjump" in r for r in low):
+            raise Refused(f"{n} options that run commands are never allowed")  # -o/-F/-S/-e/--rsh/ProxyCommand
+        if n == "zip" and any(r.startswith(("-tt", "--unzip-command")) for r in low):
+            raise Refused("zip -TT is never allowed")
+        if n in ("tar", "gtar", "bsdtar") and any(
+                r == "-i" or (r.startswith("-") and not r.startswith("--") and "I" in tokens[i + 1 + k][1:])
+                or r.startswith(("--use-compress-program", "--to-command", "--checkpoint-action", "--info-script",
+                                 "--new-volume-script")) for k, r in enumerate(low)):
+            raise Refused("tar options that run commands are never allowed")
+        if n in ("less", "more") and any("!" in r for r in rest):
+            raise Refused("less ! is never allowed")
+        if n == "defaults" and low[:1] and low[0] in ("write", "import", "delete", "rename"):
+            raise Refused("defaults write is never allowed")
         letters = "c" if re.fullmatch(r"python[\d.]*", n) else INLINE.get(n)
         if letters and any(set(_short_flags(r)) & set(letters) or r.split("=")[0] in INLINE_LONG for r in rest):
             raise Refused(f"inline code ({n} {'/'.join('-' + c for c in letters)}) is never allowed")
@@ -206,27 +240,45 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
                 p = (wd / Path(r.replace("$HOME", "~")).expanduser()).resolve()
                 if p == Path("/") or home.is_relative_to(p):
                     raise Refused("find -delete on / or the home directory is never allowed")
-        if n == "diskutil" and rest:
-            sub = low[0]
-            if sub.startswith(("erase", "zerodisk", "secureerase", "reformat", "partitiondisk")) or (
-                    sub == "apfs" and len(low) > 1 and low[1].startswith(("delete", "erase"))):
-                raise Refused("erasing disks is never allowed")
+        if n == "diskutil" and (not low or low[0] not in DISKUTIL_OK):
+            raise Refused("diskutil: only list and info are allowed")
         if n.startswith(("mkfs", "newfs")):
             raise Refused("formatting is never allowed")
-        if n == "dd" and any(r.startswith("of=/dev/") for r in low):
+        if n == "dd" and any(r.startswith("of=") and (wd / Path(r[3:]).expanduser()).resolve().is_relative_to("/dev")
+                             for r in low):
             raise Refused("dd to a device is never allowed")
-    if any(wd == s or wd.is_relative_to(s) for s in secrets):
-        raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
+        if n == "ln" and any(r == "--symbolic" or "s" in _short_flags(r) for r in rest):
+            args = [r for r in rest if not r.startswith("-")]
+            if args:  # a link's relative target is resolved from the link's own directory, not the cwd
+                last = (wd / Path(args[-1]).expanduser())
+                link_dir = last if len(args) > 1 and last.is_dir() else (last.parent if len(args) > 1 else wd)
+                for tgt in args[:-1] if len(args) > 1 else args:
+                    for base in (link_dir, wd):
+                        p = (base / Path(tgt).expanduser()).resolve()
+                        if any(p == s or p.is_relative_to(s) or s.is_relative_to(p) for s in secrets):
+                            raise Refused(f"a link to the assistant's, SSH, Claude, keychain or start-up files: {tgt}")
+    # cwd: never a secret dir, inside one, or above one (~ would let `rg -uuu` read ~/.ssh)
+    if any(wd == s or wd.is_relative_to(s) or s.is_relative_to(wd) for s in secrets):
+        raise Refused("cwd covers the assistant's, SSH, Claude, keychain or start-up files")
+    bases = [wd]  # -C / --directory change where later relative paths land (tar, git, make…)
+    for k, t in enumerate(tokens):
+        if t in ("-C", "--directory") and k + 1 < len(tokens):
+            bases.append((wd / Path(tokens[k + 1]).expanduser()).resolve())
+        elif t.startswith("--directory="):
+            bases.append((wd / Path(t.split("=", 1)[1]).expanduser()).resolve())
+        elif t.startswith("-C") and len(t) > 2 and not t.startswith("--"):
+            bases.append((wd / Path(t[2:]).expanduser()).resolve())
     for t in tokens:
         for v in _path_values(t):
             if any(w.lower() in v.lower() for w in SECRET_WORDS) or v.rstrip("/").lower().endswith(".ssh"):
-                raise Refused("the assistant's, SSH, Claude and keychain files are never touched")
+                raise Refused("the assistant's, SSH, Claude, keychain and start-up files are never touched")
             if not v or (v.startswith("-") and v == t):
                 continue
-            p = (wd / Path(v.replace("$HOME", "~")).expanduser()).resolve()
-            # the secret dirs themselves, anything inside them, and their ancestors (~, ~/.config, /Users, /)
-            if any(p == s or p.is_relative_to(s) or s.is_relative_to(p) for s in secrets):
-                raise Refused(f"path covers the assistant's, SSH, Claude or keychain files: {v}")
+            for base in bases:
+                p = (base / Path(v.replace("$HOME", "~")).expanduser()).resolve()
+                # the secret paths themselves, anything inside them, and their ancestors (~, ~/.config, /Users, /)
+                if any(p == s or p.is_relative_to(s) or s.is_relative_to(p) for s in secrets):
+                    raise Refused(f"path covers the assistant's, SSH, Claude, keychain or start-up files: {v}")
 
 
 def run_dir(cwd: str | None, approved: bool) -> Path:
@@ -365,8 +417,8 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     wd = run_dir(cwd, approved=bool(approval_id) or (unlisted and CFG["approve_unlisted"]))
     hard_deny(tokens, wd)  # before any approval is created, and for approved runs too
     if not approval_id and (risky or unlisted):
-        r = gateway("POST", "/v1/approvals",
-                    {"device": CFG["id"], "tool": "run_command", "command": command, "cwd": str(wd)})
+        r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": "run_command", "command": command,
+                                              "cwd": str(wd), **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
         if r.get("status") != "approved":  # an "always" rule approves it on the spot
             return {"status": "pending_approval", "approval_id": r["approval_id"]}
         approval_id = r["approval_id"]
@@ -579,6 +631,10 @@ TOOLS = [list_dir, read_file, search, run_command, delegate, job_status, list_jo
 
 # ---------- HTTP app ----------
 
+REQUESTER: "contextvars.ContextVar[str]" = contextvars.ContextVar("requester", default="")
+REQUESTER_RE = re.compile(r"(ask|task):[A-Za-z0-9_:.-]{1,100}")
+
+
 class BearerAuth:
     """ASGI middleware: 401 unless `Authorization: Bearer <token>` matches (constant-time)."""
 
@@ -593,6 +649,9 @@ class BearerAuth:
                             "headers": [(b"content-type", b"application/json"), (b"www-authenticate", b"Bearer")]})
                 await send({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
                 return
+            # which gateway ask or task this call belongs to (set by the gateway per run): approvals carry it
+            req = dict(scope["headers"]).get(b"x-azel-requester", b"").decode(errors="ignore")
+            REQUESTER.set(req if REQUESTER_RE.fullmatch(req) else "")
         await self.app(scope, receive, send)
 
 
