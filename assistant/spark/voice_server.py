@@ -1064,24 +1064,64 @@ async def turn(request: Request, session: str = "default"):
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
-class Turn:
-    """Server-side end-of-speech detection over a stream of 16 kHz PCM16 bytes."""
-    FRAME = 512
+# Voice activity: Silero's probability AND a margin over the call's own noise floor (background noise, other
+# people's voices far away). Tunable; `noise_mode: noisy` (shared setting) raises the bar and turns voice
+# barge-in off during playback (tap-to-interrupt still works).
+VAD_MODES = {
+    "normal": {"threshold": float(os.environ.get("VAD_THRESHOLD", "0.5")),
+               "margin_db": float(os.environ.get("NOISE_MARGIN_DB", "10")),
+               "min_voiced_ms": int(os.environ.get("MIN_VOICED_MS", "250")),
+               "barge_voiced_ms": int(os.environ.get("BARGE_MIN_VOICED_MS", "500")), "barge": True},
+    "noisy": {"threshold": float(os.environ.get("NOISY_VAD_THRESHOLD", "0.7")),
+              "margin_db": float(os.environ.get("NOISY_MARGIN_DB", "15")),
+              "min_voiced_ms": int(os.environ.get("NOISY_MIN_VOICED_MS", "400")),
+              "barge_voiced_ms": 10**9, "barge": False},
+}
 
-    def __init__(self, vad, end_silence_ms=END_SILENCE_MS, threshold=0.5):
-        self.vad, self.threshold = vad, threshold
+
+class Turn:
+    """Server-side end-of-speech detection over a stream of 16 kHz PCM16 bytes, gated by an adaptive noise floor."""
+    FRAME = 512
+    FLOOR_MIN = 30.0  # int16 RMS; digital silence must not make every breath "10 dB above the floor"
+    FLOOR_START_MAX = 300.0  # a quiet room; speech is roughly 2000-8000
+
+    def __init__(self, vad, end_silence_ms=END_SILENCE_MS, threshold=None, mode="normal"):
+        self.vad = vad
+        self.set_mode(mode)
+        if threshold is not None:
+            self.threshold = threshold
         self.end_frames = max(1, int(end_silence_ms / 1000 * 16000 / self.FRAME))
         self.pre = int(0.3 * 16000 / self.FRAME)
         self.pending = b""
         self.ring, self.speech, self.silent, self.voiced = [], [], 0, 0
+        self.floor, self.last_voiced_s = None, 0.0
+
+    def set_mode(self, mode):
+        m = VAD_MODES.get(mode, VAD_MODES["normal"])
+        self.mode, self.threshold, self.margin = mode if mode in VAD_MODES else "normal", m["threshold"], \
+            10 ** (m["margin_db"] / 20)
+        self.min_voiced_s, self.barge_voiced_s, self.barge = m["min_voiced_ms"] / 1000, m["barge_voiced_ms"] / 1000, m["barge"]
+
+    def loud_enough(self, frame):
+        """Track the noise floor (down fast, up slowly, so steady babble becomes the floor within seconds while a
+        sentence barely moves it) and say whether this frame stands out from it by the margin."""
+        x = np.frombuffer(frame, np.int16).astype(np.float32)
+        rms = max(float(np.sqrt(np.mean(x * x))), 1.0)
+        if self.floor is None:  # capped: if the user talks the moment the call connects, the floor is not their voice
+            self.floor = min(max(rms, self.FLOOR_MIN), self.FLOOR_START_MAX)
+        loud = rms >= self.floor * self.margin
+        # down fast (pauses between words), up 1 % per 32 ms frame: steady babble becomes the floor in ~4 s
+        self.floor = max(self.FLOOR_MIN, 0.7 * self.floor + 0.3 * rms if rms < self.floor else self.floor * 1.01)
+        return loud
 
     def feed(self, data: bytes):
-        """Yield ("start", None) when speech begins and ("end", float32 audio) when it ends."""
+        """Yield ("start", None) when speech begins, ("end", float32 audio) when it ends (self.last_voiced_s is its
+        voiced time), and ("drop", None) when what started was too short to be a turn (a click, a cough)."""
         self.pending += data
         step = self.FRAME * 2
         while len(self.pending) >= step:
             frame, self.pending = self.pending[:step], self.pending[step:]
-            voiced = self.vad(frame) >= self.threshold
+            voiced = self.loud_enough(frame) and self.vad(frame) >= self.threshold
             if not self.speech:
                 self.ring = (self.ring + [frame])[-self.pre:]
                 if voiced:
@@ -1094,8 +1134,36 @@ class Turn:
             if self.silent >= self.end_frames:
                 audio = np.frombuffer(b"".join(self.speech), dtype=np.int16).astype(np.float32) / 32768
                 self.speech, self.ring = [], []
-                if self.voiced * self.FRAME >= 0.25 * 16000:  # less voiced time is a click or cough
-                    yield "end", audio
+                self.last_voiced_s = self.voiced * self.FRAME / 16000
+                yield ("end", audio) if self.last_voiced_s >= self.min_voiced_s else ("drop", None)
+
+
+FILLER_SOUNDS = re.compile(r"(음+|어+|아+|으+|흠+|에+|그+|저기|그러니까)[\s.,!?~]*")
+STOP_WORDS = re.compile(r"아니|그만|잠깐|취소|됐어|멈춰|스톱|stop|그거 말고", re.I)
+QUESTION = re.compile(r"\?|뭐|언제|어디|누구|왜|어떻게|몇|얼마|무슨|어때|알려|해\s*줘|줄래|할까|인가|나요|까요|니\b")
+
+
+def real_content(text):
+    """A transcript that is someone talking to the assistant, not noise: two or more Hangul syllables outside
+    filler sounds (음, 어…), and not one of Whisper's silence hallucinations."""
+    text = (text or "").strip()
+    if not text or text.rstrip(".!") in HALLUCINATIONS:
+        return False
+    words = [w for w in re.split(r"\s+", text) if not FILLER_SOUNDS.fullmatch(w)]
+    return len(re.findall(r"[가-힣]", "".join(words))) >= 2 or bool(re.search(r"[A-Za-z]{3,}", text))
+
+
+def barge_verdict(text, voiced_s, vad_turn):
+    """While the assistant was speaking: 'interrupt' only for long enough speech with real content, else 'resume'."""
+    return "interrupt" if vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text) else "resume"
+
+
+def followup_action(text):
+    """While the assistant is thinking: 'ignore' noise, 'replace' the question being worked on (stop words or a
+    new question), or 'queue' it to answer afterwards."""
+    if not real_content(text):
+        return "ignore"
+    return "replace" if STOP_WORDS.search(text) or QUESTION.search(text) else "queue"
 
 
 @app.websocket("/v1/gateway-link")
@@ -1134,11 +1202,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     session = session or f"call-{int(time.time())}"
     log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
     start_log = {"event": "start", "log_id": log_id}
-    vad_turn = Turn(SileroVoiceActivityDetector())
+    vad_turn = Turn(SileroVoiceActivityDetector(), mode=links.settings.get("noise_mode", "normal"))
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
     # faster than real time, so "still talking" is judged by this, not by the task.
-    current: dict = {"task": None, "play_end": 0.0}
+    current: dict = {"task": None, "play_end": 0.0, "paused_at": None}
 
     async def send(obj=None, audio=None):
         async with send_lock:
@@ -1171,6 +1239,44 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         finally:
             if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
                 guard.first_end = guard.play_end = current["play_end"]
+
+    async def pause():
+        """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
+        current["paused_at"] = time.monotonic()
+        await send({"type": "pause"})
+
+    async def resume():
+        if current["paused_at"] is not None:
+            current["play_end"] += time.monotonic() - current["paused_at"]  # playback stood still meanwhile
+            current["paused_at"] = None
+            await send({"type": "resume"})
+
+    async def barge_check(audio, voiced_s):
+        """Second stage: interrupt only for real speech, else let the reply play on."""
+        t = time.perf_counter()
+        text = await transcribe(audio)
+        if barge_verdict(text, voiced_s, vad_turn) == "interrupt":
+            current["paused_at"] = None
+            await interrupt()
+            current["task"] = asyncio.current_task()
+            await answer(audio, text, timings={"barge_stt_ms": ms(t)})
+        else:
+            await resume()
+
+    async def followup(audio, prev):
+        """Speech while the assistant is thinking: a replacement cancels the current answer, a follow-up waits."""
+        text = await transcribe(audio)
+        act = followup_action(text)
+        if act == "ignore":
+            return
+        if act == "replace":
+            if prev and not prev.done():
+                prev.cancel()
+            await asyncio.gather(prev, return_exceptions=True) if prev else None
+            await send({"type": "interrupt"})
+        else:
+            await asyncio.gather(prev, return_exceptions=True) if prev else None
+        await answer(audio, text)
 
     async def interrupt(protected=False):
         # Let the opening's first sentence finish playing; re-read, since its end is known only once sent.
@@ -1213,8 +1319,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if text and not is_greeting(text, len(audio) / 16000):
             await interrupt_then_answer(audio, text)
 
-    async def answer(audio, text=None):
-        t0, timings = time.perf_counter(), {}
+    async def answer(audio, text=None, timings=None):
+        t0, timings = time.perf_counter(), timings or {}
         turn = {"assistant": [], "activity": [], "route": "", "interrupted": False}
 
         async def on_event(ev):
@@ -1283,21 +1389,34 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
                     asyncio.create_task(tap_interrupt())
                 continue
+            vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
                 now = time.monotonic()
                 task = current["task"]
                 busy = task and not task.done()
-                if kind == "start" and (busy or now < current["play_end"]):
-                    if guard.start(now) == "interrupt":
-                        await interrupt()
+                playing = now < current["play_end"] or current["paused_at"] is not None
+                if kind == "start" and guard.active(now):
+                    guard.start(now)  # a placed call's opening: its own rules (first sentence, greetings)
+                elif kind == "start" and playing and current["paused_at"] is None and vad_turn.barge:
+                    await pause()
+                elif kind == "drop":
+                    guard.end(now, 0.0)
+                    await resume()  # a click or cough: the reply plays on
                 elif kind == "end":
-                    act = guard.end(now, len(audio) / 16000)
-                    if act == "answer":
-                        current["task"] = asyncio.create_task(answer(audio))
-                    elif act == "check":
-                        asyncio.create_task(check_greeting(audio))
+                    if guard.speech_at is not None:
+                        act = guard.end(now, len(audio) / 16000)
+                        if act == "check":
+                            asyncio.create_task(check_greeting(audio))
+                        else:
+                            asyncio.create_task(interrupt_then_answer(audio))
+                    elif current["paused_at"] is not None:
+                        asyncio.create_task(barge_check(audio, vad_turn.last_voiced_s))
+                    elif playing and not vad_turn.barge:
+                        pass  # noisy mode: speech over the reply is not a turn
+                    elif busy:  # thinking: never cancel on raw voice, decide on the transcript
+                        current["task"] = asyncio.create_task(followup(audio, task))
                     else:
-                        asyncio.create_task(interrupt_then_answer(audio))
+                        current["task"] = asyncio.create_task(answer(audio))
             if guard.tick(time.monotonic()) == "interrupt":
                 await interrupt()
     except WebSocketDisconnect:
@@ -1337,7 +1456,42 @@ if __name__ == "__main__":
         assert [k for k, _ in ev] == ["start", "end"] and 0.9 < len(ev[1][1]) / 16000 < 1.6, ev
         assert list(t.feed(quiet)) == []
         short = (np.ones(3000, np.int16) * 3000).tobytes()   # 0.19 s blip: no turn
-        assert [k for k, _ in t.feed(short + quiet)] == ["start"]
+        assert [k for k, _ in t.feed(short + quiet)] == ["start", "drop"]  # a blip: no turn, and playback resumes
+
+        # noise: Silero says "speech" for everything here (its worst case); only the noise floor stands between
+        def tone(seconds, amp, seed=0):
+            rng = np.random.default_rng(seed)
+            return (rng.standard_normal(int(16000 * seconds)) * amp).clip(-32000, 32000).astype(np.int16).tobytes()
+        always = lambda frame: 0.95  # noqa: E731
+        silence = np.zeros(16000, np.int16).tobytes()
+        t = Turn(always)
+        babble = tone(8, 1000, 1)  # continuous babble; speech below is 15 dB louder (1000 * 5.6)
+        assert [k for k, _ in t.feed(babble)] in ([], ["start", "drop"])  # learns it as the floor, no turn
+        assert [k for k, _ in t.feed(tone(4, 1000, 2))] == []  # and stays quiet on it
+        ev = list(t.feed(tone(0.8, 5600, 3) + tone(1, 1000, 4)))  # "잠깐만" over the babble
+        assert [k for k, _ in ev] == ["start", "end"] and t.last_voiced_s >= 0.5, (ev, t.last_voiced_s)
+        t = Turn(always)
+        t.feed(silence) and None
+        list(t.feed(silence))
+        cough = tone(0.2, 8000, 5)
+        assert [k for k, _ in t.feed(cough + silence)] == ["start", "drop"]  # a 200 ms cough: never a turn
+        bursts = b"".join(tone(0.1, 9000, 6 + i) + silence[:9600] for i in range(5))  # door slams, clatter
+        kinds = [k for k, _ in t.feed(bursts + silence)]
+        # bursts 300 ms apart merge into one utterance (end-of-speech needs 500 ms of quiet); it reaches STT, and
+        # noise transcribes to nothing or a hallucination, which the transcript gate rejects
+        assert kinds[0] == "start" and (kinds[-1] == "drop" or barge_verdict("", t.last_voiced_s, t) == "resume")
+        noisy = Turn(always, mode="noisy")
+        list(noisy.feed(silence))
+        assert not noisy.barge and noisy.threshold > t.threshold and noisy.margin > t.margin
+        for text, voiced, want in [("잠깐만", 0.8, "interrupt"), ("잠깐만", 0.3, "resume"), ("음", 0.9, "resume"),
+                                   ("어 어", 0.9, "resume"), ("시청해 주셔서 감사합니다", 1.0, "resume"), ("", 1.0, "resume"),
+                                   ("그거 말고 내일 거", 1.2, "interrupt")]:
+            assert barge_verdict(text, voiced, t) == want, (text, voiced)
+        assert barge_verdict("잠깐만", 2.0, noisy) == "resume"  # noisy: voice never interrupts playback
+        for text, want in [("음", "ignore"), ("", "ignore"), ("아니 그거 말고", "replace"), ("잠깐", "replace"),
+                           ("내일 날씨는 어때?", "replace"), ("그리고 메일도 확인해 줘", "replace"),
+                           ("고마워요", "queue"), ("그리고 회의는 세 시예요", "queue")]:
+            assert followup_action(text) == want, (text, followup_action(text))
         class FakeWS:
             def __init__(self):
                 self.sent = []
@@ -1774,6 +1928,59 @@ if __name__ == "__main__":
             logs = [m for m in gw_ws.sent if m.get("type") == "call_log"]
             links.remove(gw_ws.lk)
             return replies, types, logs
+        def barge_route_check():
+            """Two-stage barge-in through /v1/call while a briefing plays: a cough pauses and resumes, '잠깐만'
+            pauses and interrupts. Silero is stubbed to say 'speech' for everything (its worst case)."""
+            from fastapi.testclient import TestClient
+
+            class BriefGW(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "briefing_context":
+                        links.receive(self.lk, {"id": m["id"], "type": "briefing_context", "situation": "메모", "facts": []})
+
+            async def long_briefing(messages, max_tokens=600):
+                for i in range(6):
+                    yield f"브리핑 {i}번째 문장이에요. "
+
+            async def long_tts(sentence):
+                return b"\0" * 96000, 24000  # 2 s each: the reply keeps playing while the user talks
+
+            async def stt(audio):  # continuous speech → words; a cough or burst → nothing
+                return "잠깐만" if float(np.mean(np.abs(audio) > 0.1)) > 0.25 and len(audio) >= 16000 else ""
+            globals().update(llm_stream=long_briefing, tts=long_tts, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda frame: 0.95))
+            gw_ws = BriefGW()
+            gw_ws.lk = links.add(gw_ws)
+            links.receive(gw_ws.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            got = []
+
+            def until(w, kind):
+                while True:
+                    m = w.receive()
+                    if m.get("text"):
+                        got.append(json.loads(m["text"])["type"])
+                        if got[-1] == kind:
+                            return
+
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?intent=briefing&session=bg", headers={"Authorization": "Bearer app-tok"}) as w:
+                until(w, "reply")  # the briefing is playing
+                w.send_bytes(np.zeros(8000, np.int16).tobytes() + tone(0.2, 8000, 9) + np.zeros(16000, np.int16).tobytes())
+                until(w, "resume")  # cough: paused, then resumed
+                assert "interrupt" not in got and got.count("pause") == 1, got
+                t_speech = time.monotonic()
+                w.send_bytes(tone(0.8, 9000, 10) + np.zeros(16000, np.int16).tobytes())
+                until(w, "interrupt")  # a clear "잠깐만": paused, then interrupted
+                commit_s = time.monotonic() - t_speech
+                assert got[-2:] == ["pause", "interrupt"] or "pause" in got[got.index("resume") + 1:], got
+                w.send_text(json.dumps({"type": "hangup"}))
+            links.remove(gw_ws.lk)
+            return commit_s
+        commit_s = barge_route_check()
+        assert commit_s < 3.0, commit_s  # speech 0.8 s + 0.5 s trailing silence + STT (stubbed here)
+        globals().update(llm_stream=real_llm, tts=real[1])
         replies, types, logs = briefing_check("[4] 토론지 오늘 23시")  # fast path: local Qwen from the note
         assert replies == ["오늘 브리핑이에요.", "토론지가 오늘 밤 11시까지예요.", "승인 대기가 한 건 있어요."], replies
         assert FILLER not in replies and "activity" not in types

@@ -80,6 +80,7 @@ DEFAULTS = {
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
+    "noise_mode": "normal",  # normal | noisy: the voice server's voice-activity thresholds and barge-in
     "connectors": {"claude_ai": {}, "custom": []},  # which MCP servers Claude runs load (connectors.py)
 }
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
@@ -1332,6 +1333,8 @@ async def put_settings(body: dict):
                                     for k, v in both.items()})
         check_proactive(merged)
         body["proactive"] = merged
+    if "noise_mode" in body and body["noise_mode"] not in ("normal", "noisy"):
+        raise HTTPException(400, "noise_mode: normal or noisy")
     if "reply_length" in body and body["reply_length"] not in LENGTH_STYLE:
         raise HTTPException(400, f"reply_length: one of {sorted(LENGTH_STYLE)}")
     if "connectors" in body:

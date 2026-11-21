@@ -202,6 +202,9 @@ def test_reply_length_setting(gw):
     c.post("/v1/ask", json={"text": "b"})
     assert g.LENGTH_STYLE["detailed"] in prompt()
     assert c.put("/v1/settings", json={"reply_length": "long"}).status_code == 400
+    assert c.get("/v1/settings").json()["noise_mode"] == "normal"
+    assert c.put("/v1/settings", json={"noise_mode": "noisy"}).json()["noise_mode"] == "noisy"
+    assert c.put("/v1/settings", json={"noise_mode": "loud"}).status_code == 400
 
 
 def test_settings_reject_unknown(gw):

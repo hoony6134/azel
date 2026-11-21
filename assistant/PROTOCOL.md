@@ -43,8 +43,10 @@ answering a call the assistant placed; the server then speaks that call's openin
   - `{"type":"state","value":"listening"|"thinking"|"speaking"}`
   - `{"type":"transcript","text":"…"}` — what the user said
   - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — sentence being spoken
+  - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
+  - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
-    playback now**
+    playback now** (after a `pause`, or after a tap-to-interrupt)
   - `{"type":"activity","phase","label","tool","kind","route":"claude"}` — what the assistant is doing, for
     the app's status line, icon and sounds. Only Claude turns send any; a Qwen turn sends none. `kind`:
     `calendar|mail|memory|schedule|server|files|web|terminal|notes|generic` (gistra/planit → schedule,
@@ -65,6 +67,20 @@ answering a call the assistant placed; the server then speaks that call's openin
   Claude briefing per 10 min, within which the last briefing text is spoken again. Barge-in works
   as for any reply. The call log records `reason: "briefing"`; what was said becomes the call's
   `opening`.
+- Barge-in and noise. Voice activity needs Silero's probability (0.5; noisy 0.7) **and** a margin over the
+  call's own noise floor (10 dB; noisy 15 dB). The floor follows the level down fast and up about 1 % per
+  32 ms frame, so steady background chatter becomes the floor within seconds. While the assistant is
+  speaking, speech onset only sends `pause`. The interrupt is committed when that utterance ends, only if
+  it had at least 500 ms of voiced frames and its transcript has real content: two or more Hangul syllables
+  outside filler sounds (음, 어…), and not a Whisper silence hallucination. Otherwise the server sends
+  `resume`. Shorter blips (a cough, a click) end in `resume` without STT. The commit comes about 0.5 s after
+  the utterance ends, plus STT; playback is paused from the onset, so the assistant goes quiet as fast as
+  before. While the assistant is thinking (STT, Qwen or Claude running), voice activity never cancels: the
+  new utterance is transcribed, noise is ignored, and stop words (아니, 그만, 잠깐, 취소…) or a new question
+  replace the current answer (`interrupt`, then the new one). Anything else is answered after the current
+  one. Shared setting `noise_mode` `normal`|`noisy`: noisy raises the thresholds (min voiced 400 ms) and
+  turns voice barge-in off while the assistant speaks; tap-to-interrupt still works. Tunable by env:
+  `VAD_THRESHOLD`, `NOISE_MARGIN_DB`, `MIN_VOICED_MS`, `BARGE_MIN_VOICED_MS` and their `NOISY_` variants.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
@@ -206,7 +222,7 @@ device that created them.
                 "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
-   "history_days":365,"reply_length":"normal"}
+   "history_days":365,"reply_length":"normal","noise_mode":"normal"}
   ```
   `reply_length` `brief`|`normal`|`detailed` (else 400) sets how long answers run, with the same wording for
   Qwen's system prompt and Claude's voice style: brief = one or two sentences; normal = brief for chit-chat,
