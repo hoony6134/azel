@@ -1,6 +1,6 @@
 """Drop generated clips whose speech doesn't match their label, using Whisper.
 
-Positives must be heard as the wake word (allowing one wrong syllable, e.g.
+Positives must be heard as the wake word (allowing one wrong syllable for 3+ syllables, e.g.
 박비사); negatives must NOT contain it. Rejected files move to <split>_rejected/
 so nothing is lost.
 
