@@ -1139,10 +1139,12 @@ async def schedule_reply(text, action, session, now=None):
     now = now or datetime.now(KST)
     if action == "list":
         msg, tool = {"type": "schedule", "action": "list"}, ("schedule_list", {})
-    elif action == "cancel":
-        at, _ = parse_when(text, now)
+    elif action == "cancel":  # the same day rule as creating (late_night): "내일 7시 취소" at 01:00 is today's
+        at = late_night.when_from_words(text, now)["at"] if late_night.CLOCK_RE.search(text) else None
         msg = {"type": "schedule", "action": "cancel", **({"at": at.timestamp()} if at else {})}
-        tool = ("schedule_cancel", {"at": at.isoformat()} if at else {})
+        # a time that is still ambiguous ("내일 7시" at night) is passed as words, never as "the soonest one"
+        tool = ("schedule_cancel", {"at": at.isoformat()} if at else
+                {"description": text} if late_night.CLOCK_RE.search(text) else {})
     else:  # the user's own words go to the gateway, which resolves them (late_night, cron) like on every path
         prior = pending_schedule.pop(session, (0, {}))[1]
         if prior.get("resend"):
@@ -1258,6 +1260,11 @@ def day_part(hour):
     return "밤" if hour == 0 else "낮" if hour == 12 else "오전" if hour < 12 else "오후"
 
 
+def night_rule():
+    """The gateway's late-night day rule for Qwen (late_night.prompt_rule): empty after 05:00."""
+    return late_night.prompt_rule(datetime.now(KST))
+
+
 def now_kst():
     now = datetime.now(KST)
     ampm, h12 = day_part(now.hour), (now.hour % 12 or 12)  # Qwen misreads 24-hour "17시"
@@ -1359,7 +1366,7 @@ async def respond(text, session, t0, timings, on_event=None):
             length = reply_length(settings)
             gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
             system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) \
-                + gateway_tools_text(gw_defs) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
+                + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
@@ -2265,6 +2272,8 @@ if __name__ == "__main__":
         assert personality({}) == "" and "성격" not in system_prompt("아젤")  # no settings yet: no persona line
         assert "너(아젤)의 성격과 말투: 까칠함. 이것은 너 자신의 성격이야." in system_prompt("아젤", "normal", "", "까칠함")
         assert "사용자를 '주인님'(이)라고 부른다." in system_prompt("아젤", "normal", "", "까칠함", "주인님")
+        assert "'내일'은 오늘(11월 22일)" in late_night.prompt_rule(datetime(2026, 11, 22, 1, 30, tzinfo=KST))
+        assert late_night.prompt_rule(datetime(2026, 11, 22, 9, 0, tzinfo=KST)) == ""  # only between 00:00 and 05:00
         assert "부른다" not in system_prompt("아젤", "normal", "", "까칠함", "")  # no title: no line
         cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")
         assert "성격과 말투: 귀엽고 따뜻하지만 장난기 있는 동생. 이것은" in cute and "사용자를 이 말로 묘사하거나" in cute
@@ -2897,6 +2906,11 @@ if __name__ == "__main__":
                 "reason": "깨우는 전화", "kind": "wake", "when_text": "내일 10시에 깨워 줘"}  # words, never a time
             out.append(await schedule_reply("취소", "cancel", "s", sat8))
             assert last()["name"] == "schedule_cancel" and last()["args"] == {}  # bare cancel: the soonest one
+            night = datetime(2026, 11, 22, 1, 0, tzinfo=KST)  # 01:00: "내일" still means today (late_night)
+            await schedule_reply("내일 오후 3시 알람 취소해 줘", "cancel", "s", night)
+            assert last()["args"] == {"at": "2026-11-22T15:00:00+09:00"}, last()  # today's 3 pm, not the 23rd
+            await schedule_reply("내일 7시 알람 취소해 줘", "cancel", "s", night)
+            assert last()["args"] == {"description": "내일 7시 알람 취소해 줘"}, last()  # ambiguous: words, not the soonest
             out.append(await schedule_reply("예약된 거 뭐 있어?", "list", "s", sat8))
             out.append(await schedule_reply("내일 7시에 전화해 줘", "create", "s2", sat8))  # two readings: asked back
             assert schedule_intent("저녁", "s2") == "create"  # the answer completes it

@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import agent_loop
 import cron
+import late_night
 import openings
 import connectors
 import google_tools
@@ -211,9 +212,15 @@ def active_persona(s):
     return (persona_by_id(s, pid) if pid else None) or primary_persona(s)
 
 
+def night_rule():
+    """late_night.prompt_rule for now: "내일" between 00:00 and 05:00 KST is today (empty in the day)."""
+    return late_night.prompt_rule(datetime.now(KST))
+
+
 def name_prompt(settings):
-    """Persona and reply length, from the shared settings."""
-    return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"])
+    """Persona and reply length, from the shared settings, plus the late-night day rule (every Claude, API, NIM and
+    task prompt is built from this, so all of them read "내일" the same way as the schedule path)."""
+    return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"]) + night_rule()
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)"

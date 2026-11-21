@@ -1628,3 +1628,14 @@ def test_web_tools_only_on_full_gateways(tmp_path, monkeypatch):
     assert not {"WebSearch", "WebFetch"} & set(allowed)
     args = lim.base_cmd("m", "s", allowed)
     assert "WebSearch" not in args[args.index("--allowedTools"):]
+
+
+def test_night_rule_reaches_every_prompt(gw, monkeypatch):
+    """name_prompt builds every Claude/API/NIM/task prompt: at night they all read "내일" as today."""
+    g, c, _ = gw
+    s = asyncio.run(g.load_settings())
+    monkeypatch.setattr(g, "night_rule", lambda: "\nNIGHT-RULE\n")
+    assert "NIGHT-RULE" in g.name_prompt(s) and "NIGHT-RULE" in g.task_api_system(s, [])
+    monkeypatch.undo()
+    night = g.datetime(2026, 11, 22, 1, 30, tzinfo=g.KST)
+    assert "'내일'은 오늘(11월 22일)" in g.late_night.prompt_rule(night)
