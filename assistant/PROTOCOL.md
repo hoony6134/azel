@@ -307,17 +307,19 @@ device that created them.
   (also writable as part of `PUT /v1/settings`):
   ```json
   {"claude_ai": {"Gmail": true, "Notion": false},
-   "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "transport": "http", "enabled": true, "auth_ref": "wiki"}]}
+   "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "transport": "http", "enabled": true, "auth_ref": "wiki", "allowed_tools": ["get_*"]}]}
   ```
   `claude_ai` keys are claude.ai connector display names without the `claude.ai ` prefix; a name not listed takes its
   default (Cygnus MCP, Google Calendar, Gmail on; everything else off). `custom`: ≤ 20 servers, `name` a unique ASCII
   slug (`[A-Za-z0-9_-]{1,40}`, also the tool prefix `mcp__<name>`), `url` https (plain http only to a tailnet
   address, 100.64.0.0/10), `transport` `http`|`sse` (default http), `enabled` (default true), optional `auth_ref`,
-  which must equal the server's own `name` (a server never uses another's secret). Secrets never go into settings. Each
+  which must equal the server's own `name` (a server never uses another's secret), and optional `allowed_tools` (≤ 50
+  tool names or globs over `[A-Za-z0-9_.*?-]`; empty or missing = every tool): a run is allowed only those tools of the
+  server (`mcp__<name>__<pattern>`), the rest are refused. A `PUT` entry without `allowed_tools` keeps the list already stored for that name (`[]` clears it). Secrets never go into settings. Each
   run also loads the device daemons, no plugin MCP servers, and every tool up front (no ToolSearch). A custom server
   whose secret file is missing or not 0600 is skipped. Full gateways only; limited → 403 on every route below.
   - `GET /v1/connectors[?refresh=true]` → `{"claude_ai":[{"name","enabled","status":"connected"|"needs_auth"}],
-    "custom":[{"name","url","transport","enabled","has_secret"}]}` (the app's pinned shape). The claude.ai list is
+    "custom":[{"name","url","transport","enabled","has_secret","allowed_tools"}]}` (the app's pinned shape plus `allowed_tools`). The claude.ai list is
     this gateway's login as `claude mcp list` sees it (cached from startup; `refresh=true` re-reads, ~15 s); anything
     not connected is `needs_auth`.
   - `PUT /v1/connectors` with the same shape without `status` / `has_secret` → the GET shape (400 with a reason on a

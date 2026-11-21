@@ -2386,11 +2386,14 @@ def connectors_out(conn):
     return {"claude_ai": [{"name": c["name"], "enabled": c["enabled"],
                            "status": "connected" if c["status"] == "connected" else "needs_auth"} for c in v["claude_ai"]],
             "custom": [{"name": c["name"], "url": c["url"], "transport": c.get("transport", "http"),
-                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"]} for c in v["custom"]]}
+                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"],
+                        "allowed_tools": c.get("allowed_tools", [])} for c in v["custom"]]}
 
 
-def connectors_in(body):
-    """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name."""
+def connectors_in(body, old=None):
+    """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name.
+    A server sent without `allowed_tools` (an app that predates it) keeps the one already stored under its name."""
+    kept = {c["name"]: c["allowed_tools"] for c in (old or {}).get("custom", []) if c.get("allowed_tools")}
     ai, custom = body.get("claude_ai", []), body.get("custom", [])
     if not isinstance(ai, list) or not all(isinstance(c, dict) and set(c) <= {"name", "enabled", "status"} for c in ai) \
             or not isinstance(custom, list) or set(body) - {"claude_ai", "custom"}:
@@ -2398,7 +2401,10 @@ def connectors_in(body):
     try:
         return connectors.check({"claude_ai": {c.get("name"): c.get("enabled") for c in ai},
                                  "custom": [{**{k: v for k, v in c.items() if k != "has_secret"},
-                                             "auth_ref": c.get("name")} if isinstance(c, dict) else c for c in custom]})
+                                             "auth_ref": c.get("name"),
+                                             **({"allowed_tools": kept[c["name"]]}
+                                                if "allowed_tools" not in c and c.get("name") in kept else {})}
+                                            if isinstance(c, dict) else c for c in custom]})
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -2417,7 +2423,7 @@ async def connectors_get(refresh: bool = False):
 async def connectors_put(body: dict):
     """Replace the switches and the custom list (the GET shape without status / has_secret)."""
     full_only()
-    await put_settings({"connectors": connectors_in(body)})
+    await put_settings({"connectors": connectors_in(body, (await load_settings())["connectors"])})
     return connectors_out((await load_settings())["connectors"])
 
 
