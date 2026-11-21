@@ -78,12 +78,13 @@ final class CallClient {
     /// The token goes in the Authorization header, never the query: query strings end up in proxy logs.
     /// `intent`: e.g. "briefing" for 오늘 브리핑 / the Siri briefing, so the server opens with it.
     static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil,
-                        persona: String? = nil) throws -> URLRequest {
+                        persona: String? = nil, mode: String? = nil) throws -> URLRequest {
         guard var url = URLComponents(string: voiceURL + "/v1/call") else { throw StartError.notConfigured }
         url.queryItems = [URLQueryItem(name: "session", value: session)]
         if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
         if let intent { url.queryItems?.append(URLQueryItem(name: "intent", value: intent)) }
         if let persona { url.queryItems?.append(URLQueryItem(name: "persona", value: persona)) }
+        if let mode { url.queryItems?.append(URLQueryItem(name: "mode", value: mode)) }
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -91,10 +92,10 @@ final class CallClient {
     }
 
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
-    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil) throws {
+    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
-                                                                         session: session, callID: callID, intent: intent, persona: persona))
+                                                                         session: session, callID: callID, intent: intent, persona: persona, mode: mode))
         socket = task
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
@@ -344,6 +345,14 @@ final class CallClient {
         playback = PlaybackGate()
         sending = true
     }
+
+    /// Mid-call brain switch (`{"type":"mode","value":…}`); the server confirms with a mode event.
+    func switchMode(_ mode: String) {
+        socket?.send(.string(#"{"type":"mode","value":"\#(mode)"}"#)) { _ in }
+    }
+
+    /// The mode an event reports: a `mode` event's value, or a `mode` field on any event.
+    static func reportedMode(_ e: CallEvent) -> String? { e.type == "mode" ? (e.value ?? e.mode) : e.mode }
 
     /// iOS `didDeactivate`: the system took the audio session away.
     func stopAudio() { audio.stop() }

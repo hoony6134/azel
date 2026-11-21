@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
         if case .success(let data) = await settingsResult, let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
             if let name = s.assistant_name { AssistantName.current = name }
             AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)
+            BrainModeChoice.shared.supported = BrainModeChoice.reports(data)
         }
         switch await approvalsResult {
         case .success(let data):

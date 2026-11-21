@@ -13,6 +13,7 @@ struct HomeView: View {
     @ObservedObject private var personas = PersonaModel.shared
 
     @StateObject private var tilt = TiltModel()
+    @ObservedObject private var brain = BrainModeChoice.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     /// CoreMotion only while the home screen is really in view: foreground, no call cover, motion allowed.
@@ -109,9 +110,15 @@ struct HomeView: View {
                             in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
         }
         .buttonStyle(.plain)
+        .brainModeMenu(current: brain.next?.rawValue) { brain.next = $0 }
         .disabled(model.statusError != nil)
         .opacity(model.statusError != nil ? 0.5 : 1)
         .accessibilityHint(model.statusError != nil ? FriendlyError.describe(model.statusError!).title : "통화를 시작합니다")
+        .overlay(alignment: .bottom) {
+            if let n = brain.next, n != .auto {
+                Text("다음 통화: \(n.label)").font(.footnote).foregroundStyle(Theme.text3).offset(y: 22)
+            }
+        }
     }
 
     private var quickActions: some View {

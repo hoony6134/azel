@@ -50,6 +50,8 @@ final class CallManager: NSObject, ObservableObject {
     private var incoming: [UUID: (callID: String?, reason: String?, caller: String, persona: String?, context: CallContext?)] = [:]
     /// The task or reminder this call is about (from the push's `context`).
     @Published private(set) var callContext: CallContext?
+    /// The brain answering this call (server-reported; the picked one until it says).
+    @Published private(set) var brainMode: String?
     private var activeSession: String?
     /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
     @Published private(set) var activePersona: Persona?
@@ -84,6 +86,10 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     // MARK: UI actions
+
+    @MainActor func chooseBrain(_ m: BrainMode) {
+        BrainModeChoice.shared.choose(m, inCall: inCall, client: client, current: { [weak self] in self?.brainMode }) { [weak self] in self?.error = $0 }
+    }
 
     /// `persona`: nil = the one chosen in the app (or the primary).
     @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil) {
@@ -182,6 +188,7 @@ final class CallManager: NSObject, ObservableObject {
         recording = false
         connectedAt = nil
         error = nil
+        brainMode = nil
         let session = AVAudioSession.sharedInstance()
         // .allowBluetooth: AirPods and other headsets (HFP, mic and speaker) can carry the call;
         // without it the route picker lists them but the route never moves (user bug, 2026-11-22).
@@ -199,7 +206,9 @@ final class CallManager: NSObject, ObservableObject {
         activeSession = callID ?? Session.current(sessionPrefix)
         // Outgoing briefing calls (오늘 브리핑, Siri) tell the server what to open with.
         let intent = callID == nil && sessionPrefix == "briefing" ? "briefing" : nil
-        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil) } catch {
+        let mode = MainActor.assumeIsolated { BrainModeChoice.shared.takeForCall() }
+        brainMode = mode
+        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
@@ -213,6 +222,7 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     private func handle(_ event: CallEvent) {
+        if let m = CallClient.reportedMode(event) { brainMode = m }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         switch event.type {
         case "state": state = event.value ?? ""

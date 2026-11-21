@@ -54,6 +54,12 @@ struct CallScreen: View {
             GlazeBackground(state: jarState, tint: tint)
             VStack(spacing: Theme.l) {
                 topBar
+                if let m = BrainMode.chip(call.brainMode) {
+                    Label(m, systemImage: "cpu").font(.footnote.weight(.semibold)).foregroundStyle(Theme.indigo)
+                        .padding(.horizontal, Theme.m).padding(.vertical, 4)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .accessibilityLabel("두뇌: \(m)")
+                }
                 if let c = call.callContext {
                     Label(c.chip, systemImage: c.kind == "task" ? "checklist" : "bell").font(.footnote.weight(.semibold))
                         .foregroundStyle(Theme.text).lineLimit(1)
@@ -72,6 +78,7 @@ struct CallScreen: View {
                     MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt, tint: tint).frame(width: geo.size.width, height: geo.size.height)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
+                        .brainModeMenu(current: call.brainMode) { call.chooseBrain($0) }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")
                         .accessibilityAction(named: "말 끊기") { call.interrupt() }
                 }

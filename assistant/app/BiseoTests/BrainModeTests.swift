@@ -1,0 +1,36 @@
+import XCTest
+@testable import Biseo
+
+@MainActor
+final class BrainModeTests: XCTestCase {
+    func testChipsHintsAndSettingsGuard() throws {
+        XCTAssertNil(BrainMode.chip("auto"))
+        XCTAssertNil(BrainMode.chip(nil))
+        XCTAssertEqual(BrainMode.chip("local"), "로컬만")
+        XCTAssertEqual(BrainMode.chip("claude_code"), "Claude Code")
+        XCTAssertEqual(BrainMode.local.hint, "Claude를 쓰지 않아요, 무료")
+        XCTAssertTrue(BrainModeChoice.reports(Data(#"{"brain_mode":"auto"}"#.utf8)))
+        XCTAssertFalse(BrainModeChoice.reports(Data(#"{"default_model":"auto"}"#.utf8)), "old gateway: pickers hidden")
+        let base = #"{"default_model":"auto","claude_path":"auto","task_defaults":{},"monthly_budget_usd":500,"budget_warn_pct":80,"default_device":"m","device_fallback":[],"proactive":{"morning_briefing":"08:00"}}"#
+        let old = try JSONDecoder().decode(AppSettings.self, from: Data(base.utf8))
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(old), as: UTF8.self).contains("brain_mode"), "never sent to an old gateway")
+    }
+
+    func testNextCallChoiceIsTakenOnce() {
+        let c = BrainModeChoice.shared
+        c.next = .local
+        XCTAssertEqual(c.takeForCall(), "local")
+        XCTAssertNil(c.takeForCall(), "the call after uses the default again")
+    }
+
+    func testModeOnTheURLAndFromEvents() throws {
+        let req = try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "s", callID: nil, mode: "claude_api")
+        XCTAssertTrue(req.url!.absoluteString.contains("mode=claude_api"))
+        let noMode = try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "s", callID: nil)
+        XCTAssertFalse(noMode.url!.absoluteString.contains("mode="))
+        let dec = JSONDecoder()
+        XCTAssertEqual(CallClient.reportedMode(try dec.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening","mode":"local"}"#.utf8))), "local")
+        XCTAssertEqual(CallClient.reportedMode(try dec.decode(CallEvent.self, from: Data(#"{"type":"mode","value":"claude_code"}"#.utf8))), "claude_code")
+        XCTAssertNil(CallClient.reportedMode(try dec.decode(CallEvent.self, from: Data(#"{"type":"state","value":"thinking"}"#.utf8))))
+    }
+}

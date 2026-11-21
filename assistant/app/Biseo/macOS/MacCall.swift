@@ -67,6 +67,8 @@ final class MacCall: ObservableObject {
 
     /// True while the hold-to-talk key is down (panel border goes celadon).
     @Published private(set) var talking = false
+    /// The brain answering this call (server-reported; the picked one until it says).
+    @Published private(set) var brainMode: String?
     private var pttCall = false
     /// Started by the wake word: the mic is live from the start and the call ends after 30 s of quiet.
     private var wakeCall = false
@@ -177,6 +179,10 @@ final class MacCall: ObservableObject {
 
     func hangUp() { end(error: nil, keepPanel: false) }
 
+    func chooseBrain(_ m: BrainMode) {
+        BrainModeChoice.shared.choose(m, inCall: inCall, client: client, current: { [weak self] in self?.brainMode }) { [weak self] in self?.error = $0 }
+    }
+
     func toggleMute() {
         muted.toggle()
         client.muted = muted
@@ -225,7 +231,9 @@ final class MacCall: ObservableObject {
         inCall = true
         applyDevices()
         do {
-            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id)
+            let mode = BrainModeChoice.shared.takeForCall()
+            brainMode = mode
+            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode)
             connectedAt = Date()
             if pttCall || talking { client.cue(.wake, listening: false) }
         } catch {
@@ -234,6 +242,7 @@ final class MacCall: ObservableObject {
     }
 
     private func handle(_ event: CallEvent) {
+        if let m = CallClient.reportedMode(event) { brainMode = m }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         scheduleIdle()
         switch event.type {
@@ -271,6 +280,7 @@ final class MacCall: ObservableObject {
         talking = false
         pttCall = false
         wakeCall = false
+        brainMode = nil
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
     }
@@ -326,6 +336,7 @@ struct CallPanelView: View {
                     tint: call.activePersona?.glaze ?? Theme.glazeCeladon).frame(width: 68, height: 68)
                 .contentShape(Circle())
                 .onTapGesture { call.interrupt() }
+                .brainModeMenu(current: call.brainMode) { call.chooseBrain($0) }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
             VStack(alignment: .leading, spacing: 2) {
                 let user = call.lines.last { $0.mine }?.text
@@ -367,6 +378,7 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     // §17.8: the persona's name before the route chip.
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
+                    if let m = BrainMode.chip(call.brainMode) { Text(m).font(.caption.weight(.semibold)).foregroundStyle(Theme.indigo) }
                     if let r = call.log.lastRoute { RouteChip(route: r) }
                 }
             }
