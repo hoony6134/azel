@@ -241,8 +241,12 @@ device that created them.
                 "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
-   "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":""}
+   "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":"","user_title":""}
   ```
+  `user_title`: how the assistant addresses the user, 0–12 Hangul/Latin letters or spaces (whitespace collapsed,
+  null → `""`); `""` = no fixed title, address the user naturally. A persona's own `user_title` overrides it. The
+  title in effect goes into Claude's persona block and Qwen's prompt as "사용자를 '<title>'(이)라고 부른다." (left out
+  when empty).
   `personality` (text up to 600 chars, else 400) is Azel's character: one persona block (`assistant_name` +
   personality) goes into Qwen's system prompt, Claude's voice style, briefings and autonomous-call openings,
   so both models sound like the same person. `""`, whitespace, `null` or a missing key mean the built-in
@@ -358,7 +362,8 @@ device that created them.
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
   `{"id" (slug a-z0-9_-),"name" (1–12 Hangul/Latin/space, unique),"voice" (a TTS speaker),"voice_style"
   (optional TTS instruction, ≤200),"personality" (≤600, "" = the default),"color" ("#rrggbb", orb tint),
-  "default_model" (null|haiku|sonnet|opus|nim),"share_memory" (bool, default false),"created_at","primary",
+  "default_model" (null|haiku|sonnet|opus|nim),"user_title" (same rules as the setting; `""` = use the shared
+  `user_title`; null on create or edit → `""`),"share_memory" (bool, default false),"created_at","primary",
   "deleted_at"}`. Stored in the shared settings as `personas`; settings without it migrate to one persona
   `azel` (primary) holding `assistant_name` and `personality`, which stay readable (and writable) as the
   primary's for older clients. `GET /v1/personas` (`?include=deleted`), `POST /v1/personas` → 201

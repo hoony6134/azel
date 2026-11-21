@@ -1480,3 +1480,28 @@ def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatc
     assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
     done = evs[-1]
     assert done["type"] == "done" and done["path"] == "api" and done["input_tokens"] == 1600
+
+
+def test_user_title_shared_and_per_persona(gw, monkeypatch):
+    g, c, _ = gw
+    persona_gw(g, monkeypatch)
+    assert c.get("/v1/settings").json()["user_title"] == ""
+    assert "부른다" not in g.persona_block(asyncio.run(g.load_settings()))  # none set: no line
+    assert c.put("/v1/settings", json={"user_title": "  선생 님 "}).json()["user_title"] == "선생 님"
+    for bad in ["a" * 13, "주인님!", 3]:
+        assert c.put("/v1/settings", json={"user_title": bad}).status_code == 400, bad
+    assert c.put("/v1/settings", json={"user_title": "선생님"}).status_code == 200
+    s = asyncio.run(g.load_settings())
+    assert "사용자를 '선생님'(이)라고 부른다." in g.persona_block(s)
+    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "sohee"})
+    assert r.json()["user_title"] == ""  # "" = use the shared one
+    assert c.put("/v1/personas/luna", json={"user_title": "주인님"}).json()["user_title"] == "주인님"
+    assert c.put("/v1/personas/luna", json={"user_title": "!!"}).status_code == 400
+    s = asyncio.run(g.load_settings())
+    g.current_persona.set("luna")
+    assert "사용자를 '주인님'(이)라고 부른다." in g.persona_block(s)
+    assert c.put("/v1/personas/luna", json={"user_title": None}).json()["user_title"] == ""  # null: unset
+    assert "사용자를 '선생님'(이)라고 부른다." in g.persona_block(asyncio.run(g.load_settings()))
+    g.current_persona.set(None)
+    stored = g.fake.db["settings"]
+    assert stored["user_title"] == "선생님" and next(p for p in stored["personas"] if p["id"] == "luna")["user_title"] == ""

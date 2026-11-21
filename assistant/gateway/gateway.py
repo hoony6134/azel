@@ -83,6 +83,7 @@ DEFAULTS = {
                                  "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}},
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
+    "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
@@ -93,6 +94,21 @@ DEFAULTS = {
 }
 CHOOSABLE = ("auto", "qwen", "nim", *MODELS)  # default_model, task_defaults.*.model
 NAME_RE = re.compile(r"[가-힣A-Za-z ]{1,12}")
+TITLE_RE = re.compile(r"[가-힣A-Za-z ]{0,12}")
+
+
+def check_title(v, field):
+    """user_title (shared or a persona's): 0-12 Hangul/Latin letters or spaces, whitespace collapsed; null → ""."""
+    if v is None:
+        return ""
+    if not (isinstance(v, str) and TITLE_RE.fullmatch(v)):
+        raise HTTPException(400, f"{field}: 0-12 Hangul/Latin letters or spaces")
+    return " ".join(v.split())
+
+
+def user_title(settings, p=None):
+    """The title in effect: the persona's own, else the shared one ("" = none)."""
+    return ((p or {}).get("user_title") or settings.get("user_title") or "").strip()
 
 
 # reply_length: the same wording the voice server gives Qwen, so both routes answer at the same length.
@@ -133,7 +149,9 @@ def persona_block(settings):
     p = active_persona(settings)
     text = p["personality"].strip() if isinstance(p.get("personality"), str) and p["personality"].strip() \
         else PERSONALITY_DEFAULT
-    return f"너의 이름은 '{p['name']}'이야. " + character_line(p["name"], text)
+    title = user_title(settings, p)
+    return f"너의 이름은 '{p['name']}'이야. " + character_line(p["name"], text) + \
+        (f"사용자를 '{title}'(이)라고 부른다. " if title else "")
 
 
 # ---------- personas: several assistants, one primary (stored in the shared settings as `personas`) ----------
@@ -154,6 +172,8 @@ def migrate_personas(s):
                       "voice": DEFAULT_TTS_VOICE, "voice_style": "", "personality": s.get("personality") or "",
                       "color": "#7C5CFF", "default_model": None, "share_memory": False, "created_at": 0,
                       "primary": True})
+    for p in ps:
+        p.setdefault("user_title", "")
     s["personas"] = ps
     prim = primary_persona(s)
     s["assistant_name"], s["personality"] = prim.get("name") or DEFAULTS["assistant_name"], prim.get("personality") or ""
@@ -1607,6 +1627,8 @@ async def put_settings(body: dict):
         raise HTTPException(400, "assistant_name: 1-12 Hangul/Latin letters or spaces")
     if name is not None:
         body["assistant_name"] = " ".join(name.split())
+    if "user_title" in body:
+        body["user_title"] = check_title(body["user_title"], "user_title")
     if "proactive" in body:  # a partial update merges into the current values, one level deep
         if not isinstance(body["proactive"], dict):
             raise HTTPException(400, "proactive must be an object")
@@ -1812,7 +1834,7 @@ async def tts_voices():
     return _tts_voices["voices"]
 
 
-PERSONA_FIELDS = {"name", "voice", "voice_style", "personality", "color", "default_model", "share_memory"}
+PERSONA_FIELDS = {"name", "voice", "voice_style", "personality", "color", "default_model", "share_memory", "user_title"}
 
 
 async def check_persona(body, s, pid=None):
@@ -1832,6 +1854,8 @@ async def check_persona(body, s, pid=None):
         raise HTTPException(400, "voice_style: text up to 200 characters")
     if body.get("personality") is None and "personality" in body:
         body["personality"] = ""
+    if "user_title" in body:
+        body["user_title"] = check_title(body["user_title"], "user_title")
     if not isinstance(body.get("personality", ""), str) or len(body.get("personality", "")) > 600:
         raise HTTPException(400, "personality: text up to 600 characters (\"\" = the default)")
     if "color" in body and not (isinstance(body["color"], str) and COLOR_RE.fullmatch(body["color"])):
@@ -1843,8 +1867,9 @@ async def check_persona(body, s, pid=None):
 
 
 def persona_view(p):
-    return {k: p.get(k) for k in ("id", "name", "voice", "voice_style", "personality", "color", "default_model",
-                                  "share_memory", "created_at", "primary", "deleted_at")}
+    return {**{k: p.get(k) for k in ("id", "name", "voice", "voice_style", "personality", "color", "default_model",
+                                     "share_memory", "created_at", "primary", "deleted_at")},
+            "user_title": p.get("user_title") or ""}
 
 
 async def save_personas(s):
@@ -1873,7 +1898,7 @@ async def personas_create(body: dict):
     if not (isinstance(pid, str) and PERSONA_ID.fullmatch(pid)) or persona_by_id(s, pid, include_deleted=True):
         raise HTTPException(400, "id: a new ASCII slug (a-z, 0-9, _ -)")
     p = {"id": pid, "voice_style": "", "personality": "", "color": "#7C5CFF", "default_model": None,
-         "share_memory": False, **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
+         "share_memory": False, "user_title": "", **body, "voice": body["voice"].lower(), "created_at": time.time(), "primary": False}
     s["personas"].append(p)
     await save_personas(s)
     return persona_view(p)

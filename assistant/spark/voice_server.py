@@ -116,13 +116,23 @@ def character_line(name, text):
             "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
 
 
-def system_prompt(name, length="normal", context="", persona=""):
+def title_line(title):
+    """How to address the user (same sentence as the gateway's persona_block); "" = no fixed title."""
+    return f"사용자를 '{title}'(이)라고 부른다. " if title else ""
+
+
+def user_title(p, settings):
+    """The persona's own title, else the shared `user_title` setting."""
+    return str(p.get("user_title") or settings.get("user_title") or "").strip()
+
+
+def system_prompt(name, length="normal", context="", persona="", title=""):
     """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
     at once. `context`: the brain's block, appended last; with it, Qwen answers personal questions from the context
     or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
     endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
     body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
-    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona) if persona else "") + body + " " \
+    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona) if persona else "") + title_line(title) + body + " " \
         + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
@@ -818,7 +828,7 @@ BRIEFING_CLAUDE = (  # the morning-briefing call's prompt, for when no situation
 )
 
 
-async def briefing_sentences(session, name, on_event, persona=""):
+async def briefing_sentences(session, name, on_event, persona="", title=""):
     """Sentences of a spoken briefing. Fast path: the local Qwen composes it from the situation note a full
     gateway hands over (first sentence within about 2 s). No note yet: a filler, then Claude via the link."""
     try:
@@ -827,7 +837,7 @@ async def briefing_sentences(session, name, on_event, persona=""):
         ctx = {}
     if ctx.get("situation"):
         facts = "\n".join(str(f) for f in ctx.get("facts") or [])
-        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (" " + character_line(name, persona) if persona else "")},
+        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (" " + character_line(name, persona) if persona else "") + (" " + title_line(title) if title else "")},
                     {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
         stream = llm_stream(messages, 700)
     elif time.time() - last_claude_briefing[0] < BRIEFING_COOLDOWN_S and last_claude_briefing[1]:
@@ -1142,7 +1152,7 @@ async def respond(text, session, t0, timings, on_event=None):
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = system_prompt(name, length, ctx, persona_text(persona, settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
+            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(persona, settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
@@ -1560,7 +1570,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             st = await gateway_settings()
             p = current_persona(st)
-            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st)):
+            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st),
+                                                 user_title(p, st)):
                 pcm, _ = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
                 await send(audio=pcm, gen=gen)
@@ -1986,6 +1997,9 @@ if __name__ == "__main__":
         assert personality({"personality": "까칠함", "personality_default": "기본 성격"}) == "까칠함"
         assert personality({}) == "" and "성격" not in system_prompt("아젤")  # no settings yet: no persona line
         assert "너(아젤)의 성격과 말투: 까칠함. 이것은 너 자신의 성격이야." in system_prompt("아젤", "normal", "", "까칠함")
+        assert "사용자를 '주인님'(이)라고 부른다." in system_prompt("아젤", "normal", "", "까칠함", "주인님")
+        assert "부른다" not in system_prompt("아젤", "normal", "", "까칠함", "")  # no title: no line
+        assert user_title({"user_title": ""}, {"user_title": "선생님"}) == "선생님" and user_title({"user_title": "형"}, {"user_title": "선생님"}) == "형"
         cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")
         assert "성격과 말투: 귀엽고 따뜻하지만 장난기 있는 동생. 이것은" in cute and "사용자를 이 말로 묘사하거나" in cute
         gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
