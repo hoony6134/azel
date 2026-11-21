@@ -25,7 +25,9 @@ final class PersonaTests: XCTestCase {
         let body = PersonaAPI.body(p[0])
         XCTAssertNil(body["id"]); XCTAssertNil(body["primary"])
         XCTAssertEqual(body["voice"] as? String, "sohee")
-        XCTAssertTrue(PersonaAPI.body(p[2])["color"] is NSNull)
+        XCTAssertNil(PersonaAPI.body(p[2])["color"], "unset fields are left out, not null")
+        XCTAssertNil(PersonaAPI.body(p[2])["voice_style"])
+        XCTAssertFalse(String(decoding: try JSONSerialization.data(withJSONObject: PersonaAPI.body(p[2])), as: UTF8.self).contains("null"))
     }
 
     func testSelectionFallsBackToPrimaryAndSiriMatchesByName() throws {

@@ -150,9 +150,25 @@ enum GatewayError: LocalizedError {
         }
     }
 
+    /// FastAPI `detail` (a string, or for 422 a list of {loc, msg}), else `message`/`error`.
     static func message(in body: Data) -> String? {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        if let list = obj["detail"] as? [[String: Any]] {
+            let parts = list.compactMap { item -> String? in
+                guard let msg = item["msg"] as? String else { return nil }
+                let field = (item["loc"] as? [Any])?.last.map { "\($0)" }
+                return field.map { "\($0): \(msg)" } ?? msg
+            }
+            if !parts.isEmpty { return parts.joined(separator: ", ") }
+        }
         return ["detail", "message", "error"].lazy.compactMap { obj[$0] as? String }.first
+    }
+
+    /// 400 and 422 carry an explanation for the user; other codes stay codes (404 = missing
+    /// endpoint, 409 = busy, 401/403 = token, 5xx = unreachable).
+    static func from(status code: Int, body: Data) -> GatewayError {
+        if code == 400 || code == 422, let m = message(in: body) { return .rejected(m) }
+        return .http(code)
     }
 }
 
@@ -168,8 +184,7 @@ enum Gateway {
         }
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if code == 400, let message = GatewayError.message(in: data) { throw GatewayError.rejected(message) }
-        guard (200..<300).contains(code) else { throw GatewayError.http(code) }
+        guard (200..<300).contains(code) else { throw GatewayError.from(status: code, body: data) }
         return data
     }
 
