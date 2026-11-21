@@ -702,7 +702,13 @@ LIST_COLS = f"""h.id, h.session, h.direction, h.reason, h.client,
         where t.call = h.id and jsonb_typeof(a) = 'object' and a->>'kind' is not null) as kinds"""
 # A vector-only hit (no word match) counts only when no call matches the words at all, and then needs a high
 # cosine: on ruchba's e5, an unrelated call scored above 0.86 for "주차". shortcut: tune 0.9 on real calls.
-HISTORY_VEC_MIN, HISTORY_LEX_MIN = 0.9, 0.1
+HISTORY_VEC_MIN = 0.9
+
+
+def words_in(q, text):
+    """True if any query word of two or more characters appears in the text (case-insensitive)."""
+    low = text.lower()
+    return any(w in low for w in q.lower().split() if len(w) >= 2) or q.strip().lower() in low
 
 
 def snippet(text, q, width=80):
@@ -727,8 +733,9 @@ def history_list(limit: int = 20, before: float | None = None, q: str | None = N
     best: dict[str, tuple[bool, float, str]] = {}  # call -> (word match, score, snippet)
     for h in search(Search(query=q, kinds=["transcript"], limit=100)):
         cid = (h["meta"] or {}).get("call")
-        if cid and cid not in best and (h["lex"] >= HISTORY_LEX_MIN or h["vec"] >= HISTORY_VEC_MIN):
-            best[cid] = (h["lex"] >= HISTORY_LEX_MIN, h["score"], snippet(h["text"], q))
+        word = words_in(q, h["text"])  # a real word match, not trigram fuzz ("주차" scores >0.1 on unrelated text)
+        if cid and cid not in best and (word or h["vec"] >= HISTORY_VEC_MIN):
+            best[cid] = (word, h["score"], snippet(h["text"], q))
     for r in db(f"select t.call, t.user_text, t.assistant from {TURNS} t join {HIST} h on h.id = t.call"
                 " where h.ended_at is null and (t.user_text ilike %(like)s or t.assistant::text ilike %(like)s)",
                 {"like": f"%{q}%"}):
