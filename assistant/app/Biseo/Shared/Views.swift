@@ -227,6 +227,8 @@ struct SettingsScreen<Extra: View>: View {
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @AppStorage("workSounds") private var workSounds = true
+    /// Cached so the call screen can show the tap-to-interrupt hint without a fetch.
+    @AppStorage("noiseMode") private var noiseMode = "normal"
 
     enum SaveState: Equatable { case idle, saving, saved, failed(String) }
 
@@ -351,6 +353,12 @@ struct SettingsScreen<Extra: View>: View {
                         .font(.footnote).buttonStyle(.borderless).tint(Theme.celadon)
                         .disabled((s.wrappedValue.personality ?? "").isEmpty)
                 }
+            }
+            Toggle("시끄러운 곳 모드", isOn: Binding(get: { s.wrappedValue.noise_mode == "noisy" },
+                                                 set: { s.wrappedValue.noise_mode = $0 ? "noisy" : "normal"; noiseMode = $0 ? "noisy" : "normal" }))
+                .tint(Theme.celadon).foregroundStyle(Theme.text)
+            if s.wrappedValue.noise_mode == "noisy" {
+                Text("주변 소리에 말이 끊기지 않게 해요. 말을 끊으려면 통화 중에 구를 눌러 주세요.").font(.footnote).foregroundStyle(Theme.text3)
             }
             row("답변 길이") {
                 Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
@@ -694,6 +702,7 @@ struct SettingsScreen<Extra: View>: View {
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
+            noiseMode = s.noise_mode ?? "normal"
             loadError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }
         }

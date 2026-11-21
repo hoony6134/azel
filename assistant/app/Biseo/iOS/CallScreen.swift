@@ -11,6 +11,7 @@ struct CallScreen: View {
     @State private var askRecord = false
     @AppStorage("recordingNoticeShown") private var recordingNoticeShown = false
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
+    @AppStorage("noiseMode") private var noiseMode = "normal"
 
     private var jarState: JarState { JarState(callState: call.state, inCall: call.inCall, held: call.held) }
 
@@ -66,6 +67,9 @@ struct CallScreen: View {
                 }
                 .frame(maxHeight: typeSize >= .accessibility1 ? 140 : .infinity)
                 if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                if noiseMode == "noisy" && jarState == .speaking {
+                    Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
+                }
                 captions
                 dock
                 hangUp

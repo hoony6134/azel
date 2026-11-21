@@ -48,8 +48,12 @@ final class CallClient {
     var muted = false
     /// Hold: no mic goes up, playback pauses, the recording pauses. The socket stays open.
     var held = false {
-        didSet { if held != oldValue { held ? audio.pause() : audio.resume() } }
+        didSet { if held != oldValue { playback.held = held; applyGate() } }
     }
+    /// Playback runs only when neither the user (hold) nor the server (pause) stopped it.
+    private var playback = PlaybackGate()
+
+    private func applyGate() { playback.playing ? audio.resume() : audio.pause() }
     var isConnected: Bool { socket != nil }
     /// Mac push-to-talk: false between key presses, so nothing goes up (the socket stays open).
     var sending = true
@@ -136,10 +140,17 @@ final class CallClient {
                 guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { break }
                 if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
                 if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
-                if event.type == "interrupt" {
+                // Event order matters for audio, so these run here, before the UI hop.
+                switch event.type {
+                case "interrupt":
                     audio.flush()
-                    if held { audio.pause() }
+                    playback.apply(event.type)
+                    if !playback.playing { audio.pause() }
                     recorder?.interrupt()
+                case "pause", "resume":
+                    playback.apply(event.type)   // tentative barge-in: stop playback, keep the queue
+                    applyGate()
+                default: break
                 }
                 recorder?.note(event)
                 DispatchQueue.main.async { self.onEvent?(event) }
@@ -183,7 +194,8 @@ final class CallClient {
     func interrupt() {
         socket?.send(.string(#"{"type":"interrupt"}"#)) { _ in }
         audio.flush()
-        if held { audio.pause() }
+        playback.apply("interrupt")
+        if !playback.playing { audio.pause() }
         recorder?.interrupt()
     }
 
@@ -222,9 +234,27 @@ final class CallClient {
         audio.stop()
         muted = false
         held = false
+        playback = PlaybackGate()
         sending = true
     }
 
     /// iOS `didDeactivate`: the system took the audio session away.
     func stopAudio() { audio.stop() }
+}
+
+/// Who may stop playback: the user (hold) and the server (`pause` on a tentative barge-in).
+/// `pause` keeps the queued audio; `resume` continues it; `interrupt` drops it and clears pause.
+struct PlaybackGate: Equatable {
+    var held = false
+    private(set) var serverPaused = false
+
+    var playing: Bool { !held && !serverPaused }
+
+    mutating func apply(_ eventType: String) {
+        switch eventType {
+        case "pause": serverPaused = true
+        case "resume", "interrupt": serverPaused = false
+        default: break
+        }
+    }
 }

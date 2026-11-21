@@ -87,6 +87,8 @@ struct AppSettings: Codable, Equatable {
     var assistant_name: String?
     /// How the assistant talks (≤ 600 chars). "" = the server's default. Optional for older gateways.
     var personality: String?
+    /// normal | noisy: in noisy places the server is stricter about barge-ins. Optional for older gateways.
+    var noise_mode: String?
     /// brief | normal | detailed (default normal). Optional for older gateways.
     var reply_length: String?
     /// Days the server keeps call history (0 = forever). Optional for older gateways.

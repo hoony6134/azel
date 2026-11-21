@@ -306,6 +306,9 @@ struct MacHome: View {
                         .animation(Theme.enter, value: call.inCall)
                     if call.inCall {
                         if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                        if UserDefaults.standard.string(forKey: "noiseMode") == "noisy" && jarState == .speaking {
+                            Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
+                        }
                         captions; dock
                     } else { idle }
                     if let e = call.error { Text(e).font(.footnote).foregroundStyle(Theme.danger) }
