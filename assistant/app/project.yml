@@ -46,6 +46,10 @@ targets:
         UIBackgroundModes: [audio, voip]
         # macOS (ignored on iOS): menu-bar only, no Dock icon
         LSUIElement: true
+        # azel://task/<id> opens a task (finish notifications deep-link here)
+        CFBundleURLTypes:
+          - CFBundleURLName: xyz.scian.biseo
+            CFBundleURLSchemes: [azel]
         LSApplicationCategoryType: public.app-category.productivity
         # Defaults are https/wss on azel.scian.xyz, so ATS stays on. Plain tailnet http/ws can't be
         # allowed per IP range (NSExceptionDomains takes no numeric IPs). NSAllowsLocalNetworking only

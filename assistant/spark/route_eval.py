@@ -119,11 +119,14 @@ async def full_reply(text):
 
 
 async def ack_eval():
-    bad = []
+    bad, before = [], vs.foreign_dropped[0]
     for text in ACK_CASES:
         reply, route = await full_reply(text)
         if route == "qwen" and (ack_only(reply) or "CLAUDE" in reply.upper()):  # "네 [CLAUDE]" spoken = no answer
             bad.append((text, reply))
+        if vs.FOREIGN.search(reply):  # the guard must leave no Chinese/kana in what is spoken
+            bad.append((text, "foreign text spoken: " + reply))
+    print(f"[ack] Qwen sentences with Chinese/kana dropped by the guard: {vs.foreign_dropped[0] - before}")
     print(f"[ack] non-trivial questions left without an answer (only '네', or a spoken tag): {len(bad)}/{len(ACK_CASES)}")
     for text, reply in bad:
         print(f"  ACK  {text}  -> {reply!r}")
@@ -159,7 +162,7 @@ async def _collect(messages, max_tokens=600):
 
 
 async def persona_eval(persona):
-    rows = []
+    rows, foreign = [], []
     for text, kind in PERSONA_CASES:
         sysmsg = vs.system_prompt(vs.DEFAULT_NAME, "normal", "", persona) + vs.now_kst()
         reply = await _collect([{"role": "system", "content": sysmsg}, {"role": "user", "content": text}])
@@ -168,7 +171,9 @@ async def persona_eval(persona):
             continue
         verdict = await _collect([{"role": "user", "content": JUDGE + reply}], 10)
         jokes = int(m.group()) if (m := re.search(r"\d+", verdict)) else 0
-        rows.append((text, kind, jokes, len(vs.split_ready(reply, final=True)[0]), reply))
+        if vs.FOREIGN.search(reply):
+            foreign.append((text, reply))
+        rows.append((text, kind, jokes, len([x for x in vs._SENT_END.split(reply) if x.strip()]), reply))
     judged = [r for r in rows if r[2] is not None]
     bad_humor = [r for r in judged if (r[1] == "serious" and r[2] > 0) or r[2] > 1]
     too_long = [r for r in judged if r[3] > 6]
@@ -178,6 +183,9 @@ async def persona_eval(persona):
           f"{sum(r[3] for r in judged) / max(1, len(judged)):.1f}")
     for r in bad_humor + too_long:
         print(f"  {r[1]:8} jokes={r[2]} sentences={r[3]} | {r[0]}  -> {r[4][:80]!r}")
+    print(f"[persona: {label}] raw Qwen replies with Chinese/kana (the call path drops them): {len(foreign)}")
+    for text, reply in foreign:
+        print(f"  HAN  {text}  -> {reply[:80]!r}")
     return len(bad_humor) + len(too_long)
 
 

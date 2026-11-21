@@ -32,7 +32,17 @@ struct MiniOrbRow: View {
 
     var body: some View {
         if model.personas.count > 1 {
-            ScrollView(.horizontal, showsIndicators: false) {
+            // Centered when it fits, scrolls when it doesn't; vertical room for the selection ring
+            // (it was clipped on iPhone, user screenshot 2026-11-21).
+            ViewThatFits(in: .horizontal) {
+                row
+                ScrollView(.horizontal, showsIndicators: false) { row }
+            }
+            .sheet(item: $editing) { p in PersonaEditorSheet(model: model, persona: p) }
+        }
+    }
+
+    private var row: some View {
                 HStack(spacing: Theme.m) {
                     ForEach(Array(model.ordered.enumerated()), id: \.element.id) { index, p in
                         orb(p, index: index)
@@ -50,11 +60,8 @@ struct MiniOrbRow: View {
                         .accessibilityLabel("비서 추가")
                     }
                 }
-                .padding(.horizontal, 2)
-                .frame(maxWidth: .infinity)
-            }
-            .sheet(item: $editing) { p in PersonaEditorSheet(model: model, persona: p) }
-        }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 6)
     }
 
     private var nextTint: PersonaTint {
@@ -71,6 +78,7 @@ struct MiniOrbRow: View {
                 MoonJar(state: .idle, levels: .silent, paused: reduceMotion, tint: p.glaze, breathAmplitude: 0.5)
                     .frame(width: size, height: size)
                     .overlay(Circle().strokeBorder(selected ? p.tint : .clear, lineWidth: 2).padding(-3))
+                    .contentShape(Circle())   // the orb's canvas ignores hits; clicks on the orb itself must select
                 if showNames {
                     Text(p.name).font(.footnote.weight(selected ? .semibold : .regular))
                         .foregroundStyle(selected ? Theme.text : Theme.text2).lineLimit(1)

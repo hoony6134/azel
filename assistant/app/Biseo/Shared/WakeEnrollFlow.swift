@@ -73,8 +73,7 @@ enum WakeEnrollAPI {
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         let (data, resp) = try await URLSession.shared.upload(for: req, from: multipart(clips, boundary: boundary))
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if code == 400, let m = GatewayError.message(in: data) { throw GatewayError.rejected(m) }
-        guard (200..<300).contains(code) else { throw GatewayError.http(code) }
+        guard (200..<300).contains(code) else { throw GatewayError.from(status: code, body: data) }
         return try JSONDecoder().decode(WakeEnrollResult.self, from: data)
     }
 }

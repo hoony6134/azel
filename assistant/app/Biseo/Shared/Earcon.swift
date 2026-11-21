@@ -92,20 +92,27 @@ struct EarconGate {
     static let tickInterval = 0.35, maxWait = 0.3, micHold = 0.25
 
     private var lastTick = -Double.infinity
+    /// Last time a cue other than the pulse played; a pulse within 1.5 s of one is skipped.
+    private var lastOther = -Double.infinity
+    static let pulseQuiet = 1.5
 
     /// - userLoudAt: last time the mic was above 0.25 while listening.
     /// - waited: how long this cue has already been held back.
     mutating func decide(_ cue: Cue, now: Double, listening: Bool, userLoudAt: Double, waited: Double = 0, enabled: Bool = true) -> Decision {
         guard enabled else { return .drop }
-        if cue == .wake { return .play }
+        if cue == .wake { lastOther = now; return .play }
         let userTalking = listening && now - userLoudAt < Self.micHold
-        if cue == .pulse { return userTalking ? .drop : .play } // never queued, never over the user
+        if cue == .pulse { // never queued, never over the user, never right after another cue
+            return userTalking || now - lastOther < Self.pulseQuiet ? .drop : .play
+        }
         if cue == .tick {
             guard !userTalking, now - lastTick >= Self.tickInterval else { return .drop }
             lastTick = now
+            lastOther = now
             return .play
         }
         if userTalking { return waited + 0.05 > Self.maxWait ? .drop : .wait }
+        lastOther = now
         return .play
     }
 }

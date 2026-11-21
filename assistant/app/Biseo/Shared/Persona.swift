@@ -59,11 +59,15 @@ enum PersonaAPI {
     }
 
     /// The fields the server takes (no id/primary).
+    /// The fields the server takes (no id/primary); unset optionals are left out rather than sent
+    /// as null, which the deployed gateway rejects.
     static func body(_ p: Persona) -> [String: Any] {
         var b: [String: Any] = ["name": p.name, "share_memory": p.share_memory]
-        b["voice"] = p.voice as Any? ?? NSNull(); b["voice_style"] = p.voice_style as Any? ?? NSNull()
-        b["personality"] = p.personality as Any? ?? NSNull(); b["color"] = p.color as Any? ?? NSNull()
-        b["default_model"] = p.default_model as Any? ?? NSNull()
+        if let v = p.voice { b["voice"] = v }
+        if let v = p.voice_style { b["voice_style"] = v }
+        if let v = p.personality { b["personality"] = v }
+        if let v = p.color { b["color"] = v }
+        if let v = p.default_model { b["default_model"] = v }
         return b
     }
 

@@ -131,3 +131,29 @@ final class ThinkingCueTests: XCTestCase {
         }
     }
 }
+
+final class PulseScheduleTests: XCTestCase {
+    func testPulseSlowsAfterThirtySecondsAndRestartsPerThinking() {
+        var t = ThinkingCues()
+        _ = t.event("state", value: "thinking", now: 0)
+        var pulses: [Double] = []
+        for i in 0...450 { let now = Double(i) / 10; if t.tick(now: now) == .pulse { pulses.append(now) } }
+        XCTAssertEqual(pulses.first, 3)
+        let early = zip(pulses, pulses.dropFirst()).filter { $0.1 <= 30 }.map { $1 - $0 }
+        let late = zip(pulses, pulses.dropFirst()).filter { $0.1 > 30 }.map { $1 - $0 }
+        XCTAssertTrue(early.allSatisfy { abs($0 - 3) < 0.11 }, "every 3 s at first")
+        XCTAssertTrue(!late.isEmpty && late.allSatisfy { abs($0 - 6) < 0.11 }, "every 6 s after 30 s")
+        _ = t.event("state", value: "speaking", now: 46)
+        XCTAssertEqual(t.event("state", value: "thinking", now: 50), .ack)
+        XCTAssertNil(t.tick(now: 52.9), "the clock restarts on each new thinking")
+        XCTAssertEqual(t.tick(now: 53), .pulse)
+    }
+
+    func testPulseSkippedRightAfterAnotherCue() {
+        var gate = EarconGate()
+        XCTAssertEqual(gate.decide(.working, now: 10, listening: false, userLoudAt: 0), .play)
+        XCTAssertEqual(gate.decide(.pulse, now: 11, listening: false, userLoudAt: 0), .drop, "within 1.5 s of working")
+        XCTAssertEqual(gate.decide(.pulse, now: 11.6, listening: false, userLoudAt: 0), .play)
+        XCTAssertEqual(gate.decide(.pulse, now: 12, listening: false, userLoudAt: 0), .play, "a pulse doesn't silence the next pulse")
+    }
+}

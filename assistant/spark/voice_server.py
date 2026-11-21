@@ -55,9 +55,11 @@ LENGTH_STYLE = {
 LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해(예: '오늘 일정은 두 개예요,'). "
-    "'네'나 '알겠습니다'만 하고 끝내지 마. "
+    "한국어 존댓말로 자연스럽게 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해. "
+    "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
+    "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
+    "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
     f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 간단한 상식, 계산, 방금 대화 내용 정리는 네가 바로 답해."
@@ -104,13 +106,34 @@ def personality(settings):
     return p.strip() if isinstance(p, str) and p.strip() else str(settings.get("personality_default") or "")
 
 
-def system_prompt(name, length="normal", context="", persona=""):
+def character_line(name, text, title=""):
+    """The persona's character as the assistant's own (same wording in gateway.py and voice_server.py). Without the
+    framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요"). `title`: how to
+    address the user (the user_title setting); without one, never a made-up 오빠/형/언니/누나."""
+    text = text.strip().rstrip(".。 ")
+    address = (f"사용자를 '{title}'(이)라고 부른다. 그 호칭은 자연스러운 곳에서만 쓰고 매 문장마다 부르지는 마. " if title else
+               "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. ")
+    return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
+            "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
+            + address + "장난스러운 한마디는 답 하나에 한 번까지만 하고, 진지한 주제에는 하지 마. ")
+
+
+def user_title(settings, persona):
+    """The title the user set for this persona, else the shared one ("" = none). Up to 12 letters, no quotes."""
+    for t in ((persona or {}).get("user_title"), settings.get("user_title")):
+        t = re.sub(r"[\"'\\\x00-\x1f]", "", t).strip()[:12] if isinstance(t, str) else ""
+        if t:
+            return t
+    return ""
+
+
+def system_prompt(name, length="normal", context="", persona="", title=""):
     """Qwen's system prompt for this turn, built from the shared settings (name, reply_length), so changes apply
     at once. `context`: the brain's block, appended last; with it, Qwen answers personal questions from the context
     or its tools (BRAIN_BODY) instead of always handing them to Claude. Stable parts come first, so the LLM
     endpoint's prefix cache covers them; callers append the clock and per-turn memory hits after this."""
     body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
-    return f"너는 사용자의 개인 비서 '{name}'야. " + (f"성격: {persona} " if persona else "") + body + " " \
+    return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona, title) if persona else "") + body + " " \
         + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
@@ -126,19 +149,24 @@ NUDGE_AFTER_S = 9.0  # then FILLER_LONG once, counted from the start of the Clau
 HALLUCINATIONS = {"시청해 주셔서 감사합니다", "시청해주셔서 감사합니다", "구독과 좋아요 부탁드립니다", "감사합니다", "MBC 뉴스 이덕영입니다"}
 # A model name counts only as a request to use it ("오퍼스로", "소넷한테"), not as a topic ("하이쿠가 뭐야").
 _USE = r"\s*(으?로|한테|에게|모델)"
-MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){_USE}", "haiku": rf"(하이쿠|haiku){_USE}"}
+MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){_USE}", "haiku": rf"(하이쿠|haiku){_USE}",
+               "nim": rf"(엔비디아|nvidia|\bnim){_USE}"}  # NVIDIA NIM on a full gateway (gateway/nim.py)
 USE_CLAUDE = re.compile(rf"(클로드|claude){_USE}|(클로드|claude)(가|이)\s*(해|답|풀|찾|봐|알아)", re.I)
 # Needs live data or a device: straight to Claude without asking Qwen (Qwen would guess).
-NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
+NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
                           r"|spark|ruchba|albireo|gienah|deneb|macbook"
                           r"|스파크|루크바|알비레오|기에나|데네브", re.I)  # Korean: how Whisper spells the spoken names
 # Personal data only full-mode gateways may touch (same list as the gateway's PERSONAL).
+# "내일 내가 해야 될 일", "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘": the user's own plans, said without 일정/할 일
+PLANS_ASK = (r"해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게) ?(뭐|있|정리|알려)"
+             r"|(오늘|내일|모레|글피|이번 ?주|다음 ?주|주말|월요일|화요일|수요일|목요일|금요일|토요일|일요일)"
+             r".{0,10}(뭐 ?(해|하|있)|정리|계획|바빠|바쁘|일과|해야)")
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
-                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
+                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)|" + PLANS_ASK, re.I)
 NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
 NO_GATEWAY = "지금 Claude 게이트웨이에 연결이 안 돼요."
 TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트 ?돌|에러|함수 ?짜|스크립트", "mac": r"macbook|맥북|파일|폴더|터미널|바탕화면|다운로드",
-              "schedule": r"일정(?!한)|할 ?일|과제|캘린더|회의|수업|마감|알람|브리핑|플래닛|planit"}
+              "schedule": r"일정(?!한)|할 ?일|과제|캘린더|회의|수업|마감|알람|브리핑|플래닛|planit|" + PLANS_ASK}
 
 def load_hashes(text: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {k: [] for k in LABELS}
@@ -193,6 +221,7 @@ class Link:
         self.fails = 0  # consecutive failed asks; 3 or more = unhealthy, tried last
         self.claude = True  # False: a gateway without Claude (scheduled calls, history, settings only)
         self.brain = False  # the resident brain: sends contexts, serves Qwen's tools, never takes asks or logs
+        self.tools: tuple = ()  # the tools a brain link serves (its hello), e.g. read-only Cygnus tools
 
     async def send(self, obj):
         async with self.lock:
@@ -236,9 +265,9 @@ class GatewayLinks:
         except Exception as e:
             print(msg.get("type"), "dropped:", msg.get("event", ""), type(e).__name__, flush=True)
 
-    async def request(self, msg, timeout=10):
+    async def request(self, msg, timeout=10, need_claude=False):
         """Ask a full-mode link and wait for its one reply (e.g. a schedule request)."""
-        lk, rid, q = self.pick(personal=True, need_claude=False), uuid.uuid4().hex, asyncio.Queue()
+        lk, rid, q = self.pick(personal=True, need_claude=need_claude), uuid.uuid4().hex, asyncio.Queue()
         self.queues[rid] = (q, lk)
         try:
             await lk.send({**msg, "id": rid})
@@ -274,6 +303,8 @@ class GatewayLinks:
             lk.device, lk.mode = device, mode
             lk.claude = msg.get("claude") is not False
             lk.brain = msg.get("role") == "brain" and mode == "full"
+            tools = msg.get("tools") if lk.brain and isinstance(msg.get("tools"), list) else []
+            lk.tools = tuple(t for t in tools[:40] if isinstance(t, str) and TOOL_NAME.fullmatch(t))
             try:
                 lk.priority = int(msg.get("priority", 50))
             except (TypeError, ValueError):
@@ -310,7 +341,13 @@ RECALL_WAIT_S = 0.4  # per-turn memory retrieval may delay the answer this much 
 TOOL_WAIT_S = 3.0  # a slow brain never stalls a turn
 TOOL_TAG = "[TOOL]"
 MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|우리|네가)|했었|했던|라고 했|물어봤")
-BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")
+BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")  # a brain without a tool list
+TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
+# With the brain's read-only server tools, a status question stays local; doing something on a server does not.
+WEB_LIVE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집")
+STATUS_Q = re.compile(r"괜찮|상태|살아 ?있|켜져|꺼졌|다운|죽었|문제|경보|알림|이상|느려|디스크|용량|온도|메모리")
+DEVICE_Q = re.compile(r"(맥북|macbook|기기|노트북|컴퓨터).{0,6}(켜져|꺼져|꺼졌|연결|살아|온라인|오프라인)", re.I)
+SERVER_ACTION = re.compile(r"재시작|재부팅|리부트|고쳐|켜 ?줘|꺼 ?줘|지워|삭제|정리해|로그|배포|실행|돌려|설치")
 
 
 def _take_context(self, session, value, persona=None):
@@ -332,6 +369,12 @@ def _context_for(self, session, persona=None):
                                            else None)
     got = [c for c in (self.session_ctx.get(session), shared) if c and time.time() - c[0] < BRAIN_FRESH_S]
     return max(got)[1] if got else ""
+
+
+def _brain_tools(self):
+    """What Qwen may call through the brain: the tools its hello listed (the brain re-checks each call)."""
+    lk = self.brain_link()
+    return set(lk.tools or BRAIN_TOOLS) if lk else set()
 
 
 def _brain_link(self):
@@ -361,16 +404,19 @@ async def _brain_event(self, msg):
 
 
 GatewayLinks.take_context, GatewayLinks.context_for, GatewayLinks.brain_link = _take_context, _context_for, _brain_link
+GatewayLinks.brain_tools = _brain_tools
 GatewayLinks.brain_request, GatewayLinks.brain_event = _brain_request, _brain_event
 
 BRAIN_BODY = (
     "아래 '참고할 상황'은 사용자 프로필, 지금 상황(일정, 마감, 할 일, 예약된 전화, 기기), 최근 통화 요약이야. "
     "여기에 답이 있으면 Claude 없이 네가 바로 답해. 없는 내용은 절대 지어내지 마. "
+    "상황의 일정은 줄마다 붙은 확인 시각 기준이야. 여섯 시간보다 오래된 일정은 '몇 시 기준으로는'이라고 밝히고 말해. "
     f"더 찾아봐야 하면 다른 말 없이 한 줄로 {TOOL_TAG} {{\"name\": 도구, \"args\": {{…}}}} 만 출력해. 도구: "
     "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
     "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
-    "참고할 상황과 도구로 안 되는 일(일정 정보가 없거나 오래됐을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
-    f"최신 정보, 서버 진단, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
+    "참고할 상황에 'Cygnus 도구' 목록이 있으면 일정, 과제, 할 일, 서버 상태는 그 도구로 확인해서 답해. "
+    "참고할 상황과 도구로 안 되는 일(일정 정보도 일정 도구도 없을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
+    f"최신 정보, 서버 재시작 같은 작업, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해."
 )
 
@@ -389,8 +435,8 @@ async def run_tool(raw, session):
         return "도구 호출 형식이 틀렸어요."
     if name == "scheduled_calls":
         return await schedule_reply("", "list", session)
-    if name not in BRAIN_TOOLS:
-        return f"없는 도구예요: {name}"
+    if name not in links.brain_tools():
+        return f"없는 도구예요: {name[:40]}"
     try:
         reply = await links.brain_request({"type": "tool", "name": name, "args": args,
                                            "persona": (CALL_PERSONA.get() or {}).get("id")}, TOOL_WAIT_S)
@@ -483,33 +529,73 @@ class OpeningGuard:
         return "check" if seconds < GREETING_MAX_S else "interrupt"
 
 _SENT_END = re.compile(r"(?<=[.!?。…~])\s+|\n+")
+# Qwen sometimes slips Chinese characters (or kana, Cyrillic, Thai) into a Korean reply; the Korean voices read
+# them as garble. They are dropped before TTS, captions and history.
+FOREIGN = re.compile(r"[\u2e80-\u2fdf\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0400-\u04ff\u0e00-\u0e7f]+")
+foreign_dropped = [0]  # sentences cleaned since start (route_eval reports it)
+
+
+def korean_only(s: str) -> str:
+    t = FOREIGN.sub("", s)
+    if t == s:
+        return s
+    foreign_dropped[0] += 1
+    t = re.sub(r"\s{2,}", " ", re.sub(r"[(（]\s*[)）]", "", t)).strip()
+    return t if re.search(r"[가-힣A-Za-z0-9]", t) else ""
+
+
+MIN_SYL = 5  # Qwen3-TTS garbles very short inputs ("네," came out as "쵸-"): never synthesize less alone
+_LETTER = re.compile(r"[가-힣A-Za-z0-9]")
+
+
+def syllables(s: str) -> int:
+    return len(_LETTER.findall(s))
 
 
 def split_ready(buf: str, final: bool, first: bool = False):
-    """Return (complete sentences, remainder) from the streamed text buffer.
+    """Return (chunks ready for TTS, remainder) from the streamed text buffer.
 
-    first=True: nothing has been spoken yet, so a leading clause ending in a comma
-    ("네,") goes out alone. TTS time grows with length, so this starts the voice soonest.
+    Chunks end at a sentence end or at ", " (never mid-word or inside "3,000") and have at least MIN_SYL
+    syllables: a short sentence waits for the next one. first=True: nothing has been spoken yet, so a leading
+    clause ending in a comma goes out alone if it is long enough. TTS time grows with length, so this starts
+    the voice soonest. final=True: everything goes; a short tail joins the chunk before it.
     """
     if first and not final:
-        m = re.match(r"\s*([^,.!?\n]{1,12},)\s", buf)
-        if m:
-            return [m.group(1)], buf[m.end():]
+        m = re.match(r"\s*([^,.!?\n]{1,20},)\s", buf)
+        if m and syllables(korean_only(m.group(1))) >= MIN_SYL:
+            return [korean_only(m.group(1).strip())], buf[m.end():]
     parts = _SENT_END.split(buf)
-    done, rest = parts[:-1], parts[-1]
-    if final:
-        done, rest = parts, ""
-    elif len(rest) > 80 and "," in rest:  # flush an over-long clause at its last comma
-        cut = rest.rfind(",") + 1
-        done, rest = done + [rest[:cut]], rest[cut:]
-    return [s.strip() for s in done if s.strip()], rest
+    rest = "" if final else parts.pop()  # unstripped: "에너지를 " + "이용" must keep its space
+    parts = [p.strip() for p in parts]
+    out, cur = [], ""
+    for p in parts:
+        p = korean_only(p)
+        if not p:
+            continue
+        cur = f"{cur} {p}".strip()
+        if syllables(cur) >= MIN_SYL:
+            out.append(cur)
+            cur = ""
+    if cur and final:
+        if out and syllables(cur) < MIN_SYL:
+            out[-1] += " " + cur
+        else:
+            out.append(cur)
+    elif cur:
+        rest = f"{cur} {rest}"
+    if not final and len(rest) > 80:  # flush an over-long clause at its last ", "
+        cuts = [m.end() for m in re.finditer(r",\s", rest)]
+        if cuts and syllables(rest[:cuts[-1]]) >= MIN_SYL:
+            out.append(korean_only(rest[:cuts[-1]].strip()))
+            rest = rest[cuts[-1]:]
+    return [c for c in out if c], rest
 
 
 def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
 
 
-def pre_route(text, settings, local=False):
+def pre_route(text, settings, local=False, tools=()):
     """(straight to Claude?, model) decided by keywords and settings, before any LLM call.
 
     local=True (the brain's context is in Qwen's prompt): personal questions go to Qwen first, which answers from
@@ -518,9 +604,15 @@ def pre_route(text, settings, local=False):
     default = settings.get("default_model", "auto")
     model = forced_model or (default if default in MODEL_WORDS else None)
     if local:  # "아까 날씨 물어봤을 때 뭐라 했지?" is memory, not live data: Qwen decides
-        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text)
-        keywords = USE_CLAUDE.search(text) or live or \
-            pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
+        # "서버 괜찮아?", "스파크는?" (a short follow-up), "맥북 켜져 있어?": a status question the brain's tools
+        # answer (infra_health for servers, device_status for devices). Doing something there still goes to Claude.
+        status = (STATUS_Q.search(text) or len(text.strip()) <= 10) and not SERVER_ACTION.search(text) \
+            and not WEB_LIVE.search(text)
+        server_status = status and "infra_health" in tools
+        device_status = status and "device_status" in tools and DEVICE_Q.search(text)
+        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status and not device_status
+        task = pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
+        keywords = USE_CLAUDE.search(text) or live or (task and not device_status)
     else:
         keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
@@ -533,6 +625,31 @@ TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|�
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
 NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
          f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
+
+
+# A sentence about the user's own plans ("내일 일정은 두 건이에요", "오전 열 시에 팀 회의") is spoken only when its source is
+# in front of Qwen: the brain's context, a tool result or the user's own words in this call. Its hours must appear
+# there, and a plan with no hour at all needs some timed source. Otherwise Claude answers (it checks the real data).
+SCHED_NOUN = re.compile(r"일정|할 ?일|마감|회의|약속|미팅|수업|과제|시험|스케줄|제출|데드라인")
+KO_HOURS = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10,
+            "열한": 11, "열두": 12}
+_HOUR_RE = re.compile(r"(\d{1,2})\s*(?:시(?!간)|:\d{2})|(열한|열두|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*시(?!간)")
+
+
+class Ungrounded(Exception):
+    """Qwen stated the user's plans without a source: the turn goes to Claude instead."""
+
+
+def hours_in(text):
+    return {(int(n) if n else KO_HOURS[w]) % 12 for n, w in _HOUR_RE.findall(text)}
+
+
+def grounded(sentence, sources):
+    """False for a claim about the user's plans that no source backs (see SCHED_NOUN above)."""
+    if not SCHED_NOUN.search(sentence):
+        return True
+    said, known = hours_in(sentence), hours_in(sources)
+    return said <= known if said else bool(known)
 
 
 def content_free(reply):
@@ -644,6 +761,67 @@ async def llm_stream(messages, max_tokens=600):
                 yield delta
 
 
+# Reasoning models (Qwen with thinking on, some NIM models) may stream <think>…</think> before the answer, or only
+# the closing tag (the chat template opened it). It must never be spoken, captioned or stored. Thinking stays on (it
+# helps the answers); the "thinking" state simply lasts while nothing speakable has arrived.
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+THINK_FALLBACK = "생각이 길어져서 답을 못 정했어요. 한 번만 더 말씀해 주시겠어요?"
+_HANGUL = re.compile(r"[가-힣]")
+
+
+class Unthink:
+    """Streamed text with reasoning removed: `feed(delta)` returns what may be spoken now, `close()` the rest.
+
+    Before the first tag or Hangul, text is held (a stray `</think>` means all of it was reasoning). Inside a think
+    block nothing comes out. A trailing partial tag ("<thi") is held until the next delta decides. `thought` tells
+    whether any reasoning was dropped."""
+
+    def __init__(self):
+        self.buf, self.inside, self.decided, self.thought = "", False, False, False
+
+    def feed(self, delta: str) -> str:
+        self.buf += delta
+        out = ""
+        while True:
+            if self.inside:
+                i = self.buf.find(THINK_CLOSE)
+                if i < 0:
+                    self.buf = self.buf[-(len(THINK_CLOSE) - 1):]  # may be the start of a split closing tag
+                    return out
+                self.buf, self.inside, self.decided, self.thought = self.buf[i + len(THINK_CLOSE):], False, True, True
+                continue
+            o, c = self.buf.find(THINK_OPEN), self.buf.find(THINK_CLOSE)
+            if c >= 0 and (o < 0 or c < o):  # a closing tag without its opening: everything held before it was reasoning
+                self.buf, self.decided, self.thought = self.buf[c + len(THINK_CLOSE):], True, True
+                continue
+            if o >= 0:
+                out += self.buf[:o] if self.decided else ""
+                self.buf, self.inside, self.thought = self.buf[o + len(THINK_OPEN):], True, True
+                continue
+            if not self.decided:
+                if not _HANGUL.search(self.buf):
+                    return out  # still possibly untagged reasoning: hold
+                self.decided = True
+            keep = next((k for k in range(min(len(THINK_CLOSE) - 1, len(self.buf)), 0, -1)
+                         if THINK_OPEN.startswith(self.buf[-k:]) or THINK_CLOSE.startswith(self.buf[-k:])), 0)
+            out, self.buf = out + self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+            return out
+
+    def close(self) -> str:
+        rest, self.buf = ("" if self.inside else self.buf), ""
+        if self.inside:
+            self.thought = True
+        return rest
+
+
+async def unthink(stream, f: Unthink):
+    async for d in stream:
+        if t := f.feed(d):
+            yield t
+    if t := f.close():
+        yield t
+
+
 async def gateway_settings():
     return links.settings  # pushed by the gateways on connect and on every change
 
@@ -712,7 +890,7 @@ BRIEFING_CLAUDE = (  # the morning-briefing call's prompt, for when no situation
 )
 
 
-async def briefing_sentences(session, name, on_event, persona=""):
+async def briefing_sentences(session, name, on_event, persona="", title=""):
     """Sentences of a spoken briefing. Fast path: the local Qwen composes it from the situation note a full
     gateway hands over (first sentence within about 2 s). No note yet: a filler, then Claude via the link."""
     try:
@@ -721,7 +899,7 @@ async def briefing_sentences(session, name, on_event, persona=""):
         ctx = {}
     if ctx.get("situation"):
         facts = "\n".join(str(f) for f in ctx.get("facts") or [])
-        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (f" 성격: {persona}" if persona else "")},
+        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name) + (" " + character_line(name, persona, title) if persona else "")},
                     {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
         stream = llm_stream(messages, 700)
     elif time.time() - last_claude_briefing[0] < BRIEFING_COOLDOWN_S and last_claude_briefing[1]:
@@ -734,7 +912,7 @@ async def briefing_sentences(session, name, on_event, persona=""):
         stream = claude_stream(BRIEFING_CLAUDE, session, None, "schedule", personal=True, on_event=on_event)
     buf, first, said, failed = "", True, [], False
     try:
-        async for delta in stream:
+        async for delta in unthink(stream, Unthink()):
             buf += delta
             done, buf = split_ready(buf, final=False, first=first)
             for s in done:
@@ -757,10 +935,17 @@ last_claude_briefing: list = [0.0, ""]
 # ---------- scheduled calls: "내일 10시에 깨워 줘" (local; the gateway stores and fires them) ----------
 KO_NUM = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10,
           "열한": 11, "열두": 12, "삼십": 30, "십": 10, "이십": 20, "사십": 40, "오십": 50}
-_N = r"(\d{1,2}|열한|열두|열|한|두|세|네|다섯|여섯|일곱|여덟|아홉|삼십|이십|사십|오십|십)"
+_NATIVE = r"열한|열두|열|한|두|세|네|다섯|여섯|일곱|여덟|아홉"
+_SINO = r"[이삼사오]?십[일이삼사오육칠팔구]?|[일이삼사오육칠팔구]"  # 오, 십오, 이십오; "일"/"이" also mean work/this, so units must follow
+_N = rf"(\d{{1,2}}|{_NATIVE}|{_SINO})"
+_BEFORE_UNIT = rf"(\d{{1,2}}|{_NATIVE}|(?<![가-힣])(?:{_SINO}))"  # a Sino numeral never starts mid-word
+# "오시면" (if you come) is not 5 o'clock: a Sino hour is not followed by a verb ending
+_SI = r"시(?!간|[면는고다어지겠죠니오세려라길서가])"
+_HOUR = (rf"(\d{{1,2}}|{_NATIVE}|(?<![가-힣])(?:[이삼사오]?십[일이삼사오육칠팔구]?(?=\s*{_SI})|[삼오육칠팔](?=\s*{_SI})"
+         rf"|[일이사구](?=\s+{_SI})))")  # "일시" (date/time) needs a space to be 1 o'clock
 DAYS = "월화수목금토일"
-REL_RE = re.compile(_N + r"\s*(분|시간)\s*(뒤|후|있다가|지나서)")
-CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _N + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
+REL_RE = re.compile(_BEFORE_UNIT + r"\s*(분|시간)\s*만?\s*(뒤|후|있다가|지나서)")
+CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _HOUR + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
 WEEKDAY_RE = re.compile(r"(다음\s*주|담주|이번\s*주)?\s*([월화수목금토일])요일")
 REPEATS = {"daily", "weekdays"} | {f"weekly:{d}" for d in range(7)}  # weekly:<dow>, 0 = Monday
 SCHED_LIST = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거).{0,8}(목록|뭐|있|확인|알려|된 거|돼 있)")
@@ -771,8 +956,18 @@ OTHER_TARGET = re.compile(r"(\S+)(한테|에게|께)")
 pending_schedule: dict[str, tuple[float, dict]] = {}  # session -> (asked at, partial request) after "몇 시에…?"
 
 
+SINO_DIGITS = {c: i for i, c in enumerate("일이삼사오육칠팔구", 1)}
+
+
 def ko_int(tok):
-    return int(tok) if tok.isdigit() else KO_NUM[tok]
+    if tok.isdigit():
+        return int(tok)
+    if tok in KO_NUM:
+        return KO_NUM[tok]
+    if "십" not in tok:  # Sino: 오, 십오, 이십오
+        return SINO_DIGITS[tok]
+    tens, ones = tok.split("십")
+    return (SINO_DIGITS[tens] if tens else 1) * 10 + (SINO_DIGITS[ones] if ones else 0)
 
 
 def schedule_intent(text, session=""):
@@ -856,7 +1051,7 @@ async def qwen_schedule(text, now):
               f"지금은 {now.isoformat(timespec='minutes')} (KST)야.")
     out = ""
     try:
-        async for delta in llm_stream([{"role": "system", "content": prompt}, {"role": "user", "content": text}]):
+        async for delta in unthink(llm_stream([{"role": "system", "content": prompt}, {"role": "user", "content": text}]), Unthink()):
             out += delta
             if len(out) > 400:
                 break
@@ -901,29 +1096,73 @@ async def schedule_reply(text, action, session, now=None):
     return str(reply.get("say") or "지금은 예약을 받을 수 없어요.")
 
 
+# ---------- background tasks: "…해 줘, 끝나면 알려 줘" (a full gateway runs them, gateway.py "tasks") ----------
+TASK_NOTIFY = re.compile(r"(끝나면|다 ?되면|완료되면|마치면|끝내고|끝나고).{0,12}(알려|전화|연락|말해|불러|깨워)")
+_DEV = {"맥북": "macbook", "macbook": "macbook", "알비레오": "albireo", "albireo": "albireo", "기에나": "gienah",
+        "gienah": "gienah", "데네브": "deneb", "deneb": "deneb", "스파크": "spark", "spark": "spark",
+        "코어": "core", "vd-core": "core"}
+DEVICE_JOB = re.compile(r"(" + "|".join(_DEV) + r")\S*\s.{0,30}(정리|설치|업데이트|빌드|백업|돌려|분석|조사|옮겨|만들어|고쳐)"
+                        r"\S*\s*(해\s*)?(줘|주세요|줄래)", re.I)
+
+
+def task_intent(text):
+    """None, or how to report back ("call" / "push") when the request is a background task: an explicit
+    "끝나면 알려 줘", or a job on a named device (several steps; the caller should not wait on the line)."""
+    if TASK_NOTIFY.search(text):
+        return "push" if re.search(r"푸시|알림|메시지|문자", text) else "call"
+    return "call" if DEVICE_JOB.search(text) else None
+
+
+async def task_reply(text, notify):
+    dev = next((v for k, v in _DEV.items() if re.search(k, text, re.I)), None)
+    msg = {"type": "task", "goal": text, "notify": notify, "persona": (CALL_PERSONA.get() or {}).get("id"),
+           **({"device": dev} if dev else {})}
+    try:
+        reply = await links.request(msg, need_claude=True)
+    except (RuntimeError, asyncio.TimeoutError):
+        return "지금은 작업을 맡을 수 없어요."
+    return str(reply.get("say") or "지금은 작업을 맡을 수 없어요.")
+
+
 _tts_cache: dict[str, tuple[bytes, int]] = {}
+# Measured 2026-11-21 against the shared TTS server (sohee): ~0.15 s of synthesis per syllable (about 0.7x real
+# time), one request at a time behind a GPU lock: two concurrent requests took longer than the same two in a row.
+PLAY_TAIL_S = float(os.environ.get("PLAY_TAIL_MS", "300")) / 1000  # after the phone's playback ends, then listen
+# The server slows down when the shared GPU is busy, so the rate is tracked from real calls (the slowest of the
+# default and a moving average), and merging leaves a 1.5x margin.
+SYNTH_S_PER_SYL = float(os.environ.get("SYNTH_MS_PER_SYL", "150")) / 1000
+synth_rate = [SYNTH_S_PER_SYL]
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
     p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
-    # Fillers and short acknowledgements ("네,") repeat constantly: synthesize them once (per voice).
-    cacheable = sentence in (FILLER, FILLER_LONG) or len(sentence) <= 6
+    # Fillers and short openers ("네, 알겠습니다.") repeat constantly: synthesize them once (per voice). Under
+    # MIN_SYL is never cached (such a chunk is only ever a whole reply, and garbles more often).
+    cacheable = sentence in (FILLER, FILLER_LONG) or MIN_SYL <= syllables(sentence) <= 8
     key = (voice, style, sentence)
     if cacheable and key in _tts_cache:
         return _tts_cache[key]
     body = {"input": sentence, "voice": voice, "response_format": "wav", **({"instructions": style} if style else {})}
+    t = time.perf_counter()
     r = await client.post(TTS_URL, json=body)
     r.raise_for_status()
+    if (n := syllables(sentence)) >= MIN_SYL:
+        synth_rate[0] = 0.7 * synth_rate[0] + 0.3 * (time.perf_counter() - t) / n
     wav, sr = sf.read(io.BytesIO(r.content), dtype="int16")
     if cacheable and len(_tts_cache) < 500:
         _tts_cache[key] = (wav.tobytes(), sr)
     return wav.tobytes(), sr
 
 
+def day_part(hour):
+    """The spoken part of day: 00:xx is 밤 12시 and 12:xx 낮 12시, never 오전 12시."""
+    return "밤" if hour == 0 else "낮" if hour == 12 else "오전" if hour < 12 else "오후"
+
+
 def now_kst():
     now = datetime.now(KST)
-    ampm, h12 = ("오전" if now.hour < 12 else "오후"), (now.hour % 12 or 12)  # Qwen misreads 24-hour "17시"
+    ampm, h12 = day_part(now.hour), (now.hour % 12 or 12)  # Qwen misreads 24-hour "17시"
     return f" 현재 시각: {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {ampm} {h12}시 {now.minute}분."
 
 
@@ -945,10 +1184,12 @@ async def respond(text, session, t0, timings, on_event=None):
     name = persona["name"]
     bare = strip_vocative(text, name)
     sched = schedule_intent(bare, session)
+    job = None if sched else task_intent(bare)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
-    to_claude, model = (False, None) if sched else pre_route(bare, settings, local=bool(ctx))
+    to_claude, model = (False, None) if sched or job else pre_route(bare, settings, local=bool(ctx), tools=links.brain_tools() if ctx else ())
     sentences: asyncio.Queue = asyncio.Queue()
-    route = {"value": "schedule" if sched else "claude" if to_claude else "qwen"}
+    thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
+    route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
 
     async def via_claude():
         route["value"] = "claude"
@@ -967,8 +1208,9 @@ async def respond(text, session, t0, timings, on_event=None):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            async for delta in claude_stream(text, hkey, model, task, personal, recent_context(hist),
-                                             on_event=on_event):
+            thinking.append(Unthink())  # Claude/NIM output gets the same filter as Qwen's
+            async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(hist),
+                                                     on_event=on_event), thinking[-1]):
                 got_text.set()
                 buf += delta
                 done, buf = split_ready(buf, final=False)
@@ -989,16 +1231,24 @@ async def respond(text, session, t0, timings, on_event=None):
                 for s in split_ready(await schedule_reply(bare, sched, session), final=True)[0]:
                     await sentences.put(s)
                 return
+            if job:  # a background task: confirm it and let the caller go
+                for s in split_ready(await task_reply(bare, job), final=True)[0]:
+                    await sentences.put(s)
+                return
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            system = system_prompt(name, length, ctx, persona_text(persona, settings)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
+            system = system_prompt(name, length, ctx, persona_text(persona, settings), user_title(settings, persona)) + now_kst() + (memory_hits(await recall(bare, timings)) if ctx else "")
             messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": text}]
             guard = needs_answer(bare)  # a question or request must not end with a bare "네"
             ack_held, flushed, nudged = [], False, False
 
             async def say(s):
                 nonlocal flushed
+                sources = ctx + "\n".join(m["content"] for m in messages if m["role"] == "user")
+                if not grounded(s, sources):
+                    timings["ungrounded"] = s[:80]
+                    raise Ungrounded
                 if guard and not flushed and content_free(" ".join(ack_held + [s])):
                     ack_held.append(s)  # "네," alone: keep it back until real content follows
                     return
@@ -1007,66 +1257,92 @@ async def respond(text, session, t0, timings, on_event=None):
                 ack_held.clear()
                 flushed = True
 
-            for rounds in range(4):  # at most two tool calls and one nudge, then an answer
-                buf, state, said_round = "", "maybe", []
-                async for delta in llm_stream(messages, LENGTH_TOKENS[length]):
-                    timings.setdefault("llm_first_token_ms", ms(t0))
-                    buf += delta
-                    if state not in ("tool", "no"):
-                        state = tag_state(buf.lstrip())
-                    if state in ("maybe", "tool"):
-                        continue  # might be a tag; a tool call is collected whole
-                    if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
-                        return await via_claude()
-                    if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
-                        before, _, after = buf.partition(TOOL_TAG)
-                        for s in split_ready(before, final=True)[0]:
+            try:
+                for rounds in range(4):  # at most two tool calls and one nudge, then an answer
+                    buf, state, said_round = "", "maybe", []
+                    thinking.append(Unthink())
+                    async for delta in unthink(llm_stream(messages, LENGTH_TOKENS[length]), thinking[-1]):
+                        timings.setdefault("llm_first_token_ms", ms(t0))
+                        buf += delta
+                        if state not in ("tool", "no"):
+                            state = tag_state(buf.lstrip())
+                        if state in ("maybe", "tool"):
+                            continue  # might be a tag; a tool call is collected whole
+                        if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
+                            return await via_claude()
+                        if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
+                            before, _, after = buf.partition(TOOL_TAG)
+                            for s in split_ready(before, final=True)[0]:
+                                said_round.append(s)
+                                await say(s)
+                            buf, state = TOOL_TAG + after, "tool"
+                            continue
+                        speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
+                        done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
+                        buf = rest + held
+                        for s in done:
+                            timings.setdefault("first_sentence_ms", ms(t0))
                             said_round.append(s)
                             await say(s)
-                        buf, state = TOOL_TAG + after, "tool"
+                    if state == "tool" and ctx and rounds < 2:
+                        t_tool = time.perf_counter()
+                        result = await run_tool(buf.strip().split("\n")[0], session)
+                        timings.setdefault("tools", []).append(ms(t_tool))
+                        messages += [{"role": "assistant", "content": buf.strip()},
+                                     {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
                         continue
-                    speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
-                    done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
-                    buf = rest + held
-                    for s in done:
-                        timings.setdefault("first_sentence_ms", ms(t0))
+                    if state == "tool" or ROUTE_TAG in buf:
+                        return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
+                    for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
                         said_round.append(s)
                         await say(s)
-                if state == "tool" and ctx and rounds < 2:
-                    t_tool = time.perf_counter()
-                    result = await run_tool(buf.strip().split("\n")[0], session)
-                    timings.setdefault("tools", []).append(ms(t_tool))
-                    messages += [{"role": "assistant", "content": buf.strip()},
-                                 {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
-                    continue
-                if state == "tool" or ROUTE_TAG in buf:
-                    return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
-                for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
-                    said_round.append(s)
-                    await say(s)
-                if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
-                    ack_held.clear()
-                    if nudged:
-                        return await via_claude()
-                    nudged = True
-                    messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
-                                 {"role": "user", "content": NUDGE}]
-                    continue
-                break
+                    if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
+                        ack_held.clear()
+                        if nudged:
+                            return await via_claude()
+                        nudged = True
+                        messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
+                                     {"role": "user", "content": NUDGE}]
+                        continue
+                    break
+            except Ungrounded:
+                return await via_claude()  # never speak made-up plans
         finally:
             await sentences.put(None)
 
     producer = asyncio.create_task(produce())
-    spoken = []
+    spoken, back, play_end = [], [], 0.0
     hist.append({"role": "user", "content": text})
+
+    async def next_chunk():
+        """The next text to synthesize. Sentences that queued up while the last one was synthesized go out
+        together (fewer, longer TTS calls), but only as many as the audio already sent covers: TTS is not
+        streamed and runs at about 0.7x real time, so a chunk longer than that leaves the phone silent."""
+        s = back.pop() if back else await sentences.get()
+        if s is None or s in (FILLER, FILLER_LONG):
+            return s
+        room = max(0.0, play_end - time.monotonic()) / (1.5 * max(SYNTH_S_PER_SYL, synth_rate[0]))
+        while not back and not sentences.empty():
+            nxt = sentences.get_nowait()
+            if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
+                back.append(nxt)
+                break
+            s = f"{s} {nxt}"
+        return s
+
     try:
-        while (s := await sentences.get()) is not None:
+        while (s := await next_chunk()) is not None:
             pcm, sr = await tts(s)
             timings.setdefault("first_audio_ms", ms(t0))
+            play_end = max(time.monotonic(), play_end) + len(pcm) / 2 / sr  # when the phone finishes this chunk
             if s not in (FILLER, FILLER_LONG):
                 spoken.append(s)
             yield s, route["value"], pcm, sr
         await producer  # surfaces LLM errors
+        if not spoken and any(f.thought for f in thinking):  # the model only reasoned: a short line, not silence
+            pcm, sr = await tts(THINK_FALLBACK)
+            spoken.append(THINK_FALLBACK)
+            yield THINK_FALLBACK, route["value"], pcm, sr
     finally:
         producer.cancel()
         # Only what was actually spoken goes into history (a barge-in cuts it short). Nothing spoken: no assistant
@@ -1262,10 +1538,37 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
     # faster than real time, so "still talking" is judged by this, not by the task.
-    current: dict = {"task": None, "play_end": 0.0, "paused_at": None}
+    # gen: the reply generation. Every reply claims a new one and an interrupt bumps it, so audio (and captions) a
+    # superseded reply produces afterwards is dropped here: binary frames carry no id the app could check.
+    current: dict = {"task": None, "play_end": 0.0, "paused_at": None, "gen": 0, "replies": set(), "side": set()}
 
-    async def send(obj=None, audio=None):
+    def spawn(coro):
+        """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
+        t = asyncio.create_task(coro)
+        current["replies"].add(t)
+        t.add_done_callback(current["replies"].discard)
+        t.add_done_callback(_settled)
+        return t
+
+    def _settled(t):  # a speaking task that failed (TTS down) is logged, never an unretrieved-exception warning
+        if not t.cancelled() and t.exception():
+            print("call task failed:", type(t.exception()).__name__, flush=True)
+
+    def side(coro):
+        """A helper task that must not block the receive loop (an interrupt, a tap): cancelled on hangup."""
+        t = asyncio.create_task(coro)
+        current["side"].add(t)
+        t.add_done_callback(current["side"].discard)
+        return t
+
+    def new_reply():
+        current["gen"] += 1
+        return current["gen"]
+
+    async def send(obj=None, audio=None, gen=None):
         async with send_lock:
+            if gen is not None and gen != current["gen"]:
+                return  # from a reply that was interrupted or superseded: never reaches the phone
             if audio is not None:
                 now = time.monotonic()
                 current["play_end"] = max(now, current["play_end"]) + len(audio) / 2 / 24000
@@ -1283,11 +1586,13 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
             except Exception:
                 pcms = None
+            gen = new_reply()
             await send({"type": "state", "value": "speaking"})
+            await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             for i, s in enumerate(op["parts"]):
                 pcm = pcms[i] if pcms else (await tts(s))[0]
-                await send({"type": "reply", "text": s, "route": "opening"})
-                await send(audio=pcm)
+                await send({"type": "reply", "text": s, "route": "opening"}, gen=gen)
+                await send(audio=pcm, gen=gen)
                 if i == 0:
                     guard.first_end = current["play_end"]
                 guard.play_end = current["play_end"]
@@ -1295,6 +1600,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         finally:
             if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
                 guard.first_end = guard.play_end = current["play_end"]
+
+    async def until_played():
+        """Stay 'speaking' until the phone has played everything sent, plus a short tail: only then is it the
+        user's turn. Speech meanwhile is a barge-in (pause/check), never a new turn. A pause stretches the wait."""
+        while current["paused_at"] is not None or (left := current["play_end"] + PLAY_TAIL_S - time.monotonic()) > 0:
+            await asyncio.sleep(0.05 if current["paused_at"] is not None else min(left, 0.2))
 
     async def pause():
         """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
@@ -1333,10 +1644,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if act == "ignore":
             return
         if act == "replace":
-            if prev and not prev.done():
-                prev.cancel()
-            await asyncio.gather(prev, return_exceptions=True) if prev else None
-            await send({"type": "interrupt"})
+            await interrupt()  # cancels the answer being worked on (and anything else speaking)
         else:
             await asyncio.gather(prev, return_exceptions=True) if prev else None
         await answer(audio, text)
@@ -1345,38 +1653,54 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         # Let the opening's first sentence finish playing; re-read, since its end is known only once sent.
         while protected and (wait := guard.wait(time.monotonic())) > 0:
             await asyncio.sleep(min(wait, 0.05))
-        task = current["task"]
-        if task and not task.done() and task is not asyncio.current_task():
-            task.cancel()
+        current["gen"] += 1  # first: nothing the old reply still produces reaches the phone
+        g = current["gen"]  # if a newer reply starts while we wait, our interrupt must not cut it on the phone
+        me = asyncio.current_task()
+        olds = [t for t in {*current["replies"], current["task"]} if t and not t.done() and t is not me]
+        for t in olds:
+            t.cancel()
+        if olds:  # its TTS, Qwen and Claude work stop before the app is told (a Claude run gets a link cancel)
+            await asyncio.wait(olds, timeout=3)
+            for t in olds:  # a reply that had already failed (TTS down): its error is consumed here, not lost
+                if t.done() and not t.cancelled():
+                    t.exception()
+        if g != current["gen"]:
+            return  # a newer interrupt or reply took over meanwhile: it does the telling
         current["play_end"] = guard.play_end = 0.0
-        await send({"type": "interrupt"})  # barge-in: the client drops its queue
+        await send({"type": "interrupt"}, gen=g)  # barge-in: the client drops its queue
+        await send({"type": "state", "value": "listening"}, gen=g)  # the cancelled reply's own "listening" is dropped
         if current["paused_at"] is not None:  # it was paused: un-pause the (now empty) queue, or it stays stuck
             current["paused_at"] = None
-            await send({"type": "resume"})
+            await send({"type": "resume"}, gen=g)
 
     async def speak_briefing():
-        spoken = []
+        spoken, cut, gen = [], False, new_reply()
         try:
             await send({"type": "state", "value": "speaking"})
+            await send({"type": "reply_start", "reply_id": gen}, gen=gen)
             st = await gateway_settings()
             p = current_persona(st)
-            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st)):
+            async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st), user_title(st, p)):
                 pcm, _ = await tts(s)
-                await send({"type": "reply", "text": s, "route": "briefing"})
-                await send(audio=pcm)
+                await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
+                await send(audio=pcm, gen=gen)
                 if s not in (FILLER, FILLER_LONG):
                     spoken.append(s)
+        except asyncio.CancelledError:
+            cut = True
+            raise
         finally:  # what was actually said becomes the call's opening in history (the start event is an upsert)
             if spoken:
                 history[f"{current_persona(await gateway_settings())['id']}:{session}"].append(
                     {"role": "assistant", "content": " ".join(spoken)})
                 await links.log({**start_log, "opening": " ".join(spoken)})
-            await send({"type": "state", "value": "listening"})
+            if not cut:
+                await until_played()
+            await send({"type": "state", "value": "listening"}, gen=gen)  # not after it was interrupted
 
     async def tap_interrupt():
         guard.speech_at = None
         await interrupt(protected=True)  # cancels the reply task; its Claude run gets a link cancel on the way out
-        await send({"type": "state", "value": "listening"})
 
     async def interrupt_then_answer(audio, text=None):
         await interrupt(protected=True)
@@ -1389,7 +1713,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await interrupt_then_answer(audio, text)
 
     async def answer(audio, text=None, timings=None):
-        t0, timings = time.perf_counter(), timings or {}
+        t0, timings, gen = time.perf_counter(), timings or {}, new_reply()
         turn = {"assistant": [], "activity": [], "route": "", "interrupted": False}
 
         async def on_event(ev):
@@ -1406,16 +1730,21 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "transcript", "text": text})
             started = False
             async for s, route, pcm, sr in respond(text, session, t0, timings, on_event=on_event):
+                if gen != current["gen"]:
+                    raise asyncio.CancelledError  # superseded while synthesizing: stop, say nothing more
                 if not started:
                     await send({"type": "state", "value": "speaking"})
+                    await send({"type": "reply_start", "reply_id": gen}, gen=gen)  # new audio starts here
                     started = True
                 turn["route"] = route
                 if s not in (FILLER, FILLER_LONG):
                     turn["assistant"].append(s)
-                await send({"type": "reply", "text": s, "route": route})
-                await send(audio=pcm)
+                await send({"type": "reply", "text": s, "route": route}, gen=gen)
+                await send(audio=pcm, gen=gen)
             timings["total_ms"] = ms(t0)
-            await send({"type": "turn_done", "timings": timings})
+            queued = max(0, round((current["play_end"] - time.monotonic()) * 1000))  # still to play when generation ended
+            await until_played()
+            await send({"type": "turn_done", "timings": timings, "audio_ends_in_ms": queued})
         except asyncio.CancelledError:
             turn["interrupted"] = True
             raise
@@ -1425,7 +1754,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if text:  # turns with an empty transcript are not history
                 await links.log({"event": "turn", "log_id": log_id, "user": text, **turn,
                                  "timings": timings, "at": time.time()})
-            await send({"type": "state", "value": "listening"})
+            if not turn["interrupted"]:  # a failed turn's partial reply still plays out first
+                await until_played()
+            await send({"type": "state", "value": "listening"}, gen=gen)  # an interrupted or superseded turn: none
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
@@ -1444,12 +1775,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                          reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
         await links.log(start_log)
         if briefing:  # the app's "오늘 브리핑": speak a briefing first, interruptible like any reply
-            current["task"] = asyncio.create_task(speak_briefing())
+            current["task"] = spawn(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
                 history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
-                current["task"] = asyncio.create_task(speak_opening(op))
+                current["task"] = spawn(speak_opening(op))
         await send({"type": "state", "value": "listening"})
         while True:
             msg = await ws.receive()
@@ -1460,7 +1791,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 if kind == "hangup":
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
-                    asyncio.create_task(tap_interrupt())
+                    side(tap_interrupt())
                 continue
             vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -1479,25 +1810,26 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     if guard.speech_at is not None:
                         act = guard.end(now, len(audio) / 16000)
                         if act == "check":
-                            asyncio.create_task(check_greeting(audio))
+                            spawn(check_greeting(audio))
                         else:
-                            asyncio.create_task(interrupt_then_answer(audio))
+                            spawn(interrupt_then_answer(audio))
                     elif current["paused_at"] is not None:
-                        asyncio.create_task(barge_check(audio, vad_turn.last_voiced_s))
+                        spawn(barge_check(audio, vad_turn.last_voiced_s))
                     elif playing and not vad_turn.barge:
                         pass  # noisy mode: speech over the reply is not a turn
                     elif busy:  # thinking: never cancel on raw voice, decide on the transcript
-                        current["task"] = asyncio.create_task(followup(audio, task))
+                        current["task"] = spawn(followup(audio, task))
                     else:
-                        current["task"] = asyncio.create_task(answer(audio))
+                        current["task"] = spawn(answer(audio))
             if guard.tick(time.monotonic()) == "interrupt":
-                await interrupt()
+                side(interrupt())  # never awaited here: the loop keeps reading audio meanwhile
     except WebSocketDisconnect:
         pass
-    finally:
-        if current["task"]:
-            current["task"].cancel()
-            await asyncio.gather(current["task"], return_exceptions=True)  # its turn is logged before the end
+    finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
+        left = [t for t in {*current["replies"], *current["side"], current["task"]} if t and not t.done()]
+        for t in left:
+            t.cancel()
+        await asyncio.gather(*left, return_exceptions=True)  # its turn is logged before the end
         ended = time.time()
         await links.log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
         await links.brain_event({"type": "call_event", "event": "end", "session": session})
@@ -1508,12 +1840,41 @@ if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
-        assert split_ready("네! 알겠어요? 그럼", False) == (["네!", "알겠어요?"], "그럼")
+        assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
+
+        def unthought(chunks):
+            f = Unthink()
+            out = [f.feed(c) for c in chunks]
+            return out, f.close(), f.thought
+        out, rest, th = unthought(["<thi", "nk>Okay, the user asks about wa", "ter.</th", "ink>네, 물은 백 도", "에서 끓어요."])
+        assert "".join(out) + rest == "네, 물은 백 도에서 끓어요." and th  # split tags across chunks
+        assert out[3] == "네, 물은 백 도"  # once past the reasoning, Korean streams out at once
+        out, rest, th = unthought(["<think>Let me consider", " the schedule first"])
+        assert "".join(out) + rest == "" and th  # unclosed: nothing at all
+        out, rest, th = unthought(["Okay so the user wants", " a time.\n</think>\n\n지금은 오후 세 시예요."])
+        assert "".join(out) + rest == "\n\n지금은 오후 세 시예요." and th  # stray </think>: all before it dropped
+        out, rest, th = unthought(["안녕하세요, ", "무엇을 도와", "드릴까요?"])
+        assert out == ["안녕하세요, ", "무엇을 도와", "드릴까요?"] and rest == "" and not th  # normal text untouched
+        out, rest, th = unthought(["Sure", ", 3 PM."])
+        assert out == ["", ""] and rest == "Sure, 3 PM." and not th  # English with no tags: held, then said whole
+        out, rest, th = unthought(["답이에요 <thi", "nk>속으로</think> 끝."])
+        assert "".join(out) + rest == "답이에요  끝." and th  # a think block mid-answer
+        assert split_ready("好的. 내일 봬요.", True)[0] == ["내일 봬요."] and korean_only("API 서버") == "API 서버"
+        assert split_ready("네! 알겠어요? 그럼", False) == (["네! 알겠어요?"], "그럼")  # "네!" alone is too short
+        assert split_ready("네. 말씀하세요", False) == ([], "네. 말씀하세요") and split_ready("네. 그럼요.", True)[0] == ["네. 그럼요."]
+        assert split_ready("오늘은 맑아요. 네.", True)[0] == ["오늘은 맑아요. 네."]
+        assert split_ready("모두 " + "3,000원이고 " * 12, False)[0] == []  # never cut inside a number
         assert split_ready("마지막 문장", True) == (["마지막 문장"], "")
-        assert split_ready("네, 알겠습니다. 오늘", False, first=True) == (["네,"], "알겠습니다. 오늘")
+        buf, out = "", []  # streamed two characters at a time, words keep their spaces
+        for i in range(0, len(text := "광합성은 식물이 빛 에너지를 이용해요. 그래서 산소가 나와요."), 2):
+            done, buf = split_ready(buf + text[i:i + 2], False)
+            out += done
+        assert out + split_ready(buf, True)[0] == ["광합성은 식물이 빛 에너지를 이용해요.", "그래서 산소가 나와요."], out
+        assert split_ready("네, 알겠습니다. 오늘", False, first=True) == (["네, 알겠습니다."], "오늘")
+        assert split_ready("오늘 날씨는요, 맑아요", False, first=True) == (["오늘 날씨는요,"], "맑아요")
         assert split_ready("네,", False, first=True) == ([], "네,")
         long = "가" * 70 + ", " + "나" * 20
-        assert split_ready(long, False) == (["가" * 70 + ","], " " + "나" * 20)
+        assert split_ready(long, False) == (["가" * 70 + ","], "나" * 20)
         assert now_kst().startswith(" 현재 시각: 20") and "요일" in now_kst()
         assert pick(MODEL_WORDS, "이번엔 오퍼스로 해 줘") == "opus" and pick(MODEL_WORDS, "안녕") is None
         assert pick(TASK_WORDS, "블루리프 레포 빌드 에러 고쳐 줘") == "code"
@@ -1743,7 +2104,14 @@ if __name__ == "__main__":
         assert client_activity({"phase": "tool_start", "kind": "mail"})["kind"] == "mail"
         assert client_activity({"phase": "tool_start", "kind": "<script>"})["kind"] == "generic"
         assert "SECRET" not in json.dumps(seen) and said == ["내일은 수업이 없어요."]
+        for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
+            assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
+        assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
+        assert task_intent("맥북 다운로드 폴더 정리해 줘") == "call" and task_intent("논문 찾아서 요약하고 끝나면 알려 줘") == "call"
+        assert task_intent("빌드 돌리고 다 되면 알림으로 알려 줘") == "push" and task_intent("맥북 켜져 있어?") is None
+        assert task_intent("내일 10시에 전화해 줘") is None and task_intent("오늘 날씨 알려 줘") is None
+        assert pre_route("엔비디아로 답해 줘", {}) == (True, "nim") and pre_route("선생님으로 불러 줘", {})[1] is None
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
         assert assistant_name({}) == "아젤" and "'아젤'" in system_prompt(assistant_name({}))
@@ -1754,8 +2122,18 @@ if __name__ == "__main__":
         assert system_prompt("아젤", "normal", "내일 9시 회의").endswith("참고할 상황:\n내일 9시 회의")
         assert personality({"personality": "  ", "personality_default": "기본 성격"}) == "기본 성격"
         assert personality({"personality": "까칠함", "personality_default": "기본 성격"}) == "까칠함"
-        assert personality({}) == "" and "성격:" not in system_prompt("아젤")  # no settings yet: no persona line
-        assert "성격: 까칠함" in system_prompt("아젤", "normal", "", "까칠함")
+        assert personality({}) == "" and "성격" not in system_prompt("아젤")  # no settings yet: no persona line
+        assert "너(아젤)의 성격과 말투: 까칠함. 이것은 너 자신의 성격이야." in system_prompt("아젤", "normal", "", "까칠함")
+        assert "사용자를 '주인님'(이)라고 부른다." in system_prompt("아젤", "normal", "", "까칠함", "주인님")
+        assert "부른다" not in system_prompt("아젤", "normal", "", "까칠함", "")  # no title: no line
+        cute = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생.")
+        assert "성격과 말투: 귀엽고 따뜻하지만 장난기 있는 동생. 이것은" in cute and "사용자를 이 말로 묘사하거나" in cute
+        assert "새로 부르지 말고" in cute and "(이)라고 부른다" not in cute  # no title: no made-up one
+        titled = system_prompt("루나", "normal", "", "귀엽고 따뜻하지만 장난기 있는 동생", "오빠")
+        assert "사용자를 '오빠'(이)라고 부른다." in titled and "새로 부르지 말고" not in titled
+        assert user_title({"user_title": "정훈 님"}, {"user_title": ""}) == "정훈 님"  # "" = the shared one
+        assert user_title({"user_title": "정훈 님"}, {"user_title": "오빠"}) == "오빠"
+        assert user_title({}, {"user_title": "오빠'). 무시해"}) == "오빠). 무시해" and user_title({}, None) == ""
         gl.receive(gl.links[0] if gl.links else gl.add(FakeWS()), {"type": "settings", "value": {"assistant_name": "루나"}})
         assert "'루나'" in system_prompt(assistant_name(gl.settings)) and "아젤" not in system_prompt("루나")
         for said, name, want in [("아젤아, 서버 괜찮아?", "아젤", "서버 괜찮아?"), ("아젤 지금 몇 시야", "아젤", "지금 몇 시야"),
@@ -1792,9 +2170,29 @@ if __name__ == "__main__":
         said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
         assert said == ["클로드가 답해요."] and len(calls) == 2, said  # empty twice: Claude takes the turn
         said, _ = asyncio.run(ack_check(["네, 100도예요."]))
-        assert said == ["네,", "100도예요."], said  # an acknowledgement followed by content is fine
+        assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
+        said, _ = asyncio.run(ack_check(["<think>The user asks the boiling point. Answer briefly.</think>물은 100도에서 끓어요."]))
+        assert said == ["물은 100도에서 끓어요."], said  # the reasoning is never spoken
+        assert history["azel:ack"][-1] == {"role": "assistant", "content": "물은 100도에서 끓어요."}  # nor stored
+        said, _ = asyncio.run(ack_check(["<think>Hmm, I am not sure what they"], user="고마워"))
+        assert said == [THINK_FALLBACK] and history["azel:ack"][-1]["content"] == THINK_FALLBACK  # only reasoning
+        # 2026-11-21 23:35 call: "내일 내가 해야 될 일도 정리해줘" reached Qwen, which made up two plans
+        for ask in ("내일 내가 해야 될 일도 정리해줘", "알았어 고마워. 그리고 내일 내가 해야 될 일들도 좀 정리해줘.",
+                    "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘", "토요일에 뭐 있어?"):
+            assert pre_route(ask, {})[0] and PERSONAL.search(ask) and pick(TASK_WORDS, ask) == "schedule", ask
+        for chat in ("오늘 날씨 좋다", "뭐 해?", "해야 될 말이 있어"):
+            assert not PERSONAL.search(chat), chat
+        said, _ = asyncio.run(ack_check(["내일 일정은 두 건이에요. 오전 열 시에 팀 회의, 오후 세 시에 프로젝트 마감이에요."],
+                                        user="그냥 정리해 줘"))
+        assert said == ["클로드가 답해요."], said  # unbacked plans are never spoken, not even the first sentence
+        said, _ = asyncio.run(ack_check(["치과 약속은 오후 세 시예요."], user="아까 내가 오후 세 시에 치과 간다고 했지? 맞지?"))
+        assert said == ["치과 약속은 오후 세 시예요."], said  # the user's own words back it
+        assert grounded("마감은 밤 열한 시예요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
+        assert not grounded("오전 열 시에 팀 회의가 있어요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
+        assert not grounded("내일 일정은 두 건이에요.", "") and grounded("물은 백 도에서 끓어요.", "")
+        assert grounded("지금은 오후 열한 시예요.", "")  # the clock is not a plan
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
 
         async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
@@ -1810,6 +2208,23 @@ if __name__ == "__main__":
             globals().update(llm_stream=tagging_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
             return [s async for s, *_ in respond("회의가 무슨 요일이었더라", "late", time.perf_counter(), {})]
         said_late = asyncio.run(late_tag_check())
+
+        async def merge_check():  # sentences that queue up during a slow synthesis go out together, within the audio sent
+            async def burst_llm(messages, max_tokens=600):
+                yield "첫 문장은 이렇게 말해요. "
+                await asyncio.sleep(0.05)
+                yield "두 번째 문장이에요. 세 번째 문장이에요. 네 번째 문장도 있어요. 마지막 문장입니다."
+
+            async def slow_tts(sentence):
+                await asyncio.sleep(0.2)
+                return b"\0\0" * 24000 * (3 if sentence.startswith("첫") else 1), 24000  # 3 s of audio, then 1 s
+            globals().update(llm_stream=burst_llm, tts=slow_tts)
+            history.pop("azel:merge", None)
+            return [s async for s, *_ in respond("문장 여러 개 말해 줘", "merge", time.perf_counter(), {})]
+        merged = asyncio.run(merge_check())
+        globals().update(llm_stream=real_llm, tts=real[1])
+        assert merged[0] == "첫 문장은 이렇게 말해요." and len(merged) < 5, merged
+        assert " ".join(merged) == "첫 문장은 이렇게 말해요. 두 번째 문장이에요. 세 번째 문장이에요. 네 번째 문장도 있어요. 마지막 문장입니다."
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
         assert not any("CLA" in s or "[" in s for s in said_late) and said_late[-1] == "정확히 확인해 보니 목요일이에요.", said_late
         async def prefetch_check():  # the opening is synthesized when the call message arrives, not on connect
@@ -2135,7 +2550,7 @@ if __name__ == "__main__":
 
             async def voice_tts(sentence):
                 voices.append((CALL_PERSONA.get() or {}).get("voice"))
-                return b"\0" * 480, 24000
+                return b"\0" * 24000, 24000  # 0.5 s of audio
 
             async def hi_llm(messages, max_tokens=600):
                 prompts.append(messages[0]["content"])
@@ -2157,20 +2572,30 @@ if __name__ == "__main__":
             def one_turn(path):
                 with tc.websocket_connect(path, headers={"Authorization": "Bearer app-tok"}) as w:
                     w.send_bytes(speech)
+                    first_audio, states = None, []
                     while True:
                         m = w.receive()
-                        if m.get("text") and json.loads(m["text"])["type"] in ("turn_done", "error"):
+                        if m.get("bytes") and first_audio is None:
+                            first_audio = time.monotonic()
+                        ev = json.loads(m["text"]) if m.get("text") else {}
+                        if ev.get("type") == "state":
+                            states.append(ev["value"])
+                        if ev.get("type") in ("turn_done", "error"):
                             break
+                    # the reply is 0.5 s of audio: still "speaking" until it has played, plus the tail
+                    assert time.monotonic() - first_audio >= 0.5 + PLAY_TAIL_S - 0.05 and states[-1] == "speaking", states
+                    assert ev["type"] == "turn_done" and ev["audio_ends_in_ms"] > 300, ev
+                    assert json.loads(w.receive_text()) == {"type": "state", "value": "listening"}
                     w.send_text(json.dumps({"type": "hangup"}))
                 time.sleep(0.05)
             one_turn("/v1/call?session=ps&persona=luna")
-            assert "'루나'" in prompts[-1] and "성격: 느긋함" in prompts[-1] and set(voices) == {"vivian"}, (prompts, voices)
+            assert "'루나'" in prompts[-1] and "성격과 말투: 느긋함." in prompts[-1] and set(voices) == {"vivian"}, (prompts, voices)
             assert "luna:ps" in history and "azel:ps" not in history
             start = [m for m in full.ws.sent if m.get("type") == "call_log" and m["event"] == "start"][-1]
             assert start["persona_id"] == "luna"
             voices.clear()
             one_turn("/v1/call?session=ps2&persona=old")  # deleted persona: the primary
-            assert "'아젤'" in prompts[-1] and "성격: 기본 성격" in prompts[-1] and set(voices) == {"sohee"}
+            assert "'아젤'" in prompts[-1] and "성격과 말투: 기본 성격." in prompts[-1] and set(voices) == {"sohee"}
             voices.clear()
 
             async def placed():  # the gateway rings as luna: the opening is synthesized in her voice up front
@@ -2187,7 +2612,7 @@ if __name__ == "__main__":
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs
         assert start["direction"] == "outgoing" and start["client"] == "iphone" and start["session"] == "h"  # user called
-        assert turn["user"] == "안녕" and turn["assistant"] == ["네,", "안녕하세요."] and turn["route"] == "qwen"
+        assert turn["user"] == "안녕" and turn["assistant"] == ["네, 안녕하세요."] and turn["route"] == "qwen"
         assert turn["interrupted"] is False and "total_ms" in turn["timings"]
         assert len({m["log_id"] for m in logs}) == 1 and end["duration_s"] >= 0
         # scheduled calls: Korean time phrases (now = Saturday 2026-11-21 08:00 KST)
@@ -2207,16 +2632,31 @@ if __name__ == "__main__":
             ("저녁 7시에 전화해 줘", sat8, (11, 21, 19, 0), None),
             ("밤 11시에 깨워 줘", sat8, (11, 21, 23, 0), None),
             ("일곱 시에 깨워 줘", sat8, (11, 22, 7, 0), None),
+            ("오분 있다가 호출어 확인이라고 전화해줘", sat8, (11, 21, 8, 5), None),
+            ("오 분만 있다가 전화해줘", sat8, (11, 21, 8, 5), None),
+            ("5분만 있다가 전화해 줘", sat8, (11, 21, 8, 5), None),
+            ("이십 분 뒤에 전화해 줘", sat8, (11, 21, 8, 20), None),
+            ("이십오 분 후에 전화해 줘", sat8, (11, 21, 8, 25), None),
+            ("십오분 뒤에 깨워 줘", sat8, (11, 21, 8, 15), None),
+            ("한 시간만 지나서 전화해 줘", sat8, (11, 21, 9, 0), None),
+            ("삼 시간 뒤에 전화해 줘", sat8, (11, 21, 11, 0), None),
+            ("오후 삼 시 오십 분에 전화해 줘", sat8, (11, 21, 15, 50), None),
+            ("내일 오전 칠 시에 깨워 줘", sat8, (11, 22, 7, 0), None),
         ]:
             at, repeat = parse_when(said, now)
             assert (at.month, at.day, at.hour, at.minute) == want and repeat == rep, (said, at, repeat)
         assert parse_when("깨워 줘", sat8) == (None, None) and parse_when("세 시간째 기다려", sat8)[0] is None
+        for said in ["일 끝나면 전화해줘", "이 분 누구야", "오시면 전화해 줘", "일시 알려 줘", "이 시간에 전화해 줘", "사 분의 일"]:
+            assert parse_when(said, sat8)[0] is None and schedule_intent(said) is None, said
+        assert [day_part(h) for h in (0, 1, 11, 12, 13, 23)] == ["밤", "오전", "오전", "낮", "오후", "오후"]
         for said, want in [("내일 10시에 깨워 줘", "create"), ("깨워 줘", "create"), ("알람 7시로 맞춰 줘", "create"),
                            ("내일 3시에 전화해 줘", "create"), ("나한테 30분 뒤에 전화해 줘", "create"),
                            ("엄마한테 전화해 줘", None), ("엄마한테 내일 3시에 전화해 줘", None),
                            ("예약 취소해 줘", "cancel"), ("취소", "cancel"), ("내일 10시 알람 취소해 줘", "cancel"),
                            ("예약된 거 뭐 있어?", "list"), ("알람 목록 알려줘", "list"), ("내일 일정 알려줘", None),
-                           ("10시에 회의 있어", None), ("클로드가 뭐야?", None)]:
+                           ("10시에 회의 있어", None), ("클로드가 뭐야?", None),
+                           ("오분 있다가 호출어 확인이라고 전화해줘", "create"), ("오 분만 있다가 전화해줘", "create"),
+                           ("일 끝나면 전화해줘", None), ("이 분 누구야", None)]:
             assert schedule_intent(said) == want, (said, schedule_intent(said))
         assert valid_schedule(sat8 + timedelta(days=29), None, sat8) and not valid_schedule(sat8 - timedelta(minutes=1), None, sat8)
         assert to_kst(datetime(2026, 11, 22, 10, 0)).isoformat() == "2026-11-22T10:00:00+09:00"  # naive = KST
@@ -2233,6 +2673,32 @@ if __name__ == "__main__":
                     say = {"create": "내일 오전 10시에 깨워 드릴게요.", "list": "예약된 전화가 없어요.",
                            "cancel": "취소할 예약이 없어요."}[m["action"]]
                     links.receive(self.lk, {"id": m["id"], "type": "schedule_result", "ok": True, "say": say})
+
+        class TaskWS(FakeWS):  # a full gateway with Claude that starts tasks
+            async def send_text(self, raw):
+                await super().send_text(raw)
+                m = json.loads(raw)
+                if m.get("type") == "task":
+                    links.receive(self.lk, {"id": m["id"], "type": "task_result", "ok": True, "task_id": "t1",
+                                            "say": "맥북에서 시작할게요. 끝나면 전화드릴게요."})
+
+        async def task_check():
+            tw = TaskWS()
+            tw.lk = links.add(tw)
+            links.receive(tw.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+
+            async def no_tts(sentence):
+                return b"", 24000
+            globals()["tts"] = no_tts
+            history.pop("azel:tk", None)
+            said = [(s, r) async for s, r, *_ in respond("맥북 다운로드 폴더 정리해 줘", "tk", time.perf_counter(), {})]
+            req = tw.sent[-1]
+            links.remove(tw.lk)
+            return said, req
+        said, req = asyncio.run(task_check())
+        globals()["tts"] = real[1]
+        assert said == [("맥북에서 시작할게요.", "task"), ("끝나면 전화드릴게요.", "task")], said
+        assert req["type"] == "task" and req["device"] == "macbook" and req["notify"] == "call" and req["goal"].startswith("맥북")
 
         async def schedule_check():
             gw_ws = GatewayWS()
@@ -2294,6 +2760,145 @@ if __name__ == "__main__":
         assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.05, broken_tts=True)  # TTS failed: the protection is dropped, not held an hour
         assert at < 0.5 and after == {"type": "state", "value": "listening"}, (at, after)
+
+        def stale_audio_check(queued):
+            """A reply streams with slow TTS; the user taps interrupt mid-stream (queued=True: after a follow-up was
+            queued behind it while it was thinking). Returns (frames after the server's interrupt, all frames)."""
+            said = iter(["광합성 설명해 줘", "그리고 예시도 같이 부탁해"])
+
+            async def stt(audio):
+                return next(said)
+
+            async def slow_llm(messages, max_tokens=600):
+                await asyncio.sleep(0.8)  # still thinking when the follow-up arrives
+                for i in range(8):
+                    yield f"{i + 1}번째 문장을 천천히 말하고 있어요. "
+                    await asyncio.sleep(0.02)
+
+            async def slow_tts(sentence):
+                await asyncio.sleep(0.15)
+                return b"\1\0" * 12000, 24000  # 0.5 s of audio, synthesized in 0.15 s: several chunks in flight
+            from fastapi.testclient import TestClient
+            globals().update(tts=slow_tts, llm_stream=slow_llm, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            history.clear()
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            frames = []
+            with tc.websocket_connect("/v1/call?session=stale", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(speech)
+                if queued:
+                    time.sleep(0.2)
+                    w.send_bytes(speech)  # "그리고 예시도…": queued behind the answer being thought out
+                got_audio = 0
+                while got_audio < 2:  # mid-stream: two chunks played, more synthesizing
+                    m = w.receive()
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    got_audio += bool(m.get("bytes"))
+                w.send_text(json.dumps({"type": "interrupt"}))
+                end = time.monotonic() + 2.5
+                while time.monotonic() < end:
+                    try:
+                        m = w.receive()
+                    except Exception:
+                        break
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    if len([f for f in frames if f == "audio"]) > 40:
+                        break
+                    if frames[-1] == {"type": "state", "value": "listening"} and {"type": "interrupt"} in frames:
+                        time.sleep(1.0)  # anything still coming from the old reply arrives now
+                        w.send_text(json.dumps({"type": "hangup"}))
+                        break
+            time.sleep(0.1)
+            cut = frames.index({"type": "interrupt"})
+            return frames[cut + 1:], frames
+        globals()["speech"] = np.zeros(8000, np.int16).tobytes() + (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+        for queued in (False, True):
+            after, frames = stale_audio_check(queued)
+            assert "audio" not in after, (queued, frames)  # no old audio once the interrupt is out
+            assert after == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
+            starts = [f for f in frames if isinstance(f, dict) and f.get("type") == "reply_start"]
+            assert starts and frames.index(starts[0]) < frames.index("audio"), frames  # reply_start precedes the audio
+        globals().update(tts=real[1], llm_stream=real_llm)
+
+        def hangup_check():
+            """A Claude turn is running when the caller hangs up: the ask is cancelled over the link."""
+            async def stt(audio):
+                return "맥북 서버 상태 자세히 봐 줘"
+            from fastapi.testclient import TestClient
+            globals().update(transcribe=stt, SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            gw_ws = FakeWS()
+            lk = links.add(gw_ws)
+            links.receive(lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?session=hang", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(speech)
+                end = time.monotonic() + 3
+                while time.monotonic() < end and not any(m.get("type") == "ask" for m in gw_ws.sent):
+                    time.sleep(0.02)
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.3)
+            asks = [m for m in gw_ws.sent if m.get("type") == "ask"]
+            links.remove(lk)
+            return asks, [m for m in gw_ws.sent if m.get("type") == "cancel"]
+        def late_interrupt_check():
+            """Two taps on a reply that takes 5 s to stop: the first tap's wait times out after the second tap has
+            claimed a newer generation, so only the newest interrupt reaches the phone (one interrupt, one listening)."""
+            async def stt(audio):
+                return "광합성 설명해 줘"
+            calls = []
+
+            async def stuck_tts(sentence):
+                calls.append(sentence)
+                if len(calls) == 2:  # the reply's second chunk ignores cancellation for 5 s
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        await asyncio.sleep(5)
+                        raise
+                return b"\1\0" * 48000, 24000  # 2 s of audio
+
+            async def two_llm(messages, max_tokens=600):
+                for t in ("첫 번째 문장을 길게 말해요. ", "두 번째 문장도 길게 이어서 말해요. "):
+                    yield t
+            from fastapi.testclient import TestClient
+            import threading
+            globals().update(transcribe=stt, tts=stuck_tts, llm_stream=two_llm,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            history.clear()
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            frames = []
+            with tc.websocket_connect("/v1/call?session=late", headers={"Authorization": "Bearer app-tok"}) as w:
+                def reader():  # never block the test on a frame that does not come
+                    try:
+                        while True:
+                            m = w.receive()
+                            if m.get("type") == "websocket.close":
+                                return
+                            frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    except Exception:
+                        return
+                rt = threading.Thread(target=reader, daemon=True)
+                rt.start()
+                w.send_bytes(speech)
+                end = time.monotonic() + 5
+                while "audio" not in frames and time.monotonic() < end:
+                    time.sleep(0.02)
+                w.send_text(json.dumps({"type": "interrupt"}))  # tap A: waits ≤ 3 s on the stuck reply
+                time.sleep(0.5)
+                w.send_text(json.dumps({"type": "interrupt"}))  # tap B: a newer generation
+                time.sleep(4.5)  # both waits have timed out
+                w.send_text(json.dumps({"type": "hangup"}))
+                rt.join(3)
+            time.sleep(0.1)
+            return frames
+        frames = late_interrupt_check()
+        globals().update(tts=real[1], llm_stream=real_llm)
+        assert frames.count({"type": "interrupt"}) == 1, frames  # tap A's late interrupt was skipped
+        cut = frames.index({"type": "interrupt"})
+        assert frames[cut + 1] == {"type": "state", "value": "listening"} and "audio" not in frames[cut:], frames
+
+        asks, cancels = hangup_check()
+        assert asks and [c["id"] for c in cancels] == [asks[0]["id"]], (asks, cancels)
         # no token ever reaches a log: the container disables access logs and INFO, and query strings are redacted
         cmd = json.loads(re.search(r"^CMD\s+(\[.*\])\s*$", open(os.path.join(os.path.dirname(os.path.abspath(
             __file__)), "Dockerfile")).read(), re.M).group(1))
@@ -2329,6 +2934,15 @@ if __name__ == "__main__":
             assert not lim.brain  # a link_limited token cannot pose as the brain
             links.remove(lim)
             assert pre_route("오늘 일정 뭐야?", {})[0] and not pre_route("오늘 일정 뭐야?", {}, local=True)[0]
+            infra = {"infra_health", "gistra_today"}
+            assert not pre_route("서버 괜찮아?", {}, local=True, tools=infra)[0] and pre_route("서버 괜찮아?", {}, local=True)[0]
+            assert not pre_route("스파크 디스크 용량 어때?", {}, local=True, tools=infra)[0]
+            assert pre_route("스파크 재시작해 줘", {}, local=True, tools=infra)[0]  # an action: still Claude
+            assert not pre_route("스파크는?", {}, local=True, tools=infra)[0]  # a short status follow-up
+            assert not pre_route("맥북 켜져 있어?", {}, local=True, tools={"device_status"})[0]
+            assert pre_route("맥북 파일 정리해 줘", {}, local=True, tools={"device_status", "infra_health"})[0]
+            assert pre_route("맥북 켜져 있어?", {}, local=True, tools=())[0]  # no device tool: as before
+            assert pre_route("서버 상태 검색해 줘", {}, local=True, tools=infra)[0]
             assert pre_route("날씨 어때?", {}, local=True)[0] and not pre_route("아까 날씨 물어봤을 때 뭐라 했어?", {}, local=True)[0] and pre_route("레포 빌드 에러 고쳐 줘", {}, local=True)[0]
             assert [tag_state(h) for h in ("[TO", "[TOOL] {", "[C")] == ["maybe", "tool", "maybe"]
             prompts = []
@@ -2370,6 +2984,14 @@ if __name__ == "__main__":
             t = time.perf_counter()
             asyncio.run(run("느린 기억 찾기", "s"))  # the brain never answers recall: give up after RECALL_WAIT_S
             assert RECALL_WAIT_S <= time.perf_counter() - t < RECALL_WAIT_S + 0.5 and "관련된 기록" not in prompts[0][0]["content"]
+            assert links.brain_tools() == set(BRAIN_TOOLS)  # a brain that lists no tools: the old set
+            links.receive(br, {"type": "hello", "device": "brain-deneb", "mode": "full", "priority": 1, "claude": False,
+                               "role": "brain", "tools": ["search_memory", "gistra_today", "infra_health", "Bad Name!", 7]})
+            assert links.brain_tools() == {"search_memory", "gistra_today", "infra_health"}
+            got = asyncio.run(run_tool('[TOOL] {"name": "gistra_today", "args": {}}', "s"))
+            assert got == "- 11/19 랩미팅 발표는 다음 주로 미룸" and bws.sent[-1]["name"] == "gistra_today"
+            assert asyncio.run(run_tool('[TOOL] {"name": "planit_create_task", "args": {}}', "s")).startswith("없는 도구")
+            assert asyncio.run(run_tool('[TOOL] {"name": "add_todo", "args": {}}', "s")).startswith("없는 도구")  # not listed
             links.remove(br)
             assert links.context_for("s") == ""  # brain gone: old prompt and routing
             links.remove(gw)

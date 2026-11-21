@@ -10,7 +10,12 @@ allowed_roots = ["~/dev"]
 # No npm/yarn/pnpm run/test: package scripts run arbitrary code (use delegate for that).
 allowed_commands = ["git status", "git log", "git diff", "ls", "rg"]
 # Matched anywhere in the token list; these are never run without a gateway approval.
-approval_required = ["rm", "git push", "git reset --hard", "sudo", "mv", "chmod", "chown"]
+approval_required = ["rm", "git push", "git reset --hard", "mv", "chmod", "chown"]
+# true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris): an unlisted command becomes an approval
+# request in the app instead of a refusal. false on vd-spark, vd-core and sadr. sudo, secrets, wipes and sh -c are
+# refused either way.
+approve_unlisted = false
+approval_wait_s = 120
 log_path = "~/.local/state/biseo/daemon.jsonl"   # tool-call JSON lines; used_approvals.txt sits beside it
 read_max_bytes = 256000
 output_max_bytes = 64000

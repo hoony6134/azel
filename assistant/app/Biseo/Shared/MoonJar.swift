@@ -162,6 +162,8 @@ struct MoonJar: View {
     var surge: Date? = nil
     /// tool_end: one glow pulse, +0.25 opacity over 300 ms.
     var pulse: Date? = nil
+    /// The thinking pulse's twin (§14.3): one shimmer across the orb in any state.
+    var shimmerAt: Date? = nil
     /// Mac popover only: an extra-slow sway (§6.3).
     var sway = false
     /// Persona glaze for idle/listening; thinking and speaking keep their own colours.
@@ -231,6 +233,9 @@ struct MoonJar: View {
                 draw(state, path: path, opacity: mix, ctx: ctx, center: center, R: R, t: t, level: level, boost: boost)
                 if mix < 1 { draw(previous, path: path, opacity: 1 - mix, ctx: ctx, center: center, R: R, t: t, level: level, boost: boost) }
                 if state == .idle, !calm, let p = JarPath.shimmer(at: t) { shimmer(p, path: path, ctx: ctx, center: center, R: R) }
+                if !calm, let s = shimmerAt, case let p = now.timeIntervalSince(s) / JarPath.shimmerLength, (0..<1).contains(p) {
+                    shimmer(p, path: path, ctx: ctx, center: center, R: R)
+                }
                 if let ripple, case let e = now.timeIntervalSince(ripple), e >= 0, e < 0.4 {
                     let k = 1.05 + e * (reduceMotion ? 0 : 0.8)
                     let ring = path.applying(CGAffineTransform(translationX: center.x, y: center.y).scaledBy(x: k, y: k)
