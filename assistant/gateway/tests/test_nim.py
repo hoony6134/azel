@@ -13,7 +13,7 @@ from test_gateway import events, start
 KEY = "nvapi-test-0123456789"
 
 
-def fake_openai(refuse_tools=False):
+def fake_openai(refuse_tools=False, tool="macbook__list_dir", args='{"pa', more='th": "~"}'):
     app = FastAPI()
     app.seen = []
 
@@ -37,8 +37,8 @@ def fake_openai(refuse_tools=False):
         if body.get("tools") and not any(m["role"] == "tool" for m in body["messages"]):
             return sse({"choices": [{"delta": {"content": "볼게요. "}}]},
                        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function":
-                                                               {"name": "macbook__list_dir", "arguments": '{"pa'}}]}}]},
-                       {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'th": "~"}'}}]},
+                                                               {"name": tool, "arguments": args}}]}}]},
+                       {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": more}}]},
                                      "finish_reason": "tool_calls"}]},
                        {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10}})
         return sse({"choices": [{"delta": {"content": "파일이 "}}]}, {"choices": [{"delta": {"content": "세 개예요."}}]},
@@ -179,3 +179,35 @@ def test_limited_gateway_has_no_nim(tmp_path, monkeypatch):
         assert c.get("/v1/providers/nim/models").status_code == 403
         assert c.put("/v1/settings", json={"providers": {"nim": {"enabled": True}}}).status_code == 403
         assert not (tmp_path / "providers").exists()
+
+
+def test_cygnus_bridge_tools_on_nim(nimgw, monkeypatch):
+    g, c, tmp, _, calls = nimgw
+    fake = fake_openai(tool="gistra_today", args="{", more="}")
+    g.nim.transport = httpx.ASGITransport(app=fake)
+    got = []
+
+    async def cyg_call(name, args):
+        got.append((name, args))
+        return "오늘 마감: 토론지"
+    monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: (
+        [{"name": "gistra_today", "description": "today", "input_schema": {"type": "object"}}], cyg_call))
+    c.put("/v1/providers/nim/key", json={"value": KEY})
+    enable(c)
+    ev = events(c.post("/v1/ask", json={"text": "오늘 마감 뭐야?", "session": "n5", "model": "nim"}))
+    sent_tools = [t["function"]["name"] for t in fake.seen[0][2]["tools"]]
+    assert sent_tools == ["gistra_today", "macbook__list_dir"] and got == [("gistra_today", {})]
+    assert ("tool_start", "학사 일정 확인 중") in [(e["phase"], e["label"]) for e in ev if e["type"] == "activity"]
+    assert fake.seen[-1][2]["messages"][-1]["content"] == "오늘 마감: 토론지"
+    assert not any(m == "tools/call" for m, _ in calls)
+
+
+def test_limited_refuses_plan_questions(tmp_path, monkeypatch):
+    for name, text in (("anthropic_api_key", "sk-test\n"), ("state_token_limited", "l1m\n")):
+        (tmp_path / name).write_text(text)
+        (tmp_path / name).chmod(0o600)
+    g = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        for said in ("내일 내가 해야 될 일도 정리해줘", "토요일에 뭐 있어?", "이번 주 계획 정리해 줘"):
+            ev = events(c.post("/v1/ask", json={"text": said, "session": "p"}))
+            assert ev[-1]["code"] == "personal", said

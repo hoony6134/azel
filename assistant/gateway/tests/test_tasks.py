@@ -53,6 +53,9 @@ def test_task_waits_for_approval_then_resumes(tgw):
     g.fake.db["approvals"]["ap1"] = {"id": "ap1", "device": "macbook", "status": "pending"}
     tid = c.post("/v1/tasks", json={"goal": "TASK-APPROVAL 임시 폴더 지워 줘", "notify": "push"}).json()["id"]
     t = wait_for(c, tid, ("waiting_approval",))
+    end = time.time() + 5
+    while not notes and time.time() < end:
+        time.sleep(0.02)
     assert t["steps"][-1] == {**t["steps"][-1], "kind": "approval", "approval_id": "ap1"}
     time.sleep(0.2)
     assert c.get(f"/v1/tasks/{tid}").json()["status"] == "waiting_approval"  # it waits, it does not go on
@@ -152,6 +155,9 @@ def test_call_mode_rings_for_an_approval(tgw):
     g.fake.db["approvals"]["ap1"] = {"id": "ap1", "device": "macbook", "status": "pending"}
     tid = c.post("/v1/tasks", json={"goal": "TASK-APPROVAL 지워 줘", "notify": "call", "persona": "azel"}).json()["id"]
     wait_for(c, tid, ("waiting_approval",))
+    end = time.time() + 5
+    while not notes and time.time() < end:  # the status is saved a moment before the call goes out
+        time.sleep(0.02)
     assert notes == [("call", "task_approval", "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요.", "azel")]
     c.post("/v1/approvals/ap1", json={"approve": False})
     t = wait_for(c, tid, ("done", "failed"))

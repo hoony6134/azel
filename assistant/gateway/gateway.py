@@ -172,7 +172,11 @@ def name_prompt(settings):
     return persona_block(settings) + LENGTH_STYLE.get(settings.get("reply_length"), LENGTH_STYLE["normal"])
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
-                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
+                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)"
+                      # the voice server's PLANS_ASK: "내일 내가 해야 될 일", "토요일에 뭐 있어"
+                      r"|해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게) ?(뭐|있|정리|알려)"
+                      r"|(오늘|내일|모레|글피|이번 ?주|다음 ?주|주말|[월화수목금토일]요일).{0,10}(뭐 ?(해|하|있)|정리|계획|바빠|바쁘|일과|해야)",
+                      re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
     "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 말하고, 첫 문장은 짧게 하되 '네'가 아니라 "
@@ -809,10 +813,19 @@ async def ask_nim(text, model, session):
         return
     devices = await fresh_devices()
     tools, where = await device_tools(devices)
+    cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)  # the brain's read-only Cygnus tools, when this host has them
+    cyg = {t["name"] for t in cyg_tools}
     system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
+
+    async def run(b):
+        if b["name"] in cyg:
+            return {"content": await cyg_run(b["name"], b["input"]), "is_error": False}
+        return await run_tool(b, where)
+
+    def act(phase, tool=""):
+        return activity(phase, tool if tool in cyg or not tool else f"mcp__{tool}")
     try:
-        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, tools, lambda b: run_tool(b, where),
-                                     lambda phase, tool="": activity(phase, f"mcp__{tool}" if tool else "")):
+        async for item in nim.stream(cfg, nim.read_key(HOME), system, text, cyg_tools + tools, run, act):
             yield item
     except nim.NimError as e:
         yield {"type": "error", "code": e.code, "message": e.message}
