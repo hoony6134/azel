@@ -1173,8 +1173,9 @@ async def schedule_reply(text, action, session, now=None):
     return str(reply.get("say") or "지금은 예약을 받을 수 없어요.")
 
 
-YES = re.compile(r"^\s*(응|네|넵|예|어|그래|맞아|맞아요|좋아|좋아요|ㅇㅇ|그렇게)")
-NO = re.compile(r"^\s*(아니|아뇨|노|취소|됐어|말고|안 ?해)")
+# A whole short answer only: "어제 뭐 했지?", "어떻게 해?", "네가 해 줘", "노래 틀어 줘" are not answers to "…맞죠?".
+YES = re.compile(r"^\s*(응+|어+|네+|넵|예|그래(요)?|맞아(요)?|좋아(요)?|ㅇㅇ|그렇게 ?해 ?(줘|주세요)?)\s*[.!?~]*\s*$")
+NO = re.compile(r"^\s*(아니(요|야)?|아뇨|노+|취소(해 ?(줘|주세요))?|됐어(요)?|말고|안 ?해(요)?)\s*[.!?~]*\s*$")
 DAY_PART = re.compile(r"오전|오후|아침|저녁|밤|새벽|낮|점심")
 REPEAT_WORDS = re.compile(r"매일|평일|주말|주중|매주|매월|매달|마다|[월화수목금토일]{2,}\s*\d|[월화수목금토일]{2,}\s*[한두세네다열]")
 
@@ -2904,6 +2905,12 @@ if __name__ == "__main__":
             out.append(await schedule_reply("평일 10시부터 6시까지 2시간마다 스트레칭하라고 전화해 줘", "create", "s3", sat8))
             assert "repeat_text" in last()["args"] and "when_text" not in last()["args"]
             assert schedule_intent("응", "s3") == "create"
+            for chat in ("어제 뭐 했지?", "어떻게 해?", "네가 해 줘", "노래 틀어 줘", "아니 근데 오늘 날씨는?"):
+                assert schedule_intent(chat, "s3") is None, chat  # a pending "…맞죠?" does not swallow other talk
+            for yes in ("응.", "네", "어", "좋아요!", "그렇게 해 줘"):
+                assert YES.search(yes), yes
+            for no in ("아니", "아니요.", "취소해 줘", "됐어"):
+                assert NO.search(no), no
             out.append(await schedule_reply("응", "create", "s3", sat8))
             assert last()["args"] == confirm  # resent exactly as the gateway gave it: no second guess
             out.append(await schedule_reply("평일 10시부터 6시까지 2시간마다 전화해 줘", "create", "s4", sat8))
