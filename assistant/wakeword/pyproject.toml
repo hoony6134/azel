@@ -1,0 +1,15 @@
+[project]
+name = "biseo-wakeword"
+version = "0.1.0"
+description = "Mac-side wake-word retraining on the user's own voice (CPU only; clips never leave the Mac)"
+requires-python = ">=3.11,<3.13"
+dependencies = ["torch", "numpy", "scipy", "soundfile", "onnx", "onnxruntime", "openwakeword"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = ["pytest"]
