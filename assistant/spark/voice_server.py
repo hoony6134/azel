@@ -318,6 +318,7 @@ TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
 # With the brain's read-only server tools, a status question stays local; doing something on a server does not.
 WEB_LIVE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|검색|찾아(서|줘|봐)|맛집")
 STATUS_Q = re.compile(r"괜찮|상태|살아 ?있|켜져|꺼졌|다운|죽었|문제|경보|알림|이상|느려|디스크|용량|온도|메모리")
+DEVICE_Q = re.compile(r"(맥북|macbook|기기|노트북|컴퓨터).{0,6}(켜져|꺼져|꺼졌|연결|살아|온라인|오프라인)", re.I)
 SERVER_ACTION = re.compile(r"재시작|재부팅|리부트|고쳐|켜 ?줘|꺼 ?줘|지워|삭제|정리해|로그|배포|실행|돌려|설치")
 
 
@@ -574,11 +575,15 @@ def pre_route(text, settings, local=False, tools=()):
     default = settings.get("default_model", "auto")
     model = forced_model or (default if default in MODEL_WORDS else None)
     if local:  # "아까 날씨 물어봤을 때 뭐라 했지?" is memory, not live data: Qwen decides
-        server_status = "infra_health" in tools and STATUS_Q.search(text) and not SERVER_ACTION.search(text) \
-            and not WEB_LIVE.search(text)  # "서버 괜찮아?" with Cygnus tools: Qwen answers with infra_health
-        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status
-        keywords = USE_CLAUDE.search(text) or live or \
-            pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
+        # "서버 괜찮아?", "스파크는?" (a short follow-up), "맥북 켜져 있어?": a status question the brain's tools
+        # answer (infra_health for servers, device_status for devices). Doing something there still goes to Claude.
+        status = (STATUS_Q.search(text) or len(text.strip()) <= 10) and not SERVER_ACTION.search(text) \
+            and not WEB_LIVE.search(text)
+        server_status = status and "infra_health" in tools
+        device_status = status and "device_status" in tools and DEVICE_Q.search(text)
+        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status and not device_status
+        task = pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
+        keywords = USE_CLAUDE.search(text) or live or (task and not device_status)
     else:
         keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
@@ -2473,6 +2478,10 @@ if __name__ == "__main__":
             assert not pre_route("서버 괜찮아?", {}, local=True, tools=infra)[0] and pre_route("서버 괜찮아?", {}, local=True)[0]
             assert not pre_route("스파크 디스크 용량 어때?", {}, local=True, tools=infra)[0]
             assert pre_route("스파크 재시작해 줘", {}, local=True, tools=infra)[0]  # an action: still Claude
+            assert not pre_route("스파크는?", {}, local=True, tools=infra)[0]  # a short status follow-up
+            assert not pre_route("맥북 켜져 있어?", {}, local=True, tools={"device_status"})[0]
+            assert pre_route("맥북 파일 정리해 줘", {}, local=True, tools={"device_status", "infra_health"})[0]
+            assert pre_route("맥북 켜져 있어?", {}, local=True, tools=())[0]  # no device tool: as before
             assert pre_route("서버 상태 검색해 줘", {}, local=True, tools=infra)[0]
             assert pre_route("날씨 어때?", {}, local=True)[0] and not pre_route("아까 날씨 물어봤을 때 뭐라 했어?", {}, local=True)[0] and pre_route("레포 빌드 에러 고쳐 줘", {}, local=True)[0]
             assert [tag_state(h) for h in ("[TO", "[TOOL] {", "[C")] == ["maybe", "tool", "maybe"]
