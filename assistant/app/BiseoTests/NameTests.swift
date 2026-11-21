@@ -71,6 +71,11 @@ final class PersonalityTests: XCTestCase {
         s.personality = ""                                   // 기본값으로 되돌리기
         XCTAssertTrue(String(decoding: try JSONEncoder().encode(s), as: UTF8.self).contains(#""personality":"""#))
         XCTAssertEqual(AssistantName.personality("  밝게\n"), "밝게")
+        let withDefault = Data((base + #","personality":"","personality_default":"차분하고 짧게 말해요"}"#).utf8)
+        XCTAssertEqual(PersonalityDefault.read(withDefault), "차분하고 짧게 말해요")
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: withDefault)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self).contains("personality_default"),
+                       "the read-only default is never PUT back")
         XCTAssertEqual(AssistantName.personality(String(repeating: "가", count: 700)).count, 600)
     }
 }

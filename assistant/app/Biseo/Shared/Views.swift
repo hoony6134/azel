@@ -213,6 +213,8 @@ struct SettingsScreen<Extra: View>: View {
     @State private var usage: [String: Any] = [:]
     @State private var loadError: Error?
     @State private var usageStatus: SectionStatus = .ok
+    /// Server's default personality text (read-only, never sent back), shown as the placeholder.
+    @State private var personalityDefault: String?
     @State private var saveState: SaveState = .idle
     @State private var saveTask: Task<Void, Never>?
     @State private var showSetup = false
@@ -295,7 +297,7 @@ struct SettingsScreen<Extra: View>: View {
                     Text("\((s.wrappedValue.personality ?? "").count)/\(AssistantName.personalityLimit)")
                         .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
                 }
-                TextField("기본 성격", text: Binding(
+                TextField(personalityDefault ?? "기본 성격", text: Binding(
                     get: { s.wrappedValue.personality ?? "" },
                     set: { s.wrappedValue.personality = String($0.prefix(AssistantName.personalityLimit)) }), axis: .vertical)
                     .lineLimit(3...8)
@@ -641,11 +643,13 @@ struct SettingsScreen<Extra: View>: View {
     /// Settings, usage and the shared status load in parallel and independently; the old values
     /// stay on screen until new ones arrive, and a cancelled pull-to-refresh changes nothing.
     private func load() async {
-        async let settingsResult = attempt { try await Gateway.get("/v1/settings") as AppSettings }
+        async let settingsResult = attempt { try await Gateway.send("GET", "/v1/settings") }
         async let usageResult = attempt { try await Gateway.send("GET", "/v1/usage") }
         async let refreshed: Void = model.refresh()
         switch await settingsResult {
-        case .success(let raw):
+        case .success(let data):
+            guard let raw = try? JSONDecoder().decode(AppSettings.self, from: data) else { loadError = URLError(.cannotParseResponse); break }
+            personalityDefault = PersonalityDefault.read(data) ?? personalityDefault
             // Device names migrate to their ids for display; nothing is saved until the user edits.
             let s = DeviceID.normalize(raw)
             loaded = s

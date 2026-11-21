@@ -36,3 +36,12 @@ enum AssistantName {
         return name + ((u.value - 0xAC00) % 28 != 0 ? withBatchim : without)
     }
 }
+
+/// `personality_default` from `GET /v1/settings`: read-only, so it stays out of `AppSettings`
+/// (which is PUT back whole).
+enum PersonalityDefault {
+    static func read(_ settingsJSON: Data) -> String? {
+        struct Shape: Decodable { var personality_default: String? }
+        return (try? JSONDecoder().decode(Shape.self, from: settingsJSON))?.personality_default
+    }
+}
