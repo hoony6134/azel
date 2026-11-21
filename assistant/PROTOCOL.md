@@ -239,7 +239,7 @@ device that created them.
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
-Registration body: `{"id":"macbook","name":"MacBook","url","harness":[…]}` — `id` is an ASCII
+Registration body: `{"id":"macbook","name":"macbook","url","harness":[…]}` — `id` and `name` are the same English device name (macbook, albireo, gienah, deneb, spark); `id` is an ASCII
 slug used as the MCP server name on the Claude side.
 
 Approval flow: an approval-required `run_command` posts

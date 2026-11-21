@@ -190,8 +190,8 @@ def test_settings_reject_unknown(gw):
 
 def test_devices_and_mcp_config(gw):
     g, c, tmp = gw
-    assert c.post("/v1/devices/register", json={"id": "맥북", "name": "맥북", "url": "u"}).status_code == 400
-    c.post("/v1/devices/register", json={"id": "macbook", "name": "맥북", "url": "http://x/mcp"})
+    assert c.post("/v1/devices/register", json={"id": "한글", "name": "x", "url": "u"}).status_code == 400
+    c.post("/v1/devices/register", json={"id": "macbook", "name": "macbook", "url": "http://x/mcp"})
     c.post("/v1/ask", json={"text": "a"})
     args = json.loads((tmp / "args.json").read_text())
     assert "mcp__macbook" in args and "--mcp-config" in args
@@ -219,18 +219,17 @@ def test_alert_places_call_without_apns(gw):
 
 
 def test_device_prompt_fallback(gw):
-    g, _, _ = gw
+    g, c, _ = gw
     s = asyncio.run(g.load_settings())
-    devs = [{"name": "알비레오", "id": "albireo"}, {"name": "spark", "id": "spark"}]  # old Korean names still match
+    devs = [{"name": "albireo", "id": "albireo"}, {"name": "spark", "id": "spark"}]
     p = g.device_prompt(s, devs)
-    assert p.index("albireo(") < p.index("spark(") and "기본 기기 macbook는 꺼져" in p and "알비레오" not in p
-    p = g.device_prompt(s, [{"name": "맥북", "id": "macbook"}] + devs)
+    assert p.index("albireo(") < p.index("spark(") and "기본 기기 macbook는 꺼져" in p
+    p = g.device_prompt(s, [{"name": "macbook", "id": "macbook"}] + devs)
     assert p.index("macbook(") < p.index("albireo(") and "꺼져" not in p
-    s["default_device"], s["device_fallback"] = "맥북", ["스파크"]  # settings saved before the rename
-    p = g.device_prompt(s, [{"name": "맥북", "id": "macbook"}, {"name": "스파크", "id": "spark"}])
-    assert p.index("macbook(") < p.index("spark(") and "꺼져" not in p
     assert "없어" in g.device_prompt(s, [])
-
+    g.fake.db["settings"] = {"default_device": "맥북", "device_fallback": ["알비레오", "스파크"]}  # saved before
+    s = c.get("/v1/settings").json()
+    assert s["default_device"] == "macbook" and s["device_fallback"] == ["albireo", "spark"]
 
 def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
@@ -291,7 +290,7 @@ def test_state_is_shared_not_local(gw):
     c.post("/v1/ask", json={"text": "a"})
     assert g.fake.db["usage"][0]["device"] == "macbook" and g.fake.db["usage"][0]["cost_usd"] == 0.5
     assert c.get("/v1/usage").json()["by_device"] == {"macbook": 0.5}
-    c.post("/v1/devices/register", json={"id": "albireo", "name": "알비레오", "url": "http://a/mcp"})
+    c.post("/v1/devices/register", json={"id": "albireo", "name": "albireo", "url": "http://a/mcp"})
     assert g.fake.db["devices"]["albireo"]["gateway"] == "macbook"
     c.post("/v1/push/register", json={"voip_token": "tok", "bundle_id": "xyz.scian.biseo"})
     assert g.fake.db["push"]["tok"]["env"] == "sandbox"
@@ -330,7 +329,7 @@ def test_limited_writer_cannot_steer_full_gateways(gw, monkeypatch):
 def test_ruchba_down_read_only(gw):
     g, c, tmp = gw
     c.put("/v1/settings", json={"default_model": "opus"})
-    c.post("/v1/devices/register", json={"id": "macbook", "name": "맥북", "url": "http://x/mcp"})
+    c.post("/v1/devices/register", json={"id": "macbook", "name": "macbook", "url": "http://x/mcp"})
     g.state.cache.clear()  # nothing cached in memory: the settings file copy and local devices must do
     g.fake.state.down = True
     assert c.get("/v1/settings").json()["default_model"] == "opus"
@@ -777,8 +776,8 @@ def test_limited_refuses_personal_data(limited, monkeypatch):
 
 def test_limited_uses_api_with_own_daemon_only(limited, monkeypatch):
     g, c, tmp = limited
-    c.post("/v1/devices/register", json={"id": "spark", "name": "스파크", "url": "http://spark/mcp"})
-    g.fake.db["devices"]["macbook"] = {"id": "macbook", "name": "맥북", "url": "http://mac/mcp", "harness": [],
+    c.post("/v1/devices/register", json={"id": "spark", "name": "spark", "url": "http://spark/mcp"})
+    g.fake.db["devices"]["macbook"] = {"id": "macbook", "name": "macbook", "url": "http://mac/mcp", "harness": [],
                                        "gateway": "macbook", "last_seen": 9e12}
     rpc, bodies = [], []
 
@@ -798,7 +797,7 @@ def test_limited_uses_api_with_own_daemon_only(limited, monkeypatch):
                 "usage": {"input_tokens": 1000, "output_tokens": 100}}
     monkeypatch.setattr(g, "mcp", fake_mcp)
     monkeypatch.setattr(g, "anthropic", fake_anthropic)
-    ev = events(c.post("/v1/ask", json={"text": "스파크 홈 폴더에 뭐 있어?", "model": "sonnet", "path": "claude_code"}))
+    ev = events(c.post("/v1/ask", json={"text": "spark 홈 폴더에 뭐 있어?", "model": "sonnet", "path": "claude_code"}))
     assert "".join(e["delta"] for e in ev if e["type"] == "text") == "볼게요.\n파일이 두 개 있어요.\n"
     assert ev[-1]["path"] == "api" and ev[-1]["cost_usd"] == pytest.approx((2000 * 2 + 200 * 10) / 1e6)
     assert {u for u, _, _ in rpc} == {"http://spark/mcp"}  # never the Mac's daemon

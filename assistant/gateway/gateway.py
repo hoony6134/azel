@@ -85,7 +85,7 @@ VOICE_BASE = (
 )
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
-    "MacBook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
+    "macbook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
 API_STYLE = VOICE_BASE + (
     "너는 일정, 메일, 메모리, GISTRA, Planit 같은 개인 데이터를 볼 수 없어. 그런 요청이면 "
@@ -208,6 +208,8 @@ local_devices: dict[str, dict] = {}  # daemons that registered here, so this dev
 
 
 HM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+# Settings saved before devices were named in English; read as their ids.
+OLD_DEVICE_NAMES = {"맥북": "macbook", "알비레오": "albireo", "기에나": "gienah", "데네브": "deneb", "스파크": "spark"}
 
 
 def migrate_proactive(p):
@@ -258,6 +260,8 @@ async def load_settings():
         doc = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
     s.update(doc)
     s["proactive"] = migrate_proactive(s.get("proactive"))
+    s["default_device"] = OLD_DEVICE_NAMES.get(s["default_device"], s["default_device"])
+    s["device_fallback"] = [OLD_DEVICE_NAMES.get(d, d) for d in s["device_fallback"]]
     return s
 
 
@@ -685,7 +689,7 @@ async def scheduler_tick(now, fired):
                 await job()
 
 
-RETENTION_AT = "04:00"  # call history older than history_days is deleted daily (quiet hours do not matter)
+RETENTION_AT = "04:00"  # call history older than history_days is deleted daily
 
 
 # ---------- scheduled calls ("내일 10시에 깨워 줘"); no Claude involved ----------
@@ -826,7 +830,7 @@ async def update_item(item, **fields):
 
 async def fire_scheduled(now):
     """Due items ring; unanswered ones retry every RETRY_EVERY_S up to MAX_ATTEMPTS, then count as missed.
-    User-requested calls ignore quiet hours (the user asked for that time)."""
+    User-requested calls fire even with proactive.enabled off (the user asked for that time)."""
     for item in await schedule_list():
         since = now - (item["last_attempt"] or 0)
         if item["status"] == "pending" and item["at"] <= now:
