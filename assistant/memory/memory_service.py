@@ -565,7 +565,7 @@ def list_proactive(since: float = 0, called: bool | None = None, limit: int = 10
               (since, called, called, max(1, min(limit, 500))))
 
 
-KV_KEY = r"^[a-z0-9_]{1,40}$"
+KV_KEY = r"^[a-z0-9_-]{1,64}$"  # the gateway keys approvals and tasks as approval-<id>, tasks-index
 
 
 @app.get("/v1/state/kv/{key}", dependencies=[v1])
