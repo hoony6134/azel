@@ -3318,15 +3318,6 @@ async def migrate_once():
         print("migration from gateway.db failed, will retry on next start:", type(e).__name__, e, flush=True)
 
 
-if __name__ == "__main__":
-    import sys
-    if "--migrate" in sys.argv:  # by hand; safe to repeat
-        asyncio.run(migrate_sqlite())
-        raise SystemExit
-    import uvicorn
-    assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"
-    uvicorn.run(app, host=HOST, port=PORT)
-
 
 # ---------- one tool executor for every path (tools_bridge.py) and API-backed tasks (agent_loop.py) ----------
 TASK_BACKENDS = ("claude_code", *agent_loop.BACKENDS)
@@ -3572,3 +3563,13 @@ async def run_task_api(t):
             if ev["kind"] == "auth" and t["backend"] == "claude_api":
                 raise ApiAuth()
             raise TaskLimit(ev["kind"], ev["message"])
+
+
+if __name__ == "__main__":
+    import sys
+    if "--migrate" in sys.argv:  # by hand; safe to repeat
+        asyncio.run(migrate_sqlite())
+        raise SystemExit
+    import uvicorn
+    assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"
+    uvicorn.run(app, host=HOST, port=PORT)
