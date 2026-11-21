@@ -807,6 +807,27 @@ def test_checkpoint_runs_at_its_times_with_claude_only(gw, monkeypatch):
     assert ran == [1]
 
 
+def test_briefing_context(gw):
+    g, c, _ = gw
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+    g.link_send = capture
+    asyncio.run(g.serve_briefing_context({"id": "b0"}))
+    assert sent[-1] == {"id": "b0", "type": "briefing_context", "situation": "", "facts": ["최근 24시간 서버 경보 없음"]}
+    g.fake.db["context"]["azel-situation"] = {"task_id": "azel-situation", "summary": "[4] 토론지 오늘 23시",
+                                              "open_questions": [], "updated": datetime.now(g.KST).isoformat()}
+    g.fake.db["approvals"]["a1"] = {"id": "a1", "device": "macbook", "command": "git push", "status": "pending",
+                                    "created": time.time()}
+    at = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
+    c.post("/v1/schedule", json={"at": at.isoformat(), "kind": "wake"})
+    asyncio.run(g.serve_briefing_context({"id": "b1"}))
+    assert sent[-1]["situation"] == "[4] 토론지 오늘 23시"
+    assert sent[-1]["facts"][:2] == ["승인 대기 1건", "다음 예약 전화: 내일 오전 7시 기상"]
+
+
 def test_resume_only_on_the_device_that_made_the_session(gw):
     g, c, tmp = gw
     g.fake.db["sessions"]["s9"] = {"claude_session": "other", "device": "albireo"}

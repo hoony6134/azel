@@ -791,16 +791,45 @@ async def gather_signals(now):
     for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
                      ("tasks", contexts), ("device_jobs", lambda: device_jobs(now))):
         await source(name, fn)
-    sig["situation"] = []
-    for key in (SITUATION, CHECKPOINT):  # the brain's merged note; the raw checkpoint if that is missing or stale
+    note = await situation_note(now)
+    sig["situation"] = [note] if note else []
+    return sig
+
+
+async def situation_note(now):
+    """The brain's merged note, or the raw checkpoint if that is missing or stale; "" if neither is fresh."""
+    for key in (SITUATION, CHECKPOINT):
         try:
             note = await state.call("GET", f"/v1/context/{key}")
         except Exception:
             note = None
         if note and note.get("summary") and fresh_note(note, now):
-            sig["situation"] = [note["summary"][:1500]]
-            break
-    return sig
+            return note["summary"][:1500]
+    return ""
+
+
+async def serve_briefing_context(m):
+    """What the voice server's local Qwen needs for a spoken briefing (`/v1/call?intent=briefing`): the
+    situation note plus a few live facts. Empty situation = no note yet, the voice server asks Claude instead."""
+    now, facts = time.time(), []
+    situation = ""
+    if MODE == "full":
+        situation = await situation_note(now)
+        try:
+            pend = await state.call("GET", "/v1/state/approvals") or []
+            if pend:
+                facts.append(f"승인 대기 {len(pend)}건")
+            items = await schedule_list()
+            if items:
+                i = items[0]
+                facts.append(f"다음 예약 전화: {spoken_when(i['at'], i['repeat'], now)} "
+                             f"{'기상' if i['kind'] == 'wake' else '알림'}")
+            alerts = await state.call("GET", "/v1/state/kv/alerts_recent") or []
+            recent = [a["names"] for a in alerts if now - a["at"] < 86400]
+            facts.append(f"최근 24시간 서버 경보: {', '.join(recent)}" if recent else "최근 24시간 서버 경보 없음")
+        except (StateDown, HTTPException):
+            pass
+    await link_send({"id": m["id"], "type": "briefing_context", "situation": situation, "facts": facts})
 
 
 def fresh_note(note, now, max_age_s=6 * 3600):
@@ -1121,6 +1150,8 @@ async def handle_link(ws):
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))
+        elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
+            tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "call_answered":
             try:
                 await call_answered(m.get("call_id"))

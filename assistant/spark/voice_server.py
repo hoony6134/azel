@@ -503,6 +503,49 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
                 pass
 
 
+# ---------- briefing on request: WS /v1/call?intent=briefing ----------
+BRIEFING_QWEN = (
+    "너는 개인 비서 '{name}'야. 사용자가 오늘 브리핑을 요청했어. 아래 메모와 사실만 근거로 30~40초 분량, "
+    "여섯에서 여덟 문장의 음성 브리핑을 해. '오늘 브리핑이에요.'로 시작하고 오늘 날짜를 말한 뒤 수업·회의, 마감, 할 일, "
+    "서버 상태, 승인 대기, 다음 예약 전화 순으로 말하고, 없는 항목은 건너뛰어. 메모에 없는 건 지어내지 마. "
+    "한국어 존댓말, 마크다운·목록·이모지 금지."
+)
+BRIEFING_CLAUDE = (  # the morning-briefing call's prompt, for when no situation note exists yet
+    "사용자가 오늘 브리핑을 요청했어. 오늘 수업과 마감(GISTRA), 오늘 할 일(Planit), 캘린더 일정, 서버 상태(Cygnus "
+    "인프라), 승인 대기를 확인해서 '오늘 브리핑이에요'로 시작하는 30초 안쪽 브리핑으로 말해."
+)
+
+
+async def briefing_sentences(session, name, on_event):
+    """Sentences of a spoken briefing. Fast path: the local Qwen composes it from the situation note a full
+    gateway hands over (first sentence within about 2 s). No note yet: a filler, then Claude via the link."""
+    try:
+        ctx = await links.request({"type": "briefing_context"}, timeout=2)
+    except (RuntimeError, asyncio.TimeoutError):
+        ctx = {}
+    if ctx.get("situation"):
+        facts = "\n".join(str(f) for f in ctx.get("facts") or [])
+        messages = [{"role": "system", "content": BRIEFING_QWEN.format(name=name)},
+                    {"role": "user", "content": f"{now_kst().strip()}\n\n메모:\n{ctx['situation']}\n\n사실:\n{facts}"}]
+        stream = llm_stream(messages, 700)
+    else:
+        yield FILLER
+        await on_event(dict(ROUTING))
+        stream = claude_stream(BRIEFING_CLAUDE, session, None, "schedule", personal=True, on_event=on_event)
+    buf, first = "", True
+    try:
+        async for delta in stream:
+            buf += delta
+            done, buf = split_ready(buf, final=False, first=first)
+            for s in done:
+                first = False
+                yield s
+    except RuntimeError as e:  # no gateway / Claude failed: say why
+        buf = str(e)
+    for s in split_ready(buf, final=True)[0]:
+        yield s
+
+
 # ---------- scheduled calls: "내일 10시에 깨워 줘" (local; the gateway stores and fires them) ----------
 KO_NUM = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7, "여덟": 8, "아홉": 9, "열": 10,
           "열한": 11, "열두": 12, "삼십": 30, "십": 10, "이십": 20, "사십": 40, "오십": 50}
@@ -861,7 +904,8 @@ async def gateway_link(ws: WebSocket):
 
 
 @app.websocket("/v1/call")
-async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = ""):
+async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
+               intent: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -873,6 +917,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     await ws.accept()
     session = session or f"call-{int(time.time())}"
     log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
+    start_log = {"event": "start", "log_id": log_id}
     vad_turn = Turn(SileroVoiceActivityDetector())
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
@@ -920,6 +965,22 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             task.cancel()
         current["play_end"] = guard.play_end = 0.0
         await send({"type": "interrupt"})  # barge-in: the client drops its queue
+
+    async def speak_briefing():
+        spoken = []
+        try:
+            await send({"type": "state", "value": "speaking"})
+            async for s in briefing_sentences(session, assistant_name(await gateway_settings()), send):
+                pcm, _ = await tts(s)
+                await send({"type": "reply", "text": s, "route": "briefing"})
+                await send(audio=pcm)
+                if s not in (FILLER, FILLER_LONG):
+                    spoken.append(s)
+        finally:  # what was actually said becomes the call's opening in history (the start event is an upsert)
+            if spoken:
+                history[session].append({"role": "assistant", "content": " ".join(spoken)})
+                await links.log({**start_log, "opening": " ".join(spoken)})
+            await send({"type": "state", "value": "listening"})
 
     async def tap_interrupt():
         guard.speech_at = None
@@ -977,12 +1038,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
+        briefing = intent == "briefing" and not call_id
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
-        await links.log({"event": "start", "log_id": log_id, "session": session, "call_id": call_id,
+        start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started,
                          # the user's point of view, like a phone's call log: the assistant calling = incoming
-                         "direction": "incoming" if call_id else "outgoing", "reason": (op or {}).get("reason", ""),
-                         "client": client[:20], "opening": (op or {}).get("text", ""), "started_at": started})
+                         direction="incoming" if call_id else "outgoing",
+                         reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
+        await links.log(start_log)
+        if briefing:  # the app's "오늘 브리핑": speak a briefing first, interruptible like any reply
+            current["task"] = asyncio.create_task(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
                 history[session].append({"role": "assistant", "content": op["text"]})
@@ -1394,6 +1459,64 @@ if __name__ == "__main__":
             links.remove(lim)
             assert not [m for m in lim.ws.sent if m.get("type") == "call_log"]  # never to a limited gateway
             return logs
+        def briefing_check(situation):
+            """/v1/call?intent=briefing against a fake full gateway; returns (reply texts, frame types, call logs)."""
+            from fastapi.testclient import TestClient
+
+            class BriefingGW(FakeWS):
+                async def send_text(self, raw):
+                    await super().send_text(raw)
+                    m = json.loads(raw)
+                    if m.get("type") == "briefing_context":
+                        links.receive(self.lk, {"id": m["id"], "type": "briefing_context", "situation": situation,
+                                                "facts": ["승인 대기 1건"]})
+                    elif m.get("type") == "ask":
+                        for ev in [{"type": "activity", "phase": "tool_start", "label": "캘린더 확인 중",
+                                    "tool": "mcp__claude_ai_Google_Calendar__list_events", "kind": "calendar"},
+                                   {"type": "text", "delta": "오늘 브리핑이에요. 회의가 하나 있어요."}, {"type": "done"}]:
+                            links.receive(self.lk, {"id": m["id"], **ev})
+
+            async def qwen_briefing(messages, max_tokens=600):
+                assert "토론지" in messages[1]["content"] and "승인 대기 1건" in messages[1]["content"]
+                for d in ["오늘 브리핑이에요. ", "토론지가 오늘 밤 11시까지예요. ", "승인 대기가 한 건 있어요."]:
+                    yield d
+
+            async def fake_tts(sentence):
+                return b"\0" * 480, 24000
+            globals().update(llm_stream=qwen_briefing, tts=fake_tts,
+                             SileroVoiceActivityDetector=lambda: (lambda frame: 0.0))
+            gw_ws = BriefingGW()
+            gw_ws.lk = links.add(gw_ws)
+            links.receive(gw_ws.lk, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            replies, types = [], []
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            with tc.websocket_connect("/v1/call?intent=briefing&session=b", headers={"Authorization": "Bearer app-tok"}) as w:
+                while True:
+                    m = w.receive()
+                    if not m.get("text"):
+                        continue
+                    f = json.loads(m["text"])
+                    types.append(f["type"])
+                    if f["type"] == "reply":
+                        replies.append(f["text"])
+                    if f == {"type": "state", "value": "listening"} and replies:
+                        break
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.05)
+            logs = [m for m in gw_ws.sent if m.get("type") == "call_log"]
+            links.remove(gw_ws.lk)
+            return replies, types, logs
+        replies, types, logs = briefing_check("[4] 토론지 오늘 23시")  # fast path: local Qwen from the note
+        assert replies == ["오늘 브리핑이에요.", "토론지가 오늘 밤 11시까지예요.", "승인 대기가 한 건 있어요."], replies
+        assert FILLER not in replies and "activity" not in types
+        starts = [m for m in logs if m["event"] == "start"]
+        assert starts[0]["reason"] == "briefing" and starts[0]["direction"] == "outgoing"
+        assert starts[-1]["opening"] == " ".join(replies) and starts[-1]["started_at"] == starts[0]["started_at"]
+        replies, types, logs = briefing_check("")  # no note yet: filler, then Claude over the link
+        assert replies == [FILLER, "오늘 브리핑이에요.", "회의가 하나 있어요."], replies
+        assert types.count("activity") == 2  # routing, then the tool step
+        assert [m for m in logs if m["event"] == "start"][-1]["opening"] == "오늘 브리핑이에요. 회의가 하나 있어요."
+        globals()["llm_stream"] = real_llm
         logs = history_check()
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs

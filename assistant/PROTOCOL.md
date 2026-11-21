@@ -31,7 +31,8 @@ it is used, and it will be removed once every shipped app sends the header. Both
 `client` hashes. The voice server never logs query strings or headers: its container runs uvicorn with
 `--no-access-log --log-level warning`, and query strings in uvicorn's log lines are redacted.
 Query: `session` (stable per conversation), optional `client` (`iphone`|`mac`|`terminal`, for the call
-history), optional `call_id` (set when
+history), optional `intent=briefing` (the app's "오늘 브리핑": the server speaks a briefing first, see below),
+optional `call_id` (set when
 answering a call the assistant placed; the server then speaks that call's opening first).
 
 - Client → server **binary**: mono PCM16 little-endian, 16 kHz, any frame size
@@ -55,6 +56,14 @@ answering a call the assistant placed; the server then speaks that call's openin
     same objects between its `audio` lines.
   - `{"type":"turn_done","timings":{…}}`
   - `{"type":"error","message":"…"}`
+- Briefing (`intent=briefing`, without `call_id`): the server first asks a full gateway for the situation
+  (`briefing_context` over the link, 2 s timeout). With a situation note, the local Qwen composes a
+  30–40 s briefing from it right away (today's date, classes/meetings, deadlines, todos, server health,
+  pending approvals, the next scheduled call), spoken sentence by sentence as `reply` frames with
+  `"route":"briefing"`. With no note yet it says the filler, sends `activity` `routing`, and streams a
+  Claude briefing over the link (the morning-briefing prompt) with its activity events. Barge-in works
+  as for any reply. The call log records `reason: "briefing"`; what was said becomes the call's
+  `opening`.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
@@ -98,7 +107,9 @@ JSON text frames:
   voice `{"id","type":"schedule_result","ok","say","item"?|"items"?}` (items in the `/v1/schedule` shape,
   `created_by: "voice"`); the voice server speaks `say` (e.g. "내일 오전 10시에 깨워 드릴게요.").
   `{"type":"call_answered","call_id"}` when `/v1/call` connects with a `call_id` (stops a scheduled call's
-  retries).
+  retries). `{"type":"briefing_context","id"}` → gateway → voice `{"id","type":"briefing_context",
+  "situation": "<azel-situation, or azel-checkpoint if that is stale; \"\" if neither is fresh>",
+  "facts":["승인 대기 N건","다음 예약 전화: …","최근 24시간 서버 경보: …"]}`.
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
