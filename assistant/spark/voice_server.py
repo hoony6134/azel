@@ -980,7 +980,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
         await links.log({"event": "start", "log_id": log_id, "session": session, "call_id": call_id,
-                         "direction": "outgoing" if call_id else "incoming", "reason": (op or {}).get("reason", ""),
+                         # the user's point of view, like a phone's call log: the assistant calling = incoming
+                         "direction": "incoming" if call_id else "outgoing", "reason": (op or {}).get("reason", ""),
                          "client": client[:20], "opening": (op or {}).get("text", ""), "started_at": started})
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
@@ -1396,7 +1397,7 @@ if __name__ == "__main__":
         logs = history_check()
         assert [m["event"] for m in logs] == ["start", "turn", "end"], logs
         start, turn, end = logs
-        assert start["direction"] == "incoming" and start["client"] == "iphone" and start["session"] == "h"
+        assert start["direction"] == "outgoing" and start["client"] == "iphone" and start["session"] == "h"  # user called
         assert turn["user"] == "안녕" and turn["assistant"] == ["네,", "안녕하세요."] and turn["route"] == "qwen"
         assert turn["interrupted"] is False and "total_ms" in turn["timings"]
         assert len({m["log_id"] for m in logs}) == 1 and end["duration_s"] >= 0

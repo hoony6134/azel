@@ -83,7 +83,12 @@ JSON text frames:
   `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"call_log","event":"start"|"turn"|"end","log_id",…}` — call history, sent
   only to a full-mode link (dropped when none is up; the voice server stores no history):
-  start `{"session","call_id","direction":"outgoing"|"incoming","reason","client","opening","started_at"}`,
+  start `{"session","call_id","direction":"incoming"|"outgoing","reason","client","opening","started_at"}`,
+  where `direction` is from the USER's point of view, the same as a phone's call log:
+  `"direction":"incoming"`: the assistant called the user (VoIP push / `call_id` present).
+  `"direction":"outgoing"`: the user called the assistant (app call button, Siri, Mac push-to-talk).
+  (Voice servers before this was pinned sent the opposite; `memory_service.py --fix-call-directions` corrects
+  stored rows by `call_id` presence, idempotently.)
   turn `{"user","assistant":["sentence",…],"route","activity":[{"label","kind","at"},…],"timings",
   "interrupted","at"}` (`at` in epoch seconds; activity = the turn's tool_start/thinking steps)
   (never for an empty transcript; fillers left out), end `{"ended_at","duration_s"}`. One `log_id` per

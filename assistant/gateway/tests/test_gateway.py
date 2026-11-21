@@ -429,7 +429,7 @@ def test_migration_retries_when_ruchba_is_down(tmp_path, monkeypatch):
 
 
 CALL_LOG = [
-    {"type": "call_log", "event": "start", "log_id": "L1", "session": "s1", "call_id": "c1", "direction": "outgoing",
+    {"type": "call_log", "event": "start", "log_id": "L1", "session": "s1", "call_id": "c1", "direction": "incoming",
      "reason": "morning_briefing", "client": "iphone", "opening": "좋은 아침이에요.", "started_at": 1.0},
     {"type": "call_log", "event": "turn", "log_id": "L1", "user": "오늘 일정 알려줘", "assistant": ["10시 회의예요."],
      "route": "claude", "activity": ["캘린더 확인 중"], "timings": {"total_ms": 4000}, "interrupted": False},
@@ -457,7 +457,7 @@ def test_call_history_round_trip(gw):
     g, c, _ = gw
     asyncio.run(g.handle_link(LinkWS(CALL_LOG)))
     h = g.fake.db["history"]["L1"]
-    assert [t["user"] for t in h["turns"]] == ["오늘 일정 알려줘"] and h["ended"] and h["direction"] == "outgoing"
+    assert [t["user"] for t in h["turns"]] == ["오늘 일정 알려줘"] and h["ended"] and h["direction"] == "incoming"
     assert "type" not in h and h["turns"][0]["activity"] == ["캘린더 확인 중"]
     assert c.get("/v1/history").json() == [{"id": "L1", "title": "오늘 일정 알려줘", "turns": 1}]
     assert c.get("/v1/history?q=일정").json()[0]["id"] == "L1" and c.get("/v1/history?q=없음").json() == []

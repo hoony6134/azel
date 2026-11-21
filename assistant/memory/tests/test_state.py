@@ -151,7 +151,7 @@ def test_approval_ids_kept_on_migration(client):
 
 def test_call_history_round_trip(client):
     t0 = time.time()
-    client.post("/v1/state/history/h1/start", json={"session": "s1", "call_id": "c1", "direction": "outgoing",
+    client.post("/v1/state/history/h1/start", json={"session": "s1", "call_id": "c1", "direction": "incoming",
                                                     "reason": "morning_briefing", "client": "iphone",
                                                     "opening": "좋은 아침이에요.", "started_at": t0})
     client.post("/v1/state/history/h1/turns", json={
@@ -165,7 +165,7 @@ def test_call_history_round_trip(client):
     assert client.post("/v1/state/history/h1/end", json={"ended_at": t0 + 95}).json() == {"ok": True, "turns": 2}
     [row] = client.get("/v1/state/history").json()
     assert row["id"] == "h1" and row["title"] == "오늘 일정 알려줘" and row["turns"] == 2
-    assert row["routes"] == {"claude": 1, "qwen": 1} and abs(row["duration_s"] - 95) < 1 and row["direction"] == "outgoing"
+    assert row["routes"] == {"claude": 1, "qwen": 1} and abs(row["duration_s"] - 95) < 1 and row["direction"] == "incoming"
     assert row["session"] == "s1" and row["last_reply"] == "네, 언제든 불러 주세요." and sorted(row["kinds"]) == ["calendar", "mail"]
     full = client.get("/v1/state/history/h1").json()
     assert [t["user"] for t in full["turns"]] == ["오늘 일정 알려줘", "고마워"]
@@ -259,6 +259,19 @@ def test_proactive_log_and_kv(client):
     assert client.get("/v1/state/kv/Bad-Key").status_code == 422
     lim = limited_client("100.64.0.8", "l1m")
     assert lim.get("/v1/state/proactive_log").status_code == 403 and lim.get("/v1/state/kv/alerts_recent").status_code == 403
+
+
+def test_fix_call_directions_is_idempotent(client):
+    m = sys.modules["memory_service"]
+    client.post("/v1/state/history/old_in/start", json={"call_id": "c7", "direction": "outgoing"})  # written reversed
+    client.post("/v1/state/history/old_out/start", json={"call_id": "", "direction": "incoming"})
+    client.post("/v1/state/history/new_in/start", json={"call_id": "c8", "direction": "incoming"})  # already right
+    assert m.fix_call_directions() == 2
+    assert m.fix_call_directions() == 0  # again: nothing changes
+    rows = {r["id"]: r["direction"] for r in client.get("/v1/state/history?limit=100").json()}
+    assert rows["old_in"] == "incoming" and rows["old_out"] == "outgoing" and rows["new_in"] == "incoming"
+    for hid in ("old_in", "old_out", "new_in"):
+        client.delete(f"/v1/state/history/{hid}")
 
 
 def test_bad_tokens(client):

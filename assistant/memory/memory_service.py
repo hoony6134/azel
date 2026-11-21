@@ -788,7 +788,23 @@ def history_prune(older_than_days: float = Query(gt=0)):
     return delete_calls([r["id"] for r in rows])
 
 
+def fix_call_directions():
+    """One-off for rows written before direction was pinned to the user's point of view (voice servers before
+    the fix sent the opposite). Idempotent: direction follows call_id presence, so repeating changes nothing.
+    Run: docker compose run --rm memory .venv/bin/python memory_service.py --fix-call-directions"""
+    return len(db(f"update {HIST} set direction = case when coalesce(call_id, '') <> '' then 'incoming'"
+                  " else 'outgoing' end where direction is distinct from"
+                  " (case when coalesce(call_id, '') <> '' then 'incoming' else 'outgoing' end) returning id"))
+
+
 if __name__ == "__main__":
+    import sys
+    if "--fix-call-directions" in sys.argv:
+        from psycopg.rows import dict_row
+        pool = ConnectionPool(DB_URL, min_size=1, max_size=1, open=True,
+                              kwargs={"autocommit": True, "row_factory": dict_row})
+        print(f"call directions fixed: {fix_call_directions()} rows")
+        raise SystemExit
     import uvicorn
     assert HOST.startswith("100.") or HOST.startswith("127."), "bind a Tailscale or loopback address only"
     uvicorn.run(app, host=HOST, port=PORT)
