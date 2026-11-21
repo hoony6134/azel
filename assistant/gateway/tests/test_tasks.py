@@ -162,3 +162,13 @@ def test_call_mode_rings_for_an_approval(tgw):
     c.post("/v1/approvals/ap1", json={"approve": False})
     t = wait_for(c, tid, ("done", "failed"))
     assert t["result"] == "거절돼서 나머지만 했어요." and notes[-1][1] == "task"
+
+
+def test_call_mode_rings_on_failure(tgw):
+    g, c, notes = tgw
+    tid = c.post("/v1/tasks", json={"goal": "TASK-SPEND 큰 작업", "notify": "call", "persona": "azel"}).json()["id"]
+    t = wait_for(c, tid, ("done", "failed"))
+    end = time.time() + 5
+    while not notes and time.time() < end:
+        time.sleep(0.02)
+    assert t["status"] == "failed" and notes == [("call", "task", "맡기신 작업이 끝나지 못했어요. " + t["error"], "azel")]

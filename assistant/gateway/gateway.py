@@ -840,6 +840,13 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
                    + v["cache_creation_input_tokens"], "output_tokens": v["output_tokens"], "cost_usd": v["cost_usd"]}
 
 
+# Measured on the cost eval (brain session): NIM models put markdown and 반말 into spoken replies, misdated
+# weekdays without the date, and doubted data the tools had already given.
+NIM_STYLE = (" 반드시 존댓말로만 말해. 별표(**), 샵(#), 번호 목록 같은 마크다운은 절대 쓰지 마. 날짜와 요일은 아래의 지금"
+             " 날짜를 기준으로 계산하고, 도구 결과에 나온 상태(완료 여부 등)는 그대로 믿고 다시 묻지 마.")
+SPOKEN_MARKDOWN = re.compile(r"\*\*|__|^#{1,6}\s*|`", re.M)
+
+
 async def ask_nim(text, model, session):
     """The hosted NVIDIA NIM path: streams like Claude, with the devices' tools when the model takes tools."""
     settings = await load_settings()
@@ -851,7 +858,9 @@ async def ask_nim(text, model, session):
     tools, where = await device_tools(devices)
     cyg_tools, cyg_run = claude_api.cygnus_bridge(HOME)  # the brain's read-only Cygnus tools, when this host has them
     cyg = {t["name"] for t in cyg_tools}
-    system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
+    now = datetime.now(KST)
+    system = (name_prompt(settings) + API_STYLE + device_prompt(settings, devices) + NIM_STYLE
+              + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}(한국 시간)이야.")
 
     async def run(b):
         if b["name"] in cyg:
@@ -862,7 +871,7 @@ async def ask_nim(text, model, session):
         return activity(phase, tool if tool in cyg or not tool else f"mcp__{tool}")
     try:
         async for item in nim.stream(cfg, nim.read_key(HOME), system, text, cyg_tools + tools, run, act):
-            yield item
+            yield SPOKEN_MARKDOWN.sub("", item) if isinstance(item, str) else item
     except nim.NimError as e:
         yield {"type": "error", "code": e.code, "message": e.message}
     except httpx.HTTPError as e:

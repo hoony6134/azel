@@ -128,6 +128,7 @@ def test_ask_streams_with_a_tool_call_and_records_usage(nimgw):
     row = g.fake.db["usage"][-1]
     assert row["path"] == "nim" and row["model"] == "nvidia/nemotron-3-ultra-550b-a55b"
     assert abs(row["cost_usd"] - (300 * 1.0 + 30 * 10.0) / 1e6) < 1e-12
+    assert "존댓말" in fake.seen[0][2]["messages"][0]["content"] and "요일" in fake.seen[0][2]["messages"][0]["content"]
     second = fake.seen[-1][2]["messages"]
     assert second[-1] == {"role": "tool", "tool_call_id": "c1", "content": "a b c"}
     assert all(KEY not in json.dumps(m) for m in second)  # the key only ever rides in the header
