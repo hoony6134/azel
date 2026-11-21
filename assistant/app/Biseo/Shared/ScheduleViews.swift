@@ -51,9 +51,10 @@ struct ScheduleCard: View {
         Card("예약", trailing: AnyView(Button("모두 보기") { showList = true }.font(.subheadline).tint(Theme.celadon))) {
             if let next = schedule.next {
                 ScheduleRow(item: next)
-            } else {
+            } else if schedule.status == .ok {
                 Text("예약된 전화가 없어요").foregroundStyle(Theme.text2)
             }
+            SectionNote(status: schedule.status) { Task { await schedule.refresh() } }
         }
         .sheet(isPresented: $showList) {
             NavigationStack { ScheduleScreen(schedule: schedule) }
@@ -123,7 +124,7 @@ struct ScheduleScreen: View {
                 if !schedule.missed.isEmpty {
                     Card("놓친 전화") { ForEach(schedule.missed) { item in row(item) } }
                 }
-                if let e = schedule.error { Text(FriendlyError.describe(e).title).font(.footnote).foregroundStyle(Theme.danger) }
+                SectionNote(status: schedule.status) { Task { await schedule.refreshAll() } }
             }
             .padding(20)
             .frame(maxWidth: 640).frame(maxWidth: .infinity)

@@ -166,6 +166,7 @@ final class ScheduleModel: ObservableObject {
     /// `include=all`: also past items, loaded by the list sheet.
     @Published private(set) var all: [ScheduledCall] = []
     @Published private(set) var error: Error?
+    @Published private(set) var status: SectionStatus = .ok
 
     var upcoming: [ScheduledCall] { (all.isEmpty ? active : all).filter(\.isActive).sorted { $0.at < $1.at } }
     var next: ScheduledCall? { active.filter(\.isActive).min { $0.at < $1.at } }
@@ -175,12 +176,18 @@ final class ScheduleModel: ObservableObject {
 
     func refresh() async {
         guard Config.token != nil else { return }
-        do { active = try await ScheduleAPI.list(); error = nil } catch { self.error = error }
+        switch await attempt({ try await ScheduleAPI.list() }) {
+        case .success(let items): active = items; error = nil; status = .ok
+        case .failure(let e): if let s = SectionStatus.from(e) { status = s; error = s.isFailed ? e : nil }
+        }
     }
 
     func refreshAll() async {
         guard Config.token != nil else { return }
-        do { all = try await ScheduleAPI.list(all: true); active = all.filter(\.isActive); error = nil } catch { self.error = error }
+        switch await attempt({ try await ScheduleAPI.list(all: true) }) {
+        case .success(let items): all = items; active = items.filter(\.isActive); error = nil; status = .ok
+        case .failure(let e): if let s = SectionStatus.from(e) { status = s; error = s.isFailed ? e : nil }
+        }
     }
 
     func create(at: Date, repeatRule: String?, kind: String, note: String) async throws {

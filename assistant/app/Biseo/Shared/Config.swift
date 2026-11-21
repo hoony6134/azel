@@ -9,12 +9,15 @@ enum Config {
     // plain http/ws to the tailnet anyway. The advanced fields exist only for another TLS host.
     static let addressNote = "기본은 azel.scian.xyz예요. 다른 서버를 쓸 때만 바꾸세요 (wss://, https://만 돼요)."
 
+    /// Tests point the app at a fake server without touching the real Keychain item or defaults.
+    static var testOverride: (gateway: String, token: String)?
+
     static var voiceURL: String {
         get { usable(UserDefaults.standard.string(forKey: "voiceURL")) ?? publicVoiceURL }
         set { UserDefaults.standard.set(newValue, forKey: "voiceURL") }
     }
     static var gatewayURL: String {
-        get { usable(UserDefaults.standard.string(forKey: "gatewayURL")) ?? publicGatewayURL }
+        get { testOverride?.gateway ?? usable(UserDefaults.standard.string(forKey: "gatewayURL")) ?? publicGatewayURL }
         set { UserDefaults.standard.set(newValue, forKey: "gatewayURL") }
     }
 
@@ -42,7 +45,7 @@ enum Config {
         String(raw.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) }.map(Character.init))
     }
     static var token: String? {
-        get { Keychain.read() }
+        get { testOverride?.token ?? Keychain.read() }
         set { Keychain.write(newValue) }
     }
 }

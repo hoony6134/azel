@@ -189,12 +189,14 @@ struct HistoryList: View {
 
     var body: some View {
         Group {
-            if !model.loadedOnce && model.items.isEmpty && model.error == nil {
+            if !model.loadedOnce && model.items.isEmpty && model.status == .ok {
                 List(0..<6, id: \.self) { _ in HistoryRow(item: HistoryItem(id: "p", title: "오늘 일정 뭐 있어?", started_at: Date().timeIntervalSince1970, duration_s: 240, turns: 6)) }
                     .redacted(reason: .placeholder)
             } else if model.items.isEmpty, let q = model.results.map({ _ in model.query }) {
                 ContentUnavailableView { Text("‘\(q)’에 맞는 기록이 없어요").font(.subheadline).foregroundStyle(Theme.text2) }
-            } else if model.items.isEmpty, model.error != nil, model.offlineSince == nil {
+            } else if model.items.isEmpty, model.status == .unavailable {
+                EmptyState(title: "기록은 서버 업데이트 후 볼 수 있어요", message: "이 기능은 서버 업데이트 후 사용할 수 있어요.")
+            } else if model.items.isEmpty, model.status.isFailed, model.offlineSince == nil {
                 EmptyState(title: "기록을 불러올 수 없어요", message: FriendlyError.describe(model.error!).message,
                            detail: model.error?.localizedDescription, action: ("다시 시도", { Task { await model.refresh() } }))
             } else if model.items.isEmpty {

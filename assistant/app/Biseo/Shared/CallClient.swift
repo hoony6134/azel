@@ -55,10 +55,12 @@ final class CallClient {
     init() {}
 
     /// The token goes in the Authorization header, never the query: query strings end up in proxy logs.
-    static func request(voiceURL: String, token: String, session: String, callID: String?) throws -> URLRequest {
+    /// `intent`: e.g. "briefing" for 오늘 브리핑 / the Siri briefing, so the server opens with it.
+    static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil) throws -> URLRequest {
         guard var url = URLComponents(string: voiceURL + "/v1/call") else { throw StartError.notConfigured }
         url.queryItems = [URLQueryItem(name: "session", value: session)]
         if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
+        if let intent { url.queryItems?.append(URLQueryItem(name: "intent", value: intent)) }
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -66,10 +68,10 @@ final class CallClient {
     }
 
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
-    func start(session: String, callID: String? = nil) throws {
+    func start(session: String, callID: String? = nil, intent: String? = nil) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
-                                                                         session: session, callID: callID))
+                                                                         session: session, callID: callID, intent: intent))
         socket = task
         receivedAny = false
         task.resume()

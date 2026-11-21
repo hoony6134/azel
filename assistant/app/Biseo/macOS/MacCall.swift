@@ -30,6 +30,7 @@ final class MacCall: ObservableObject {
 
     private let client = CallClient()
     private var activeSession = Session.current("mac")
+    private var activeIntent: String?
     private var panel: NSPanel?
 
     private init() {
@@ -107,8 +108,9 @@ final class MacCall: ObservableObject {
         }
     }
 
-    func start(panel usePanel: Bool, session: String? = nil) {
+    func start(panel usePanel: Bool, session: String? = nil, intent: String? = nil) {
         guard !inCall else { return }
+        activeIntent = intent
         activeSession = session ?? Session.current("mac")
         log = CallLog()
         activity = ActivityLog()
@@ -175,7 +177,7 @@ final class MacCall: ObservableObject {
         inCall = true
         applyDevices()
         do {
-            try client.start(session: activeSession)
+            try client.start(session: activeSession, intent: activeIntent)
             connectedAt = Date()
             if pttCall || talking { client.cue(.wake, listening: false) }
         } catch {

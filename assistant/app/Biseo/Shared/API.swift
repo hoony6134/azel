@@ -146,7 +146,11 @@ enum Gateway {
     }
 
     static func approvals() async throws -> [[String: Any]] {
-        let json = try await getJSON("/v1/approvals")
+        try parseApprovals(try await send("GET", "/v1/approvals"))
+    }
+
+    static func parseApprovals(_ data: Data) throws -> [[String: Any]] {
+        let json = try JSONSerialization.jsonObject(with: data)
         // The contract doesn't pin the envelope: accept a bare list or {"approvals": [...]}.
         return (json as? [[String: Any]]) ?? ((json as? [String: Any])?["approvals"] as? [[String: Any]]) ?? []
     }

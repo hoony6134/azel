@@ -153,7 +153,9 @@ final class CallManager: NSObject, ObservableObject {
             return
         }
         activeSession = callID ?? Session.current(sessionPrefix)
-        do { try client.start(session: activeSession!, callID: callID) } catch {
+        // Outgoing briefing calls (오늘 브리핑, Siri) tell the server what to open with.
+        let intent = callID == nil && sessionPrefix == "briefing" ? "briefing" : nil
+        do { try client.start(session: activeSession!, callID: callID, intent: intent) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }

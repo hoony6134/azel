@@ -67,17 +67,15 @@ struct ProactiveDecision: Decodable, Identifiable, Equatable {
 /// "왜 전화했는지 보기": recent proactive decisions, called or not.
 struct ProactiveLogView: View {
     @State private var items: [ProactiveDecision] = []
-    @State private var error: Error?
+    @State private var status: SectionStatus = .ok
     @State private var loaded = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Theme.m) {
-                if let error {
-                    let f = FriendlyError.describe(error)
-                    EmptyState(title: f.title, message: f.message, detail: error.localizedDescription, action: ("다시 시도", { Task { await load() } }))
-                } else if loaded && items.isEmpty {
+                SectionNote(status: status) { Task { await load() } }
+                if loaded && items.isEmpty && status == .ok {
                     EmptyState(title: "아직 기록이 없어요", message: "\(AssistantName.josa(AssistantName.current, "이", "가")) 먼저 전화할지 판단하면 여기에 남아요.")
                 }
                 ForEach(items) { d in
@@ -105,7 +103,10 @@ struct ProactiveLogView: View {
     }
 
     private func load() async {
-        do { items = try await ProactiveDecision.load(); error = nil } catch { self.error = error }
+        switch await attempt({ try await ProactiveDecision.load() }) {
+        case .success(let list): items = list; status = .ok
+        case .failure(let e): guard let s = SectionStatus.from(e) else { return }; status = s
+        }
         loaded = true
     }
 }
