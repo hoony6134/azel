@@ -69,3 +69,10 @@ def test_clip_cap(api):
     m, c, *_ = api
     r = c.post("/v1/wake/enroll", files=files(*[wav() for _ in range(m.MAX_CLIPS + 2)])).json()
     assert r["accepted"] == m.MAX_CLIPS and r["rejected"][0]["reason"] == "too many clips"
+
+
+def test_oversize_upload_and_request_caps(api):
+    m, c, *_ = api
+    r = c.post("/v1/wake/enroll", files=files(b"\0" * (m.MAX_BYTES + 5000), wav())).json()
+    assert r["accepted"] == 1 and r["rejected"] == [{"index": 0, "reason": "too large"}]
+    assert c.post("/v1/wake/enroll", files=files(*[wav(0.5)] * (m.MAX_CLIPS + 1))).status_code == 413

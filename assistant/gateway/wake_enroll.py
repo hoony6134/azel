@@ -33,6 +33,7 @@ DIR = HOME / "wake-enroll"
 VERIFIER = HOME / "azel_verifier.pkl"
 MIN_CLIPS, MAX_CLIPS = 5, 20
 MIN_S, MAX_S = 0.4, 2.5
+MAX_BYTES = int(MAX_S * 32000) + 1024  # a valid clip is never bigger
 
 router = APIRouter(prefix="/v1/wake")
 lock = threading.Lock()
@@ -114,9 +115,11 @@ async def enroll(clips: list[UploadFile]):
     private_dir(DIR / "clips")
     have = len(list((DIR / "clips").glob("*.wav")))
     accepted, rejected = 0, []
+    if len(clips) > MAX_CLIPS:
+        raise HTTPException(413, f"at most {MAX_CLIPS} clips per request")
     for i, up in enumerate(clips):
-        data = await up.read()
-        reason = check_clip(data) or ("too many clips" if have + accepted >= MAX_CLIPS else None)
+        data = await up.read(MAX_BYTES + 1)  # never buffer more than one clip's worth
+        reason = ("too large" if len(data) > MAX_BYTES else check_clip(data)) or ("too many clips" if have + accepted >= MAX_CLIPS else None)
         if reason:
             rejected.append({"index": i, "reason": reason})
             continue
