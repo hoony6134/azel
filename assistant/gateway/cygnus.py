@@ -244,7 +244,8 @@ async def write(name, args):
         raise PermissionError("Cygnus 쓰기 토큰이 없어요.")
     if _write_client is None:
         import os
-        _write_client = Cygnus(os.environ.get("BRAIN_CYGNUS_URL", "https://mcp.scian.xyz"),
+        # the write PAT is audience-bound to the memory endpoint (resource …/memory); the read PAT is "*"
+        _write_client = Cygnus(os.environ.get("CYGNUS_MEMORY_URL", "https://mcp.scian.xyz/memory"),
                                _pat_file("cygnus_pat_rw").read_text().strip())
     _write_client.cache.clear()
     out = await _write_client.call(name, body)
