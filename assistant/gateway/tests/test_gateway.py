@@ -137,6 +137,51 @@ def test_tool_labels(gw):
                                       "kind": "generic", "route": "claude"}
 
 
+def test_old_proactive_settings_migrate_on_read(gw):
+    g, c, _ = gw
+    g.fake.db["settings"] = {"proactive": {"morning_briefing": "07:30", "deadline_check": "21:00",
+                                           "quiet_hours": ["23:30", "07:30"],
+                                           "triggers": {"deadline": False, "server_down": False}}}
+    p = c.get("/v1/settings").json()["proactive"]
+    assert p == {"enabled": True, "morning_briefing": {"enabled": True, "time": "07:30"},
+                 "deadline_check": {"enabled": False, "time": "21:00"}, "server_alerts": False,
+                 "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120,
+                                "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}}
+    assert "quiet_hours" not in json.dumps(p) and not hasattr(g, "in_quiet_hours")
+
+
+def test_proactive_settings_merge_and_validate(gw):
+    g, c, _ = gw
+    p = c.put("/v1/settings", json={"proactive": {"autonomous": {"enabled": True}}}).json()["proactive"]
+    assert p["autonomous"]["enabled"] and p["autonomous"]["max_per_day"] == 3 and p["morning_briefing"]["time"] == "08:00"
+    p = c.put("/v1/settings", json={"proactive": {"morning_briefing": {"time": "07:00"}}}).json()["proactive"]
+    assert p["morning_briefing"] == {"enabled": True, "time": "07:00"} and p["autonomous"]["enabled"]  # kept
+    for bad in [{"enabled": "yes"}, {"morning_briefing": {"time": "25:00"}}, {"autonomous": {"max_per_day": 50}},
+                {"autonomous": {"window": ["23:00", "08:00"]}}, {"autonomous": {"window": ["08:00"]}},
+                {"autonomous": {"min_gap_minutes": -1}}, {"autonomous": {"checkpoints": ["8:30"]}},
+                {"server_alerts": 1}]:
+        assert c.put("/v1/settings", json={"proactive": bad}).status_code == 400, bad
+
+
+def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypatch):
+    g, c, _ = gw
+    c.put("/v1/settings", json={"proactive": {"enabled": False}})
+    placed = []
+
+    async def fake_place(reason, opening=None):
+        placed.append(reason)
+        return {"call_id": f"c{len(placed)}"}
+    monkeypatch.setattr(g, "place_call", fake_place)
+    alert = {"alerts": [{"status": "firing", "labels": {"severity": "critical", "alertname": "NodeDown"}}]}
+    assert c.post("/v1/alerts", json=alert).json() == {"called": False}
+    asyncio.run(g.scheduler_tick(datetime(2026, 11, 21, 8, 0, tzinfo=g.KST), {}))  # briefing time
+    assert placed == []
+    at = (datetime.now(g.KST) + timedelta(minutes=5)).replace(second=0, microsecond=0)
+    c.post("/v1/schedule", json={"at": at.isoformat(), "kind": "wake"})
+    asyncio.run(g.fire_scheduled(at.timestamp() + 1))
+    assert placed == ["wake"]  # the user asked for this one
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400
@@ -166,20 +211,11 @@ def test_approval_flow(gw):
 
 def test_alert_places_call_without_apns(gw):
     g, c, _ = gw
-    g.in_quiet_hours = lambda s, now=None: False
     r = c.post("/v1/alerts", json={"alerts": [{"status": "firing", "labels": {"severity": "critical", "alertname": "NodeDown"}}]}).json()
     assert r["called"] and r["sent"] == 0
     assert "NodeDown" in c.get(f"/v1/calls/{r['call_id']}").json()["opening"]
     r = c.post("/v1/alerts", json={"alerts": [{"status": "firing", "labels": {"severity": "warning"}}]}).json()
     assert r == {"called": False}
-
-
-def test_quiet_hours(gw):
-    g, _, _ = gw
-    s = {"proactive": {"quiet_hours": ["23:30", "07:30"]}}
-    at = lambda hm: datetime.strptime(f"2026-11-21 {hm}", "%Y-%m-%d %H:%M")  # noqa: E731
-    assert g.in_quiet_hours(s, at("23:45")) and g.in_quiet_hours(s, at("03:00"))
-    assert not g.in_quiet_hours(s, at("08:00")) and not g.in_quiet_hours(s, at("23:00"))
 
 
 def test_device_prompt_fallback(gw):
@@ -438,7 +474,6 @@ def test_history_days_setting_and_retention(gw, monkeypatch):
     for bad in [-1, 1.5, "30", True, 99999]:
         assert c.put("/v1/settings", json={"history_days": bad}).status_code == 400, bad
     assert c.put("/v1/settings", json={"history_days": 30}).status_code == 200
-    g.in_quiet_hours = lambda s, now=None: True  # 04:00 is in quiet hours; retention runs anyway
     at4 = datetime(2026, 11, 22, 4, 0, tzinfo=g.KST)
     asyncio.run(g.scheduler_tick(at4, {}))
     assert g.fake.pruned == 30
@@ -549,7 +584,6 @@ def fire_setup(g, monkeypatch, **item):
 
 def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
     g, _, _ = gw
-    g.in_quiet_hours = lambda s, now=None: True  # a wake call the user asked for ignores quiet hours
     at, placed, alerts = fire_setup(g, monkeypatch)
     item = g.fake.db["schedule"]["s1"]
     asyncio.run(g.fire_scheduled(at - 60))
@@ -610,7 +644,6 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
         ran.append(reason)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
-    g.in_quiet_hours = lambda s, now=None: False
     asyncio.run(g.scheduler_tick(datetime(2026, 11, 21, 8, 0, tzinfo=g.KST), {}))
     assert ran == []  # no briefing without Claude
 
@@ -634,8 +667,7 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
         ran.append(g.INSTANCE)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
-    g.in_quiet_hours = lambda s, now=None: False
-    g.fake.db["settings"] = {"proactive": {**g.DEFAULTS["proactive"], "triggers": {"deadline": False}}}
+    g.fake.db["settings"] = {"proactive": {"deadline_check": {"enabled": False}}}
     now = datetime(2026, 11, 21, 8, 0, tzinfo=g.KST)
     for inst in ["macbook-aaa", "albireo-bbb", "gienah-ccc"]:  # three gateways tick in the same minute
         monkeypatch.setattr(g, "INSTANCE", inst)
@@ -651,7 +683,6 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
 
 def test_alert_calls_once_across_gateways(gw, monkeypatch):
     g, c, _ = gw
-    g.in_quiet_hours = lambda s, now=None: False
     body = {"alerts": [{"status": "firing", "labels": {"severity": "critical", "alertname": "NodeDown"}}]}
     assert c.post("/v1/alerts", json=body).json()["called"]
     monkeypatch.setattr(g, "INSTANCE", "albireo-x")

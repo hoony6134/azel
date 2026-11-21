@@ -60,8 +60,11 @@ DEFAULTS = {
     "task_defaults": {"chat": {"model": "qwen"}, "schedule": {"model": "sonnet"},
                       "code": {"model": "opus", "path": "claude_code"}, "mac": {"model": "sonnet"}},
     "monthly_budget_usd": 500, "budget_warn_pct": 80,
-    "proactive": {"morning_briefing": "08:00", "deadline_check": "20:00", "quiet_hours": ["23:30", "07:30"],
-                  "triggers": {"deadline": True, "server_down": True}},
+    # "먼저 전화하기": proactive calls. User-created scheduled calls are not proactive and always fire.
+    "proactive": {"enabled": True, "morning_briefing": {"enabled": True, "time": "08:00"},
+                  "deadline_check": {"enabled": True, "time": "20:00"}, "server_alerts": True,
+                  "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120,
+                                 "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}},
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "history_days": 365,  # call history kept this long; 0 = forever
@@ -204,6 +207,44 @@ history_outbox = Outbox("pending_history.json", "history_rejected.jsonl",
 local_devices: dict[str, dict] = {}  # daemons that registered here, so this device works offline
 
 
+HM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+
+
+def migrate_proactive(p):
+    """Any stored `proactive` (incl. the old flat shape with quiet_hours/triggers) in today's shape, defaults
+    filled in. Old: {"morning_briefing":"08:00","deadline_check":"20:00","quiet_hours":[…],
+    "triggers":{"deadline":bool,"server_down":bool}}."""
+    p, out = dict(p) if isinstance(p, dict) else {}, copy.deepcopy(DEFAULTS["proactive"])
+    trig = p.pop("triggers", None) or {}
+    p.pop("quiet_hours", None)  # removed: scheduled calls replace quiet hours
+    for key, flag in (("morning_briefing", None), ("deadline_check", "deadline")):
+        if isinstance(p.get(key), str):
+            p[key] = {"time": p[key], "enabled": bool(trig.get(flag, True)) if flag else True}
+    if "server_down" in trig and "server_alerts" not in p:
+        p["server_alerts"] = bool(trig["server_down"])
+    for k, v in p.items():
+        if isinstance(out.get(k), dict) and isinstance(v, dict):
+            out[k].update({kk: vv for kk, vv in v.items() if kk in out[k]})
+        elif k in out and not isinstance(out[k], dict):
+            out[k] = v
+    return out
+
+
+def check_proactive(p):
+    """400 unless `p` (already migrated) has the right types and ranges."""
+    a = p["autonomous"]
+    ok = all(isinstance(x, bool) for x in (p["enabled"], p["server_alerts"], p["morning_briefing"]["enabled"],
+                                            p["deadline_check"]["enabled"], a["enabled"]))
+    times = [p["morning_briefing"]["time"], p["deadline_check"]["time"], *a["window"], *a["checkpoints"]] \
+        if isinstance(a["window"], list) and isinstance(a["checkpoints"], list) else [None]
+    ok = ok and all(isinstance(t, str) and HM_RE.fullmatch(t) for t in times) and len(a["window"]) == 2 \
+        and len(a["checkpoints"]) <= 6 and a["window"][0] < a["window"][1]
+    ok = ok and all(isinstance(a[k], int) and not isinstance(a[k], bool) for k in ("max_per_day", "min_gap_minutes")) \
+        and 0 <= a["max_per_day"] <= 10 and 0 <= a["min_gap_minutes"] <= 1440
+    if not ok:
+        raise HTTPException(400, "proactive: see PROTOCOL.md section 3 for the shape")
+
+
 async def load_settings():
     s = copy.deepcopy(DEFAULTS)
     try:
@@ -216,6 +257,7 @@ async def load_settings():
     except StateDown:
         doc = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
     s.update(doc)
+    s["proactive"] = migrate_proactive(s.get("proactive"))
     return s
 
 
@@ -577,12 +619,6 @@ async def apns_send(payload, kind):
     return {"sent": sent}
 
 
-def in_quiet_hours(settings, now=None):
-    now = (now or datetime.now(KST)).strftime("%H:%M")
-    start, end = settings["proactive"]["quiet_hours"]
-    return (start <= now or now < end) if start > end else (start <= now < end)
-
-
 async def place_call(reason, opening=None):
     if MODE == "limited":
         raise HTTPException(403, "limited gateways do not place calls")
@@ -634,16 +670,13 @@ async def scheduler_tick(now, fired):
             await fire_scheduled(now.timestamp())
     except StateDown:
         pass
-    jobs = {"morning_briefing": lambda: place_call("morning_briefing")}
-    if s["proactive"]["triggers"].get("deadline"):
-        jobs["deadline_check"] = deadline_call
-    if not CLAUDE_OK:
-        jobs = {}  # briefings and deadline checks need Claude
+    p = s["proactive"]
+    jobs = {"morning_briefing": lambda: place_call("morning_briefing"), "deadline_check": deadline_call}
+    if not CLAUDE_OK or not p["enabled"]:
+        jobs = {}  # briefings and deadline checks need Claude; the master switch stops every proactive call
     for key, job in jobs.items():
-        if hm == s["proactive"].get(key) and fired.get(key) != today:
+        if p[key]["enabled"] and hm == p[key]["time"] and fired.get(key) != today:
             fired[key] = today
-            if in_quiet_hours(s, now):
-                continue
             try:
                 won = await take_lease(f"job:{key}:{today}", 86400)
             except StateDown:
@@ -966,6 +999,15 @@ async def put_settings(body: dict):
         raise HTTPException(400, "assistant_name: 1-12 Hangul/Latin letters or spaces")
     if name is not None:
         body["assistant_name"] = " ".join(name.split())
+    if "proactive" in body:  # a partial update merges into the current values, one level deep
+        if not isinstance(body["proactive"], dict):
+            raise HTTPException(400, "proactive must be an object")
+        cur = (await load_settings())["proactive"]
+        both = {**cur, **body["proactive"]}
+        merged = migrate_proactive({k: {**cur[k], **v} if isinstance(cur.get(k), dict) and isinstance(v, dict) else v
+                                    for k, v in both.items()})
+        check_proactive(merged)
+        body["proactive"] = merged
     days = body.get("history_days")
     if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500):
         raise HTTPException(400, "history_days: a whole number of days, 0 = keep forever")
@@ -1121,7 +1163,7 @@ async def alerts(body: dict):
     s = await load_settings()
     firing = [a for a in body.get("alerts", []) if a.get("status") == "firing"
               and a.get("labels", {}).get("severity") == "critical"]
-    if not firing or not s["proactive"]["triggers"].get("server_down") or in_quiet_hours(s):
+    if not firing or not s["proactive"]["enabled"] or not s["proactive"]["server_alerts"]:
         return {"called": False}
     names = ", ".join(sorted({a["labels"].get("alertname", "알 수 없는 경보") for a in firing}))
     try:  # Alertmanager may post the same alert to several gateways: one call per alert set per 10 min

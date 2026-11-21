@@ -169,10 +169,22 @@ device that created them.
    "task_defaults":{"chat":{"model":"qwen"},"schedule":{"model":"sonnet"},
                     "code":{"model":"opus","path":"claude_code"},"mac":{"model":"sonnet"}},
    "monthly_budget_usd":500,"budget_warn_pct":80,
-   "proactive":{"morning_briefing":"08:00","quiet_hours":["23:30","07:30"],
-                "triggers":{"deadline":true,"server_down":true}},
-   "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤"}
+   "proactive":{"enabled":true,
+                "morning_briefing":{"enabled":true,"time":"08:00"},
+                "deadline_check":{"enabled":true,"time":"20:00"},
+                "server_alerts":true,
+                "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
+                              "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
+   "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
+   "history_days":365}
   ```
+  `proactive.enabled` is the master switch ("먼저 전화하기"): off, no proactive call fires (briefing,
+  deadline check, server alerts, autonomous calls). User-created scheduled calls always fire. There are no
+  quiet hours any more (scheduled calls replace them). A stored settings document in the old shape
+  (`"morning_briefing":"08:00"`, `quiet_hours`, `triggers.deadline/server_down`) is migrated on read.
+  `PUT` with `proactive` merges one level deep into the current values (e.g. `{"proactive":{"autonomous":
+  {"enabled":true}}}`), then validates: times `HH:MM`, `window` start < end, `max_per_day` 0–10,
+  `min_gap_minutes` 0–1440, at most 6 `checkpoints`; otherwise 400.
   `assistant_name` (default "아젤"; 1–12 Hangul/Latin letters or spaces, else 400) is the assistant's spoken
   name: the gateways use it for the VoIP push `caller` and Claude's prompts, and the voice server for
   Qwen's system prompt (built per turn from the settings pushed over the link), so a rename applies on
@@ -198,7 +210,7 @@ device that created them.
   400 if `at` is not an ISO string with offset, is past, or is more than 30 days out (or repeat/kind/note
   invalid). `DELETE /v1/schedule/{id}` → cancels and returns the item (404 unless pending or fired). Firing: the full gateway holding lease
   `scheduler` (TTL 150 s, renewed every minute, priority = `BISEO_SCHEDULER_PRIORITY`, a lower value takes
-  it over) places the call at `at` (quiet hours ignored: the user asked for that time; opening "일어나실
+  it over) places the call at `at` (always, even with `proactive.enabled` off: the user asked for it; opening "일어나실
   시간이에요." or the reminder note), retries every 2 min while unanswered up to 3 attempts, then marks it
   `missed` and sends an alert push. Answered (voice `call_answered`) → `answered`; repeating items go back
   to `pending` at their next occurrence (also after a miss). Status changes are compare-and-set, so two
