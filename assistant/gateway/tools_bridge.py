@@ -231,9 +231,11 @@ class Bridge:
                 raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
             r = await self.d["web_search"](q, int(args.get("max") or 5))
             src = "; ".join(f"{x['title'] or x['url']} <{x['url']}>" for x in r["sources"][:5])
+            site = site_name(r["sources"][0]) if r["sources"] else ""
             first = re.split(r"(?<=[.!?。])\s+|\n", r["text"].strip())[0] if r["text"] else "찾은 결과가 없어요."
-            return first[:200], r, (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
-                "\n(답할 때 출처는 사이트 이름만 짧게, URL은 읽지 마.)"
+            lead = f"[{site} 기준] " if site else ""  # the citation in front, where a model copies it from
+            return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
+                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
@@ -688,6 +690,15 @@ def cancelled(done):
     if not done:
         raise Fail("not_found", "그런 예약이 없어요.")
     return done[1], done[0]
+
+
+def site_name(src):
+    """'기상청' from a result's title, else the bare domain ('weather.go.kr')."""
+    title = re.split(r"\s*[|·:\-–—]\s*", str(src.get("title") or ""))[-1].strip()
+    if title and len(title) <= 20:
+        return title
+    host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", str(src.get("url", ""))).split("/")[0])
+    return host
 
 
 async def none_true():

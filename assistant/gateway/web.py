@@ -14,7 +14,8 @@ import httpx
 
 import claude_api
 
-SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 2}
+SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 3,
+               "user_location": {"type": "approximate", "country": "KR", "timezone": "Asia/Seoul"}}
 SEARCH_USD = 0.01  # per search request, on top of tokens
 SEARCH_SYSTEM = ("웹 검색 결과를 한국어로 짧게 정리해. 질문에 바로 답하는 사실과 숫자만, 날짜가 있으면 날짜와 함께. "
                  "항목마다 출처 사이트 이름을 괄호로. 모르면 모른다고 해.")
@@ -23,9 +24,11 @@ MAX_CHARS = 4000
 REDIRECTS = 3
 
 
-async def search(api_key, query, n=5, client=None):
+async def search(api_key, query, n=5, client=None, today=None):
     """{"text", "sources": [{"title", "url"}], "cost_usd", "usage"}."""
-    messages = [{"role": "user", "content": str(query)[:300]}]
+    from datetime import datetime, timedelta, timezone
+    today = today or datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d (%a)")
+    messages = [{"role": "user", "content": f"오늘은 {today}, 한국이야. 질문: {str(query)[:300]}"}]
     text, sources, cost, usage = [], [], 0.0, {}
     c = client or httpx.AsyncClient(timeout=60)
     try:
