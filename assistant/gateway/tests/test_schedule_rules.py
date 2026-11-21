@@ -1,6 +1,8 @@
 """Batch 5 schedules end to end through the REST adapters: rules (cron), read-back, one fire moved or skipped,
 push reminders, and the same result on the app's envelope and the legacy bodies."""
 import asyncio
+
+import pytest
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -101,3 +103,30 @@ def test_rule_ends_after_its_end_date(gw, monkeypatch):  # noqa: F811
     asyncio.run(g.fire_scheduled(at))
     asyncio.run(g.call_answered(g.fake.db["schedule"]["r2"]["call_id"]))
     assert g.fake.db["schedule"]["r2"]["status"] == "answered"  # the last day: nothing after it
+
+
+def test_daily_cap_counts_the_rules_own_window():
+    """A rule starting next month is checked against next month's calls, not the next two weeks'."""
+    import cron as C
+    from datetime import date as _date, datetime as _dt, timedelta as _td, timezone as _tz
+    kst = _tz(_td(hours=9))
+    now = _dt(2026, 11, 22, 9, 0, tzinfo=kst)
+    start = _date(2026, 12, 20)
+    busy = [_dt(2026, 12, 21, h, 0, tzinfo=kst) for h in range(6, 21)]  # 15 calls on 12/21 from other items
+    with pytest.raises(C.CronError):
+        C.check("0 6-23 * * *", now, start, None, lambda a, b: [t for t in busy if a <= t <= b])  # 18 + 15 > 20
+    C.check("0 6-23 * * *", now, None, None, lambda a, b: [t for t in busy if a <= t <= b])  # starts now: 12/21 is out of view
+
+
+def test_identical_rule_is_refused(tmp_path, monkeypatch):
+    from test_gateway import start as _start
+    g = _start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
+
+    async def two():
+        body = {"cron": "0 7 * * *", "kind": "wake", "note": "기상"}
+        await g.schedule_create(dict(body), "app")
+        with pytest.raises(g.HTTPException) as e:
+            await g.schedule_create(dict(body), "app")
+        assert e.value.status_code == 409
+        await g.schedule_create({**body, "cron": "0 8 * * *"}, "app")  # a different time is fine
+    asyncio.run(two())

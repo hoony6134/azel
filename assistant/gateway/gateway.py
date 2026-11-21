@@ -1470,9 +1470,9 @@ def item_fires(row, after, until):
     return [t.timestamp() for t in cron.fires(expr, a, u, start, end, row.get("skips") or ())]
 
 
-def upcoming(items, now, skip_id=None):
-    """Every active item's fires over cron's horizon, as KST datetimes (for the daily cap)."""
-    until = now + cron.HORIZON_DAYS * 86400
+def upcoming(items, now, skip_id=None, until=None):
+    """Every active item's fires from now over cron's horizon (or to `until`), as KST datetimes (for the daily cap)."""
+    until = until or now + cron.HORIZON_DAYS * 86400
     return [datetime.fromtimestamp(t, KST) for i in items if i["id"] != skip_id
             for t in item_fires(i, now, until)]
 
@@ -1505,6 +1505,9 @@ def check_schedule(body, created_by, now=None, others=()):
         if repeat and repeat.startswith("weekly:") and datetime.fromtimestamp(at, KST).weekday() != int(repeat[7:]):
             raise HTTPException(400, "repeat weekly:<dow> must match the weekday of at (0 = Monday)")
         day = datetime.fromtimestamp(at, KST).date()
+        if callable(others):  # that day's fires of the other items
+            begin = datetime.combine(day, datetime.min.time(), KST)
+            others = others(begin, begin + timedelta(days=1))
         if sum(o.date() == day for o in others) + 1 > cron.DAY_CAP:
             raise HTTPException(400, f"하루 전화가 {cron.DAY_CAP}번을 넘게 돼요.")
     kind = body.get("kind") or "wake"
@@ -1584,8 +1587,13 @@ async def schedule_create(body, created_by, now=None):
     if body.get("interpretation"):
         raw = f"{raw} [{body['interpretation']}]".strip()
     purpose = body.get("purpose") or (await openings.purpose(raw.split(" [")[0], llm_json) if raw else "")
+    items = await schedule_list()
+    expr = " ".join(str(body.get("cron") or "").split())
+    if expr and any(item_cron(i) == expr and i.get("persona_id", pid) == pid and i.get("kind") == (body.get("kind") or "wake")
+                    and (i.get("purpose") or "") == (purpose or "") for i in items):
+        raise HTTPException(409, "이미 같은 반복 예약이 있어요.")  # the same rule twice would ring twice
     checked = check_schedule({**body, "purpose": purpose, "request": raw}, created_by, now,
-                             upcoming(await schedule_list(), now))
+                             lambda a, b: upcoming(items, a.timestamp(), until=b.timestamp()))
     row = await state.call("POST", "/v1/state/schedule", {**checked, "persona_id": pid})
     if origin := origin_ctx.get():  # made during a call: its call continues that conversation
         await state.call("PUT", f"/v1/state/kv/origin-{row['id']}", {"session": origin})
@@ -1652,7 +1660,8 @@ async def schedule_update(sid, changes, occurrence=None, now=None):
             new = " ".join([str(t.minute), str(t.hour), *new.split()[2:]])
         start = cron.as_date(changes["start_date"]) if "start_date" in changes else item_dates(item)[0]
         end = cron.as_date(changes["end_date"]) if "end_date" in changes else item_dates(item)[1]
-        cron.check(new, datetime.fromtimestamp(now, KST), start, end, upcoming(items, now, skip_id=sid))
+        cron.check(new, datetime.fromtimestamp(now, KST), start, end,
+                   lambda a, b: upcoming(items, a.timestamp(), skip_id=sid, until=b.timestamp()))
         first = cron.next_fire(new, datetime.fromtimestamp(now + 30, KST), start, end, item.get("skips") or ())
         fields.update(cron=new, start_date=start and start.isoformat(), end_date=end and end.isoformat(),
                       at=first.timestamp())

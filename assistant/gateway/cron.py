@@ -134,19 +134,27 @@ def rule_text(expr, start=None, end=None):
     return span + text
 
 
+def cap_window(now, start=None):
+    """The days the daily cap is checked over: HORIZON_DAYS from the rule's first day (never before now)."""
+    begin = max(now, datetime.combine(start, time(0), now.tzinfo)) if start else now
+    return begin, begin + timedelta(days=HORIZON_DAYS)
+
+
 def check(expr, now, start=None, end=None, others=()):
     """Refuse a rule that can't or shouldn't run: raises CronError with the reason to say.
-    others: the active rules' upcoming fire datetimes (one-off items included) for the daily cap."""
+    others: the other active items' fire datetimes (one-off items included) for the daily cap, or a function
+    (begin, until) -> them, so a rule starting next month is checked against next month's calls."""
     if start and end and end < start:
         raise CronError("끝나는 날이 시작하는 날보다 빨라요.")
-    until = now + timedelta(days=HORIZON_DAYS)
+    begin, until = cap_window(now, start)
+    others = others(begin, until) if callable(others) else others
     own = list(fires(expr, now, until, start, end))
     if not own and next_fire(expr, now, start, end) is None:
         raise CronError("그 규칙으로는 전화할 날이 없어요.")
     if any((b - a).total_seconds() < MIN_GAP_S for a, b in zip(own, own[1:])):
         raise CronError("전화 사이가 30분은 넘어야 해요.")
     per_day = {}
-    for t in [*own, *(o for o in others if now < o <= until)]:
+    for t in [*own, *(o for o in others if begin <= o <= until)]:
         per_day[t.date()] = per_day.get(t.date(), 0) + 1
     if per_day and max(per_day.values()) > DAY_CAP:
         raise CronError(f"하루 전화가 {DAY_CAP}번을 넘게 돼요.")
