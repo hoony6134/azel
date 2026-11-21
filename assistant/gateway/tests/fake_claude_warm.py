@@ -38,6 +38,8 @@ while True:
         continue
     n += 1
     text = m["message"]["content"][0]["text"]
+    if "멈춤" in text:  # hangs mid-turn (a stuck MCP server): the gateway must kill it
+        time.sleep(30)
     delta("네, ")
     if "느린" in text:
         got = lines(3)

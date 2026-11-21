@@ -1263,6 +1263,73 @@ def test_mcp_client_parses_sse_and_json(gw, monkeypatch):
         asyncio.run(g.mcp("http://d/mcp", "tools/list", {}))
 
 
+def test_warm_pool_race_cap_displace_and_call_end(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+    import claude_warm
+    monkeypatch.setattr(claude_warm, "MAX_PROCS", 2)
+
+    def spawned():
+        return len((tmp_path / "args.json").read_text().splitlines()) if (tmp_path / "args.json").exists() else 0
+
+    async def run():
+        await asyncio.gather(g.prewarm("azel:c1"), g.ask_text("안녕", "azel:c1"))  # prewarm races the first ask
+        n_race = spawned()
+        first = g.warm_pool.procs["azel:c1"]
+        await g.ask_text("둘", "azel:c2")
+        await g.ask_text("셋", "azel:c3")  # cap 2: the least recently used (c1) goes, closed
+        capped = (sorted(g.warm_pool.procs), first.proc.returncode is not None)
+        w = g.warm_pool.procs["azel:c3"]
+        cfg = w.cfg
+        settings = await g.load_settings()
+        settings["assistant_name"] = "새이름"  # a different prompt: a new process, the old one closed with its config
+        g.fake.db["settings"] = {**g.fake.db["settings"], "assistant_name": "새이름"}
+        await g.ask_text("넷", "azel:c3")
+        displaced = (w.proc.returncode is not None, cfg is None or not os.path.exists(cfg))
+        await g.handle_link(LinkWS([{"type": "call_log", "event": "start", "log_id": "L9", "session": "s9",
+                                     "persona_id": "azel"}]))
+        await asyncio.sleep(0.3)  # the prewarm task runs
+        warm9 = "azel:s9" in g.warm_pool.procs
+        await g.handle_link(LinkWS([{"type": "call_log", "event": "end", "log_id": "L9", "ended_at": 1.0}]))
+        await asyncio.sleep(0.1)
+        closed9 = "azel:s9" not in g.warm_pool.procs
+        await g.warm_pool.close_all()
+        return n_race, capped, displaced, warm9, closed9
+    n_race, capped, displaced, warm9, closed9 = asyncio.run(run())
+    assert n_race == 1  # one process, not two
+    assert capped == (["azel:c2", "azel:c3"], True)
+    assert displaced == (True, True)
+    assert warm9 and closed9  # prewarmed at the call's start under the asks' key, closed at its end
+
+
+def test_warm_turn_timeout_kills_a_hung_process(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+    import claude_warm
+    monkeypatch.setattr(claude_warm, "TURN_IDLE_S", 0.5)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="nothing for too long"):  # serve_ask turns it into an error event
+            [e async for e in g.ask_stream("멈춤", "azel:h1")]  # the fake never answers
+        w = g.warm_pool.procs.get("azel:h1")
+        dead = w is None or w.proc.returncode is not None
+        await g.warm_pool.close_all()
+        return dead
+    assert asyncio.run(run())
+
+
+def test_prewarm_uses_the_call_persona(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
+    g.fake.db["settings"] = {"personas": [{"id": "azel", "name": "아젤", "voice": "sohee", "primary": True},
+                                          {"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋함"}]}
+
+    async def run():
+        await g.prewarm("luna:s1", "luna")
+        style = g.warm_pool.procs["luna:s1"].style
+        await g.warm_pool.close_all()
+        return style
+    style = asyncio.run(run())
+    assert "'루나'" in style and "느긋함" in style
+
+
 def test_warm_claude_keeps_one_process_per_session(tmp_path, monkeypatch):
     g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
 

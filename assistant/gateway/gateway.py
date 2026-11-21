@@ -64,6 +64,7 @@ MAX_TOOL_TURNS = 8
 WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no")
 COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
 warm_pool = Pool()
+call_warm_keys: dict[str, str] = {}  # call_log id -> its warm process key, closed when the call ends
 assert MODE in ("full", "limited"), "BISEO_MODE must be full or limited"
 
 MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"}
@@ -141,7 +142,7 @@ def migrate_personas(s):
                       "primary": True})
     s["personas"] = ps
     prim = primary_persona(s)
-    s["assistant_name"], s["personality"] = prim["name"], prim["personality"]
+    s["assistant_name"], s["personality"] = prim.get("name") or DEFAULTS["assistant_name"], prim.get("personality") or ""
     return s
 
 
@@ -591,12 +592,14 @@ async def resume_id(session):
     return prev["claude_session"] if prev and prev["device"] == DEVICE else None  # sessions live on their host
 
 
-async def prewarm(session):
+async def prewarm(session, persona_id=None):
     """A call started: start its warm Claude now, so MCP connects while the user is still talking. Same model,
-    prompt and devices as ask_claude_code would use for a chat turn, so that turn reuses it."""
+    prompt (the call's persona) and devices as ask_claude_code would use for a chat turn, so that turn reuses it.
+    `session` is the key the voice server's asks use: "<persona>:<call session>"."""
     if not (WARM and CLAUDE_OK and MODE == "full") or not isinstance(session, str) or not session \
             or session.startswith(COLD_SESSIONS):
         return
+    current_persona.set(persona_id if isinstance(persona_id, str) else None)  # this task only
     try:
         WORKDIR.mkdir(parents=True, exist_ok=True)
         devices, settings = await fresh_devices(), await load_settings()
@@ -1327,8 +1330,14 @@ async def handle_link(ws):
         elif m.get("type") == "cancel" and (t := tasks.pop(m.get("id"), None)):
             t.cancel()
         elif m.get("type") == "call_log":
-            if m.get("event") == "start":
-                asyncio.create_task(prewarm(m.get("session")))
+            if m.get("event") == "start" and isinstance(m.get("session"), str):
+                pid = m.get("persona_id") if isinstance(m.get("persona_id"), str) else "azel"
+                warm_key = f"{pid}:{m['session']}"  # what the voice server's asks use as the session
+                if isinstance(m.get("log_id"), str):
+                    call_warm_keys[m["log_id"]] = warm_key
+                asyncio.create_task(prewarm(warm_key, pid))
+            elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
+                asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_schedule(m))

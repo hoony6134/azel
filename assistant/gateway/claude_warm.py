@@ -16,6 +16,8 @@ import time
 IDLE_S = float(os.environ.get("BISEO_WARM_IDLE_S", "600"))  # recycle a process unused this long
 MAX_TURNS = 40  # recycle long conversations (context grows; a fresh one resumes the session anyway)
 DRAIN_S = 5  # after a barge-in, wait this long for the interrupted turn's result, then kill (and respawn)
+MAX_PROCS = int(os.environ.get("BISEO_WARM_MAX", "4"))  # warm processes per gateway; the least recently used goes
+TURN_IDLE_S = float(os.environ.get("BISEO_WARM_TURN_S", "120"))  # a turn silent this long: the process is hung
 
 
 def base_cmd(model, style, allowed, mcp_config=None, resume=None, settings=None):
@@ -80,7 +82,15 @@ class WarmClaude:
             await self.proc.stdin.drain()
             done = False
             try:
-                async for raw in self.proc.stdout:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(self.proc.stdout.readline(), TURN_IDLE_S)
+                    except asyncio.TimeoutError:  # hung (a stuck MCP server, a wedged CLI): kill it, never reuse
+                        await self.close()
+                        self.turns = MAX_TURNS
+                        raise RuntimeError("warm claude produced nothing for too long")
+                    if not raw:
+                        break  # the process exited
                     if _is_result(raw):
                         done = True
                     yield raw
@@ -127,22 +137,61 @@ def _is_result(raw):
 
 
 class Pool:
-    """Warm processes by voice session. A changed model, prompt or device set starts a new one."""
+    """Warm processes by voice session (at most MAX_PROCS). A changed prompt or device set starts a new one; every
+    process that leaves the pool is closed (now, or right after its running turn), with its token-bearing config."""
 
     def __init__(self):
         self.procs: dict[str, WarmClaude] = {}
+        self.locks: dict[str, asyncio.Lock] = {}
+        self._loop = None
+
+    def _lock(self, session):
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:  # locks belong to one event loop
+            self.locks, self._loop = {}, loop
+        return self.locks.setdefault(session, asyncio.Lock())
 
     async def get(self, session, model, style, allowed, cwd, mcp_servers=None, resume=None, settings=None, env=None):
-        w = self.procs.get(session)
-        if w and (not w.alive() or w.key != key(style, allowed, mcp_servers, settings)):
-            if not w.lock.locked():
-                await w.close()
-            w = None  # one still mid-turn is left to the reaper
-        if w is None:
-            w = WarmClaude(model, style, allowed, cwd, mcp_servers, resume, settings, env)
-            await w.start()
-            self.procs[session] = w
-        return w
+        """The session's warm process. One creation at a time per session, so a prewarm racing the first ask
+        yields one process, not two."""
+        async with self._lock(session):
+            w = self.procs.get(session)
+            if w and (not w.alive() or w.key != key(style, allowed, mcp_servers, settings)):
+                self.procs.pop(session, None)
+                await self._retire(w)
+                w = None
+            if w is None:
+                await self._make_room()
+                w = WarmClaude(model, style, allowed, cwd, mcp_servers, resume, settings, env)
+                await w.start()
+                self.procs[session] = w
+            w.used = time.monotonic()
+            return w
+
+    async def _make_room(self):
+        while len(self.procs) >= MAX_PROCS:
+            s, w = min(self.procs.items(), key=lambda kv: kv[1].used)
+            self.procs.pop(s)
+            await self._retire(w)
+
+    async def _retire(self, w):
+        """Close now, or right after the turn it is serving (never kill an answer mid-sentence)."""
+        if w.lock.locked():
+            asyncio.get_running_loop().create_task(self._close_after_turn(w))
+        else:
+            await w.close()
+
+    @staticmethod
+    async def _close_after_turn(w):
+        async with w.lock:
+            pass
+        await w.close()
+
+    async def close(self, session):
+        """The call ended: its process goes (it would otherwise idle until the reaper)."""
+        w = self.procs.pop(session, None)
+        if w:
+            await self._retire(w)
 
     async def reap(self):
         """Close idle processes; call this every minute."""
@@ -153,6 +202,6 @@ class Pool:
                 self.procs.pop(s, None)
 
     async def close_all(self):
-        for w in self.procs.values():
+        for w in list(self.procs.values()):
             await w.close()
         self.procs.clear()
