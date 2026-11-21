@@ -96,6 +96,7 @@ DEFAULTS = {
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
+    "brain_mode": "auto",  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
@@ -1022,7 +1023,19 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     budget = settings["monthly_budget_usd"]
     if MODE == "limited" and model == "nim":
         model = None  # a limited gateway has no NIM: its usual Claude path
+    mode = await brain_mode(settings)
+    if mode == "local":  # Qwen only: nothing here may reach Claude or a paid API
+        yield {"type": "text", "delta": LOCAL_LINE}
+        yield {"type": "done", "model": "qwen", "path": "local", "input_tokens": 0, "output_tokens": 0,
+               "cost_usd": 0.0, "budget_warning": False}
+        return
     model, path = resolve(settings, model, path, task, text)
+    if mode == "claude_api" or (mode == "claude_code" and MODE == "limited"):
+        path = "api"
+    elif mode == "claude_code":
+        path = "claude_code"
+    if mode != "auto" and model == "nim":
+        model = settings["default_model"] if settings["default_model"] in MODELS else "sonnet"
     # Only paid paths are held to the budget: a spent API budget must not stop subscription (claude_code) asks.
     if path in settings["budget_paths"] and await month_cost(settings) >= budget:
         yield {"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}
@@ -1137,10 +1150,26 @@ def origin_of(m):
     return v if isinstance(v, str) and ORIGIN_RE.fullmatch(v) else ""
 
 
+BRAIN_MODES = ("auto", "local", "claude_api", "claude_code")
+LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
+mode_ctx: contextvars.ContextVar = contextvars.ContextVar("brain_mode", default="")  # this request's, else the setting
+
+
+def mode_of(m):
+    v = m.get("mode")
+    return v if v in BRAIN_MODES else ""
+
+
+async def brain_mode(settings=None):
+    """The mode this request runs in: the call's own (a link frame's "mode"), else the shared setting."""
+    return mode_ctx.get() or (settings or await load_settings()).get("brain_mode", "auto")
+
+
 def served(coro, m):
     """A link request served in its own context carrying the conversation it came from."""
     ctx = contextvars.copy_context()
     ctx.run(origin_ctx.set, origin_of(m))
+    ctx.run(mode_ctx.set, mode_of(m))
     if origin_of(m):
         ctx.run(requester_ctx.set, requester_id("ask", origin_of(m)))  # Qwen's tool calls belong to that ask
     return asyncio.create_task(coro, context=ctx)
@@ -1857,6 +1886,7 @@ async def link_send(obj):
 
 async def serve_ask(m):
     current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)  # this task only
+    mtoken = mode_ctx.set(mode_of(m))  # the call's mode, for this ask only
     try:
         async for ev in ask_stream(m["text"], m.get("session") or "default", m.get("model"), None, m.get("task")):
             await link_send({"id": m["id"], **ev})
@@ -1865,6 +1895,8 @@ async def serve_ask(m):
     except Exception as e:
         print("ask failed:", type(e).__name__, e, flush=True)
         await link_send({"id": m["id"], "type": "error", "message": "Claude 요청이 실패했어요."})
+    finally:
+        mode_ctx.reset(mtoken)
 
 
 async def handle_link(ws):
@@ -2066,6 +2098,8 @@ async def put_settings(body: dict):
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
             raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
+    if "brain_mode" in body and body["brain_mode"] not in BRAIN_MODES:
+        raise HTTPException(400, f"brain_mode: one of {list(BRAIN_MODES)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
         raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
     if body.get("task_backend") == "nim":  # the shared default must be able to run
@@ -2942,7 +2976,11 @@ async def task_create(body, source="api"):
 async def task_backend_for(spec, settings):
     """(backend actually used, why it differs from the one asked for or None). Falls back to claude_code only
     where that can run: mail/calendar without a live Google grant, no API key, or the API budget spent."""
-    want = spec["backend"] or settings.get("task_backend", "claude_api")
+    mode = await brain_mode(settings)
+    if mode == "local":
+        return "qwen", None  # never a paid or Claude backend in local mode, not even as a fallback
+    want = {"claude_api": "claude_api", "claude_code": "claude_code"}.get(mode) or spec["backend"] or \
+        settings.get("task_backend", "claude_api")
     if want == "claude_code" or not CLAUDE_OK:
         return want, None
     if MAIL_CAL.search(spec["goal"]) and google_status() != "connected":
@@ -3360,6 +3398,7 @@ bridge = tools_bridge.Bridge(
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
+    mode=lambda: brain_mode(),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
 

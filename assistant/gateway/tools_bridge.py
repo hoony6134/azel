@@ -146,8 +146,9 @@ class Bridge:
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
         cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
+        own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if await self.mode() == "local" else OWN_TOOLS
         g_defs, _ = self.d.get("google", lambda: ([], None))()
-        return [*dev_defs, *OWN_TOOLS, *cyg_defs, *g_defs], where
+        return [*dev_defs, *own, *cyg_defs, *g_defs], where
 
     # ---------- one call ----------
     async def call(self, name, args, persona_id=None, caller="api", on_progress=None, where=None):
@@ -248,6 +249,8 @@ class Bridge:
         if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
             return await getattr(self, name)(args, persona_id)
         if name == "web_search":
+            if await self.mode() == "local":  # Haiku-backed: not in local mode (web_fetch stays)
+                raise Fail("unavailable", "로컬 모드에서는 웹 검색을 못 해요.")
             q = str(args["query"]).strip()
             if not q:
                 raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
@@ -356,6 +359,9 @@ class Bridge:
         await self.d["place_call"]("user_request", f"말씀하신 대로 전화드렸어요. {reason}", pid)
         await self.log_call(reason, None, pid)
         return "지금 전화를 걸게요."
+
+    async def mode(self):
+        return await self.d["mode"]() if "mode" in self.d else "auto"
 
     def now(self):
         return self.d.get("now", lambda: datetime.now(KST))()
