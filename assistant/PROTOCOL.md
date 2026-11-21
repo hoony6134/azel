@@ -163,7 +163,8 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
   `POST /v1/approvals/{id}`, `POST /v1/push/register`, `GET|PUT /v1/connectors`, `PUT /v1/connectors/secret/{name}`,
   `GET|DELETE /v1/history`, `GET|DELETE /v1/history/{id}`, `GET|POST /v1/schedule`, `DELETE /v1/schedule/{id}`,
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
-  `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices` (bearer header).
+  `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
+  `GET|POST|DELETE /v1/wake/enroll` (bearer header).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -272,6 +273,10 @@ device that created them.
     or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
     `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
     Claude processes. Each full gateway that should use the server needs its own copy.
+- Wake-word enrollment (full gateways only; not mounted on limited ones; `gateway/wake_enroll.py`, owned by the
+  wakeword session): `POST /v1/wake/enroll` multipart `clips[]` (16 kHz mono 16-bit WAV, 0.4–2.5 s) →
+  `{"accepted","rejected":[{"index","reason"}],"training"}`; `GET /v1/wake/enroll` → `{"clips","trained_at",
+  "status":"none"|"training"|"ready"|"failed"}`; `DELETE /v1/wake/enroll` → 204. Clips stay on that gateway's host.
 - `GET /v1/usage` → `{"month":"2026-11","by_model":{…},"by_path":{…},"by_device":{…},"cost_usd":…}`
   (all gateways together; the monthly budget is shared). API-path cost uses list prices per MTok:
   haiku 0.10/0.50, sonnet 2/10, opus 4/20 USD in/out.

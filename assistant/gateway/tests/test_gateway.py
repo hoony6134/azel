@@ -358,6 +358,12 @@ def test_connectors_app_shape(gw, monkeypatch):
         assert c.put("/v1/connectors", json=bad).status_code == 400, bad
 
 
+def test_wake_enrollment_mounted_on_full_gateways(gw):
+    g, c, _ = gw
+    assert c.get("/v1/wake/enroll").json()["status"] == "none"
+    assert c.get("/v1/wake/enroll", headers={"Authorization": "Bearer nope"}).status_code == 401  # bearer applies
+
+
 def test_claude_error_is_spoken_not_silent(gw):
     g, c, _ = gw
     ev = events(c.post("/v1/ask", json={"text": "한도 걸린 질문"}))
@@ -1164,6 +1170,8 @@ def test_tokens_per_mode(tmp_path, monkeypatch):
 
 def test_limited_has_no_call_history(limited):
     g, c, _ = limited
+    for method in ("get", "post", "delete"):  # wake-word enrollment is not mounted on a limited gateway
+        assert getattr(c, method)("/v1/wake/enroll").status_code in (404, 405), method
     for method, path in [("get", "/v1/history"), ("get", "/v1/history/L1"), ("delete", "/v1/history/L1"),
                          ("delete", "/v1/history?older_than_days=30"), ("get", "/v1/schedule"),
                          ("get", "/v1/proactive/log"), ("get", "/v1/personas"), ("delete", "/v1/personas/azel"),
