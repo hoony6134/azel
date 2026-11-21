@@ -55,16 +55,24 @@ SYSTEM = (
 )
 FILLER = "잠시만요, 확인해 볼게요."
 FILLER_LONG = "조금만 더 기다려 주세요."
+FILLER_AFTER_S = float(os.environ.get("FILLER_AFTER_MS", "1200")) / 1000  # say FILLER only if Claude is this slow
+NUDGE_AFTER_S = 9.0  # then FILLER_LONG once, counted from the start of the Claude turn
 # Whisper's classic outputs on silence or noise; never treat them as the user speaking.
 HALLUCINATIONS = {"시청해 주셔서 감사합니다", "시청해주셔서 감사합니다", "구독과 좋아요 부탁드립니다", "감사합니다", "MBC 뉴스 이덕영입니다"}
-MODEL_WORDS = {"opus": r"오퍼스|opus", "sonnet": r"소넷|sonnet", "haiku": r"하이쿠|haiku"}
+# A model name counts only as a request to use it ("오퍼스로", "소넷한테"), not as a topic ("하이쿠가 뭐야").
+_USE = r"\s*(으?로|한테|에게|모델)"
+MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){_USE}", "haiku": rf"(하이쿠|haiku){_USE}"}
+USE_CLAUDE = re.compile(rf"(클로드|claude){_USE}|(클로드|claude)(가|이)\s*(해|답|풀|찾|봐|알아)", re.I)
+# Needs live data or a device: straight to Claude without asking Qwen (Qwen would guess).
+NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
+                          r"|스파크|루크바|알비레오|기에나|데네브", re.I)
 # Personal data only full-mode gateways may touch (same list as the gateway's PERSONAL).
-PERSONAL = re.compile(r"일정|캘린더|스케줄|회의|약속|메일|이메일|편지함|기억|메모리|연락처|과제|수업|시험|성적|마감|할 ?일"
-                      r"|브리핑|지스트라|GISTRA|플래닛|Planit", re.I)
+PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
+                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
 NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
 NO_GATEWAY = "지금 Claude 게이트웨이에 연결이 안 돼요."
-TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트|에러", "mac": r"맥북|파일|폴더|터미널",
-              "schedule": r"일정|할 일|과제|캘린더|회의|수업|마감|알람|브리핑"}
+TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트 ?돌|에러|함수 ?짜|스크립트", "mac": r"맥북|파일|폴더|터미널|바탕화면|다운로드",
+              "schedule": r"일정(?!한)|할 ?일|과제|캘린더|회의|수업|마감|알람|브리핑|플래닛|planit"}
 
 def load_hashes(text: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {k: [] for k in LABELS}
@@ -187,6 +195,22 @@ def split_ready(buf: str, final: bool, first: bool = False):
 
 def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
+
+
+def pre_route(text, settings):
+    """(straight to Claude?, model) decided by keywords and settings, before any LLM call."""
+    forced_model = pick(MODEL_WORDS, text)
+    default = settings.get("default_model", "auto")
+    model = forced_model or (default if default in MODEL_WORDS else None)
+    keywords = USE_CLAUDE.search(text) or PERSONAL.search(text) or NEEDS_CLAUDE.search(text) or pick(TASK_WORDS, text)
+    return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
+
+
+def tag_state(head):
+    """Qwen's reply so far (left-stripped): 'tag' = route to Claude, 'maybe' = too short to tell, 'no' = speak it."""
+    if head.startswith(ROUTE_TAG):
+        return "tag"
+    return "maybe" if ROUTE_TAG.startswith(head) else "no"
 
 
 def token_label(got: str, labels=("client",)):
@@ -341,25 +365,22 @@ def recent_context(hist, n=6):
 async def respond(text, session, t0, timings):
     """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
     hist = history[session]
-    settings = await gateway_settings()
-    forced_model = pick(MODEL_WORDS, text)
-    default = settings.get("default_model", "auto")
-    to_claude = bool(forced_model) or default in MODEL_WORDS or bool(re.search(r"클로드", text))
+    to_claude, model = pre_route(text, await gateway_settings())
     sentences: asyncio.Queue = asyncio.Queue()
     route = {"value": "claude" if to_claude else "qwen"}
 
     async def via_claude():
         route["value"] = "claude"
-        await sentences.put(FILLER)
         task = pick(TASK_WORDS, text) or "chat"
-        model = forced_model or (default if default in MODEL_WORDS else None)
         buf, got_text = "", asyncio.Event()
 
-        async def nudge():  # Claude with tools can take 10-20 s; say something once
-            try:
-                await asyncio.wait_for(got_text.wait(), 9)
-            except asyncio.TimeoutError:
-                await sentences.put(FILLER_LONG)
+        async def nudge():  # at most one FILLER, then one FILLER_LONG; none once Claude's text arrives
+            for wait, line in ((FILLER_AFTER_S, FILLER), (NUDGE_AFTER_S - FILLER_AFTER_S, FILLER_LONG)):
+                try:
+                    await asyncio.wait_for(got_text.wait(), wait)
+                    return
+                except asyncio.TimeoutError:
+                    await sentences.put(line)
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
@@ -387,10 +408,10 @@ async def respond(text, session, t0, timings):
             async for delta in llm_stream(messages):
                 timings.setdefault("llm_first_token_ms", ms(t0))
                 buf += delta
-                head = buf.lstrip()
-                if ROUTE_TAG.startswith(head[:len(ROUTE_TAG)]) and len(head) < len(ROUTE_TAG):
+                state = tag_state(buf.lstrip())
+                if state == "maybe":
                     continue  # might be the routing tag; wait for more
-                if head.startswith(ROUTE_TAG):
+                if state == "tag":
                     return await via_claude()
                 done, buf = split_ready(buf, final=False, first="first_sentence_ms" not in timings)
                 for s in done:
@@ -718,6 +739,29 @@ if __name__ == "__main__":
                 assert str(e) == NO_PERSONAL
             links.remove(b)
         asyncio.run(stream_check())
+        async def filler_check(first_delay, gap=0.0):
+            """Sentences spoken for one Claude turn whose first text arrives after `first_delay` s."""
+            async def fake_claude(text, session, model, task, personal=False, context="", timeout=180):
+                await asyncio.sleep(first_delay)
+                yield "네, 확인했어요. "
+                await asyncio.sleep(gap)
+                yield "내일은 일정이 없어요."
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            globals().update(claude_stream=fake_claude, tts=fake_tts, FILLER_AFTER_S=0.05, NUDGE_AFTER_S=0.25)
+            return [s async for s, *_ in respond("내일 일정 알려줘", f"f{first_delay}{gap}", time.perf_counter(), {})]
+        real = claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S
+        said = "네, 확인했어요.", "내일은 일정이 없어요."
+        assert asyncio.run(filler_check(0.0)) == [*said]  # quick answer: no filler
+        assert asyncio.run(filler_check(0.1)) == [FILLER, *said]  # slow: one filler
+        assert asyncio.run(filler_check(0.35)) == [FILLER, FILLER_LONG, *said]  # very slow: nudge once
+        assert asyncio.run(filler_check(0.0, gap=0.4)) == [*said]  # pauses after the first text: no filler
+        claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S = real
+        assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
+        assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
+        assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
+        assert [tag_state(h) for h in ("", "[CLA", "[CLAUDE]", "네")] == ["maybe", "maybe", "tag", "no"]
         h = {k: hashlib.sha256(k.encode()).hexdigest() for k in ("app-tok", "link-tok", "lim-tok")}
         HASHES = load_hashes(f"# generated on the Mac\nclient {h['app-tok']}\nlink {h['link-tok']}\n"
                              f"link_limited {h['lim-tok']}\n")

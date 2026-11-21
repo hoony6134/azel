@@ -61,8 +61,8 @@ DEFAULTS = {
     "default_device": "맥북", "device_fallback": ["알비레오", "스파크"],
 }
 # Personal data only full gateways may touch. Same list as the voice server's PERSONAL.
-PERSONAL = re.compile(r"일정|캘린더|스케줄|회의|약속|메일|이메일|편지함|기억|메모리|연락처|과제|수업|시험|성적|마감|할 ?일"
-                      r"|브리핑|지스트라|GISTRA|플래닛|Planit", re.I)
+PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
+                      r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)", re.I)
 PERSONAL_REFUSAL = "개인 비서 기능은 지금 쓸 수 없어요."
 VOICE_BASE = (
     "지금은 음성 통화 중이고 답은 그대로 소리로 읽혀. 한국어 존댓말로 두세 문장 안에 요점만 말해. "
