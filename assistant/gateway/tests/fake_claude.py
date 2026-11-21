@@ -4,6 +4,14 @@ import json, os, sys
 open(os.environ["FAKE_CLAUDE_ARGS"], "w").write(json.dumps(sys.argv[1:]))
 if "느린" in sys.argv[2]:  # lets tests cancel a run mid-flight
     import time; time.sleep(3)
+if "도구" in sys.argv[2]:  # one tool call, with arguments and a result that must never reach the app
+    ev = lambda e: print(json.dumps({"type": "stream_event", "event": e}))  # noqa: E731
+    ev({"type": "content_block_start", "index": 0, "content_block": {
+        "type": "tool_use", "id": "toolu_1", "name": "mcp__claude_ai_Cygnus_MCP__gistra_today", "input": {}}})
+    ev({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": '{"q": "SECRET-ARG"}'}})
+    ev({"type": "message_stop"})
+    print(json.dumps({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "SECRET-RESULT"}]}}))
 for t in ["네, ", "확인했어요."]:
     print(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": t}}}))
 print(json.dumps({"type": "result", "total_cost_usd": 0.5, "usage": {"input_tokens": 10, "output_tokens": 5}, "session_id": "sess-1"}))
