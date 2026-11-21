@@ -1,4 +1,4 @@
-# 김비서 memory service. Tailnet only: the port is published on ruchba's Tailscale IP.
+# 박비서 memory service. Tailnet only: the port is published on ruchba's Tailscale IP.
 services:
   memory:
     build: .

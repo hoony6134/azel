@@ -27,12 +27,12 @@ targets:
     info:
       path: Biseo/Info.plist
       properties:
-        CFBundleDisplayName: 김비서
+        CFBundleDisplayName: 박비서
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        NSMicrophoneUsageDescription: 김비서와 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.
+        NSMicrophoneUsageDescription: 박비서와 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.
         UIBackgroundModes: [audio, voip]
         # The servers are plain HTTP/WS on Tailscale 100.64.x.x IPs. NSAllowsLocalNetworking does not
         # cover 100.64/10 and Apple's docs say NSExceptionDomains must not hold numeric IPs, so ATS is

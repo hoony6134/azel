@@ -28,7 +28,7 @@ struct SetupView: View {
             }
             .disabled(Config.token == nil && token.isEmpty)
         }
-        .navigationTitle("김비서 연결")
+        .navigationTitle("박비서 연결")
     }
 }
 
@@ -77,7 +77,7 @@ struct CallView: View {
             } else {
                 Spacer()
                 Button { call.startCall() } label: {
-                    Label("김비서에게 전화", systemImage: "phone.fill")
+                    Label("박비서에게 전화", systemImage: "phone.fill")
                         .font(.title2.bold()).frame(maxWidth: .infinity).padding(.vertical, 28)
                 }
                 .buttonStyle(.borderedProminent).tint(.green)

@@ -42,7 +42,7 @@ final class CallManager: NSObject, ObservableObject {
     func startCall(prefix: String = "iphone") {
         guard !inCall else { return }
         sessionPrefix = prefix
-        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: "김비서"))
+        let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: "박비서"))
         controller.request(CXTransaction(action: action)) { [weak self] err in
             if let err { DispatchQueue.main.async { self?.error = err.localizedDescription } }
         }
@@ -198,7 +198,7 @@ extension CallManager: PKPushRegistryDelegate {
     func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload,
                       for type: PKPushType, completion: @escaping () -> Void) {
         let p = payload.dictionaryPayload
-        let caller = p["caller"] as? String ?? "김비서"
+        let caller = p["caller"] as? String ?? "박비서"
         let uuid = UUID()
         incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String)
         let update = CXCallUpdate()

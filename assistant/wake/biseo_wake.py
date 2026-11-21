@@ -1,4 +1,4 @@
-"""Always-on wake-word listener for 김비서 (Mac).
+"""Always-on wake-word listener for 박비서 (Mac).
 
 wake word (openWakeWord) -> "네?" -> record with Silero VAD -> POST /v1/turn ->
 play the streamed reply -> 6 s follow-up window without the wake word -> back to wake.
@@ -30,7 +30,7 @@ FRAME = 2560  # 160 ms: a multiple of both Silero's 512 and openWakeWord's 1280 
 FRAME_S = FRAME / SR
 CONFIG_PATH = Path.home() / ".config/biseo/wake.toml"
 DEFAULTS = {
-    "model": "hey_jarvis",  # built-in openWakeWord name, or a path to an .onnx (kim_biseo.onnx)
+    "model": "hey_jarvis",  # built-in openWakeWord name, or a path to an .onnx (park_biseo.onnx)
     "threshold": 0.5,
     "server": "http://100.64.0.11:8891",
     "tts_url": "http://100.64.0.11:8890/v1/audio/speech",

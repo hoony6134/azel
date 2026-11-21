@@ -1,4 +1,4 @@
-# 김비서 — component contracts
+# 박비서 — component contracts
 
 Every service listens only on its host's Tailscale address. Every request carries
 `Authorization: Bearer <token>` (WebSocket: `?token=<token>` query, since iOS
