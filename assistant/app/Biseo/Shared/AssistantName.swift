@@ -22,6 +22,13 @@ enum AssistantName {
         return ok ? name : nil
     }
 
+    static let personalityLimit = 600
+
+    /// What gets saved for `personality`: trimmed and cut to the limit; "" means the server default.
+    static func personality(_ raw: String) -> String {
+        String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(personalityLimit))
+    }
+
     /// Korean particle after `name`: 이/가, 은/는, 을/를, 과/와, 아/야 by the last syllable's batchim.
     /// Non-Hangul endings count as no batchim (DESIGN §0).
     static func josa(_ name: String, _ withBatchim: String, _ without: String) -> String {

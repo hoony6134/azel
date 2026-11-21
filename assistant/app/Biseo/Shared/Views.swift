@@ -288,6 +288,29 @@ struct SettingsScreen<Extra: View>: View {
                     .accessibilityHint("호출어는 바뀌지 않습니다")
             }
             if let nameError { Text(nameError).font(.footnote).foregroundStyle(Theme.danger) }
+            VStack(alignment: .leading, spacing: Theme.xs) {
+                HStack {
+                    Text("성격").foregroundStyle(Theme.text)
+                    Spacer()
+                    Text("\((s.wrappedValue.personality ?? "").count)/\(AssistantName.personalityLimit)")
+                        .font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
+                }
+                TextField("기본 성격", text: Binding(
+                    get: { s.wrappedValue.personality ?? "" },
+                    set: { s.wrappedValue.personality = String($0.prefix(AssistantName.personalityLimit)) }), axis: .vertical)
+                    .lineLimit(3...8)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { s.wrappedValue.personality = AssistantName.personality(s.wrappedValue.personality ?? "") }
+                    .accessibilityLabel("성격")
+                HStack {
+                    Text("\(AssistantName.josa(AssistantName.current, "이", "가")) 말하는 성격이에요. 진지한 일에는 장난치지 않아요.")
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                    Spacer()
+                    Button("기본값으로 되돌리기") { s.wrappedValue.personality = "" }
+                        .font(.footnote).buttonStyle(.borderless).tint(Theme.celadon)
+                        .disabled((s.wrappedValue.personality ?? "").isEmpty)
+                }
+            }
             row("답변 길이") {
                 Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
                                                    set: { s.wrappedValue.reply_length = $0 })) {
