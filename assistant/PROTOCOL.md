@@ -252,7 +252,11 @@ device that created them.
   `user_title`: how the assistant addresses the user, 0–12 Hangul/Latin letters or spaces (whitespace collapsed,
   null → `""`); `""` = no fixed title, address the user naturally. A persona's own `user_title` overrides it. The
   title in effect goes into Claude's persona block and Qwen's prompt as "사용자를 '<title>'(이)라고 부른다." (left out
-  when empty).
+  when empty). Persona and settings changes reach the voice server at once over the link (every change pushes the
+  whole settings), and each call takes its persona snapshot when it starts. Because the app reuses one session id per
+  day, a change of the persona's name or title also starts that conversation fresh: the voice server drops the
+  persona+session history it built under the old name/title, and the gateway keys the resumed Claude session by
+  session + a hash of name and title.
   `personality` (text up to 600 chars, else 400) is Azel's character: one persona block (`assistant_name` +
   personality) goes into Qwen's system prompt, Claude's voice style, briefings and autonomous-call openings,
   so both models sound like the same person. `""`, whitespace, `null` or a missing key mean the built-in

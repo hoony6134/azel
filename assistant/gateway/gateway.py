@@ -649,7 +649,7 @@ async def ask_claude_code(text, model, session):
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
     servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
-    resume = await resume_id(session)
+    resume = await resume_id(session, settings)
     cfg, proc = None, None
     if WARM and not session.startswith(COLD_SESSIONS):
         source = (await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, resume, run_settings,
@@ -697,7 +697,7 @@ async def ask_claude_code(text, model, session):
                              result=str(e.get("result") or "")[:300])
                 if e.get("session_id"):
                     try:
-                        await state.call("PUT", f"/v1/state/sessions/{quote(session, safe='')}",
+                        await state.call("PUT", f"/v1/state/sessions/{quote(session_key(session, settings), safe='')}",
                                          {"claude_session": e["session_id"], "device": DEVICE})
                     except StateDown:
                         pass  # the next turn just starts a fresh Claude session
@@ -721,8 +721,17 @@ def run_args(settings, devices, requester=""):
                                {"X-Azel-Requester": requester} if requester else None)
 
 
-async def resume_id(session):
-    prev = await state.get(f"/v1/state/sessions/{quote(session, safe='')}")
+def session_key(session, settings):
+    """The voice session plus who is speaking to whom: the app reuses one session id all day, so a renamed persona or
+    a new user title starts a fresh Claude conversation instead of resuming one that keeps using the old title."""
+    p = active_persona(settings)
+    sig = hashlib.sha1(f"{p.get('name')}|{user_title(settings, p)}".encode()).hexdigest()[:8]
+    return f"{session}~{sig}"
+
+
+async def resume_id(session, settings):
+    key = session_key(session, settings)
+    prev = await state.get(f"/v1/state/sessions/{quote(key, safe='')}")
     return prev["claude_session"] if prev and prev["device"] == DEVICE else None  # sessions live on their host
 
 
@@ -742,7 +751,7 @@ async def prewarm(session, persona_id=None):
             return
         style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
         servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
-        await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session),
+        await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, await resume_id(session, settings),
                             run_settings, run_env)
     except Exception as e:
         print("prewarm failed:", type(e).__name__, flush=True)
