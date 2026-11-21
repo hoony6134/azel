@@ -25,8 +25,11 @@ The voice server stores **no plaintext token**: it compares SHA-256 digests (`hm
 
 ## 1. Live call — `WS /v1/call` on the voice server
 
-Auth: `Authorization: Bearer <client token>` header (preferred); the `?token=` query is a fallback
-for old clients only (it can end up in proxy logs). Both are checked against the `client` hashes.
+Auth: `Authorization: Bearer <client token>` header. The `?token=` query is a **deprecated** fallback for
+old clients (it can end up in proxy logs); the server logs a one-line warning without the value each time
+it is used, and it will be removed once every shipped app sends the header. Both are checked against the
+`client` hashes. The voice server never logs query strings or headers: its container runs uvicorn with
+`--no-access-log --log-level warning`, and query strings in uvicorn's log lines are redacted.
 Query: `session` (stable per conversation), optional `client` (`iphone`|`mac`|`terminal`, for the call
 history), optional `call_id` (set when
 answering a call the assistant placed; the server then speaks that call's opening first).

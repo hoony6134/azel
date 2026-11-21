@@ -13,6 +13,7 @@ import hmac
 import io
 import ipaddress
 import json
+import logging
 import os
 import re
 import sys
@@ -101,6 +102,23 @@ def load_hashes(text: str) -> dict[str, list[str]]:
     assert out["client"] and out["link"], "token hash file needs client and link entries"
     return out
 
+
+class RedactQuery(logging.Filter):
+    """Strip query strings (which may carry ?token=) from uvicorn's log lines, whatever the log level."""
+    def filter(self, record):
+        if isinstance(record.msg, str):
+            record.msg = redact_query(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_query(a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
+def redact_query(text):
+    return re.sub(r"\?[^\s\"']*", "?<redacted>", text)
+
+
+for _name in ("uvicorn.error", "uvicorn.access"):
+    logging.getLogger(_name).addFilter(RedactQuery())
 
 CHECK_ONLY = "--check" in sys.argv
 if not CHECK_ONLY:
@@ -832,6 +850,9 @@ async def gateway_link(ws: WebSocket):
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
+        if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
+            print("deprecated: /v1/call got its token in the query string; clients must send Authorization",
+                  flush=True)
     except HTTPException:
         await ws.close(code=4401)
         return
@@ -1432,4 +1453,13 @@ if __name__ == "__main__":
         assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
         at, after = tap_check(0.05, broken_tts=True)  # TTS failed: the protection is dropped, not held an hour
         assert at < 0.5 and after == {"type": "state", "value": "listening"}, (at, after)
+        # no token ever reaches a log: the container disables access logs and INFO, and query strings are redacted
+        cmd = json.loads(re.search(r"^CMD\s+(\[.*\])\s*$", open(os.path.join(os.path.dirname(os.path.abspath(
+            __file__)), "Dockerfile")).read(), re.M).group(1))
+        assert "--no-access-log" in cmd and cmd[cmd.index("--log-level") + 1] == "warning", cmd
+        rec = logging.LogRecord("uvicorn.error", logging.INFO, "", 0, '%s - "WebSocket %s" [accepted]',
+                                (("100.64.0.8", 5), "/v1/call?token=s3cret&session=x"), None)
+        RedactQuery().filter(rec)
+        assert "s3cret" not in rec.getMessage() and "/v1/call?<redacted>" in rec.getMessage()
+        assert any(isinstance(f, RedactQuery) for f in logging.getLogger("uvicorn.error").filters)
         print("voice_server checks ok")
