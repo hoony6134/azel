@@ -1669,3 +1669,11 @@ def test_speech_style_follows_the_persona(gw):
     g, c, _ = gw
     for text in (g.VOICE_STYLE, g.FULL_API_STYLE, g.NIM_STYLE):
         assert "말투(존댓말/반말)는 비서 성격을 따르고" in text and "반드시 존댓말" not in text and "한국어 존댓말로" not in text
+
+
+def test_main_block_is_last():
+    """`python gateway.py` blocks in uvicorn.run: nothing may be defined after the __main__ block (batch 5 outage)."""
+    import ast, pathlib
+    tree = ast.parse(pathlib.Path(__file__).resolve().parents[1].joinpath("gateway.py").read_text())
+    last = tree.body[-1]
+    assert isinstance(last, ast.If) and "__main__" in ast.unparse(last.test)
