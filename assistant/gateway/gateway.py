@@ -2912,6 +2912,13 @@ async def serve_tool(m):
         await link_send({"id": m["id"], "type": "tool_result", "result": "도구를 쓰지 못했어요.", "is_error": True})
 
 
+def task_api_system(settings, devices):
+    """The API backends' task prompt; the clock comes last (claude -p knows the date from its environment)."""
+    now = datetime.now(KST)
+    return name_prompt(settings) + TASK_API_STYLE + device_prompt(settings, devices) + \
+        f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M} (KST)야."
+
+
 def task_backend_cfg(backend, settings):
     if backend == "claude_api":
         if not API_KEY:
@@ -2932,7 +2939,7 @@ async def run_task_api(t):
     """One task on an API backend (agent_loop): same caps, steps, approvals and notification as claude_code."""
     settings = await load_settings()
     devices = await fresh_devices()
-    system = name_prompt(settings) + TASK_API_STYLE + device_prompt(settings, devices)
+    system = task_api_system(settings, devices)
 
     async def cancelled():
         return bool((await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"))
