@@ -1,14 +1,14 @@
-# openWakeWord training config for "김비서". Clips come from gen_http.py (Qwen3-TTS voices,
+# openWakeWord training config for "아젤". Clips come from gen_http.py (Qwen3-TTS voices,
 # Whisper-filtered); --generate_clips is never used (it needs English Piper TTS).
-model_name: "kim_biseo"
-target_phrase: ["김비서"]
+model_name: "azel"
+target_phrase: ["아젤"]
 custom_negative_phrases: []
-n_samples: 2500
+n_samples: 1500
 n_samples_val: 400
 tts_batch_size: 50
 augmentation_batch_size: 16
-piper_sample_generator_path: "/nonexistent"
-output_dir: "/work/clips"
+piper_sample_generator_path: "/work/piper_stub"
+output_dir: "/work/out"  # not /work/clips: that dir is root-owned from an old container run
 rir_paths: ["/work/data/rirs"]
 background_paths: ["/work/data/background"]
 background_paths_duplication_rate: [1]
