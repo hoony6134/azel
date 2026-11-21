@@ -226,6 +226,8 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showConnectors = false
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
+    @State private var titleDraft = ""
+    @State private var titleError: String?
     @AppStorage("workSounds") private var workSounds = true
     /// Cached so the call screen can show the tap-to-interrupt hint without a fetch.
     @AppStorage("noiseMode") private var noiseMode = "normal"
@@ -316,6 +318,17 @@ struct SettingsScreen<Extra: View>: View {
             PersonaListCard(model: personas)
         }
         Card("대화") {
+            VStack(alignment: .leading, spacing: Theme.xs) {
+                row("호칭") {
+                    TextField("예: 정훈님, 오빠, 대표님", text: $titleDraft)
+                        .multilineTextAlignment(.trailing).frame(maxWidth: 180)
+                        .onChange(of: titleDraft) { commitTitle(s) }
+                        .onAppear { titleDraft = s.wrappedValue.user_title ?? "" }
+                        .accessibilityLabel("나를 부르는 말")
+                }
+                if let titleError { Text(titleError).font(.footnote).foregroundStyle(Theme.danger) }
+                else { Text("나를 부르는 말이에요. 비우면 호칭 없이 불러요.").font(.footnote).foregroundStyle(Theme.text3) }
+            }
             row("답변 길이") {
                 Picker("답변 길이", selection: Binding(get: { s.wrappedValue.reply_length ?? "normal" },
                                                    set: { s.wrappedValue.reply_length = $0 })) {
@@ -377,6 +390,13 @@ struct SettingsScreen<Extra: View>: View {
             }
             Text("호출어는 다시 학습하기 전까지 '\(AssistantName.fallback)'로 유지돼요.").font(.footnote).foregroundStyle(Theme.text3)
         }
+    }
+
+    /// "" = 호칭 없이; anything else must pass the 0–12 character check before it is saved.
+    private func commitTitle(_ s: Binding<AppSettings>) {
+        guard let t = AssistantName.validatedTitle(titleDraft) else { titleError = "한글, 영문, 공백으로 12자까지 쓸 수 있어요"; return }
+        titleError = nil
+        if (s.wrappedValue.user_title ?? "") != t { s.wrappedValue.user_title = t }
     }
 
     /// Empty → the default name; anything else must pass validation before it is saved.
@@ -712,6 +732,7 @@ struct SettingsScreen<Extra: View>: View {
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }
+            titleDraft = s.user_title ?? ""
             noiseMode = s.noise_mode ?? "normal"
             loadError = nil
         case .failure(let e): if SectionStatus.from(e) != nil { loadError = e }

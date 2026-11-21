@@ -199,7 +199,8 @@ struct PersonaEditor: View {
         return nil
     }
     private var tooLong: Bool { (p.personality ?? "").count > Persona.personalityLimit }
-    private var valid: Bool { nameProblem == nil && !tooLong }
+    private var titleValid: Bool { p.user_title.map { AssistantName.validatedTitle($0) != nil } ?? true }
+    private var valid: Bool { nameProblem == nil && !tooLong && titleValid }
     private var changed: Bool { p != original }
 
     var body: some View {
@@ -278,6 +279,16 @@ struct PersonaEditor: View {
                     Text("\((p.personality ?? "").count)/\(Persona.personalityLimit)").font(.footnote.monospacedDigit())
                         .foregroundStyle(tooLong ? Theme.danger : Theme.text3)
                 }
+                // 호칭 for this persona
+                Card("호칭") {
+                    TextField("기본 호칭 사용", text: Binding(get: { p.user_title ?? "" }, set: { p.user_title = $0.isEmpty ? nil : $0 }))
+                        .textFieldStyle(.roundedBorder)
+                    if let t = p.user_title, AssistantName.validatedTitle(t) == nil {
+                        Text("한글, 영문, 공백으로 12자까지예요").font(.footnote).foregroundStyle(Theme.danger)
+                    } else {
+                        Text("비워 두면 설정의 호칭을 써요.").font(.footnote).foregroundStyle(Theme.text3)
+                    }
+                }
                 // 7. 기억 공유
                 Card {
                     Toggle("기억 공유", isOn: $p.share_memory).tint(p.tint).foregroundStyle(Theme.text)
@@ -353,9 +364,13 @@ struct PersonaEditor: View {
 
     private func save() async {
         p.name = trimmedName
+        p.user_title = p.user_title.flatMap(AssistantName.validatedTitle).flatMap { $0.isEmpty ? nil : $0 }
         saving = true
         defer { saving = false }
-        do { try await model.save(p); dismiss() } catch { message = "저장하지 못했어요: " + FriendlyError.describe(error).title }
+        do {
+            if let note = try await model.save(p) { message = note; try? await Task.sleep(nanoseconds: 1_500_000_000) }
+            dismiss()
+        } catch { message = "저장하지 못했어요: " + FriendlyError.describe(error).title }
     }
 }
 

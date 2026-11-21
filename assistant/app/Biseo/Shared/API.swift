@@ -93,6 +93,8 @@ struct AppSettings: Codable, Equatable {
     var reply_length: String?
     /// Days the server keeps call history (0 = forever). Optional for older gateways.
     var history_days: Int?
+    /// How the assistant addresses the user ("" = no 호칭). Optional for older gateways.
+    var user_title: String?
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 

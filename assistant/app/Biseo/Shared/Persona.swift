@@ -12,15 +12,18 @@ struct Persona: Codable, Identifiable, Equatable, Hashable {
     var default_model: String?
     var share_memory: Bool
     var primary: Bool
+    /// 호칭 for this persona; nil/"" = follow the shared `user_title`.
+    var user_title: String?
 
     static let limit = 8
 
-    enum CodingKeys: String, CodingKey { case id, name, voice, voice_style, personality, color, default_model, share_memory, primary }
+    enum CodingKeys: String, CodingKey { case id, name, voice, voice_style, personality, color, default_model, share_memory, primary, user_title }
 
     init(id: String = "", name: String, voice: String? = nil, voice_style: String? = nil, personality: String? = nil, color: String? = nil,
-         default_model: String? = nil, share_memory: Bool = true, primary: Bool = false) {
+         default_model: String? = nil, share_memory: Bool = true, primary: Bool = false, user_title: String? = nil) {
         self.id = id; self.name = name; self.voice = voice; self.voice_style = voice_style; self.personality = personality
         self.color = color; self.default_model = default_model; self.share_memory = share_memory; self.primary = primary
+        self.user_title = user_title
     }
 
     init(from decoder: Decoder) throws {
@@ -34,6 +37,7 @@ struct Persona: Codable, Identifiable, Equatable, Hashable {
         default_model = try c.decodeIfPresent(String.self, forKey: .default_model)
         share_memory = try c.decodeIfPresent(Bool.self, forKey: .share_memory) ?? true
         primary = try c.decodeIfPresent(Bool.self, forKey: .primary) ?? false
+        user_title = try? c.decodeIfPresent(String.self, forKey: .user_title)
     }
 
     static let personalityLimit = 500
@@ -68,6 +72,7 @@ enum PersonaAPI {
         if let v = p.personality { b["personality"] = v }
         if let v = p.color { b["color"] = v }
         if let v = p.default_model { b["default_model"] = v }
+        if let v = p.user_title, !v.isEmpty { b["user_title"] = v }   // "" = shared setting: left out
         return b
     }
 
@@ -179,9 +184,31 @@ final class PersonaModel: ObservableObject {
         }
     }
 
-    func save(_ p: Persona) async throws {
-        if p.id.isEmpty { _ = try await PersonaAPI.create(p) } else { try await PersonaAPI.update(p) }
+    /// Saves; if an older gateway refuses the 호칭 field, saves everything else and says so.
+    /// Returns a note for the user when the 호칭 couldn't be saved.
+    @discardableResult
+    func save(_ p: Persona) async throws -> String? {
+        var note: String?
+        do {
+            try await write(p)
+        } catch GatewayError.rejected(let detail) where p.user_title?.isEmpty == false && Self.isUnknownField(detail) {
+            var rest = p
+            rest.user_title = nil
+            try await write(rest)
+            note = "호칭은 서버 업데이트 후 저장돼요"
+        }
         await refresh()
+        return note
+    }
+
+    private func write(_ p: Persona) async throws {
+        if p.id.isEmpty { _ = try await PersonaAPI.create(p) } else { try await PersonaAPI.update(p) }
+    }
+
+    /// "unknown persona fields: user_title" and the like.
+    static func isUnknownField(_ detail: String) -> Bool {
+        let d = detail.lowercased()
+        return d.contains("user_title") || d.contains("unknown") || d.contains("extra")
     }
 
     func delete(_ p: Persona, deleteHistory: Bool = false) async throws {
