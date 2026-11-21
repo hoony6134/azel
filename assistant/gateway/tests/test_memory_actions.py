@@ -159,4 +159,4 @@ def test_a_similar_cygnus_memory_is_never_claimed():
     assert r["ok"] and not any(n == "memory_edit" for n, _ in w.cyg_writes)  # the user's own memory stays
     w.save_reply = '[{"status":"대기 중","id":"m_held","reason":"held for owner review"}]'
     r = run(b.run("remember", {"fact": "주말엔 등산"}, "azel"))
-    assert "확인을 기다려요" in r["spoken"] and w.recs[2]["meta"].get("cygnus_id") is None
+    assert "확인을 기다려요" in r["spoken"] and list(w.recs.values())[-1]["meta"].get("cygnus_id") is None
