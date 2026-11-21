@@ -242,6 +242,14 @@ class OpeningGuard:
             return "interrupt"
         return None
 
+    def protect(self, now):
+        """A placed call's opening is starting: protected until speak_opening knows when sentence one ends."""
+        self.first_end = self.play_end = now + 3600
+
+    def wait(self, now):
+        """Seconds until an interrupt may act: the rest of the opening's first sentence, else 0."""
+        return max(0.0, self.first_end - now) if self.active(now) else 0.0
+
     def end(self, now, seconds):
         """An utterance ended: 'answer' (normal turn), 'check' (maybe a greeting) or 'interrupt' then answer."""
         held, self.speech_at = self.speech_at is not None, None
@@ -642,7 +650,6 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     guard = OpeningGuard()
 
     async def speak_opening(op):
-        guard.first_end = guard.play_end = time.monotonic() + 3600  # protected until its audio is out
         try:
             pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
         except Exception:
@@ -656,24 +663,30 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 guard.first_end = current["play_end"]
             guard.play_end = current["play_end"]
 
-    async def interrupt(delay=0.0):
-        if delay > 0:
-            await asyncio.sleep(delay)  # let the opening's first sentence finish playing
+    async def interrupt(protected=False):
+        # Let the opening's first sentence finish playing; re-read, since its end is known only once sent.
+        while protected and (wait := guard.wait(time.monotonic())) > 0:
+            await asyncio.sleep(min(wait, 0.05))
         task = current["task"]
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
         current["play_end"] = guard.play_end = 0.0
         await send({"type": "interrupt"})  # barge-in: the client drops its queue
 
-    async def interrupt_then_answer(audio, delay, text=None):
-        await interrupt(delay)
+    async def tap_interrupt():
+        guard.speech_at = None
+        await interrupt(protected=True)  # cancels the reply task; its Claude run gets a link cancel on the way out
+        await send({"type": "state", "value": "listening"})
+
+    async def interrupt_then_answer(audio, text=None):
+        await interrupt(protected=True)
         current["task"] = asyncio.current_task()
         await answer(audio, text)
 
-    async def check_greeting(audio, delay):
+    async def check_greeting(audio):
         text = await transcribe(audio)
         if text and not is_greeting(text, len(audio) / 16000):
-            await interrupt_then_answer(audio, delay, text)
+            await interrupt_then_answer(audio, text)
 
     async def answer(audio, text=None):
         t0, timings = time.perf_counter(), {}
@@ -705,6 +718,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             op = links.openings.pop(call_id, None)
             if op and op["parts"]:
                 history[session].append({"role": "assistant", "content": op["text"]})
+                guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
                 current["task"] = asyncio.create_task(speak_opening(op))
         await send({"type": "state", "value": "listening"})
         while True:
@@ -712,8 +726,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("text"):
-                if json.loads(msg["text"]).get("type") == "hangup":
+                kind = json.loads(msg["text"]).get("type")
+                if kind == "hangup":
                     break
+                if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
+                    asyncio.create_task(tap_interrupt())
                 continue
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
                 now = time.monotonic()
@@ -723,13 +740,13 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     if guard.start(now) == "interrupt":
                         await interrupt()
                 elif kind == "end":
-                    act, wait = guard.end(now, len(audio) / 16000), max(0.0, guard.first_end - now)
+                    act = guard.end(now, len(audio) / 16000)
                     if act == "answer":
                         current["task"] = asyncio.create_task(answer(audio))
                     elif act == "check":
-                        asyncio.create_task(check_greeting(audio, wait))
+                        asyncio.create_task(check_greeting(audio))
                     else:
-                        asyncio.create_task(interrupt_then_answer(audio, wait))
+                        asyncio.create_task(interrupt_then_answer(audio))
             if guard.tick(time.monotonic()) == "interrupt":
                 await interrupt()
     except WebSocketDisconnect:
@@ -915,6 +932,31 @@ if __name__ == "__main__":
         assert g.end(3.0, 2.0) == "answer"  # that utterance is then answered normally
         assert g.start(0.2) == "hold" and g.end(1.9, 1.7) == "interrupt"  # long but over before s1 ends: deferred
         assert g.start(9.0) == "interrupt"  # opening finished: ordinary barge-in again
+        assert g.wait(9.0) == 0.0 and g.wait(5.0) == 0.0 and g.wait(1.5) == 0.5  # waits only for sentence one
+        g.protect(100.0)
+        assert g.wait(100.0) > 3000 and g.start(100.1) == "hold"  # protected before its audio is even known
+
+        def tap_check(tap_after):
+            """Place a 2-sentence opening (0.3 s per sentence), tap interrupt after `tap_after` s, and return
+            (seconds from connect to the server's interrupt, messages after it)."""
+            async def slow_tts(sentence):
+                return b"\0" * 14400, 24000  # 0.3 s at 24 kHz
+            from fastapi.testclient import TestClient
+            globals().update(tts=slow_tts, SileroVoiceActivityDetector=lambda: (lambda frame: 0.0))
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            links.openings["cx"] = prepare_opening("첫 문장이에요. 두 번째 문장이에요.")
+            with tc.websocket_connect("/v1/call?call_id=cx", headers={"Authorization": "Bearer app-tok"}) as w:
+                t0 = time.monotonic()
+                time.sleep(tap_after)
+                w.send_text(json.dumps({"type": "interrupt"}))
+                while True:
+                    m = w.receive()
+                    if m.get("text") and json.loads(m["text"])["type"] == "interrupt":
+                        at = time.monotonic() - t0
+                        break
+                after = json.loads(w.receive()["text"])
+                w.send_text(json.dumps({"type": "hangup"}))
+            return at, after
         h = {k: hashlib.sha256(k.encode()).hexdigest() for k in ("app-tok", "link-tok", "lim-tok")}
         HASHES = load_hashes(f"# generated on the Mac\nclient {h['app-tok']}\nlink {h['link-tok']}\n"
                              f"link_limited {h['lim-tok']}\n")
@@ -963,4 +1005,8 @@ if __name__ == "__main__":
                 raise AssertionError(f"loaded {broken!r}")
             except AssertionError as e:
                 assert "loaded" not in str(e)
+        at, after = tap_check(0.0)  # tapped during the first sentence: deferred until it has played
+        assert 0.25 <= at < 1.0 and after == {"type": "state", "value": "listening"}, (at, after)
+        at, after = tap_check(0.4)  # after the first sentence: immediate
+        assert at < 0.55 and after == {"type": "state", "value": "listening"}, (at, after)
         print("voice_server checks ok")

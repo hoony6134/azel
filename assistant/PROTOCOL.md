@@ -42,7 +42,10 @@ answering a call the assistant placed; the server then speaks that call's openin
     playback now**
   - `{"type":"turn_done","timings":{…}}`
   - `{"type":"error","message":"…"}`
-- Client → server **text**: `{"type":"hangup"}` (or just close).
+- Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
+  handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
+  answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}`. During a placed call's
+  opening the first sentence still finishes first.
 
 ## 1b. Gateway link — `WS /v1/gateway-link` on the voice server
 
