@@ -6,8 +6,24 @@ from test_gateway import TestClient, private, start
 from test_tasks import tgw, wait_for  # noqa: F401  (fixture)
 
 
-def test_tools_routes_and_call_user_refusal_in_a_call(tgw):  # noqa: F811
+def tailnet(g):
+    return TestClient(g.app, headers={"Authorization": "Bearer t0k"}, client=("100.64.0.8", 5))
+
+
+def test_tools_routes_are_tailnet_only(tgw):  # noqa: F811
     g, c, notes = tgw
+    assert c.get("/v1/tools").status_code == 403  # "testclient" is no tailnet address
+    t = tailnet(g)
+    assert t.get("/v1/tools").status_code == 200
+    for path, kw in (("/v1/tools", {}), ("/v1/mcp", {"json": {"jsonrpc": "2.0", "id": 1, "method": "ping"}}),
+                     ("/v1/tools/call", {"json": {"name": "schedule_list"}})):
+        method = t.get if path == "/v1/tools" else t.post
+        assert method(path, headers={"X-Forwarded-For": "1.2.3.4"}, **kw).status_code == 403, path  # the public proxy
+
+
+def test_tools_routes_and_call_user_refusal_in_a_call(tgw):  # noqa: F811
+    g, _, notes = tgw
+    c = tailnet(g)
     names = [t["name"] for t in c.get("/v1/tools").json()]
     assert "call_user" in names and "create_task" in names
     r = c.post("/v1/tools/call", json={"name": "call_user", "args": {"reason": "회의 알림"}, "persona_id": "azel"}).json()
@@ -23,7 +39,8 @@ def test_tools_routes_and_call_user_refusal_in_a_call(tgw):  # noqa: F811
 
 
 def test_mcp_server_for_claude_code(tgw):  # noqa: F811
-    g, c, notes = tgw
+    g, _, notes = tgw
+    c = tailnet(g)
     init = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).json()
     assert init["result"]["serverInfo"]["name"] == "azel"
     tools = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).json()["result"]["tools"]
@@ -77,7 +94,8 @@ def test_task_backend_setting(tgw, monkeypatch):  # noqa: F811
 
 
 def test_google_tools_only_with_a_live_grant(tgw, tmp_path):  # noqa: F811
-    g, c, notes = tgw
+    g, c0, notes = tgw
+    c = tailnet(g)
     assert g.google_status() == "none" and "gmail_search" not in [t["name"] for t in c.get("/v1/tools").json()]
     for name, data in (("google_client.json", {"installed": {"client_id": "x", "client_secret": "y",
                                                              "token_uri": "https://t", "auth_uri": "https://a"}}),
@@ -90,3 +108,14 @@ def test_google_tools_only_with_a_live_grant(tgw, tmp_path):  # noqa: F811
     assert g.google_status() == "expired" and "gmail_read" not in [t["name"] for t in c.get("/v1/tools").json()]
     r = c.post("/v1/tasks", json={"goal": "이번 주 캘린더 일정 정리해 줘", "backend": "qwen", "notify": "none"})
     assert r.json()["backend"] == "claude_code"  # no live grant: calendar work stays on the claude.ai connectors
+
+
+def test_limited_gateway_serves_no_tools(tmp_path, monkeypatch):
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    private(tmp_path / "state_token_limited", "l1m\n")
+    g = start(tmp_path, monkeypatch, BISEO_MODE="limited", BISEO_DEVICE="spark")
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}, client=("100.64.0.11", 5)) as c:
+        assert c.get("/v1/tools").status_code == 403
+        assert c.post("/v1/tools/call", json={"name": "call_user", "args": {"reason": "x"}}).status_code == 403
+        assert c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status_code == 403
+    assert g.google_status() == "none" and g.bridge.d["google"]() == ([], None)

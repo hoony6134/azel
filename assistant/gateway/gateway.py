@@ -14,6 +14,7 @@ import contextvars
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -2890,17 +2891,34 @@ def google_status():
 MAIL_CAL = re.compile(r"메일|편지함|답장|캘린더|일정(?!한)|약속|회의|스케줄", re.I)
 
 
+TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def tailnet_only(request: Request):
+    """/v1/tools*, /v1/mcp: never through the public proxy (it is a tailnet peer, so its headers give it away)."""
+    host = request.client.host if request.client else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise HTTPException(403, "tailnet only")
+    if any(h in request.headers for h in ("x-forwarded-for", "forwarded", "x-real-ip")) or \
+            not (ip in TAILNET or ip.is_loopback):
+        raise HTTPException(403, "tailnet only")
+
+
 @app.get("/v1/tools")
-async def tools_list(caller: str = "api"):
+async def tools_list(request: Request, caller: str = "api"):
     """Every tool a model path may call (Messages-API shapes): devices, call_user, create_task, Cygnus."""
     full_only()
+    tailnet_only(request)
     return (await bridge.tools("qwen" if caller == "qwen" else "api"))[0]
 
 
 @app.post("/v1/tools/call")
-async def tools_call(body: dict):
+async def tools_call(request: Request, body: dict):
     """{name, args, persona_id?, caller?} -> {content, is_error, approval?}. Waits up to 5 min for an approval."""
     full_only()
+    tailnet_only(request)
     if not isinstance(body.get("name"), str):
         raise HTTPException(400, "name required")
     caller = "qwen" if body.get("caller") == "qwen" else "api"
@@ -2909,8 +2927,9 @@ async def tools_call(body: dict):
 
 @app.post("/v1/mcp")
 async def mcp_server(request: Request):
-    """call_user and create_task as an MCP server (streamable HTTP, stateless JSON) for claude -p."""
+    """The assistant's own tools as an MCP server (streamable HTTP, stateless JSON) for claude -p."""
     full_only()
+    tailnet_only(request)
     msg = await request.json()
     out = await tools_bridge.mcp_handle(bridge, msg if isinstance(msg, dict) else {}, current_persona.get())
     return Response(status_code=202) if out is None else JSONResponse(out)
