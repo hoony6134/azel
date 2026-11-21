@@ -82,27 +82,17 @@ async def _result(block, run_tool):
 
 def cygnus_bridge(home):
     """(tool definitions, run_tool) for the read-only Cygnus tools, or ([], None) without a PAT or the brain module.
+    The bridge itself (allowlist, validation, trimming) is assistant/brain/cygnus.py's tools() / call().
 
-    shortcut: imports assistant/brain/cygnus.py from the sibling directory, so a host needs the brain directory next to
-    the gateway's; move cygnus.py into a shared package if more services need it."""
+    shortcut: imports cygnus.py from the sibling brain directory, so a host needs it next to the gateway's; move it
+    into a shared package if more services need it."""
+    import os
     import sys
     from pathlib import Path
-    pat = home / "cygnus_pat"
     brain_dir = Path(__file__).resolve().parent.parent / "brain"
-    if not pat.exists() or not (brain_dir / "cygnus.py").exists():
+    if not (home / "cygnus_pat").exists() or not (brain_dir / "cygnus.py").exists():
         return [], None
-    assert pat.stat().st_mode & 0o077 == 0, f"{pat} must be chmod 600"
+    os.environ.setdefault("BISEO_HOME", str(home))
     sys.path.insert(0, str(brain_dir))
     import cygnus
-    import os
-    client = cygnus.Cygnus(os.environ.get("BRAIN_CYGNUS_URL", "https://mcp.scian.xyz"), pat.read_text().strip())
-
-    async def run(name, args):
-        if name not in cygnus.TOOLS:
-            raise KeyError(name)
-        try:
-            args = cygnus.check_args(name, args)
-        except ValueError as e:
-            return f"도구 인자가 틀렸어요: {e}"
-        return await client.call(name, args)
-    return cygnus.tool_defs(list(cygnus.TOOLS)), run
+    return (cygnus.tools(), cygnus.call) if cygnus.available() else ([], None)
