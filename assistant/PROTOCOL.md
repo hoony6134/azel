@@ -324,8 +324,11 @@ device that created them.
     flagged and stops within about 5 s.
   - Approvals: when a device tool answers `pending_approval`, the run stops, the task shows `waiting_approval` with
     the existing approval (`GET|POST /v1/approvals`), and resumes the same Claude session with the decision.
-  - On `done`/`failed`: `notify:"call"` rings as the task's persona with the result as the opening (reason `task`),
-    `"push"` sends an alert ("작업 완료" / "작업 실패"); a cancelled task sends nothing. Cost goes into usage as path
+  - `notify` (default `"push"`) fires when the task finishes, fails, or needs an approval: `"call"` rings as the
+    task's persona with the result as the opening (reason `task`; `task_approval` with "맡기신 작업에 승인이 필요해요…");
+    `"push"` sends an alert push (not VoIP) to the `alert_token`s from `/v1/push/register`, titled "작업 완료" /
+    "작업 실패" / "승인 필요", with `"type":"task","task_id":"<id>"` at the payload's top level next to `aps` (the app
+    opens `azel://task/<id>`); `"none"` sends nothing. A cancelled task sends nothing. Cost goes into usage as path
     `task`. Stored in ruchba's kv (`task-<id>`, index `tasks-index`, newest 200); a gateway restarting marks its own
     unfinished tasks `failed`.
   - Voice: "…해 줘, 끝나면 알려 줘" (push when it says 알림/푸시) or a job on a named device ("맥북 다운로드 폴더 정리해
@@ -340,8 +343,9 @@ device that created them.
   `"writer":"full","limited":true,"static":true` (only in that gateway's memory, not in the shared devices table).
   A limited device is never given `delegate`: dropped from the API/NIM tool list, refused by the tool runner, and
   denied (`permissions.deny`) in `claude -p` runs. Its daemon config must also allow only read/diagnostic tools.
-- `POST /v1/push/register` `{"voip_token","bundle_id","env":"sandbox"|"production","alert_token"?}` —
-  the app sends its PushKit token (and optionally its ordinary APNs token, for missed-call notices).
+- `POST /v1/push/register` `{"voip_token"?,"bundle_id","env":"sandbox"|"production","alert_token"?}` —
+  the app sends its PushKit token and/or its ordinary APNs token (missed-call notices, task pushes). macOS sends
+  only `alert_token`. `bundle_id` and at least one token are required (400 otherwise).
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:

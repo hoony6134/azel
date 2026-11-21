@@ -18,8 +18,8 @@ def tgw(tmp_path, monkeypatch):
         notes.append(("call", reason, opening, persona_id))
         return {"call_id": "c"}
 
-    async def push(title, body):
-        notes.append(("push", title, body))
+    async def push(title, body, **extra):
+        notes.append(("push", title, body, extra))
     g.place_call, g.send_alert_push = place_call, push
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         yield g, c, notes
@@ -60,7 +60,8 @@ def test_task_waits_for_approval_then_resumes(tgw):
     t = wait_for(c, tid, ("done", "failed"))
     assert t["status"] == "done" and t["result"] == "승인받고 정리했어요."
     assert [s["kind"] for s in t["steps"]] == ["tool", "approval", "approval_approved"]
-    assert notes == [("push", "작업 완료", "맡기신 작업 끝났어요. 승인받고 정리했어요.")]
+    assert notes == [("push", "승인 필요", "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요.", {"type": "task", "task_id": tid}),
+                     ("push", "작업 완료", "맡기신 작업 끝났어요. 승인받고 정리했어요.", {"type": "task", "task_id": tid})]
 
 
 def test_budget_kill(tgw):
@@ -126,3 +127,32 @@ def test_limited_gateway_has_no_tasks(tmp_path, monkeypatch):
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         assert c.post("/v1/tasks", json={"goal": "x"}).status_code == 403
         assert c.get("/v1/tasks").status_code == 403
+
+
+def test_alert_only_registration_and_task_push_payload(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
+    sent = []
+
+    async def apns_send(payload, kind):
+        sent.append((kind, payload))
+        return {"sent": 1}
+    g.apns_send = apns_send
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        assert c.post("/v1/push/register", json={"bundle_id": "xyz.scian.azel"}).status_code == 400
+        assert c.post("/v1/push/register", json={"alert_token": "mac-alert", "bundle_id": "xyz.scian.azel"}).status_code == 200
+        assert g.fake.db["push"] == {"mac-alert": {"token": "mac-alert", "bundle_id": "xyz.scian.azel", "env": "sandbox",
+                                                   "kind": "alert"}}
+    asyncio.run(g.task_notify({"id": "abc123abc123", "notify": "push", "status": "done", "result": "끝", "persona": None}))
+    assert sent == [("alert", {"aps": {"alert": {"title": "작업 완료", "body": "맡기신 작업 끝났어요. 끝"}, "sound": "default"},
+                               "type": "task", "task_id": "abc123abc123"})]
+
+
+def test_call_mode_rings_for_an_approval(tgw):
+    g, c, notes = tgw
+    g.fake.db["approvals"]["ap1"] = {"id": "ap1", "device": "macbook", "status": "pending"}
+    tid = c.post("/v1/tasks", json={"goal": "TASK-APPROVAL 지워 줘", "notify": "call", "persona": "azel"}).json()["id"]
+    wait_for(c, tid, ("waiting_approval",))
+    assert notes == [("call", "task_approval", "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요.", "azel")]
+    c.post("/v1/approvals/ap1", json={"approve": False})
+    t = wait_for(c, tid, ("done", "failed"))
+    assert t["result"] == "거절돼서 나머지만 했어요." and notes[-1][1] == "task"

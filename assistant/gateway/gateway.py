@@ -861,9 +861,10 @@ async def send_voip_push(payload):
     return await apns_send(payload, "voip")
 
 
-async def send_alert_push(title, body):
-    """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token."""
-    return await apns_send({"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}, "alert")
+async def send_alert_push(title, body, **extra):
+    """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token. `extra` rides at the
+    payload's top level next to `aps` (a task push: `type: "task"`, `task_id`, so the app opens azel://task/<id>)."""
+    return await apns_send({"aps": {"alert": {"title": title, "body": body}, "sound": "default"}, **extra}, "alert")
 
 
 async def apns_send(payload, kind):
@@ -1994,10 +1995,11 @@ async def history_prune(older_than_days: float):
 
 @app.post("/v1/push/register")
 async def push_register(body: dict):
-    if not body.get("voip_token") or not body.get("bundle_id"):
-        raise HTTPException(400, "voip_token and bundle_id required")
-    await state.call("PUT", f"/v1/state/push_tokens/{quote(body['voip_token'], safe='')}",
-                     {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox")})
+    if not body.get("bundle_id") or not (body.get("voip_token") or body.get("alert_token")):
+        raise HTTPException(400, "bundle_id and voip_token and/or alert_token required")  # macOS: alert only
+    if body.get("voip_token"):
+        await state.call("PUT", f"/v1/state/push_tokens/{quote(body['voip_token'], safe='')}",
+                         {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox")})
     if body.get("alert_token"):  # ordinary notifications (missed scheduled calls)
         await state.call("PUT", f"/v1/state/push_tokens/{quote(body['alert_token'], safe='')}",
                          {"bundle_id": body["bundle_id"], "env": body.get("env", "sandbox"), "kind": "alert"})
@@ -2255,6 +2257,7 @@ async def wait_approval(t, aid):
     t["status"] = "waiting_approval"
     task_step(t, "approval", approval_id=aid)
     await task_save(t)
+    await task_notify(t, approval=True)
     while True:
         a = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}") or {}
         if a.get("status") in ("approved", "rejected"):
@@ -2310,17 +2313,22 @@ async def run_task(t):
 
 
 def task_summary(t):
+    if t["status"] == "waiting_approval":
+        return "맡기신 작업에 승인이 필요해요. 앱에서 확인해 주세요."
     if t["status"] == "done":
         return f"맡기신 작업 끝났어요. {t['result'] or '결과는 앱에서 확인해 주세요.'}"[:600]
     return f"맡기신 작업이 끝나지 못했어요. {t['error'] or ''}"[:600]
 
 
-async def task_notify(t):
+async def task_notify(t, approval=False):
+    """When a task finishes, fails or needs an approval: a call as its persona, or an alert push the app opens
+    as azel://task/<id>."""
     try:
         if t["notify"] == "call":
-            await place_call("task", opening=task_summary(t), persona_id=t["persona"])
+            await place_call("task_approval" if approval else "task", opening=task_summary(t), persona_id=t["persona"])
         elif t["notify"] == "push":
-            await send_alert_push("작업 완료" if t["status"] == "done" else "작업 실패", task_summary(t)[:180])
+            title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
+            await send_alert_push(title, task_summary(t)[:180], type="task", task_id=t["id"])
     except Exception as e:
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 
