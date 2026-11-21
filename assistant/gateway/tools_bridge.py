@@ -123,7 +123,7 @@ CREATE_TASK = {
 # in the same run (ask or task), a side-effect action from a model needs a read-back the user confirmed.
 TAINT_TOOLS = {"web_search", "web_fetch", "memory_recall", "people_lookup"}
 SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "schedule_update": "예약 변경",
-                "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기"}
+                "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기", "home_scene": "집 장면 실행"}
 TAINT_S = 600
 
 
@@ -142,6 +142,7 @@ class Bridge:
     async def tools(self, caller="api"):
         """Messages-API definitions of everything this caller may use, and where device tools run."""
         dev_defs, where = await self.d["device_tools"](await self.d["fresh_devices"]())
+        dev_defs = [t for t in dev_defs if where[t["name"]][1] not in MAC_TOOL_NAMES]  # reached as music_* / home_scene
         if caller in ("qwen", "voice"):  # a voice turn of any model never delegates; tasks do
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
@@ -247,6 +248,8 @@ class Bridge:
             return await self.approval_status(args)
         if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
             return await getattr(self, name)(args, persona_id)
+        if name in MAC_ACTIONS:
+            return await self.mac(name, args, where, caller)
         if name == "web_search":
             q = str(args["query"]).strip()
             if not q:
@@ -273,6 +276,31 @@ class Bridge:
         if name not in where:
             raise Fail("not_found", f"없는 도구예요: {str(name)[:40]}")
         return await self.device(name, args, where, caller, on_progress)
+
+    async def mac(self, name, args, where, caller):
+        """music_play / music_control / home_scene: the Mac daemon's narrow `music` / `home` tool (its own checks apply)."""
+        tool = MAC_ACTIONS[name]
+        if where is None:
+            _, where = await self.tools(caller)
+        macs = sorted(n for n, (_, t) in where.items() if t == tool)
+        if not macs:
+            raise Fail("unavailable", "지금은 음악과 집 제어를 할 수 있는 맥이 연결돼 있지 않아요.")
+        call = {"music_play": lambda: {"action": "play", "query": str(args.get("query") or "")},
+                "music_control": lambda: {k: args[k] for k in ("action", "volume") if args.get(k) is not None},
+                "home_scene": lambda: {"scene": str(args["name"])}}[name]()
+        res = await self.d["run_tool"]({"id": "bridge", "name": macs[0], "input": call}, where)
+        text = str(res.get("content", ""))
+        try:
+            out = json.loads(text)
+        except ValueError:
+            out = {"status": "error" if res.get("is_error") else "ok", "result": text}
+        status = out.get("status", "ok") if isinstance(out, dict) else "ok"
+        if status == "not_found":
+            raise Fail("not_found", "라이브러리에서 못 찾았어요.")
+        if status != "ok":
+            why = str(out.get("reason") or out.get("error") or text)[:200]
+            raise Fail("failed", f"실행하지 못했어요: {why}")
+        return str(out.get("result") or "했어요.")[:200], out
 
     async def device(self, name, args, where, caller, on_progress):
         url, tool = where[name]
@@ -814,13 +842,35 @@ WEB_FETCH = {
     "description": "웹 페이지 하나를 읽어 글만 돌려준다(http/https 주소만, 내부 주소는 안 됨). 출처는 사이트 이름만 말해.",
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["url"], "properties": {
         "url": {"type": "string", "maxLength": 2000}}}}
+MUSIC_PLAY = {
+    "name": "music_play",
+    "description": ("맥의 Apple Music으로 노래를 튼다. query는 사용자가 말한 노래·가수·앨범·플레이리스트 이름 그대로(라이브러리에서 "
+                    "찾는다). query 없이 부르면 멈춘 곡을 이어서 튼다. 못 찾으면 못 찾았다고 말해."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "query": {"type": "string", "maxLength": 100}}}}
+MUSIC_CONTROL = {
+    "name": "music_control",
+    "description": "Apple Music 조작: pause(일시정지), resume(이어서), next(다음 곡), previous(이전 곡), volume(0~100), now_playing(지금 나오는 곡).",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["action"], "properties": {
+        "action": {"type": "string", "enum": ["pause", "resume", "next", "previous", "volume", "now_playing"]},
+        "volume": {"type": "integer", "description": "action이 volume일 때 0~100(벗어나면 맞춰 줌)"}}}}
+HOME_SCENE = {
+    "name": "home_scene",
+    "description": "사용자가 미리 허용해 둔 집 장면(조명 끄기, 영화 모드 등)을 실행한다. name은 허용된 장면 이름 그대로; 모르면 도구가 목록을 알려 준다.",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["name"], "properties": {
+        "name": {"type": "string", "maxLength": 60}, "confirmed": CONFIRMED}}}
+# These run on the user's Mac through its daemon's `music` and `home` tools (fixed templates / an allowlist there),
+# so they are hidden as `<device>__music` and every model path gets the same two names.
+MAC_ACTIONS = {"music_play": "music", "music_control": "music", "home_scene": "home"}
+MAC_TOOL_NAMES = set(MAC_ACTIONS.values())
 WEB_NAMES = {"web_search", "web_fetch"}  # the Claude API path has native server tools by these names
 # schedule_create: call_user that must have a time (the app's "new schedule" form); same handler, same checks.
 SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH)
+             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
+             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
@@ -873,6 +923,15 @@ for _n, _m in {
     "web_fetch": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                   "no_rest": "앱에는 페이지 읽기 화면이 없어요(모델 경로 전용).",
                   "examples": ({"url": "https://example.com"}, {"url": "file:///etc/passwd"})},
+    "music_play": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                   "no_rest": "앱에는 음악 화면이 없어요(모델 경로에서 맥 데몬으로).",
+                   "examples": ({"query": "아이유"}, {"query": 1})},
+    "music_control": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                      "no_rest": "앱에는 음악 화면이 없어요(모델 경로에서 맥 데몬으로).",
+                      "examples": ({"action": "pause"}, {"action": "explode"})},
+    "home_scene": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                   "no_rest": "앱에는 집 제어 화면이 없어요(모델 경로에서 맥 데몬으로).",
+                   "examples": ({"name": "azel-movie"}, {})},
 }.items():
     ACTIONS[_n] = _m
 APP_ACTIONS = {n for n, m in ACTIONS.items() if "app" in m["scopes"]}

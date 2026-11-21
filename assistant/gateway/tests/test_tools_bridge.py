@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -271,7 +272,7 @@ def test_schedule_task_and_approval_tools():
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
         run(b.call("call_user", {"when": when, "reason": note}, caller="app"))
-    assert [t["name"] for t in run(b.tools("api"))[0]][3:18] == [t["name"] for t in TB.OWN_TOOLS]
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:21] == [t["name"] for t in TB.OWN_TOOLS]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
     assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"},
@@ -485,3 +486,59 @@ def test_injected_actions_need_a_confirmed_read_back():
     assert r["ok"]
     b.d["who"] = lambda: "ask:azel:call-2"  # another run, nothing read: acts as before
     assert run(b.run("create_task", {"goal": "정리", "notify": "none"}, caller="qwen"))["ok"]
+
+
+class MacWorld(World):
+    """macbook with the daemon's music and home tools; answers like the daemon does."""
+    reply = {"status": "ok", "result": "playing"}
+
+    async def device_tools(self, devices):
+        names = ["list_dir", "music", "home"]
+        return ([{"name": f"macbook__{n}", "description": n, "input_schema": {"type": "object"}} for n in names],
+                {f"macbook__{n}": ("http://mac", n) for n in names})
+
+    async def run_tool(self, block, where):
+        self.run.append((block["name"], dict(block["input"])))
+        return {"content": json.dumps(self.reply), "is_error": False}
+
+
+def test_music_and_home_actions_reach_the_mac_daemon_without_approval_and_hide_the_raw_tools():
+    w = MacWorld()
+    b = w.bridge()
+    for caller in ("api", "qwen"):
+        names = [t["name"] for t in run(b.tools(caller))[0]]
+        assert {"music_play", "music_control", "home_scene", "macbook__list_dir"} <= set(names)
+        assert "macbook__music" not in names and "macbook__home" not in names
+    r = run(b.call("music_play", {"query": "아이유"}, caller="qwen"))  # the local model needs no approval for this
+    assert r["content"] == "playing" and not r["is_error"]
+    run(b.call("music_control", {"action": "volume", "volume": 300}))
+    run(b.call("music_control", {"action": "next"}))
+    w.reply = {"status": "ok", "result": "scene done"}
+    run(b.call("home_scene", {"name": "azel-movie"}))
+    assert w.run == [("macbook__music", {"action": "play", "query": "아이유"}),
+                     ("macbook__music", {"action": "volume", "volume": 300}),
+                     ("macbook__music", {"action": "next"}),
+                     ("macbook__home", {"scene": "azel-movie"})]
+
+
+def test_music_and_home_errors_become_spoken_failures():
+    w = MacWorld()
+    b = w.bridge()
+    w.reply = {"status": "not_found", "result": "not found"}
+    assert "못 찾았어요" in run(b.call("music_play", {"query": "없는 곡"}))["content"]
+    w.reply = {"status": "refused", "reason": "unknown scene; allowed: azel-movie"}
+    r = run(b.call("home_scene", {"name": "front door lock"}))
+    assert r["is_error"] and "allowed: azel-movie" in r["content"]
+    assert run(b.call("music_control", {"action": "explode"}))["is_error"]  # schema: not in the enum
+    w2 = World()  # no daemon with music: say so
+    assert "맥이 연결돼 있지 않아요" in run(w2.bridge().call("music_control", {"action": "pause"}))["content"]
+
+
+def test_home_scene_after_a_web_read_needs_the_user_to_confirm():
+    w = MacWorld()
+    b = w.bridge()
+    b.d["who"] = lambda: "ask:s1"
+    b.tainted["ask:s1"] = time.monotonic()
+    r = run(b.call("home_scene", {"name": "azel-movie"}))
+    assert "확인할게요" in r["content"] and w.run == []
+    assert not run(b.call("home_scene", {"name": "azel-movie", "confirmed": True}))["is_error"] and len(w.run) == 1
