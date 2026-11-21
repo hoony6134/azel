@@ -98,7 +98,8 @@ answering a call the assistant placed; the server then speaks that call's openin
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}` (every interrupt, voice or tap, ends
-  with exactly that pair; a cancelled reply's own `listening` is dropped). During a placed call's
+  with exactly that pair; a cancelled reply's own `listening` is dropped, and an interrupt overtaken by a newer one or
+  by a new reply sends nothing). During a placed call's
   opening the first sentence still finishes first.
 
 ## 1b. Gateway link — `WS /v1/gateway-link` on the voice server
@@ -466,21 +467,25 @@ device that created them.
   takes lease `job:<name>:<date>` (24 h) fires it. Lease holder = `<device>-<random per process>`,
   so a restarted gateway cannot fire the same job twice. No lease service → the job is skipped.
 - Approvals: risky or (on `approve_unlisted` devices) unlisted daemon commands waiting for the user's tap.
-  - `POST /v1/approvals` `{"device","tool","command","cwd"}` (daemons) → `{"approval_id","status":"pending",
+  - `POST /v1/approvals` `{"device","tool","command","cwd","requester"?}` (daemons) → `{"approval_id","status":"pending",
     "expires_at"}` and an alert push (`"type":"approval","approval_id"`, body "<device>에서 명령 실행 승인이 필요해요";
     the command is shown only in the app). If an `always` rule matches (same device, exact command and cwd) →
     `{"approval_id","status":"approved","rule_id"}` at once, no push (still audited when it runs), except when the
     request comes from a task: a task's commands always need a tap.
   - `GET /v1/approvals` → pending ones only: `[{"id","device","tool","command","cwd","status","created","decided",
-    "expires_at","decision","requester","rule_id"}]`. `requester`: the ask or task this gateway was running when the
-    approval came in (`{"session","persona"}` or `{"task_id","persona"}`), else null. `GET /v1/approvals/{id}` → the
+    "expires_at","decision","requester","rule_id"}]`. `requester`: the run that asked, per ask or task (never "whoever
+    ran last"): each `claude -p` run and each API/NIM daemon call carries `X-Azel-Requester: ask:<persona:session>` or
+    `task:<id>` to the daemon, which passes it back as `requester`; shown as `{"session","persona"}` or `{"task_id"}`,
+    null when missing or malformed. A task resumes only on approvals whose requester is that task. `GET /v1/approvals/{id}` → the
     same object; `status` `pending|approved|used|rejected|expired` (a pending one expires 5 minutes after it was
     made; an approved one that has not run within 10 minutes of the tap expires too; `used` once it ran).
   - `POST /v1/approvals/{id}` `{"decision":"once"|"always"|"deny"}` (older apps: `{"approve":bool}` = once / deny)
-    → `{"id","status","decision","rule_id"?,"forced_once"?}`; 409 when it is no longer pending (decided or expired).
-    `always` also stores a rule `{"id","device","command","cwd","created"}`, except for commands that run other code
-    (wrappers such as env/xargs/find/nohup/timeout, shells, interpreters, `open`, package managers, git …): those are
-    approved once and the answer carries `"forced_once":true`. Full gateways only (403 on limited).
+    → `{"id","status","decision","rule_id"?,"forced_once"?,"forced_reason"?}`; 409 when it is no longer pending.
+    `always` stores a rule `{"id","device","command","cwd","created"}` only for read-only programs: `open` (apps with
+    `-a`/`-b` and URLs, not files with executable extensions), `ls`, `cat`, `head`, `tail`, `wc`, `du`, `df`, `pwd`,
+    `git status|log|diff|show|branch`, `rg`, `grep`, `find` without `-exec`/`-delete`, `sw_vers`, `uptime`,
+    `pmset -g`, `system_profiler`. Anything else is approved once, with `"forced_once":true` and a Korean
+    `forced_reason` for the app to show. Full gateways only (403 on limited).
   - `GET /v1/approvals/rules` → the rules; `DELETE /v1/approvals/rules/{id}` revokes one (404 if unknown).
   - `POST /v1/approvals/{id}/use` `{"device","command","cwd"}` (daemons, right before an approved run) spends the
     approval in ruchba atomically and once: approved, for that device, exact command and cwd, within 10 minutes of
@@ -508,20 +513,29 @@ then checks `GET /v1/approvals/{id}` → `{"status":"approved","device","command
 and an exact command/cwd match, spends it with `POST /v1/approvals/{id}/use` (central, atomic, once, within 10 min of
 the tap; also kept in the local used-ids file), runs it, and reports `POST /v1/approvals/{id}/ran`
 `{"exit_code","status"}` (no output).
-Approved runs may use any existing directory under `$HOME` as cwd; allowlisted runs without approval stay inside
-`allowed_roots` with `check_args`.
+Approved runs may use any existing directory under `$HOME` as cwd, except one that is, is inside, or contains a
+protected path (so never `~` itself); allowlisted runs without approval stay inside `allowed_roots` with `check_args`.
 `approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,
 vd-core and sadr (unlisted commands are refused there, approval id or not).
 Never runnable, refused before any approval exists (and for approved runs). Names compare case-insensitively and
 every argv position counts, so wrappers (env incl. `-S`/`--split-string`, xargs, `find -exec`, nice, nohup, time,
 timeout, caffeinate, command) hide nothing:
-- `sudo`/`su`/`doas`/`pkexec`; `security`; any `osascript`;
-- inline code: `sh|bash|zsh|… -c`, `python* -c`, `perl -e/-E`, `ruby -e`, `node -e/-p/--eval`, `php -r`, `lua -e`;
+- `sudo`/`su`/`doas`/`pkexec`; `security`; `osascript`; `awk`/`gawk`/`nawk`, `expect`, `sqlite3`, `vim`/`vi`/`nvim`,
+  `emacs`, `tmux`, `screen`, `bun`, `deno`, `php`, `make`, `xcrun`, `launchctl`, `crontab`, `at`, `periodic`;
+- inline code: `sh|bash|zsh|… -c`, `python* -c`, `perl -e/-E`, `ruby -e`, `node -e/-p/--eval`, `lua -e`;
+- options that run commands: `git -c|--config*|--exec-path|--upload-pack|--receive-pack` and `core.sshCommand`;
+  `ssh|scp|sftp -o|-F|-S|-e` and ProxyCommand/LocalCommand/ProxyJump; `rsync -e|--rsh`; `zip -TT|--unzip-command`;
+  `tar -I|--use-compress-program|--to-command|--checkpoint-action`; `less`/`more` with `!`; `defaults write|import|
+  delete|rename`; variables such as `GIT_SSH_COMMAND`, `PAGER`, `EDITOR`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`;
 - `open -a|-b` of Terminal or iTerm, `open` of `.command|.tool|.sh|.scpt|.applescript|.workflow` files;
-- `rm -r` or `find … -delete` on `/` or the home directory (or above it); `diskutil erase*|zeroDisk|secureErase|
-  reformat|partitionDisk|apfs delete*|apfs erase*`; `mkfs*`/`newfs*`; `dd of=/dev/…`;
-- any path (argument, `--opt=value`, attached `-C/path`, cwd; symlinks resolved first) that is, is inside, or is an
-  ancestor of `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains` (so `~`, `~/.config`, `/Users`, `/`).
+- `rm -r` or `find … -delete` on `/` or the home directory (or above it); any `diskutil` subcommand except `list` and
+  `info`; `mkfs*`/`newfs*`; `dd` with an `of=` that resolves under `/dev` (`//dev/disk2` too);
+- `ln -s` whose target, resolved from the link's own directory (and from the cwd), is or covers a protected path;
+- any path (argument, `--opt=value`, every attached short-option value such as `-Cx/..`, cwd; relative paths also
+  resolved against each `-C`/`--directory`; symlinks resolved first) that is, is inside, or is an ancestor of a
+  protected path: `~/.config/biseo`, `~/.ssh`, `~/.claude`, `~/Library/Keychains`, `~/.zshrc`, `~/.zprofile`,
+  `~/.zshenv`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/Library/LaunchAgents`, `~/.gitconfig`,
+  `~/.config/git` (so `~`, `~/.config`, `~/Library`, `/Users`, `/` too).
 Still no shell: argv only.
 
 Tools: `list_dir(path)`, `read_file(path, max_bytes?)`, `search(query, path?)`,
