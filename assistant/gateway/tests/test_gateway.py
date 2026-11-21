@@ -228,7 +228,7 @@ def test_personality(gw):
 # ---------- personas ----------
 def persona_gw(g, monkeypatch):
     async def voices():
-        return ["sohee", "ryan", "vivian"]
+        return ["sohee", "ryan", "aiden", "vivian"]
     monkeypatch.setattr(g, "tts_voices", voices)
 
 
@@ -246,9 +246,9 @@ def test_personas_migrate_from_one_assistant(gw):
 def test_personas_crud_and_limits(gw, monkeypatch):
     g, c, _ = gw
     persona_gw(g, monkeypatch)
-    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "Vivian", "personality": "느긋함",
+    r = c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "Aiden", "personality": "느긋함",
                                      "color": "#22aa88", "share_memory": True})
-    assert r.status_code == 201 and r.json()["voice"] == "vivian" and not r.json()["primary"]
+    assert r.status_code == 201 and r.json()["voice"] == "aiden" and not r.json()["primary"]
     for bad in [{"name": "루나", "voice": "sohee"},  # name taken
                 {"name": "새비서", "voice": "nova"},  # not a TTS speaker
                 {"name": "a" * 13, "voice": "sohee"}, {"name": "새비서"}, {"name": "새비서", "voice": "sohee", "color": "red"},
@@ -276,7 +276,7 @@ def test_personas_crud_and_limits(gw, monkeypatch):
 def test_persona_calls_schedule_and_asks(gw, monkeypatch):
     g, c, tmp = gw
     persona_gw(g, monkeypatch)
-    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋하고 다정함"})
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "aiden", "personality": "느긋하고 다정함"})
     sent, pushes = [], []
 
     async def capture(obj):
@@ -307,7 +307,7 @@ def test_persona_calls_schedule_and_asks(gw, monkeypatch):
 def test_persona_delete_voices_and_samples(gw, monkeypatch):
     g, c, _ = gw
     persona_gw(g, monkeypatch)
-    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "vivian"})
+    c.post("/v1/personas", json={"id": "luna", "name": "루나", "voice": "aiden"})
     c.post("/v1/personas", json={"id": "mira", "name": "미라", "voice": "ryan"})
     assert c.delete("/v1/personas/luna").json()["deleted_at"] and g.fake.persona_data == ("luna", False)
     c.delete("/v1/personas/mira?delete_history=true")
@@ -318,7 +318,7 @@ def test_persona_delete_voices_and_samples(gw, monkeypatch):
     g.fake.state.down = False
     assert not c.get("/v1/personas/nova").json()["deleted_at"]
     v = c.get("/v1/voices").json()
-    assert {"id": "sohee", "label": "소희", "desc": "따뜻한 한국어 여성", "lang": "ko"} in v and len(v) == 3
+    assert {"id": "sohee", "label": "소희", "desc": "따뜻한 한국어 여성", "lang": "ko"} in v and len(v) == 3 and "vivian" not in {x["id"] for x in v}
     calls = []
 
     async def fake_sample(text, voice, style):
@@ -1319,7 +1319,7 @@ def test_warm_turn_timeout_kills_a_hung_process(tmp_path, monkeypatch):
 def test_prewarm_uses_the_call_persona(tmp_path, monkeypatch):
     g = start(tmp_path, monkeypatch, BISEO_WARM_CLAUDE="1", BISEO_CLAUDE=str(HERE / "fake_claude_warm.py"))
     g.fake.db["settings"] = {"personas": [{"id": "azel", "name": "아젤", "voice": "sohee", "primary": True},
-                                          {"id": "luna", "name": "루나", "voice": "vivian", "personality": "느긋함"}]}
+                                          {"id": "luna", "name": "루나", "voice": "aiden", "personality": "느긋함"}]}
 
     async def run():
         await g.prewarm("luna:s1", "luna")
