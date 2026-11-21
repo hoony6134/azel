@@ -145,6 +145,7 @@ final class AudioIO {
 
     /// iOS: call after CallKit activated the audio session.
     func start() throws {
+        started = true   // from here on stop() has something to undo, even if start throws
         let input = engine.inputNode
         #if os(macOS)
         // Set before voice processing so the echo canceller pairs the chosen devices.
@@ -170,17 +171,37 @@ final class AudioIO {
             if let one = PCM.firstChannel(buffer), let data = PCM.pcm16Data(from: one, converter: converter) { self?.onMic?(data) }
         }
         let mixer = engine.mainMixerNode
+        // Taps run on the engine's messenger queue, which stop() waits on while holding the engine
+        // lock: never touch a node or the engine in here (Mac hang on hang-up, 2026-11-22). Levels only.
         mixer.installTap(onBus: 0, bufferSize: 1024, format: mixer.outputFormat(forBus: 0)) { [weak self] buffer, _ in
-            guard let self else { return }
-            levels.update(out: buffer)
-            // Ducking: −8 dB in ~30 ms while speech plays, back in ~150 ms.
-            let target: Float = speechPlaying ? 0.4 : 1
-            let dt = Float(buffer.frameLength) / Float(buffer.format.sampleRate)
-            let tau: Float = target < cuePlayer.volume ? 0.03 : 0.15
-            cuePlayer.volume += (target - cuePlayer.volume) * min(1, dt / tau * 3)
+            self?.levels.update(out: buffer)
         }
         try engine.start()
         player.play()
+        startDucking()
+    }
+
+    private var started = false
+    private var duckTimer: DispatchSourceTimer?
+
+    /// Cue ducking on the main queue at 30 Hz: −8 dB in ~30 ms while speech plays, back in ~150 ms.
+    private func startDucking() {
+        duckTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now(), repeating: 1.0 / 30)
+        t.setEventHandler { [weak self] in
+            guard let self, self.started else { return }
+            let v = self.cuePlayer.volume
+            self.cuePlayer.volume = Self.duck(volume: v, speech: self.speechPlaying, dt: 1.0 / 30)
+        }
+        t.resume()
+        duckTimer = t
+    }
+
+    static func duck(volume: Float, speech: Bool, dt: Float) -> Float {
+        let target: Float = speech ? 0.4 : 1
+        let tau: Float = target < volume ? 0.03 : 0.15
+        return volume + (target - volume) * min(1, dt / tau * 3)
     }
 
     func play(_ pcm16: Data) {
@@ -229,12 +250,16 @@ final class AudioIO {
     var isRunning: Bool { engine.isRunning }
     var voiceProcessingOn: Bool { engine.inputNode.isVoiceProcessingEnabled }
 
+    /// Idempotent. Taps and the ducking timer go first, then the players and the engine.
     func stop() {
+        duckTimer?.cancel(); duckTimer = nil
+        guard started else { return }
+        started = false
+        engine.inputNode.removeTap(onBus: 0)
+        engine.mainMixerNode.removeTap(onBus: 0)
         player.stop()
         cuePlayer.stop()
         speechLock.lock(); speechEnd = 0; scheduledSamples = 0; pausedAt = nil; speechLock.unlock()
-        engine.inputNode.removeTap(onBus: 0)
-        engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()
         // Voice processing left on keeps ducking other audio after the call; it only runs in calls.
         if engine.inputNode.isVoiceProcessingEnabled { try? engine.inputNode.setVoiceProcessingEnabled(false) }
