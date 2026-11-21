@@ -1278,6 +1278,41 @@ def recent_context(hist, n=6):
     return ("최근 통화 내용:\n" + "\n".join(lines) + "\n\n") if lines else ""
 
 
+TITLE_EVERY = 3  # replies without the title before it comes back
+title_gap: dict[str, int] = {}  # history key -> replies since the user's title was last said
+
+
+class Address:
+    """The user's title (호칭) in a call's replies, deterministic rather than left to the model: the first reply
+    starts with it, later replies bring it back after TITLE_EVERY without it, and a reply never says it twice."""
+
+    def __init__(self, title, hkey, first_reply):
+        self.title, self.hkey, self.named, self.started = title, hkey, False, False
+        gap = title_gap.get(hkey, 0)
+        self.due = bool(title) and (first_reply or gap >= TITLE_EVERY)
+
+    def __call__(self, s):
+        if not self.title:
+            return s
+        t = re.escape(self.title)
+        first, self.started = not self.started, True
+        if self.title in s:
+            # the model's own vocative counts when it is due or the reply asks the user something back;
+            # otherwise (and always the second time in a reply) it is dropped and the sentence kept
+            if self.named or not (self.due or s.rstrip().endswith("?")):
+                s = re.sub(rf"^\s*{t}\s*[,!.]?\s*|\s*,\s*{t}(?=[,.!?\s]|$)", "", s, count=1).strip() or s
+            if self.title in s:
+                self.named = True
+            return s
+        if first and self.due:
+            self.named = True
+            return f"{self.title}, {s}"
+        return s
+
+    def done(self):
+        title_gap[self.hkey] = 0 if self.named else title_gap.get(self.hkey, 0) + 1
+
+
 async def respond(text, session, t0, timings, on_event=None):
     """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
     settings = await gateway_settings()
@@ -1297,6 +1332,7 @@ async def respond(text, session, t0, timings, on_event=None):
     sentences: asyncio.Queue = asyncio.Queue()
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
     route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
+    address = Address(user_title(settings, persona), hkey, not any(m["role"] == "assistant" for m in hist))
 
     async def via_claude():
         route["value"] = "claude"
@@ -1462,12 +1498,19 @@ async def respond(text, session, t0, timings, on_event=None):
         """The next text to synthesize. Sentences that queued up while the last one was synthesized go out
         together (fewer, longer TTS calls), but only as many as the audio already sent covers: TTS is not
         streamed and runs at about 0.7x real time, so a chunk longer than that leaves the phone silent."""
-        s = back.pop() if back else await sentences.get()
+        if back:
+            s = back.pop()  # already addressed when it was set aside
+        else:
+            s = await sentences.get()
+            if s is None or s in (FILLER, FILLER_LONG):
+                return s
+            s = address(s)
         if s is None or s in (FILLER, FILLER_LONG):
             return s
         room = max(0.0, play_end - time.monotonic()) / (1.5 * max(SYNTH_S_PER_SYL, synth_rate[0]))
         while not back and not sentences.empty():
             nxt = sentences.get_nowait()
+            nxt = nxt if nxt is None or nxt in (FILLER, FILLER_LONG) else address(nxt)
             if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
                 back.append(nxt)
                 break
@@ -1493,6 +1536,7 @@ async def respond(text, session, t0, timings, on_event=None):
         # turn at all; a placeholder text would leak into captions and Qwen would parrot it.
         if spoken:
             hist.append({"role": "assistant", "content": " ".join(spoken)})
+            address.done()
 
 
 app = FastAPI(title="assistant-voice")
@@ -2251,6 +2295,15 @@ if __name__ == "__main__":
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
+        title_gap.clear()
+        replies = []
+        for i, said in enumerate([["네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["대표님, 좋아요."],
+                                  ["그럼요."], ["오늘은 쉬세요."], ["대표님, 더 필요한 거 있으세요?"]]):
+            a = Address("대표님", "t", i == 0)
+            replies.append([a(x) for x in said])
+            a.done()
+        assert replies == [["대표님, 네, 확인했어요.", "그리고요."], ["맑아요."], ["좋아요."], ["그럼요."],
+                           ["대표님, 오늘은 쉬세요."], ["대표님, 더 필요한 거 있으세요?"]], replies
         for ask in ("오늘 광주 날씨 어때?", "비트코인 시세 알려줘"):  # with the gateway's web_search: Qwen answers
             assert not pre_route(ask, {}, local=True, tools=("web_search",))[0] and pre_route(ask, {}, local=True)[0], ask
         assert korean_only("기상청 기준으로 맑아요 (https://www.weather.go.kr/w/index.do).") == "기상청 기준으로 맑아요."
