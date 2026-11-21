@@ -1131,7 +1131,7 @@ def with_title(opening, title):
     return f"{title}, {opening}"
 
 
-async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None):
+async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
@@ -1152,9 +1152,10 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
     await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
-                     "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {})})
+                     "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {}),
+                     **({"context": context} if context else {})})
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
-                                 "persona": persona["id"]})
+                                 "persona": persona["id"], **({"context": context} if context else {})})
     return {"call_id": call_id, **push}
 
 
@@ -1765,8 +1766,10 @@ async def attempt(item, now):
         await finish(claimed, now, "answered")
         return
     origin = (await state.call("GET", f"/v1/state/kv/origin-{item['id']}") or {}).get("session")
+    label = item.get("purpose") or openings.purpose_rule(item.get("note") or "") or str(item.get("note") or "")[:30]
     await place_call(item["kind"], opening, call_id=call_id, persona_id=item.get("persona_id"),
-                     **({"origin_session": origin} if origin else {}))
+                     **({"origin_session": origin} if origin else {}),
+                     context={"kind": "schedule", "label": label, "id": item["id"]})  # the call screen's chip
 
 
 async def finish(item, now, status):
@@ -3033,7 +3036,11 @@ async def wait_approval(t, aid):
 TASK_APPROVAL_POLL_S = 3
 
 
+task_live: dict[str, dict] = {}  # the task dicts this gateway's runners hold (a notify change must reach them)
+
+
 def start_task(t):
+    task_live[t["id"]] = t
     run = task_runs[t["id"]] = asyncio.create_task(run_task(t))
     run.add_done_callback(_task_settled)
     return run
@@ -3087,6 +3094,7 @@ async def run_task(t):
         t.update(status="failed", finished=time.time(), error="작업이 실패했어요.")
     finally:
         task_runs.pop(t["id"], None)
+        task_live.pop(t["id"], None)
         try:
             await task_save(t)
             # a task runs on `claude -p`: the subscription path, so it counts like any claude_code ask
@@ -3134,7 +3142,9 @@ async def task_notify(t, approval=False):
             persona = persona_by_id(settings, t["persona"] or "") or primary_persona(settings)
             await place_call("task_approval" if approval else "task",
                              opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"],
-                             **({"origin_session": t["origin_session"]} if t.get("origin_session") else {}))
+                             **({"origin_session": t["origin_session"]} if t.get("origin_session") else {}),
+                             context={"kind": "task", "id": t["id"],
+                                      "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]})
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
@@ -3180,6 +3190,28 @@ async def tasks_list(request: Request, limit: int = 20):
 @app.get("/v1/tasks/{tid}")
 async def tasks_get(request: Request, tid: str):
     return await act("task_status", {"id": tid}, request=request)
+
+
+async def task_set_notify(tid, notify):
+    """Change how a queued or running task reports back (call | push | none)."""
+    full_only()
+    if notify not in ("call", "push", "none"):
+        raise HTTPException(400, "notify: call, push or none")
+    t = task_live.get(tid) or (await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None)
+    if not t:
+        raise HTTPException(404, "no such task")
+    if t["status"] not in ("queued", "running", "waiting_approval"):
+        raise HTTPException(409, f"task already {t['status']}")
+    t["notify"] = notify  # the runner's own dict when it runs here, so its finish uses the new choice
+    await task_save(t)
+    return task_view(t, steps=False)
+
+
+@app.patch("/v1/tasks/{tid}")
+async def tasks_patch(tid: str, body: dict):
+    if set(body) - {"notify"}:
+        raise HTTPException(400, "only notify can be changed")
+    return await task_set_notify(tid, body.get("notify"))
 
 
 @app.post("/v1/tasks/{tid}/cancel")

@@ -346,6 +346,9 @@ class GatewayLinks:
                                                             str(msg.get("persona") or ""))
             origin = msg.get("origin_session")
             self.openings[msg["call_id"]]["origin"] = origin if isinstance(origin, str) and ORIGIN_RE.fullmatch(origin) else ""
+            ctx = msg.get("context")
+            self.openings[msg["call_id"]]["context"] = {k: str(ctx.get(k) or "")[:60] for k in ("kind", "label", "id")} \
+                if isinstance(ctx, dict) and ctx.get("kind") in ("task", "schedule") else None
         elif isinstance(msg.get("id"), str) and isinstance(t, str) and msg["id"] in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
@@ -2009,6 +2012,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 
     try:
         op = links.openings.pop(call_id, None) if call_id else None
+        if op and op.get("context"):  # first message: what this call is about (the app's "맡긴 작업: …" chip)
+            await send({"type": "context", "context": op["context"]})
         # The persona: a placed call's own (it rang as that persona), else ?persona=, else the primary. Every task
         # this call starts inherits it (name, character, TTS voice, history key, Claude session, tags).
         CALL_PERSONA.set(pick_persona(links.settings, (op or {}).get("persona") or persona))
@@ -3239,7 +3244,15 @@ if __name__ == "__main__":
             links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
             links.receive(full, {"type": "call", "call_id": "cz", "opening": "정훈님, 맡기신 다운로드 정리 끝났어요.",
                                  "origin_session": "azel:day"})
-            assert links.openings["cz"]["origin"] == "azel:day"
+            assert links.openings["cz"]["origin"] == "azel:day" and links.openings["cz"]["context"] is None
+            links.receive(full, {"type": "call", "call_id": "cv", "opening": "x",
+                                 "context": {"kind": "task", "label": "역사 특강 과제", "id": "abcabcabcabc"}})
+            assert links.openings["cv"]["context"] == {"kind": "task", "label": "역사 특강 과제", "id": "abcabcabcabc"}
+            with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
+                    "/v1/call?call_id=cv&session=cv", headers={"Authorization": "Bearer app-tok"}) as w:
+                first = json.loads(w.receive_text())  # before any state: the app's chip
+                w.send_text(json.dumps({"type": "hangup"}))
+            assert first == {"type": "context", "context": {"kind": "task", "label": "역사 특강 과제", "id": "abcabcabcabc"}}
             links.receive(full, {"type": "call", "call_id": "cw", "opening": "x", "origin_session": "bad id!"})
             assert links.openings["cw"]["origin"] == ""  # only a session-shaped origin is kept
             tc = TestClient(app, client=("100.64.0.8", 1))

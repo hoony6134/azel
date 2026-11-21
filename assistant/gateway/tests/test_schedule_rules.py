@@ -91,7 +91,7 @@ def test_push_reminder_fires_as_a_notification_and_moves_on(gw, monkeypatch):  #
 def test_rule_ends_after_its_end_date(gw, monkeypatch):  # noqa: F811
     g, _, _ = gw
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         return {"call_id": call_id}
     monkeypatch.setattr(g, "place_call", fake_place)
     at = kst(2026, 11, 23, 9, 0).timestamp()

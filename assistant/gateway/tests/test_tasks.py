@@ -274,7 +274,7 @@ def test_finish_call_continues_the_conversation(tgw, monkeypatch):
         sent.append(obj)
         return True
 
-    async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None):
+    async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, **kw):
         calls.append((reason, origin_session))
         return {"call_id": "c"}
     g.link_send, g.place_call = link_send, place_call
@@ -320,3 +320,38 @@ def test_reminder_and_call_now_carry_their_origin(tgw, monkeypatch):
     assert [m for m in sent if m.get("type") == "call"][-1]["origin_session"] == "luna:mac-2026-11-22"
     c.portal.call(g.place_call, "deadline", "마감이에요.")  # a proactive call has no conversation behind it
     assert "origin_session" not in [m for m in sent if m.get("type") == "call"][-1]
+
+
+def test_call_context_and_notify_change(tgw, monkeypatch):
+    """The app's call screen chip: task and reminder calls carry context {kind, label, id} in the VoIP push and on
+    the link (the voice server sends it as the call's first message). PATCH /v1/tasks/{id} changes notify."""
+    g, c, _ = tgw
+    pushes, frames = [], []
+
+    async def push(payload):
+        pushes.append(payload)
+        return {"sent": 1}
+
+    async def link_send(obj):
+        frames.append(obj)
+        return True
+    monkeypatch.setattr(g, "send_voip_push", push)
+    monkeypatch.setattr(g, "link_send", link_send)
+    monkeypatch.setattr(g, "place_call", g.real_place_call)
+    tid = c.post("/v1/tasks", json={"goal": "TASK-SLOW 역사학특강 최신 과제해줘", "notify": "push"}).json()["id"]
+    wait_for(c, tid, ("running",))
+    assert c.patch(f"/v1/tasks/{tid}", json={"notify": "call"}).json()["notify"] == "call"
+    assert c.patch(f"/v1/tasks/{tid}", json={"notify": "sms"}).status_code == 400
+    assert c.patch(f"/v1/tasks/{tid}", json={"goal": "x"}).status_code == 400
+    assert g.task_live[tid]["notify"] == "call"  # the runner's own copy changed
+    asyncio.run(g.task_notify({**g.task_live[tid], "status": "done", "result": "끝"}))  # as the runner would at the end
+    ctx = pushes[-1]["context"]
+    assert ctx["kind"] == "task" and ctx["id"] == tid and "과제" in ctx["label"] and "해줘" not in ctx["label"]
+    assert [f for f in frames if f.get("type") == "call"][-1]["context"] == ctx
+    c.post(f"/v1/tasks/{tid}/cancel")
+    assert c.patch(f"/v1/tasks/{tid}", json={"notify": "push"}).status_code == 409  # finished: nothing to change
+    at = (g.datetime.now(g.KST) + g.timedelta(hours=1)).replace(microsecond=0).isoformat()
+    item, _ = c.portal.call(g.schedule_create, {"at": at, "kind": "reminder", "note": "약 먹으라고 전화해줘",
+                                                "notify": "call"}, "app")
+    c.portal.call(g.attempt, g.fake.db["schedule"][item["id"]], time.time())
+    assert pushes[-1]["context"] == {"kind": "schedule", "label": "약 먹기", "id": item["id"]}

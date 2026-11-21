@@ -211,7 +211,7 @@ def test_master_switch_stops_proactive_calls_but_not_scheduled_ones(gw, monkeypa
     c.put("/v1/settings", json={"proactive": {"enabled": False}})
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append(reason)
         return {"call_id": f"c{len(placed)}"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -495,7 +495,7 @@ def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append((reason, opening))
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -832,7 +832,7 @@ def test_schedule_over_the_link(gw):
 def fire_setup(g, monkeypatch, **item):
     placed, alerts = [], []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append((reason, opening))
         assert g.fake.db["schedule"]["s1"]["call_id"] == call_id  # claimed with the attempt, before ringing
         return {"call_id": call_id}
@@ -926,7 +926,7 @@ def test_gateway_without_claude(tmp_path, monkeypatch):
         assert ev == [{"type": "error", "code": "no_claude", "message": "이 기기에서는 Claude를 쓸 수 없어요."}]
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         ran.append(reason)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -960,7 +960,7 @@ def test_guardrails(gw):
 def auto_setup(g, monkeypatch, verdict):
     placed, asked = [], []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
@@ -1154,7 +1154,7 @@ def test_scheduled_job_fires_once_across_gateways(gw, monkeypatch):
     g, _, _ = gw
     ran = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         ran.append(g.INSTANCE)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -1176,7 +1176,7 @@ def test_alert_limits(gw, monkeypatch):
     g, c, _ = gw
     placed = []
 
-    async def fake_place(reason, opening=None, call_id=None, persona_id=None):
+    async def fake_place(reason, opening=None, call_id=None, persona_id=None, **kw):
         placed.append(opening)
         return {"call_id": "x"}
     monkeypatch.setattr(g, "place_call", fake_place)
