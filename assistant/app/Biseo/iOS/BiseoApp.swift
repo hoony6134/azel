@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 @main
 struct BiseoApp: App {
@@ -11,6 +12,7 @@ struct BiseoApp: App {
         _ = CallManager.shared // PushKit must be registered on every launch, including background VoIP launches
         Recordings.cleanup()
         Config.migrateAddresses()
+        UNUserNotificationCenter.current().delegate = TaskNotificationHandler.shared
     }
 
     var body: some Scene {
@@ -34,6 +36,7 @@ struct BiseoApp: App {
             }
             .preferredColorScheme(nil)
             .tint(Theme.celadon)
+            .onOpenURL { url in if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } } }
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
             }
@@ -69,5 +72,19 @@ struct RootView: View {
         .fullScreenCover(isPresented: Binding(get: { call.inCall }, set: { if !$0 { call.hangUp() } })) {
             CallScreen()
         }
+    }
+}
+
+/// Tapping a "task finished" notification opens that task (payload `task_id` or `task`).
+final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = TaskNotificationHandler()
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        guard let id = TaskModel.taskID(from: response.notification.request.content.userInfo) else { return }
+        await TaskModel.shared.openTask(id: id)
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
     }
 }

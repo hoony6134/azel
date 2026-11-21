@@ -40,6 +40,7 @@ struct HomeView: View {
                 }
                 quickActions
                 ScheduleCard(schedule: schedule)
+                RunningTasksCard(tasks: TaskModel.shared, app: model)
                 recents
             }
             .padding(.horizontal, 20)

@@ -97,6 +97,7 @@ struct Popover: View {
     @ObservedObject var wake: WakeModel
     @ObservedObject var history: HistoryModel
     @ObservedObject private var call = MacCall.shared
+    @ObservedObject private var tasks = TaskModel.shared
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -133,6 +134,17 @@ struct Popover: View {
                         small("새 대화", "square.and.pencil") { model.newConversation() }
                     }
                 }
+                if !TaskModel.shared.active.isEmpty {
+                    let running = TaskModel.shared.active
+                    Button { show() } label: {
+                        HStack {
+                            Label("작업 \(running.count)개 진행 중", systemImage: "gearshape.2").foregroundStyle(Theme.text)
+                            Spacer()
+                            Text(running.first?.goal ?? "").font(.footnote).foregroundStyle(Theme.text3).lineLimit(1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
                 if !model.approvals.isEmpty {
                     Button { show() } label: {
                         Label("승인 \(model.approvals.count)건", systemImage: "checkmark.shield").frame(maxWidth: .infinity, alignment: .leading)
@@ -168,7 +180,7 @@ struct Popover: View {
         .padding(Theme.l)
         .frame(width: 340)
         .background(Theme.bgRaised)
-        .task { await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh() }
+        .task { await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh(); await TaskModel.shared.refresh() }
     }
 
     private func small(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -338,6 +350,7 @@ struct MacHome: View {
             .buttonStyle(.plain).disabled(model.statusError != nil)
             Text("어디서든 \(HotKey.label)로 부를 수 있어요").font(.footnote).foregroundStyle(Theme.text3)
             ScheduleCard(schedule: schedule)
+            RunningTasksCard(tasks: TaskModel.shared, app: model)
             VStack(alignment: .leading, spacing: Theme.m) {
                 HStack {
                     Text("최근 대화").font(.headline).foregroundStyle(Theme.text)
