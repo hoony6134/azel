@@ -147,7 +147,8 @@ final class WakeEnrollModel: ObservableObject {
             }
         } catch {
             listening = false
-            step = .failed("녹음을 시작하지 못했어요")
+            Log.call.error("wake record failed: \(error.localizedDescription, privacy: .public)")
+            step = .failed("녹음을 시작하지 못했어요 (\(error.localizedDescription))")
         }
     }
 
@@ -176,7 +177,9 @@ final class WakeEnrollModel: ObservableObject {
         } catch GatewayError.rejected(let why) {
             step = .failed(why)
         } catch {
-            step = .failed(SectionStatus.from(error) == .unavailable ? "호출어 등록은 서버 업데이트 후 사용할 수 있어요" : "올리지 못했어요. 다시 시도해 주세요.")
+            Log.call.error("wake upload failed: \(String(describing: error), privacy: .public)")
+            step = .failed(SectionStatus.from(error) == .unavailable ? "호출어 등록은 서버 업데이트 후 사용할 수 있어요"
+                           : "올리지 못했어요: \(error.localizedDescription)")
         }
     }
 
