@@ -77,3 +77,36 @@ def test_oversize_upload_and_request_caps(api):
     r = c.post("/v1/wake/enroll", files=files(b"\0" * (m.MAX_BYTES + 5000), wav())).json()
     assert r["accepted"] == 1 and r["rejected"] == [{"index": 0, "reason": "too large"}]
     assert c.post("/v1/wake/enroll", files=files(*[wav(0.5)] * (m.MAX_CLIPS + 1))).status_code == 413
+
+
+def test_training_never_sticks(tmp_path, monkeypatch):
+    """Missing wake venv, a hung trainer, a crash and a corrupt status file all end in "failed", never "training"."""
+    monkeypatch.setenv("BISEO_HOME", str(tmp_path))
+    import wake_enroll
+    m = importlib.reload(wake_enroll)
+    m.private_dir(m.DIR)
+    m.private_dir(m.DIR / "clips")
+    (m.DIR / "clips" / "a.wav").write_bytes(wav())
+    monkeypatch.setenv("BISEO_WAKE_PY", str(tmp_path / "no-such-python"))
+    m.state["running"] = True
+    m.train_loop()
+    assert m.status()["status"] == "failed" and not m.state["running"]
+    assert "not found" in m.read_status()["error"]
+    py = tmp_path / "py"  # a "python" that hangs
+    py.write_text("#!/bin/sh\nsleep 30\n")
+    py.chmod(0o755)
+    monkeypatch.setenv("BISEO_WAKE_PY", str(py))
+    monkeypatch.setattr(m, "TRAIN_TIMEOUT_S", 1)
+    m.state["running"] = True
+    t = time.monotonic()
+    m.train_loop()
+    assert time.monotonic() - t < 10 and m.status()["status"] == "failed" and "longer than" in m.read_status()["error"]
+
+    def boom():
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(m, "train_once", boom)
+    m.state["running"] = True
+    m.train_loop()
+    assert not m.state["running"] and m.status()["status"] == "failed"
+    (m.DIR / "status.json").write_text("{not json")  # a crash mid-write
+    assert m.status()["status"] == "failed"
