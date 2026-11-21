@@ -114,7 +114,7 @@ struct Popover: View {
             } else {
                 HStack(spacing: Theme.m) {
                     MoonJar(state: call.inCall ? JarState(callState: call.state, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline),
-                            levels: call.levels).frame(width: 64, height: 64)
+                            levels: call.levels, sway: true).frame(width: 64, height: 64)
                     VStack(alignment: .leading, spacing: Theme.s) {
                         Text(MacCall.pttMode == .hold ? "\(HotKey.label)를 누른 채 말하세요" : "\(HotKey.label)를 눌러 말하세요").font(.subheadline).foregroundStyle(Theme.text2)
                         Button { call.inCall ? call.hangUp() : call.start(panel: true) } label: {
