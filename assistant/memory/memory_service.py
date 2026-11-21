@@ -8,7 +8,7 @@ import ipaddress
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -106,6 +106,14 @@ create table if not exists {STATE}.proactive_log(
 create index if not exists proactive_log_at on {STATE}.proactive_log (at desc);
 alter table {STATE}.proactive_log add column if not exists persona_id text not null default 'azel';
 alter table {STATE}.scheduled_calls add column if not exists persona_id text not null default 'azel';
+-- batch 5: cron rules (additive; constant defaults, so no table rewrite; old rows keep cron null and use repeat)
+alter table {STATE}.scheduled_calls add column if not exists cron text;
+alter table {STATE}.scheduled_calls add column if not exists start_date date;
+alter table {STATE}.scheduled_calls add column if not exists end_date date;
+alter table {STATE}.scheduled_calls add column if not exists notify text not null default 'call';
+alter table {STATE}.scheduled_calls add column if not exists purpose text not null default '';
+alter table {STATE}.scheduled_calls add column if not exists request text not null default '';
+alter table {STATE}.scheduled_calls add column if not exists skips jsonb not null default '[]';
 create table if not exists {STATE}.call_history(
     id text primary key, session text, call_id text, direction text, reason text, client text, opening text,
     started_at timestamptz not null default now(), ended_at timestamptz, duration_s double precision);
@@ -589,7 +597,9 @@ def put_kv(body: dict | list = Body(...), key: str = FPath(pattern=KV_KEY)):
 # ---------- scheduled calls (full gateways only) ----------
 SCHED = f"{STATE}.scheduled_calls"
 SCHED_COLS = (f"id, {EPOCH.format('at')}, repeat, kind, note, created_by, persona_id, status, attempts, call_id,"
-              f" {EPOCH.format('last_attempt')}, {EPOCH.format('created')}")
+              f" {EPOCH.format('last_attempt')}, {EPOCH.format('created')}, cron, start_date::text as start_date,"
+              " end_date::text as end_date, notify, purpose, request, skips")
+CRON_RE = r"^[0-9*,/\- ]{9,100}$"  # shape only; the gateway's cron.py parses and checks it
 REPEAT_RE = r"^(daily|weekdays|weekly:[0-6])$"  # weekly:<dow>, 0 = Monday
 
 
@@ -600,13 +610,21 @@ class Scheduled(BaseModel):
     note: str = Field("", max_length=200)
     created_by: str = Field("app", pattern="^(voice|app)$")
     persona_id: str = Field("azel", pattern=r"^[a-z0-9_-]{1,32}$")
+    cron: str | None = Field(None, pattern=CRON_RE)
+    start_date: date | None = None
+    end_date: date | None = None
+    notify: str = Field("call", pattern="^(call|push)$")
+    purpose: str = Field("", max_length=60)
+    request: str = Field("", max_length=300)
 
 
 @app.post("/v1/state/schedule", dependencies=[v1])
 def add_scheduled(s: Scheduled):
-    return db(f"insert into {SCHED}(id, at, repeat, kind, note, created_by, persona_id)"
-              f" values(%s,to_timestamp(%s),%s,%s,%s,%s,%s) returning {SCHED_COLS}",
-              (uuid.uuid4().hex[:12], s.at, s.repeat, s.kind, s.note, s.created_by, s.persona_id))[0]
+    return db(f"insert into {SCHED}(id, at, repeat, kind, note, created_by, persona_id, cron, start_date, end_date,"
+              f" notify, purpose, request) values(%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+              f" returning {SCHED_COLS}",
+              (uuid.uuid4().hex[:12], s.at, s.repeat, s.kind, s.note, s.created_by, s.persona_id, s.cron,
+               s.start_date, s.end_date, s.notify, s.purpose, s.request))[0]
 
 
 @app.get("/v1/state/schedule", dependencies=[v1])
@@ -623,15 +641,29 @@ class ScheduledUpdate(BaseModel):
     at: float | None = None
     last_attempt: float | None = None
     expect_status: str | None = None  # compare-and-set: only update while the row is still in this status
+    cron: str | None = Field(None, pattern=CRON_RE)
+    start_date: date | None = None  # an explicit null clears it
+    end_date: date | None = None
+    notify: str | None = Field(None, pattern="^(call|push)$")
+    purpose: str | None = Field(None, max_length=60)
+    note: str | None = Field(None, max_length=200)
+    skips: list[float] | None = Field(None, max_length=200)
 
 
 @app.post("/v1/state/schedule/{sid}", dependencies=[v1])
 def update_scheduled(sid: str, u: ScheduledUpdate):
     sets, args = [], []
-    for col in ("status", "attempts", "call_id"):
+    for col in ("status", "attempts", "call_id", "cron", "notify", "purpose", "note"):
         if getattr(u, col) is not None:
             sets.append(f"{col}=%s")
             args.append(getattr(u, col))
+    for col in ("start_date", "end_date"):
+        if col in u.model_fields_set:
+            sets.append(f"{col}=%s")
+            args.append(getattr(u, col))
+    if u.skips is not None:
+        sets.append("skips=%s")
+        args.append(Jsonb(u.skips))
     for col in ("at", "last_attempt"):
         if getattr(u, col) is not None:
             sets.append(f"{col}=to_timestamp(%s)")
