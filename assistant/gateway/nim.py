@@ -75,8 +75,9 @@ def check(cfg, cur) -> dict:
     if not isinstance(out["enabled"], bool):
         raise ValueError("providers.nim.enabled: true or false")
     u = urlparse(out["base_url"]) if isinstance(out["base_url"], str) else None
-    if not u or u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment:
-        raise ValueError("providers.nim.base_url: an https URL without credentials or query")
+    if not u or u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment \
+            or u.port not in (None, 443) or not allowed_host(u.hostname):
+        raise ValueError("providers.nim.base_url: https://integrate.api.nvidia.com/… (or another *.api.nvidia.com host)")
     out["base_url"] = out["base_url"].rstrip("/")
     if not isinstance(out["model"], str) or not re.fullmatch(r"[\w.:/@+-]{1,200}", out["model"]):
         raise ValueError("providers.nim.model: a model id such as nvidia/nemotron-3-ultra-550b-a55b")
@@ -87,6 +88,12 @@ def check(cfg, cur) -> dict:
             for m, p in prices.items()):
         raise ValueError("providers.nim.prices: {model: [usd per MTok in, out]}")
     return out
+
+
+def allowed_host(host: str) -> bool:
+    """The key only ever goes to NVIDIA's hosted API: integrate.api.nvidia.com or another *.api.nvidia.com."""
+    host = host.lower().rstrip(".")
+    return host == "integrate.api.nvidia.com" or host.endswith(".api.nvidia.com")
 
 
 def view(cfg, home) -> dict:

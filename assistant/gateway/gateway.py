@@ -1713,6 +1713,8 @@ async def put_settings(body: dict):
             body["providers"] = {**cur, **({"nim": nim.check(prov["nim"], cur["nim"])} if "nim" in prov else {})}
         except ValueError as e:
             raise HTTPException(400, str(e))
+        if body["providers"]["nim"]["base_url"] != cur["nim"]["base_url"]:
+            nim.write_key(HOME, "")  # a key is never carried over to a different endpoint: enter it again
     if "budget_paths" in body:
         bp = body["budget_paths"]
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):

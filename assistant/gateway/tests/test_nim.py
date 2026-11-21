@@ -69,7 +69,7 @@ def nimgw(tmp_path, monkeypatch):
 
 
 def enable(c, **extra):
-    r = c.put("/v1/settings", json={"providers": {"nim": {"enabled": True, "base_url": "https://nim.test/v1", **extra}}})
+    r = c.put("/v1/settings", json={"providers": {"nim": {"enabled": True, "base_url": "https://integrate.api.nvidia.com/v1", **extra}}})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -90,8 +90,8 @@ def test_key_is_write_only(nimgw):
 
 def test_settings_validation(nimgw):
     g, c, *_ = nimgw
-    assert c.put("/v1/settings", json={"providers": {"nim": {"base_url": "http://nim.test/v1"}}}).status_code == 400
-    assert c.put("/v1/settings", json={"providers": {"nim": {"base_url": "https://u:p@nim.test"}}}).status_code == 400
+    assert c.put("/v1/settings", json={"providers": {"nim": {"base_url": "http://integrate.api.nvidia.com/v1"}}}).status_code == 400
+    assert c.put("/v1/settings", json={"providers": {"nim": {"base_url": "https://u:p@integrate.api.nvidia.com"}}}).status_code == 400
     assert c.put("/v1/settings", json={"providers": {"nim": {"evil": 1}}}).status_code == 400
     assert c.put("/v1/settings", json={"providers": {"openai": {}}}).status_code == 400
     s = enable(c, model="nvidia/nemotron-x", prices={"nvidia/nemotron-x": [1.0, 2.0]})
@@ -212,3 +212,14 @@ def test_limited_refuses_plan_questions(tmp_path, monkeypatch):
         for said in ("내일 내가 해야 될 일도 정리해줘", "토요일에 뭐 있어?", "이번 주 계획 정리해 줘"):
             ev = events(c.post("/v1/ask", json={"text": said, "session": "p"}))
             assert ev[-1]["code"] == "personal", said
+
+
+def test_base_url_allowlist_and_key_dropped_on_change(nimgw):
+    g, c, tmp, *_ = nimgw
+    for bad in ("https://evil.example/v1", "https://api.nvidia.com.evil.io/v1", "https://integrate.api.nvidia.com:8443/v1",
+                "https://nvidia.com/v1"):
+        assert c.put("/v1/settings", json={"providers": {"nim": {"base_url": bad}}}).status_code == 400, bad
+    c.put("/v1/providers/nim/key", json={"value": KEY})
+    assert c.put("/v1/settings", json={"providers": {"nim": {"enabled": True}}}).json()["providers"]["nim"]["has_key"]
+    s = c.put("/v1/settings", json={"providers": {"nim": {"base_url": "https://eu.api.nvidia.com/v1"}}}).json()
+    assert s["providers"]["nim"]["has_key"] is False and not (tmp / "providers" / "nim_key").exists()
