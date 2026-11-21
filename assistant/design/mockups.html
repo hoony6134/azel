@@ -138,6 +138,58 @@ canvas.jar { display:block; }
 .ptt .act { display:flex; align-items:center; gap:5px; font-size:13px; font-weight:600; }
 .ptt .act svg { width:13px; height:13px; color:var(--indigo); }
 
+/* History (DESIGN.md §15) */
+.search { display:flex; align-items:center; gap:8px; height:40px; border-radius:12px; padding:0 12px; background:color-mix(in srgb, var(--text) 9%, transparent); color:var(--text3); font-size:17px; margin-bottom:8px; }
+.search svg { width:17px; height:17px; }
+.day { font-size:13px; font-weight:600; color:var(--text2); margin:14px 4px 6px; }
+.hlist { background:var(--card); border:1px solid var(--stroke); border-radius:18px; overflow:hidden; }
+.hrow { display:grid; grid-template-columns:24px 1fr auto; gap:4px 10px; align-items:center; padding:12px 16px; border-top:1px solid var(--stroke); position:relative; }
+.hrow:first-child { border-top:none; }
+.hrow > svg { width:20px; height:20px; color:var(--text2); grid-row:span 2; }
+.hrow > svg.in { color:var(--celadon); }
+.hrow .ht { font-size:17px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hrow .hm { font-size:13px; color:var(--text3); grid-column:2; font-variant-numeric:tabular-nums; }
+.hrow .hc { grid-row:1 / span 2; grid-column:3; display:flex; gap:4px; align-items:center; color:var(--text3); }
+.hrow .hc svg { width:15px; height:15px; }
+.hrow.swiped { transform:translateX(-88px); background:var(--card); }
+.swipe-del { position:absolute; right:0; top:0; bottom:0; width:88px; background:var(--hangup); color:#fff; display:grid; place-items:center; font-size:15px; font-weight:600; }
+.hwrap { position:relative; }
+.toast { position:absolute; left:20px; right:20px; bottom:96px; height:48px; border-radius:16px; background:var(--text); color:var(--bg); display:flex; align-items:center; justify-content:space-between; padding:0 16px; font-size:15px; }
+.toast b { color:var(--bg); font-weight:700; }
+.detail { background:linear-gradient(180deg, color-mix(in srgb, var(--glazeCel) 15%, var(--bg)), var(--bg) 40%); }
+.nav { display:flex; justify-content:space-between; align-items:center; height:44px; color:var(--celadon); font-size:17px; }
+.dh { font-size:20px; font-weight:600; line-height:1.35; }
+.dm { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text2); margin:6px 0 12px; flex-wrap:wrap; }
+.dm svg { width:14px; height:14px; }
+.player { display:flex; align-items:center; gap:10px; height:56px; padding:0 12px 0 6px; border-radius:28px; background:var(--card); border:1px solid var(--stroke); margin-bottom:14px; }
+.player .pp { width:44px; height:44px; border-radius:50%; background:var(--celadon); color:var(--onAccent); display:grid; place-items:center; flex:none; }
+.player .pp svg { width:20px; height:20px; }
+.wavebar { flex:1; display:flex; align-items:center; gap:2px; height:28px; }
+.wavebar i { flex:1; border-radius:1px; background:var(--stroke); }
+.wavebar i.p { background:var(--celadon); }
+.player .tm { font-size:13px; color:var(--text2); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.player .sp { font-size:13px; font-weight:600; color:var(--text); border:1px solid var(--stroke); border-radius:8px; padding:4px 8px; }
+.tx { display:flex; flex-direction:column; gap:22px; overflow:hidden; }
+.tx .u { align-self:flex-end; max-width:80%; text-align:right; color:var(--text3); font-size:17px; line-height:1.45; }
+.tx .a { color:var(--text3); font-size:20px; line-height:1.5; }
+.tx .now { color:var(--text); }
+.tx .u.now { color:var(--text2); }
+.tx .am { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+.tx .steps { display:flex; align-items:center; gap:5px; font-size:13px; color:var(--text3); margin-top:8px; }
+.tx .steps svg { width:13px; height:13px; }
+.cut { font-size:13px; color:var(--text3); border:1px solid var(--stroke); border-radius:999px; padding:2px 8px; margin-left:6px; white-space:nowrap; }
+.macwin { width:min(820px,100%); height:500px; border-radius:12px; overflow:hidden; display:grid; grid-template-columns:280px 1fr; grid-template-rows:44px 1fr; background:var(--bg); box-shadow:0 0 0 1px #2b3338, 0 30px 60px rgba(0,0,0,.35); }
+.macwin .tb { grid-column:1 / span 2; display:flex; align-items:center; gap:8px; padding:0 14px; background:var(--bgRaised); border-bottom:1px solid var(--stroke); font-size:13px; font-weight:600; }
+.macwin .tb i { width:12px; height:12px; border-radius:50%; background:#4a5258; display:inline-block; }
+.macwin .tb .s { margin-left:auto; width:200px; height:28px; margin-bottom:0; font-size:13px; font-weight:400; }
+.macwin aside { background:var(--bgRaised); border-right:1px solid var(--stroke); padding:4px 8px; overflow:hidden; }
+.macwin aside .hrow { border-radius:10px; border:none; padding:8px 10px; }
+.macwin aside .hrow.sel { background:color-mix(in srgb, var(--celadon) 22%, transparent); }
+.macwin aside .ht { font-size:13px; } .macwin aside .hm { font-size:11px; }
+.macwin aside .hrow > svg { width:16px; height:16px; }
+.macwin section { padding:20px 28px; overflow:hidden; }
+.macwin .tx .a { font-size:16px; } .macwin .tx .u { font-size:14px; }
+
 /* Settings / approvals lists */
 .title { font-size:34px; font-weight:700; margin:10px 0 14px; }
 .stack { display:flex; flex-direction:column; gap:14px; overflow:hidden; }
@@ -209,6 +261,12 @@ canvas.jar { display:block; }
   <symbol id="i-folder" viewBox="0 0 24 24"><path fill="currentColor" d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
   <symbol id="i-cal" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M3.5 10h17M8 3v4M16 3v4"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-out" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M9 6h9v9M18 6L6 18"/></symbol>
+  <symbol id="i-in" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M15 18H6V9M6 18L18 6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5l11 7-11 7z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M15 15l5 5"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></symbol>
   <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M4 7l8 6 8-6"/></symbol>
   <symbol id="i-doc" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M6 3h8l4 4v14H6z"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M9 12h6M9 16h6"/></symbol>
   <symbol id="i-brain" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M12 5a3 3 0 0 0-5.6 1.4A3.2 3.2 0 0 0 4.5 12a3.2 3.2 0 0 0 2 5.4A3 3 0 0 0 12 19zm0 0a3 3 0 0 1 5.6 1.4 3.2 3.2 0 0 1 1.9 5.6 3.2 3.2 0 0 1-2 5.4A3 3 0 0 1 12 19"/></symbol>
@@ -232,7 +290,7 @@ canvas.jar { display:block; }
       <span style="color:var(--amber)"><svg width="17" height="17"><use href="#i-shield"/></svg>승인 2건</span>
     </div>
     <div class="recent">
-      <h2>최근 대화</h2>
+      <h2 style="display:flex;justify-content:space-between">최근 대화 <span style="color:var(--celadon);font-weight:600">모두 보기</span></h2>
       <div class="card"><div class="me">오늘 일정 뭐 있어?</div>
         <div class="meta"><span class="foot">오전 8:02 · 4분</span><span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
         <div class="ai">10시 랩 미팅, 오후 2시에 알고리즘 과제 마감이 있어요. 과제는 어제 70%까지 하셨어요.</div>
@@ -244,6 +302,7 @@ canvas.jar { display:block; }
   </div>
   <nav class="tabbar">
     <span class="tab on"><svg><use href="#i-home"/></svg>홈</span>
+    <span class="tab"><svg><use href="#i-clock"/></svg>기록</span>
     <span class="tab"><svg><use href="#i-shield"/></svg>승인<span class="badge">2</span></span>
     <span class="tab"><svg><use href="#i-gear"/></svg>설정</span>
   </nav>
@@ -289,6 +348,7 @@ canvas.jar { display:block; }
         <div class="row"><span>이름</span><span class="v" style="color:var(--text)" aria-label="비서 이름, 아젤">아젤</span></div>
         <div class="foot" style="margin:2px 0 6px;line-height:1.4">호출어는 다시 학습하기 전까지 ‘아젤’로 유지돼요.</div>
         <div class="row"><span>작업 효과음 <span class="foot" style="color:var(--celadon);font-weight:600">&nbsp;들어 보기</span></span><span class="switch" role="switch" aria-checked="true" aria-label="작업 효과음"></span></div>
+        <div class="row"><span>기록 보관</span><span class="menu">30일 ⌄</span></div>
       </div>
       <div class="card">
         <h2>사용량 <span class="foot">11월 · 통화 42회</span></h2>
@@ -315,6 +375,7 @@ canvas.jar { display:block; }
   </div>
   <nav class="tabbar">
     <span class="tab"><svg><use href="#i-home"/></svg>홈</span>
+    <span class="tab"><svg><use href="#i-clock"/></svg>기록</span>
     <span class="tab"><svg><use href="#i-shield"/></svg>승인<span class="badge">2</span></span>
     <span class="tab on"><svg><use href="#i-gear"/></svg>설정</span>
   </nav>
@@ -347,11 +408,78 @@ canvas.jar { display:block; }
   </div>
   <nav class="tabbar">
     <span class="tab"><svg><use href="#i-home"/></svg>홈</span>
+    <span class="tab"><svg><use href="#i-clock"/></svg>기록</span>
     <span class="tab on"><svg><use href="#i-shield"/></svg>승인<span class="badge">2</span></span>
     <span class="tab"><svg><use href="#i-gear"/></svg>설정</span>
   </nav>
 </div></div>
 <figcaption>iPhone · 승인</figcaption>
+</figure>
+
+
+<!-- 7. History list -->
+<figure>
+<div class="phone"><div class="screen">
+  <div class="statusbar"><span>9:41</span><span class="island"></span><span>100%</span></div>
+  <div class="body">
+    <div class="title" style="margin-bottom:10px">기록</div>
+    <div class="search" role="search" aria-label="기록 검색"><svg aria-hidden="true"><use href="#i-search"/></svg>기록 검색</div>
+    <div class="hwrap" style="flex-shrink:1;min-height:0;overflow:hidden">
+      <h2 class="day">오늘</h2>
+      <div class="hlist">
+        <div class="hrow" aria-label="오전 8시 2분, 오늘 일정 뭐 있어?, 4분, 6턴, 내가 건 전화, Claude 사용"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">오늘 일정 뭐 있어?</span><span class="hc"><svg aria-hidden="true"><use href="#i-wave"/></svg><span class="chip claude">Claude</span></span><span class="hm">오전 8:02 · 4분 · 6턴</span></div>
+        <div class="hrow" aria-label="오전 7시, 아침 브리핑, 3분, 4턴, 아젤이 건 전화"><svg class="in" aria-hidden="true"><use href="#i-in"/></svg><span class="ht">아침 브리핑</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm">오전 7:00 · 3분 · 4턴</span></div>
+      </div>
+      <h2 class="day">어제</h2>
+      <div class="hlist" style="position:relative">
+        <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">잘 자, 내일 7시에 깨워 줘</span><span class="hc"><span class="chip qwen">로컬</span></span><span class="hm">오후 11:40 · 1분 · 2턴</span></div>
+        <div style="position:relative;overflow:hidden;border-top:1px solid var(--stroke)"><span class="swipe-del">삭제</span>
+          <div class="hrow swiped"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">스파크 GPU 메모리 얼마나 써?</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm">오후 4:18 · 2분 · 3턴</span></div></div>
+        <div class="hrow" style="opacity:.5" aria-label="지우는 중"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">이 PR 리뷰 코멘트 몇 개 남았어?</span><span class="hc foot">지우는 중…</span><span class="hm">오후 2:05 · 5분 · 7턴</span></div>
+      </div>
+      <h2 class="day">11월 19일 수요일</h2>
+      <div class="hlist">
+        <div class="hrow"><svg class="in" aria-hidden="true"><use href="#i-in"/></svg><span class="ht">과제 마감 1시간 전이에요</span><span class="hc"><span class="chip claude">Claude</span></span><span class="hm">오후 1:00 · 2분 · 3턴</span></div>
+      </div>
+    </div>
+    <div class="toast" role="status">기록을 지웠어요 <b>실행 취소</b></div>
+  </div>
+  <nav class="tabbar">
+    <span class="tab"><svg><use href="#i-home"/></svg>홈</span>
+    <span class="tab on"><svg><use href="#i-clock"/></svg>기록</span>
+    <span class="tab"><svg><use href="#i-shield"/></svg>승인<span class="badge">2</span></span>
+    <span class="tab"><svg><use href="#i-gear"/></svg>설정</span>
+  </nav>
+</div></div>
+<figcaption>iPhone · 기록 (스와이프 삭제 · 지우는 중 · 실행 취소)</figcaption>
+</figure>
+
+<!-- 8. History detail -->
+<figure>
+<div class="phone"><div class="screen detail">
+  <div class="statusbar"><span>9:41</span><span class="island"></span><span>100%</span></div>
+  <div class="body">
+    <div class="nav"><span>‹ 기록</span><span style="display:flex;gap:18px" aria-hidden="true">공유&nbsp; 삭제</span></div>
+    <div class="dh">오늘 일정 뭐 있어?</div>
+    <div class="dm"><svg aria-hidden="true"><use href="#i-out"/></svg>오늘 오전 8:02 · 4분 · 6턴 <span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
+    <div class="player">
+      <span class="pp" aria-label="일시정지"><svg><use href="#i-pause"/></svg></span>
+      <span class="wavebar" role="slider" aria-label="재생 위치" aria-valuetext="1분 20초 / 4분 2초"></span>
+      <span class="tm">1:20 / 4:02</span><span class="sp" aria-label="재생 속도 1배">1×</span>
+    </div>
+    <div class="tx">
+      <div class="u">오늘 일정 뭐 있어?</div>
+      <div><div class="am"><span class="chip claude">Claude</span></div>
+        <div class="a now">10시 랩 미팅, 오후 2시에 알고리즘 과제 마감이 있어요. 과제는 어제 70%까지 하셨어요.</div>
+        <div class="steps" aria-label="한 일 3단계"><span aria-hidden="true">›</span><svg aria-hidden="true"><use href="#i-brain"/></svg><svg aria-hidden="true"><use href="#i-doc"/></svg><svg aria-hidden="true"><use href="#i-cal"/></svg>3단계</div></div>
+      <div class="u">과제 어디까지 했더라. 노션에 적어 둔 거 확인해 줘</div>
+      <div><div class="am"><span class="chip claude">Claude</span></div>
+        <div class="a">노션 메모로는 3번 문제까지 끝내셨고, 4번은 점화식만…<span class="cut">✂ 말이 끊겼어요</span></div></div>
+      <div class="u">그거면 됐어, 고마워</div>
+    </div>
+  </div>
+</div></div>
+<figcaption>iPhone · 기록 상세 (녹음 재생 따라가기 · 끊긴 응답)</figcaption>
 </figure>
 
 <!-- Mac -->
@@ -368,10 +496,11 @@ canvas.jar { display:block; }
     <div class="q"><span>오늘 브리핑</span><span>새 대화</span></div>
     <div class="appr"><span>승인 2건</span><span>›</span></div>
     <div class="rec">
-      <div><span>8:02</span><span>10시 랩 미팅, 오후 2시에 알고리즘 과제 마감…</span></div>
-      <div><span>어제</span><span>네, 내일 아침 7시에 전화드릴게요.</span></div>
-      <div><span>어제</span><span>스파크 GPU 메모리는 지금 61% 쓰고 있어요.</span></div>
+      <div><span>8:02</span><span>오늘 일정 뭐 있어?</span></div>
+      <div><span>어제</span><span>잘 자, 내일 7시에 깨워 줘</span></div>
+      <div><span>어제</span><span>스파크 GPU 메모리 얼마나 써?</span></div>
     </div>
+    <div style="color:var(--celadon);font-weight:600;margin-top:6px">기록 모두 보기… ⌘Y</div>
     <div class="ft"><span>설정… ⌘,</span><span>종료 ⌘Q</span></div>
   </div>
   <div class="keyhint">⌥ Space 떼면 답해요</div>
@@ -395,6 +524,31 @@ canvas.jar { display:block; }
   </div>
 </div>
 <figcaption>Mac · 말하기 패널 (작업 중: 한 줄 활동)</figcaption>
+</figure>
+<figure style="width:100%;align-items:center">
+<div class="macwin">
+  <div class="tb"><i></i><i></i><i></i>&nbsp; 기록 <div class="search s" role="search" aria-label="기록 검색"><svg aria-hidden="true"><use href="#i-search"/></svg>검색</div></div>
+  <aside>
+    <h2 class="day">오늘</h2>
+    <div class="hrow sel"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">오늘 일정 뭐 있어?</span><span class="hc"><span class="chip claude" style="font-size:11px">Claude</span></span><span class="hm">오전 8:02 · 4분 · 6턴</span></div>
+    <div class="hrow"><svg class="in" aria-hidden="true"><use href="#i-in"/></svg><span class="ht">아침 브리핑</span><span class="hc"></span><span class="hm">오전 7:00 · 3분 · 4턴</span></div>
+    <h2 class="day">어제</h2>
+    <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">잘 자, 내일 7시에 깨워 줘</span><span class="hc"></span><span class="hm">오후 11:40 · 1분 · 2턴</span></div>
+    <div class="hrow"><svg aria-hidden="true"><use href="#i-out"/></svg><span class="ht">스파크 GPU 메모리 얼마나 써?</span><span class="hc"></span><span class="hm">오후 4:18 · 2분 · 3턴</span></div>
+  </aside>
+  <section>
+    <div class="dh">오늘 일정 뭐 있어?</div>
+    <div class="dm"><svg aria-hidden="true"><use href="#i-out"/></svg>오늘 오전 8:02 · 4분 · 6턴 <span class="chip qwen">로컬</span><span class="chip claude">Claude</span></div>
+    <div class="tx" style="max-width:520px">
+      <div class="u now">오늘 일정 뭐 있어?</div>
+      <div><div class="am"><span class="chip claude">Claude</span></div>
+        <div class="a now">10시 랩 미팅, 오후 2시에 알고리즘 과제 마감이 있어요. 과제는 어제 70%까지 하셨어요.</div>
+        <div class="steps"><span aria-hidden="true">›</span><svg aria-hidden="true"><use href="#i-brain"/></svg><svg aria-hidden="true"><use href="#i-doc"/></svg><svg aria-hidden="true"><use href="#i-cal"/></svg>3단계</div></div>
+      <div class="u now">과제 어디까지 했더라</div>
+    </div>
+  </section>
+</div>
+<figcaption>Mac · 기록 창 (⌘Y, 녹음 없는 기기: 플레이어 없음)</figcaption>
 </figure>
 
 </main>
@@ -438,6 +592,11 @@ document.querySelectorAll('figure[data-call]').forEach(fig => {
   node.querySelector('.activity').innerHTML = c.act || '';
   if (s === 'listening') node.querySelector('.ctl').classList.remove('on');
   fig.prepend(node);
+});
+
+// History player waveform (static demo: 24 bars, first third played)
+document.querySelectorAll('.wavebar').forEach(w => {
+  w.innerHTML = Array.from({length:24}, (_, i) => `<i class="${i < 8 ? 'p' : ''}" style="height:${30 + 60*Math.abs(Math.sin(i*1.7))}%"></i>`).join('');
 });
 
 // Theme toggle
