@@ -237,6 +237,7 @@ struct SettingsScreen<Extra: View>: View {
                     EmptyState(title: f.title, message: f.message, detail: loadError.localizedDescription, action: ("다시 시도", { Task { await load() } }))
                 }
                 if let s = Binding($settings) { assistantCard(s) }
+                Card("호출어") { WakeEnrollRow() }
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
