@@ -16,11 +16,13 @@ Connector names are claude.ai's display names without the "claude.ai " prefix ("
 or a JSON object of headers), written through the write-only `PUT /v1/connectors/secret/{name}`.
 """
 import asyncio
+import ipaddress
 import json
 import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEFAULT_ON = ("Cygnus MCP", "Google Calendar", "Gmail")
 SLUG = re.compile(r"[A-Za-z0-9_-]{1,40}")
@@ -88,13 +90,24 @@ def check(conn):
         if not (isinstance(c.get("name"), str) and SLUG.fullmatch(c["name"])) or c["name"] in names:
             raise ValueError("connectors.custom[].name: a unique ASCII slug")
         names.add(c["name"])
-        if not (isinstance(c.get("url"), str) and re.fullmatch(r"https?://[^\s]{1,500}", c["url"])):
-            raise ValueError("connectors.custom[].url: http(s) URL")
+        if not (isinstance(c.get("url"), str) and re.fullmatch(r"https?://[^\s]{1,500}", c["url"]) and secure_url(c["url"])):
+            raise ValueError("connectors.custom[].url: https, or http only to a tailnet address (100.64.0.0/10)")
         if c.get("transport", "http") not in ("http", "sse") or not isinstance(c.get("enabled", True), bool):
             raise ValueError("connectors.custom[]: transport http|sse, enabled bool")
-        if c.get("auth_ref") is not None and not (isinstance(c["auth_ref"], str) and SLUG.fullmatch(c["auth_ref"])):
-            raise ValueError("connectors.custom[].auth_ref: an ASCII slug (a file name under ~/.config/biseo/mcp/)")
+        if c.get("auth_ref") is not None and c["auth_ref"] != c["name"]:
+            raise ValueError("connectors.custom[].auth_ref: the server's own name (secrets are never shared)")
     return {"claude_ai": dict(ai), "custom": [{"transport": "http", "enabled": True, **c} for c in custom]}
+
+
+def secure_url(url):
+    """https anywhere; plain http only to a tailnet IP (100.64.0.0/10), where WireGuard already encrypts."""
+    u = urlsplit(url)
+    if u.scheme == "https":
+        return True
+    try:
+        return u.scheme == "http" and ipaddress.ip_address(u.hostname or "") in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return False
 
 
 def enabled(conn, name):

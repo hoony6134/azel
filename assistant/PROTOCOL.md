@@ -260,8 +260,9 @@ device that created them.
   ```
   `claude_ai` keys are claude.ai connector display names without the `claude.ai ` prefix; a name not listed takes its
   default (Cygnus MCP, Google Calendar, Gmail on; everything else off). `custom`: ≤ 20 servers, `name` a unique ASCII
-  slug (`[A-Za-z0-9_-]{1,40}`, also the tool prefix `mcp__<name>`), `url` http(s), `transport` `http`|`sse` (default
-  http), `enabled` (default true), optional `auth_ref` (slug) naming the secret. Secrets never go into settings. Each
+  slug (`[A-Za-z0-9_-]{1,40}`, also the tool prefix `mcp__<name>`), `url` https (plain http only to a tailnet
+  address, 100.64.0.0/10), `transport` `http`|`sse` (default http), `enabled` (default true), optional `auth_ref`,
+  which must equal the server's own `name` (a server never uses another's secret). Secrets never go into settings. Each
   run also loads the device daemons, no plugin MCP servers, and every tool up front (no ToolSearch). A custom server
   whose secret file is missing or not 0600 is skipped. Full gateways only; limited → 403 on every route below.
   - `GET /v1/connectors[?refresh=true]` → `{"claude_ai":[{"name","enabled","status":"connected"|"needs_auth"}],

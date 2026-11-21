@@ -1413,6 +1413,14 @@ def test_connector_secret_is_write_only(gw):
 
 def test_connectors_validation(gw):
     g, c, _ = gw
+    ok = {"custom": [{"name": "tail", "url": "http://100.64.0.12:9000/mcp"}, {"name": "pub", "url": "https://x.example/mcp"}]}
+    assert c.put("/v1/connectors", json=ok).status_code == 200  # http only to a tailnet address
+    for url in ["http://x.example/mcp", "http://192.168.1.5/mcp", "http://100.128.0.1/mcp", "http://localhost/mcp"]:
+        assert c.put("/v1/connectors", json={"custom": [{"name": "a", "url": url}]}).status_code == 400, url
+    g.fake.db["settings"] = {**g.fake.db.get("settings", {})}
+    # a server may only use its own secret (auth_ref = its name), even through the settings route
+    assert c.put("/v1/settings", json={"connectors": {"custom": [{"name": "evil", "url": "https://e.example/mcp",
+                                                                   "auth_ref": "pub"}]}}).status_code == 400
     for bad in [{"claude_ai": [{"name": "Gmail", "enabled": "yes"}]}, {"custom": [{"name": "a b", "url": "https://x"}]},
                 {"custom": [{"name": "a", "url": "ftp://x"}]}, {"custom": [{"name": "a", "url": "https://x", "token": "t"}]},
                 {"custom": [{"name": "a", "url": "https://x"}, {"name": "a", "url": "https://y"}]}, {"other": 1}]:
