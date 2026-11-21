@@ -40,6 +40,12 @@ answering a call the assistant placed; the server then speaks that call's openin
   - `{"type":"reply","text":"…","route":"qwen"|"claude"}` — sentence being spoken
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
     playback now**
+  - `{"type":"activity","phase","label","tool"}` — what the assistant is doing, for the app's status line
+    and sounds. `phase`: `routing` (the turn goes to Claude; sent before any filler, label "Claude에게
+    물어보는 중"), `thinking` (API path, label "생각 중"), `tool_start` / `tool_end` (`tool` = the raw tool
+    name, e.g. `mcp__claude_ai_Gmail__search_threads`; `label` in Korean, e.g. "메일 확인 중",
+    "macbook에서 명령 실행 중"). Never carries tool arguments or results. `/v1/turn` NDJSON carries the
+    same objects between its `audio` lines.
   - `{"type":"turn_done","timings":{…}}`
   - `{"type":"error","message":"…"}`
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
@@ -64,7 +70,7 @@ JSON text frames:
   `{"type":"settings","value":{…}}` (on connect and every change; from any link, the last one wins,
   since all gateways read the same shared settings),
   `{"type":"call","call_id","opening"}` (sent before the VoIP push; may arrive on any link),
-  `{"id","type":"text"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
+  `{"id","type":"text"|"activity"|"done"|"error",…}` (answers to an ask, same shapes as `/v1/ask`).
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
@@ -116,7 +122,11 @@ through this gateway stay usable, new approvals → 503. `claude -p` sessions re
 device that created them.
 
 - `POST /v1/ask` `{"text","session","model"?,"path"?,"task"?}` → NDJSON stream of
-  `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}`.
+  `{"type":"text","delta":"…"}` … `{"type":"done","model","path","usage":{…}}`, with
+  `{"type":"activity","phase","tool","label"}` interleaved: `tool_start`/`tool_end` per tool call on the
+  `claude -p` path (labels mapped from the tool name only: gistra_* 학사 일정, planit_* 할 일, Google
+  Calendar 캘린더, Gmail 메일, memory_* 기억, infra_* 서버 상태, Notion 노션, daemon run_command /
+  list_dir·read_file·search / browse / delegate, anything else "도구 준비 중"), one `thinking` on the API path.
   `model`: `haiku|sonnet|opus|auto`; `path`: `api|claude_code|auto`
   (auto = API when a key is configured, else `claude -p`). Omitted → settings defaults.
 - `GET /v1/settings` / `PUT /v1/settings` — whole JSON document:

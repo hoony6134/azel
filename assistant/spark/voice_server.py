@@ -383,7 +383,16 @@ async def gateway_settings():
     return links.settings  # pushed by the gateways on connect and on every change
 
 
-async def claude_stream(text, session, model, task, personal=False, context="", timeout=180):
+ROUTING = {"type": "activity", "phase": "routing", "label": "Claude에게 물어보는 중", "tool": ""}
+
+
+def client_activity(ev):
+    """The app-facing activity event: phase, label and tool name only (the gateway never sends arguments)."""
+    return {"type": "activity", "phase": str(ev.get("phase", "")), "label": str(ev.get("label", "")),
+            "tool": str(ev.get("tool", ""))}
+
+
+async def claude_stream(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
     """Text deltas from a gateway over its link; RuntimeError carries a speakable message.
 
     `context` (recent turns of the call) goes only to full-mode links: earlier turns may be personal."""
@@ -399,7 +408,10 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
             except asyncio.TimeoutError:
                 lk.fails += 1
                 raise RuntimeError("Claude 답이 너무 늦어서 끊었어요.")
-            if ev["type"] == "text":
+            if ev["type"] == "activity":
+                if on_event:
+                    await on_event(client_activity(ev))
+            elif ev["type"] == "text":
                 yield ev["delta"]
             elif ev["type"] == "error":
                 finished = True
@@ -449,7 +461,7 @@ def recent_context(hist, n=6):
     return ("최근 통화 내용:\n" + "\n".join(lines) + "\n\n") if lines else ""
 
 
-async def respond(text, session, t0, timings):
+async def respond(text, session, t0, timings, on_event=None):
     """Yield (sentence, route, pcm, sr) for one user utterance; records history as it goes."""
     hist = history[session]
     settings = await gateway_settings()
@@ -460,6 +472,8 @@ async def respond(text, session, t0, timings):
 
     async def via_claude():
         route["value"] = "claude"
+        if on_event:
+            await on_event(dict(ROUTING))  # before any filler
         task = pick(TASK_WORDS, text) or "chat"
         buf, got_text = "", asyncio.Event()
 
@@ -473,7 +487,8 @@ async def respond(text, session, t0, timings):
         nudger = asyncio.create_task(nudge())
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
-            async for delta in claude_stream(text, session, model, task, personal, recent_context(hist)):
+            async for delta in claude_stream(text, session, model, task, personal, recent_context(hist),
+                                             on_event=on_event):
                 got_text.set()
                 buf += delta
                 done, buf = split_ready(buf, final=False)
@@ -554,13 +569,20 @@ async def turn(request: Request, session: str = "default"):
         text = await transcribe(wav)
         timings["stt_ms"] = ms(t0)
         yield json.dumps({"type": "transcript", "text": text, "stt_ms": timings["stt_ms"]}, ensure_ascii=False) + "\n"
-        reply, seq = [], 0
+        reply, seq, acts = [], 0, []
+
+        async def on_event(ev):
+            acts.append(ev)
         if text:
-            async for s, route, pcm, sr in respond(text, session, t0, timings):
+            async for s, route, pcm, sr in respond(text, session, t0, timings, on_event):
+                while acts:
+                    yield json.dumps(acts.pop(0), ensure_ascii=False) + "\n"
                 reply.append(s)
                 yield json.dumps({"type": "audio", "seq": seq, "text": s, "route": route, "sr": sr,
                                   "pcm16": base64.b64encode(pcm).decode()}, ensure_ascii=False) + "\n"
                 seq += 1
+        for ev in acts:
+            yield json.dumps(ev, ensure_ascii=False) + "\n"
         timings["total_ms"] = ms(t0)
         yield json.dumps({"type": "done", "reply": " ".join(reply), "timings": timings}, ensure_ascii=False) + "\n"
 
@@ -698,7 +720,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 return
             await send({"type": "transcript", "text": text})
             started = False
-            async for s, route, pcm, sr in respond(text, session, t0, timings):
+            async for s, route, pcm, sr in respond(text, session, t0, timings, on_event=send):
                 if not started:
                     await send({"type": "state", "value": "speaking"})
                     started = True
@@ -875,7 +897,7 @@ if __name__ == "__main__":
         asyncio.run(stream_check())
         async def filler_check(first_delay, gap=0.0):
             """Sentences spoken for one Claude turn whose first text arrives after `first_delay` s."""
-            async def fake_claude(text, session, model, task, personal=False, context="", timeout=180):
+            async def fake_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
                 await asyncio.sleep(first_delay)
                 yield "네, 확인했어요. "
                 await asyncio.sleep(gap)
@@ -892,6 +914,35 @@ if __name__ == "__main__":
         assert asyncio.run(filler_check(0.35)) == [FILLER, FILLER_LONG, *said]  # very slow: nudge once
         assert asyncio.run(filler_check(0.0, gap=0.4)) == [*said]  # pauses after the first text: no filler
         claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S = real
+
+        async def activity_check():  # gateway activity -> app frames, routing first, nothing but phase/label/tool
+            seen, a = [], links.add(FakeWS())
+            links.receive(a, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+
+            async def on_event(ev):
+                seen.append(ev)
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            globals()["tts"] = fake_tts
+            run = asyncio.ensure_future(collect(respond("내일 일정 알려줘", "act", time.perf_counter(), {}, on_event)))
+            await asyncio.sleep(0.01)
+            ask = a.ws.sent[-1]
+            for m in [{"type": "activity", "phase": "tool_start", "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today",
+                       "label": "학사 일정 확인 중", "args": {"q": "SECRET"}},
+                      {"type": "text", "delta": "내일은 수업이 없어요."}, {"type": "done"}]:
+                links.receive(a, {"id": ask["id"], **m})
+            said = await run
+            links.remove(a)
+            globals()["tts"] = real[1]
+            return seen, said
+
+        async def collect(gen):
+            return [s async for s, *_ in gen]
+        seen, said = asyncio.run(activity_check())
+        assert seen == [ROUTING, {"type": "activity", "phase": "tool_start", "label": "학사 일정 확인 중",
+                                  "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today"}], seen
+        assert "SECRET" not in json.dumps(seen) and said == ["내일은 수업이 없어요."]
         assert pre_route("클로드가 뭐야?", {}) == (False, None) and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")

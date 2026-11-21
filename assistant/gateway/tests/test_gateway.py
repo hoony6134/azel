@@ -102,6 +102,38 @@ def test_assistant_name(gw, monkeypatch):
         assert c.put("/v1/settings", json={"assistant_name": name}).status_code == 200
 
 
+def test_tool_activity_without_arguments(gw):
+    g, c, _ = gw
+    ev = events(c.post("/v1/ask", json={"text": "도구 써서 오늘 수업 알려줘"}))
+    acts = [e for e in ev if e["type"] == "activity"]
+    assert acts == [{"type": "activity", "phase": "tool_start", "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today",
+                     "label": "학사 일정 확인 중"},
+                    {"type": "activity", "phase": "tool_end", "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today",
+                     "label": "학사 일정 확인 중"}]
+    assert "SECRET" not in json.dumps(ev)  # neither the arguments nor the result
+    assert "".join(e["delta"] for e in ev if e["type"] == "text").strip() == "네, 확인했어요."
+
+
+def test_tool_labels(gw):
+    g, _, _ = gw
+    for name, label in [
+        ("mcp__claude_ai_Cygnus_MCP__gistra_today", "학사 일정 확인 중"),
+        ("mcp__claude_ai_Cygnus_MCP__planit_get_day", "할 일 확인 중"),
+        ("mcp__claude_ai_Cygnus_MCP__memory_recall", "기억 찾는 중"),
+        ("mcp__claude_ai_Cygnus_MCP__infra_status", "서버 상태 보는 중"),
+        ("mcp__claude_ai_Google_Calendar__list_events", "캘린더 확인 중"),
+        ("mcp__claude_ai_Gmail__search_threads", "메일 확인 중"),
+        ("mcp__claude_ai_Notion__notion-search", "노션 보는 중"),
+        ("mcp__macbook__run_command", "macbook에서 명령 실행 중"),
+        ("mcp__albireo__read_file", "albireo 파일 보는 중"), ("mcp__albireo__list_dir", "albireo 파일 보는 중"),
+        ("mcp__gienah__search", "gienah 파일 보는 중"), ("mcp__macbook__browse", "웹페이지 읽는 중"),
+        ("mcp__deneb__delegate", "deneb에 작업 맡기는 중"), ("mcp__macbook__job_status", "도구 준비 중"),
+        ("ToolSearch", "도구 준비 중"), ("mcp__claude_ai_Cygnus_MCP__search", "도구 준비 중"), ("", "도구 준비 중"),
+    ]:
+        assert g.tool_label(name) == label, name
+    assert g.activity("thinking") == {"type": "activity", "phase": "thinking", "tool": "", "label": "생각 중"}
+
+
 def test_settings_reject_unknown(gw):
     g, c, _ = gw
     assert c.put("/v1/settings", json={"nope": 1}).status_code == 400
@@ -350,7 +382,8 @@ def test_limited_refuses_personal_data(limited, monkeypatch):
         ev = events(c.post("/v1/ask", json={"text": text, "task": task}))
         assert ev == [{"type": "error", "code": "personal", "message": "개인 비서 기능은 지금 쓸 수 없어요."}]
     ok = events(c.post("/v1/ask", json={"text": "최근 통화 내용:\n사용자: 내일 일정 알려줘\n\n고마워, 근데 환율은?"}))
-    assert ok[0] == {"type": "text", "delta": "1400원이에요.\n"}  # personal words in history alone do not refuse
+    assert ok[0]["type"] == "activity" and ok[0]["phase"] == "thinking"
+    assert ok[1] == {"type": "text", "delta": "1400원이에요.\n"}  # personal words in history alone do not refuse
     assert c.post("/v1/calls", json={"reason": "manual"}).status_code == 403
     assert not (tmp / "args.json").exists()  # `claude -p` never ran
 

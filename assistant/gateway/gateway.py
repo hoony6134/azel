@@ -255,6 +255,34 @@ def device_prompt(settings, devices):
     return (f" 켜져 있는 기기, 우선순위 순: {names}. 사용자가 기기를 말하지 않으면 맨 앞 기기를 써.{note}")
 
 
+TOOL_LABELS = [  # (prefix of the tool's own name, label); the first match wins
+    ("gistra_", "학사 일정 확인 중"), ("planit_", "할 일 확인 중"), ("memory_", "기억 찾는 중"), ("infra_", "서버 상태 보는 중"),
+]
+SERVER_LABELS = [("google_calendar", "캘린더 확인 중"), ("gmail", "메일 확인 중"), ("notion", "노션 보는 중")]
+DEVICE_LABELS = {"run_command": "{}에서 명령 실행 중", "list_dir": "{} 파일 보는 중", "read_file": "{} 파일 보는 중",
+                 "search": "{} 파일 보는 중", "browse": "웹페이지 읽는 중", "delegate": "{}에 작업 맡기는 중"}
+
+
+def tool_label(name):
+    """Korean label for a tool, from its name alone (never its arguments or result)."""
+    server, _, tool = name.removeprefix("mcp__").partition("__") if name.startswith("mcp__") else ("", "", name)
+    for prefix, label in TOOL_LABELS:
+        if tool.startswith(prefix):
+            return label
+    for key, label in SERVER_LABELS:
+        if key in server.lower() or tool.lower().startswith(key):
+            return label
+    if server and not server.startswith("claude_ai_") and tool in DEVICE_LABELS:
+        return DEVICE_LABELS[tool].format(server)  # a device daemon: the server name is the device id
+    return "도구 준비 중"
+
+
+def activity(phase, tool=""):
+    """Progress event for the app. Only the tool's name and label: arguments and results stay private."""
+    label = {"thinking": "생각 중"}.get(phase) or tool_label(tool)
+    return {"type": "activity", "phase": phase, "tool": tool, "label": label}
+
+
 async def ask_claude_code(text, model, session):
     """Yield text deltas, then a final dict with usage, from `claude -p` stream-json."""
     WORKDIR.mkdir(parents=True, exist_ok=True)
@@ -281,6 +309,7 @@ async def ask_claude_code(text, model, session):
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.DEVNULL, limit=2**24)
     final = {"model": model, "path": "claude_code"}
+    open_tools: dict[str, str] = {}  # tool_use id -> name, until its result comes back
     try:
         async for raw in proc.stdout:
             try:
@@ -293,6 +322,15 @@ async def ask_claude_code(text, model, session):
                     yield ev["delta"]["text"]
                 elif ev.get("type") == "message_stop":
                     yield "\n"  # turns between tool calls are separate utterances
+                elif ev.get("type") == "content_block_start" and ev["content_block"].get("type") == "tool_use":
+                    block = ev["content_block"]
+                    open_tools[block.get("id", "")] = block.get("name", "")
+                    yield activity("tool_start", block.get("name", ""))
+            elif e.get("type") == "user":  # tool results come back as a user message
+                content = e.get("message", {}).get("content")
+                for block in content if isinstance(content, list) else []:
+                    if block.get("type") == "tool_result" and block.get("tool_use_id") in open_tools:
+                        yield activity("tool_end", open_tools.pop(block["tool_use_id"]))
             elif e.get("type") == "result":
                 u = e.get("usage", {})
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
@@ -376,6 +414,7 @@ async def ask_api(text, model, session):
     system = name_prompt(settings) + API_STYLE + device_prompt(settings, devices)
     messages = [{"role": "user", "content": text}]
     final = {"model": model, "path": "api", "input_tokens": 0, "output_tokens": 0}
+    yield activity("thinking")
     for _ in range(MAX_TOOL_TURNS):
         body = {"model": MODELS[model], "max_tokens": 4096, "system": system, "messages": messages,
                 "output_config": {"effort": "low"}, **({"tools": tools} if tools else {})}
@@ -412,6 +451,8 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     async for item in gen(text, model, session):
         if isinstance(item, str):
             yield {"type": "text", "delta": item}
+        elif item.get("type") == "activity":
+            yield item
         else:
             await record_usage({"model": model, "path": path, "task": task or "",
                                 "input_tokens": item.get("input_tokens", 0),
