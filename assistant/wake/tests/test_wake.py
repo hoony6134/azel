@@ -155,9 +155,9 @@ def test_save_audio_true_writes_clip(tmp_path):
 def test_config_defaults_and_override(tmp_path):
     assert bw.load_config(tmp_path / "missing.toml") == bw.DEFAULTS
     f = tmp_path / "wake.toml"
-    f.write_text('model = "~/models/park_biseo.onnx"\nthreshold = 0.7\n')
+    f.write_text('model = "~/models/azel.onnx"\nthreshold = 0.7\n')
     cfg = bw.load_config(f)
-    assert cfg["model"] == "~/models/park_biseo.onnx" and cfg["threshold"] == 0.7
+    assert cfg["model"] == "~/models/azel.onnx" and cfg["threshold"] == 0.7
     assert cfg["save_audio"] is False and cfg["followup_s"] == 6
 
 

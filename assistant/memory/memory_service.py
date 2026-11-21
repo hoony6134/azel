@@ -1,4 +1,4 @@
-"""박비서 memory: raw records (hybrid search), task context, contacts. Long-term facts stay in Cygnus MCP.
+"""아젤 memory: raw records (hybrid search), task context, contacts. Long-term facts stay in Cygnus MCP.
 
 Contract: ../PROTOCOL.md section 5. Runs on ruchba in Docker (compose.yaml), Tailscale IP only.
 """
