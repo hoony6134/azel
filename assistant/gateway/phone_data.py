@@ -26,10 +26,10 @@ TOOLS = (
      "input_schema": {"type": "object", "additionalProperties": False, "required": ["metric"], "properties": {
          "metric": {"type": "string", "enum": METRICS}, "range": RANGE_PROP}}},
     {"name": "phone_sleep",
-     "description": ("아이폰·애플워치 수면 기록. '어제 몇 시간 잤어?', '어젯밤 잠'은 date를 비워(가장 최근 밤). "
-                     "특정한 밤이면 date에 일어난 날(YYYY-MM-DD)."),
+     "description": ("아이폰·애플워치 수면 기록. '어제 몇 시간 잤어?'는 비워(가장 최근 밤), 특정한 밤은 date(일어난 날), "
+                     "'일주일 동안 얼마나 잤어?'처럼 여러 밤은 range(last_7_days, this_week, last_week, this_month)."),
      "input_schema": {"type": "object", "additionalProperties": False, "properties": {
-         "date": {"type": "string", "pattern": DATE_RE.pattern, "description": "일어난 날"}}}},
+         "date": {"type": "string", "pattern": DATE_RE.pattern, "description": "일어난 날"}, "range": RANGE_PROP}}},
     {"name": "phone_workouts",
      "description": "아이폰·애플워치 운동 기록(종류, 시간, 칼로리). '이번 주 운동 얼마나 했어?'는 이걸로.",
      "input_schema": {"type": "object", "additionalProperties": False, "properties": {"range": RANGE_PROP}}},
@@ -272,6 +272,21 @@ def sleep_text(day, today):
     return main + (f" {', '.join(stages)}이에요." if stages else "")
 
 
+def sleep_range_text(nights, a, b, rng, today):
+    """'최근 7일(11월 16일–22일) 기록된 7일 동안 하루 평균 6시간 40분 주무셨어요. 가장 길게는 …, 가장 짧게는 …'"""
+    when = span_word(a, b, rng, today)
+    if not nights:
+        return f"{when}에는 수면 기록이 없어요."
+    mins = [(d, (d.get("sleep") or {}).get("asleep_min") or d["sleep"]["in_bed_min"]) for d in nights]
+    avg = sum(m for _, m in mins) / len(mins)
+    out = f"{when} 기록된 {len(mins)}일 동안 하루 평균 {dur(avg)} 주무셨어요."
+    if len(mins) > 1:
+        (hd, hm), (ld, lm) = max(mins, key=lambda x: x[1]), min(mins, key=lambda x: x[1])
+        word = lambda d: f"{date.fromisoformat(d['date']).month}월 {date.fromisoformat(d['date']).day}일 아침"  # noqa: E731
+        out += f" 가장 길게는 {word(hd)}까지 {dur(hm)}, 가장 짧게는 {word(ld)}까지 {dur(lm)}이었어요."
+    return out
+
+
 WORKOUT = {"running": "달리기", "walking": "걷기", "cycling": "자전거", "swimming": "수영", "hiking": "등산",
            "strength": "근력 운동", "hiit": "고강도 인터벌", "yoga": "요가", "dance": "댄스", "elliptical": "일립티컬",
            "rowing": "로잉", "stairs": "계단 오르기", "core": "코어 운동", "pilates": "필라테스", "soccer": "축구",
@@ -367,6 +382,8 @@ async def run(name, args, state, live, now):
     rng = args.get("range") or ("this_week" if kind == "workouts" else "today")
     if kind in ("health", "workouts"):
         a, b = span(rng, today)
+    elif kind == "sleep" and args.get("range") and not args.get("date"):
+        a, b = span(args["range"], today)  # several nights: "일주일 동안 얼마나 잤어?"
     elif kind == "sleep":
         a = b = date.fromisoformat(args["date"]) if args.get("date") else today
         if not args.get("date"):
@@ -403,6 +420,9 @@ async def run(name, args, state, live, now):
         text = health_text(args["metric"], days, a, b, rng, today)
         if not text:
             text = f"{span_word(a, b, rng, today)}에는 그 기록이 없어요."
+    elif kind == "sleep" and args.get("range") and not args.get("date"):
+        nights = [d for d in days if (d.get("sleep") or {}).get("asleep_min") or (d.get("sleep") or {}).get("in_bed_min")]
+        text = sleep_range_text(nights, a, b, args["range"], today)
     elif kind == "sleep":
         nights = [d for d in days if (d.get("sleep") or {}).get("asleep_min") or (d.get("sleep") or {}).get("in_bed_min")]
         text = sleep_text(nights[-1], today) if nights else \

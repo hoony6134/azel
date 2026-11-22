@@ -115,6 +115,19 @@ def test_sleep_latest_night():
     assert text == "최근 수면 기록이 없어요."
 
 
+def test_sleep_over_a_week_from_the_synced_days():  # live 2026-11-22: "일주일 동안 내가 얼마나 잤는지"
+    mins = [400, 380, 420, 350, 460, 390, 410]
+    store = Store({"days": {f"2026-11-{16 + i}": day(f"2026-11-{16 + i}", sleep={"asleep_min": m})
+                            for i, m in enumerate(mins)}, "updated": NOW.timestamp() - 3600})
+    text, data = run("phone_sleep", {"range": "last_7_days"}, store=store)
+    assert data["source"] == "sync" and text.startswith(
+        "최근 7일(11월 16일–22일) 기록된 7일 동안 하루 평균 6시간 41분 주무셨어요. 가장 길게는 11월 20일 아침까지 7시간 40분, "
+        "가장 짧게는 11월 19일 아침까지 5시간 50분이었어요."), text
+    seen = []
+    run("phone_sleep", {"range": "this_week"}, live=phone({"days": []}, seen=seen))
+    assert seen[0][1] == {"from": "2026-11-16", "to": "2026-11-22"}
+
+
 def test_workouts_week():
     days = [day("2026-11-18", workouts=[{"type": "running", "minutes": 30, "kcal": 300}]),
             day("2026-11-20", workouts=[{"type": "strength", "minutes": 45}, {"type": "walking", "minutes": 55}])]

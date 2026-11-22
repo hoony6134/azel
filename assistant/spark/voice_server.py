@@ -15,6 +15,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import logging
 import os
 import re
@@ -791,9 +792,66 @@ DEVICE_TOOL_KO = {"list_dir": "폴더 보기", "read_file": "파일 읽기", "se
                   "list_jobs": "맡긴 작업 목록", "browse": "웹 페이지 열기", "delegate": "여러 단계 작업 맡기기"}
 
 
-def gateway_tools_text(defs):
+# ---------- which tools fit the user's words (live 2026-11-22: "일주일 동안 내가 얼마나 잤는지 수면시간 확인해줘" got
+# "불러올게요" three times and no call, with phone_sleep 1 of 115 tools) ----------
+GRAM_STOP = {"해줘", "알려", "려줘", "확인", "인해", "줘요", "어요", "해요", "하는", "있어", "에서", "으로", "이야", "는지", "얼마",
+             "마나"}
+TOOL_MATCH_MIN = 6.0  # a request this close to one tool's description is that tool's job (small talk stays under ~3)
+SHORTLIST = 8  # tools described in full each turn, by relevance; the rest by name (any of them may still be called)
+CORE_TOOLS = ("call_user", "create_task", "memory_recall", "web_search", "weather", "agenda", "stock_quote")
+_tool_index: dict = {"key": None}
+
+
+def grams(text):
+    """Character bigrams of Korean words (particles and endings barely matter), whole Latin words and their parts."""
+    t = re.sub(r"[^가-힣A-Za-z0-9]+", " ", str(text).lower())
+    out = set()
+    for w in t.split():
+        if not re.search(r"[가-힣]", w):
+            out |= {w} | set(w.split("_"))
+        elif len(w) == 1:
+            out.add(w)
+        else:
+            out |= {w[i:i + 2] for i in range(len(w) - 1)}
+    return out - GRAM_STOP
+
+
+def tool_doc(t):
+    props = (t.get("input_schema") or {}).get("properties") or {}
+    return grams(t["name"].replace("_", " ") + " " + str(t.get("description", "")) + " " + " ".join(
+        f"{p.get('description', '')} {' '.join(map(str, p.get('enum', [])))}" for p in props.values() if isinstance(p, dict)))
+
+
+def rank_tools(text, defs):
+    """[(score, tool)] for the assistant's own tools, best first: bigrams shared with each tool's name and
+    descriptions, weighted by how rare they are among the tools (idf), so "수면" counts and "확인" hardly."""
+    own = [t for t in defs if "__" not in t["name"]]
+    key = tuple(t["name"] for t in own)
+    if _tool_index["key"] != key:
+        docs = {t["name"]: tool_doc(t) for t in own}
+        df: dict = {}
+        for g in docs.values():
+            for x in g:
+                df[x] = df.get(x, 0) + 1
+        # shortcut: at least 30 tools for the weights, so TOOL_MATCH_MIN means the same with a short test list; tune both
+        # if the live list changes a lot (it has ~44 own tools)
+        _tool_index.update(key=key, docs=docs, df=df, n=max(len(docs), 30))
+    q, docs, df, n = grams(text), _tool_index["docs"], _tool_index["df"], _tool_index["n"]
+    return sorted(((sum(math.log((n + 1) / (df[x] + 1)) for x in q & docs[t["name"]]), t) for t in own),
+                  key=lambda st: -st[0])
+
+
+def matched_tool(text, defs):
+    """The one tool a request plainly asks for, or None."""
+    ranked = rank_tools(text, defs) if text else []
+    return ranked[0][1] if ranked and ranked[0][0] >= TOOL_MATCH_MIN else None
+
+
+def gateway_tools_text(defs, text=""):
     """Every tool Qwen may call, in its prompt. Device tools are one line per kind (13 devices × 7 tools listed one by
-    one used up the old 40-line cap, so call_user, memory, web and the Cygnus tools never reached Qwen)."""
+    one used up the old 40-line cap, so call_user, memory, web and the Cygnus tools never reached Qwen). Own tools:
+    the ones that fit the user's words and the core ones in full (no 160-character cut: four lost their ends), the
+    rest by name only."""
     if not defs:
         return ""
     devices: dict[str, list] = {}
@@ -804,7 +862,13 @@ def gateway_tools_text(defs):
             devices.setdefault(tool, []).append(dev)
         else:
             own.append(t)
-    lines = [f"- {t['name']}: {str(t.get('description', ''))[:160]}" for t in own]
+    fit = [t["name"] for score, t in rank_tools(text, defs)[:SHORTLIST] if score > 0] if text else []
+    full = [t for t in own if t["name"] in fit or t["name"] in CORE_TOOLS or len(own) <= SHORTLIST + len(CORE_TOOLS)]
+    full.sort(key=lambda t: fit.index(t["name"]) if t["name"] in fit else len(fit))
+    lines = [f"- {t['name']}{arg_hint(t)}: {str(t.get('description', ''))}" for t in full]
+    rest = [t["name"] for t in own if t not in full]
+    if rest:
+        lines.append("- 그 밖의 도구(이름만, 필요하면 불러도 돼): " + ", ".join(rest))
     if devices:
         lines.append("- 기기 도구, 이름은 '기기__도구'(예: spark__run_command, macbook__list_dir): " + "; ".join(
             f"{tool}={DEVICE_TOOL_KO.get(tool, tool)} [{', '.join(ds)}]" for tool, ds in devices.items()))
@@ -826,6 +890,11 @@ def gateway_tools_text(defs):
             + ("\n뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '○○ 기준으로'처럼 결과에 나온 사이트 이름만 말하고 주소는 읽지 마."
                if "web_search" in names else "")
             + "\n'찾아볼게요'라고만 하고 끝내지 마: 찾을 거면 바로 도구를 불러.")
+
+
+def arg_hint(t):
+    props = (t.get("input_schema") or {}).get("properties") or {}
+    return "(" + ", ".join(props) + ")" if props else ""
 
 
 TOOL_TEXT_MAX = 2000
@@ -1172,6 +1241,39 @@ LOOKUP_OBJ = re.compile(r"일정|캘린더|스케줄|수업|마감|과제|할\s*
 
 def is_promise(s, wants_lookup):
     return bool(ANNOUNCE.search(s)) and (wants_lookup or bool(LOOKUP_VERB.search(s) and LOOKUP_OBJ.search(s)))
+
+
+def future(s):
+    """A first-person future ending: '불러올게요', '드릴게요', '갈게', '하겠습니다' (a syllable with final ㄹ before 게)."""
+    if re.search(r"겠습니다|겠어요", s):
+        return True
+    return any((ord(m[1]) - 0xAC00) % 28 == 8 for m in re.finditer(r"([가-힣])\s*게요?(?![가-힣])", s))
+
+
+# The user pushing on an unkept promise ("아니 말로만 하지 말고 진짜 하라고", "일로 와"): the request is the earlier one.
+PUSH = re.compile(r"말로만|진짜\s*(해|하라)|빨리|아직(도)?\s*(안|멀)|왜\s*안|해\s*달라고|하라고|하라니까|일로\s*와|이리\s*와|어서|됐어\?|했어\?")
+REQUEST = re.compile(r"해\s*줘|해\s*봐|해\s*달라|하라고|하라니까|알려\s*줘|보여\s*줘|불러\s*줘|찾아\s*줘|확인\s*해|읽어\s*줘")
+pending_lookup: dict[str, tuple[float, str]] = {}  # history key -> (when, the request a promise was not kept for)
+RANGE_WORDS = ((r"일주일|7\s*일|칠\s*일|한\s*주|최근\s*주", "last_7_days"), (r"지난\s*주", "last_week"),
+               (r"이번\s*주", "this_week"), (r"이번\s*달|한\s*달", "this_month"), (r"어제", "yesterday"), (r"오늘", "today"))
+
+
+def infer_args(tool, text):
+    """Arguments for a forced call from the user's own words: a range word, the words themselves for a required text
+    field, the first choice for a required enum. Nothing invented beyond that."""
+    schema = tool.get("input_schema") or {}
+    props, need = schema.get("properties") or {}, set(schema.get("required") or [])
+    args = {}
+    if "range" in props and (r := next((r for w, r in RANGE_WORDS if re.search(w, text)), None)):
+        args["range"] = r
+    for k, p in props.items():
+        if k in args or k not in need or not isinstance(p, dict):
+            continue
+        if p.get("enum"):
+            args[k] = next((e for e in p["enum"] if str(e) in text), p["enum"][0])
+        elif p.get("type") == "string":
+            args[k] = text[:int(p.get("maxLength") or 200)]
+    return args
 
 
 # a promise that never got its tool call (after a nudge and, where one fits, a direct lookup): said, not dropped
@@ -2021,9 +2123,16 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 return await via_claude()
             length = reply_length(settings)
             gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
+            pend = pending_lookup.get(hkey)
+            request_text = bare
+            if pend and time.time() - pend[0] < 600 and (PUSH.search(bare) or not matched_tool(bare, gw_defs)) \
+                    and (PUSH.search(bare) or REQUEST.search(bare) or needs_answer(bare)):
+                request_text = pend[1]  # "진짜 하라고": still the sleep record asked a turn ago
+            wanted = matched_tool(request_text, gw_defs)
+            requested = bool(needs_answer(bare) or REQUEST.search(bare) or PUSH.search(bare))
             system = (local_prompt if offline or play else str)(system_prompt(
                 name, length, ctx, persona_text(persona, settings), user_title(settings, persona))) \
-                + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
+                + gateway_tools_text(gw_defs, request_text) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
                 + fetched["agenda"] + play
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             # No-tool turns pass through as the model said them (user decision 2026-11-22: "툴콜을 안 할 때의 안전장치는
@@ -2053,7 +2162,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if not looked and live and (FIGURE.search(s) or LISTING.search(s)):
                     guessed.append(s)  # today's figure or a listing claim before any lookup: from memory, never said
                     return
-                if not looked and (ctx or gw_defs) and is_promise(s, wants_lookup):
+                if not looked and (ctx or gw_defs) and (is_promise(s, wants_lookup) or
+                                                        (requested and wanted and future(s))):
                     announced.append(s)  # a promise to look: said only once the tool actually runs
                     return
                 await sentences.put(s)
@@ -2105,6 +2215,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                 await promise_once(x)
                             announced.clear()
                             looked.append(line)
+                            pending_lookup.pop(hkey, None)  # the request got its tool
                             result = await run_tool(line, session, tool_say)
                             tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
                             if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
@@ -2135,27 +2246,32 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         announced.clear(), guessed.clear()
                         if not tool_nudged:
                             tool_nudged = True
+                            hint = f" 이 요청에는 {wanted['name']}{arg_hint(wanted)}가 맞아." if wanted else ""
                             messages += [{"role": "assistant", "content": " ".join(said_round)},
-                                         {"role": "user", "content": TOOL_NUDGE}]
+                                         {"role": "user", "content": TOOL_NUDGE + hint}]
                             continue
                         names = {t["name"] for t in gw_defs}  # twice: look it up for Qwen, then let it answer
                         span = agenda_range(bare, datetime.now(KST)) if "agenda" in names else None
                         pick_ = "agenda" if span else "weather" if WEATHER_Q.search(bare) and "weather" in names else \
                             "stock_quote" if re.search(r"주가|주식|종가|환율", bare) and "stock_quote" in names else \
-                            "web_search" if "web_search" in names else None
+                            wanted["name"] if wanted else "web_search" if "web_search" in names else None
                         if pick_:
                             args = {"from": span[0].isoformat(), "to": span[1].isoformat()} if pick_ == "agenda" else \
-                                {} if pick_ == "weather" else {"query": bare[:60 if pick_ == "stock_quote" else 200]}
+                                {} if pick_ == "weather" else infer_args(wanted, request_text) \
+                                if wanted and pick_ == wanted["name"] else {"query": bare[:60 if pick_ == "stock_quote" else 200]}
                             line = TOOL_TAG + " " + json.dumps({"name": pick_, "args": args}, ensure_ascii=False)
                             looked.append(line)
+                            pending_lookup.pop(hkey, None)
                             result = await run_tool(line, session, None)
                             timings.setdefault("tools", []).append(0)
                             messages += [{"role": "assistant", "content": line},
                                          {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
                             continue
+                        pending_lookup[hkey] = (time.time(), request_text)  # the user may push: "진짜 하라고"
                         await sentences.put(LOOKUP_FAILED)  # nothing to look it up with: say so, never just go quiet
                         break
                     if announced:  # still only a promise (no tool call, native or [TOOL]) after the tries above
+                        pending_lookup[hkey] = (time.time(), request_text)
                         await sentences.put(LOOKUP_FAILED)
                         break
                     if asked and not stubbed and stub(" ".join(said_round), user_title(settings, persona)):
@@ -4968,6 +5084,41 @@ if __name__ == "__main__":
             assert not is_promise("잠시만 기다려 주세요.", False) and is_promise("잠시만 기다려 주세요.", True)
             assert is_promise("내일 일정 확인해 볼게요.", False) and not is_promise("확인해 볼게요.", False)
             globals()["gateway_tool"] = saved_gw_tool
+            # live 2026-11-22 (로컬): "일주일 동안 … 수면시간 확인해줘" got "불러올게요" three times and no tool. Any first-person
+            # future reply to a request a tool plainly fits is a promise: nudged with that tool named, then called for Qwen.
+            sleep_def = {"name": "phone_sleep", "description": (  # as the gateway sends it (phone_data.py)
+                "아이폰·애플워치 수면 기록. '어제 몇 시간 잤어?'는 비워(가장 최근 밤), 특정한 밤은 date(일어난 날), "
+                "'일주일 동안 얼마나 잤어?'처럼 여러 밤은 range(last_7_days, this_week, last_week, this_month)."),
+                         "input_schema": {"type": "object", "properties": {"date": {"type": "string"},
+                                                                           "range": {"type": "string"}}}}
+            gw_tools.update(at=time.time(), defs=[*gw_tools["defs"], sleep_def,
+                                                  {"name": "music_play", "description": "음악 틀기"}])
+            assert future("네, 일주일간 수면 기록을 불러올게요.") and future("확인하겠습니다.") and future("카레는 내가 사줄게.")
+            assert not future("어제 잘 잤어요.") and not future("그게 좋겠네요")
+            assert matched_tool("일주일 동안 내가 얼마나 잤는지 수면시간 확인해줘.", gw_tools["defs"])["name"] == "phone_sleep"
+            assert matched_tool("오늘 좀 피곤하다", gw_tools["defs"]) is None and matched_tool("카레 사줘", gw_tools["defs"]) is None
+            assert infer_args(sleep_def, "일주일 동안 얼마나 잤어") == {"range": "last_7_days"} and infer_args(sleep_def, "잤어?") == {}
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["네, 일주일간 수면 기록을 불러올게요.", "네, 바로 불러올게요.",
+                                                 "최근 7일 동안 하루 평균 6시간 40분 주무셨어요."])
+            said = asyncio.run(run("일주일 동안 내가 얼마나 잤는지 수면시간 확인해줘.", "sl"))
+            assert ran == [{"name": "phone_sleep", "args": {"range": "last_7_days"}}], ran
+            assert "phone_sleep(date, range)가 맞아" in ann[1][-2 if len(ann[1]) > 2 else -1]["content"] or \
+                any("phone_sleep(date, range)가 맞아" in m["content"] for m in ann[1])
+            assert said[-1][0] == "최근 7일 동안 하루 평균 6시간 40분 주무셨어요." and LOOKUP_FAILED not in [x for x, _ in said]
+            # the user pushing on an unkept promise: still the sleep request, not "말로만" matched to something else
+            ann.clear(), ran.clear()
+            pending_lookup["azel:push"] = (time.time(), "일주일 동안 내가 얼마나 잤는지 수면시간 확인해줘.")
+            globals()["llm_stream"] = announcer(["네, 바로 불러올게요.", "네, 바로 불러올게요.", "평균 6시간 40분이에요."])
+            said = asyncio.run(run("아니 말로만 하지 말고 진짜 하라고", "push"))
+            assert ran == [{"name": "phone_sleep", "args": {"range": "last_7_days"}}] and "azel:push" not in pending_lookup, ran
+            # small talk keeps its own words: no tool fits, nothing is held
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["카레는 내가 사줄게."])
+            said = asyncio.run(run("카레 사줘", "curry"))
+            assert [x for x, _ in said] == ["카레는 내가 사줄게."] and ran == [] and len(ann) == 1, said
+            text = gateway_tools_text(gw_tools["defs"], "일주일 동안 수면시간 확인해줘")
+            assert "- phone_sleep(date, range): 아이폰·애플워치 수면 기록" in text
             gw_tools.clear(), gw_tools.update(saved_tools)
             globals()["run_tool"] = saved_run
             globals()["llm_stream"] = fake_llm
