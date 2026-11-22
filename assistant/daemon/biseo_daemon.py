@@ -647,12 +647,24 @@ BLOCKED_TEXT = re.compile(r"(permission|권한)[^.\n]{0,40}(denied|refused|block
                           r"|\ballow (WebSearch|WebFetch|Bash)|grant (me )?(the )?permission|wasn't (allowed|permitted)", re.I)
 
 
+NEVER_ALLOWED = ("rm", "git push", "sudo")  # refused on purpose (--disallowedTools): trying one is not being blocked
+
+
+def _wanted(denial: dict) -> bool:
+    """A refusal the user could lift. A finished report whose last step tried `rm` on old previews was marked
+    blocked and its finish call said it had failed (live 2026-11-22)."""
+    if denial.get("tool_name") != "Bash":
+        return True
+    cmd = str((denial.get("tool_input") or {}).get("command") or "").strip()
+    return not any(cmd == p or cmd.startswith(p + " ") for p in NEVER_ALLOWED)
+
+
 def _blocked(data: dict, text: str) -> list[str] | None:
     """The tools a finished run was refused (names), [] when only its text says so, None when it was not blocked."""
-    denials = data.get("permission_denials") if isinstance(data.get("permission_denials"), list) else []
-    names = sorted({str(x.get("tool_name") or "?")[:40] for x in denials if isinstance(x, dict)})
-    if names:
-        return names
+    denials = data.get("permission_denials")
+    if isinstance(denials, list) and denials:  # claude's own list decides; its prose may mention the rm it skipped
+        names = sorted({str(x.get("tool_name") or "?")[:40] for x in denials if isinstance(x, dict) and _wanted(x)})
+        return names or None
     return [] if BLOCKED_TEXT.search(text or "") else None
 
 
@@ -671,6 +683,7 @@ def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
                 _remember_session(sid, cwd, job["job_id"])
             status = "failed" if data.get("is_error") or out.returncode else "done"
             blocked = _blocked(data, job["result"])
+            job["needs_input"] = blocked is not None  # always present: the gateway's text check is for older daemons
             if blocked is not None:  # refused something it needed: not done, and the user is told what
                 status, job["needs_input"], job["blocked"] = "failed", True, blocked
         except ValueError:

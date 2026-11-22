@@ -3964,16 +3964,19 @@ async def await_jobs(t, deadline):
                 j.update({k: got[k] for k in ("session_id", "cwd", "output_file") if isinstance(got.get(k), str)})
                 open_jobs.remove(j)
                 out = str(got.get("result") or got.get("summary") or "").strip()
-                if got.get("needs_input") or state_ == "done" and JOB_BLOCKED.search(out):  # an older daemon says done
+                if got.get("needs_input") or "needs_input" not in got and state_ == "done" and JOB_BLOCKED.search(out):
+                    t["result"] = out[:4000] or t.get("result")  # what it did make stays readable in the app
                     names = [TOOL_KO.get(n.split("(")[0], n) for n in got.get("blocked") or []]
                     task_step(t, "job_blocked", label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업이 권한에 막힘",
                               job_id=j["job_id"])
+                    # the spoken error stays short Korean: the job's own (often English) text was read out in the call
                     raise TaskLimit("blocked", f"기기 작업이 권한 때문에 막혀서 끝내지 못했어요"
-                                    + (f"({', '.join(dict.fromkeys(names))})" if names else "") + f". {out[:300]}".rstrip())
+                                    + (f"({', '.join(dict.fromkeys(names))})" if names else "") + ". 자세한 내용은 앱에 있어요.")
                 task_step(t, "job_" + state_, label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업 "
                           f"{'끝남' if state_ == 'done' else '실패'}", job_id=j["job_id"])
                 if state_ == "failed":
-                    raise TaskLimit("error", f"기기 작업이 실패했어요. {out[:300]}".strip())
+                    t["result"] = out[:4000] or t.get("result")
+                    raise TaskLimit("error", "기기 작업이 실패했어요. 자세한 내용은 앱에 있어요.")
                 t["result"] = out[:4000] or t.get("result")
         await task_save(t)
         if open_jobs:
