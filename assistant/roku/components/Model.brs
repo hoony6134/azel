@@ -544,7 +544,8 @@ function buildV1(d as Object, now as Integer) as Object
     for each l in arr(d.calendar)
         t = sv(l)
         if Left(t, 2) = "- " then t = Mid(t, 3)
-        if Left(t, 4) <> "캘린더 " and t <> "일정 없음" then
+        ' all-day lines (LMS deadlines, holidays) are not a timetable; GISTRA and the strip carry those
+        if Left(t, 4) <> "캘린더 " and t <> "일정 없음" and Instr(1, t, " 종일 ") = 0 then
             c = newCard("todo", 560)
             c.sent = clean(t)
             c.dtitle = c.sent
