@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+from datetime import date as Date, datetime, timedelta, timezone
 
 import httpx
 import numpy as np
@@ -382,26 +382,37 @@ PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|�
 NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
 # "오늘 일정", "내일 뭐 있어", "이번 주 일정": the gateway's agenda tool (Google Calendar and Gistra merged) is read
 # once before any model runs, so every path answers from both, not from whichever one tool the model picks.
-AGENDA_ASK = re.compile(r"일정(?!한)|스케줄|캘린더|약속|" + PLANS_ASK)
+AGENDA_ASK = re.compile(r"일정(?!한)|스케줄|캘린더|약속|브리핑|" + PLANS_ASK)
 AGENDA_WAIT_S = 8
 
 
 def agenda_range(text, now):
-    """(from, to) dates of the schedule a question asks about, or None when it is not a schedule question."""
+    """(from, to) dates of the schedule a question asks about, or None when it is not a schedule question. A named day
+    reads from today through that day ("월요일 그러니까 내일 일정도" -> today and tomorrow); "다음 주까지" through next
+    Sunday; "다음 주" alone is next Monday to Sunday; "이번 주" today to Sunday."""
     if not AGENDA_ASK.search(text):
         return None
     today = late_night.day_for(0, now)
-    if re.search(r"다음 ?주|담주", text):
-        start = today + timedelta(days=7 - today.weekday())
-        return start, start + timedelta(days=6)
-    if re.search(r"이번 ?주", text):
-        return today, today + timedelta(days=6 - today.weekday())
-    if "주말" in text:
-        sat = today if today.weekday() == 6 else today + timedelta(days=5 - today.weekday())
-        return sat, today + timedelta(days=6 - today.weekday())
+    monday = today - timedelta(days=today.weekday())
+    if re.search(r"(다음 ?주|담주)\s*(까지|안에|중에)", text):
+        return today, monday + timedelta(days=13)
+    ends = []
+    for m in late_night.WEEKDAY_RE.finditer(text):
+        wd = late_night.DAYS.index(m[2])
+        ends.append(monday + timedelta(days=7 + wd) if m[1] and re.match(r"다음|담", m[1]) else
+                    today + timedelta(days=(wd - today.weekday()) % 7))
     word, add = late_night.day_word(text)
-    day = late_night.day_for(add, now) if word else today
-    return day, day
+    if word:
+        ends.append(late_night.day_for(add, now))
+    if ends:
+        return today, max(max(ends), today)
+    if re.search(r"다음 ?주|담주", text):
+        return monday + timedelta(days=7), monday + timedelta(days=13)
+    if re.search(r"이번 ?주", text):
+        return today, monday + timedelta(days=6)
+    if "주말" in text:
+        return (today if today.weekday() == 6 else monday + timedelta(days=5)), monday + timedelta(days=6)
+    return today, today
 
 
 async def agenda_prefetch(text, gw_names, timings):
@@ -1139,8 +1150,11 @@ ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알
 TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|여보세요|여보|"
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
 # "엔트로픽 주가 찾아볼게요." with no tool call: a promise, not an answer. Held back, spoken only once a tool runs.
-ANNOUNCE = re.compile(r"(찾아|알아|확인해|검색해|살펴|조회해)\s*(볼게요|보겠습니다|드릴게요)|(확인|검색|조회)(할게요|하겠습니다)"
-                      r"|알려\s*드릴게요")
+ANNOUNCE = re.compile(r"(찾아|알아|확인해|검색해|살펴|조회해|점검해)\s*(볼게요|보겠습니다|드릴게요)"
+                      r"|(확인|검색|조회|점검|파악)\s*(할게요|하겠습니다|해\s*드릴게요)|알려\s*드릴게요"
+                      r"|^(잠시만|잠깐만)\s*(기다려\s*주세요|기다려\s*줘|요)?[.!~]*$|기다려\s*주세요[.!~]*$")
+# a promise that never got its tool call (after a nudge and, where one fits, a direct lookup): said, not dropped
+LOOKUP_FAILED = "죄송해요, 지금은 그걸 찾아보지 못했어요."
 WEATHER_Q = re.compile(r"날씨|기온|몇\s*도|비\s*(와|올|오)|눈\s*(와|올|오)|우산|추워|더워|미세먼지")
 # Today's figures (rates, prices, weather): a number said before any lookup is a guess ("환율은 약 1,310원대",
 # live 2026-11-22), so it is held back and Qwen is asked to look it up (re-asked, never cut to a filler).
@@ -1148,7 +1162,7 @@ LIVE_Q = re.compile(r"환율|주가|시세|가격|금리|유가|코스피|코스
 # a figure, in digits or in words ("천삼백삼십 원"): Qwen writes numbers both ways
 FIGURE = re.compile(r"\d|[일이삼사오육칠팔구십백천만억]{2,}\s*(원|달러|엔|도|퍼센트|%)")
 TOOL_NUDGE = (f"방금 찾아보겠다고만 하고 도구를 부르지 않았어. 지금 바로 도구를 불러: 다른 말 없이 {TOOL_TAG} "
-              '{"name": "도구 이름", "args": {…}} 한 줄만 출력해. 날씨는 weather, 주가와 환율은 stock_quote, 그 밖의 지금 정보(가격, 뉴스)는 '
+              '{"name": "도구 이름", "args": {…}} 한 줄만 출력해. 일정·브리핑은 agenda, 날씨는 weather, 주가와 환율은 stock_quote, 그 밖의 지금 정보(가격, 뉴스)는 '
               'web_search.')
 RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일을 한 도구가 없었어. 하지 않은 일을 했다고 하지 말고, 그 말은 빼고 "
                       "이어서 자연스럽게 다시 말해. 이미 한 말은 반복하지 마.",
@@ -1994,6 +2008,12 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             announced, guessed, looked, tool_nudged = [], [], [], False  # "찾아볼게요" / a figure before any lookup
             live = asked and bool(LIVE_Q.search(bare)) and any(t["name"] in ("web_search", "weather") for t in gw_defs)
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
+            promised = set()
+
+            async def promise_once(x):  # the same "확인하겠습니다" twice in one turn is said once
+                if x not in promised:
+                    promised.add(x)
+                    await sentences.put(x)
 
             async def say(s):
                 sources = ctx + fetched["agenda"] + "\n".join(m["content"] for m in messages if m["role"] == "user" and m["content"] not in notes)
@@ -2006,7 +2026,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if not looked and live and FIGURE.search(s):
                     guessed.append(s)  # today's figure before any lookup: a guess, never said
                     return
-                if not looked and asked and (ctx or gw_defs) and ANNOUNCE.search(s):
+                if not looked and (ctx or gw_defs) and ANNOUNCE.search(s):
                     announced.append(s)  # a promise to look: said only once the tool actually runs
                     return
                 await sentences.put(s)
@@ -2055,7 +2075,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                 await sentences.put(text)
                             line = (native_call(buf) or "") if NATIVE_TAG in buf else buf.strip().split("\n")[0]
                             for x in announced:  # "찾아볼게요" as the filler while the tool runs
-                                await sentences.put(x)
+                                await promise_once(x)
                             announced.clear()
                             looked.append(line)
                             result = await run_tool(line, session, tool_say)
@@ -2084,7 +2104,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         timings["announce_only"] = timings.get("announce_only", 0) + 1
                         timings.setdefault("raw_announce", buf[:200])  # the raw output, to see a mangled tool call
                         for x in announced:  # the filler while Qwen tries again
-                            await sentences.put(x)
+                            await promise_once(x)
                         announced.clear(), guessed.clear()
                         if not tool_nudged:
                             tool_nudged = True
@@ -2092,19 +2112,25 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                          {"role": "user", "content": TOOL_NUDGE}]
                             continue
                         names = {t["name"] for t in gw_defs}  # twice: look it up for Qwen, then let it answer
-                        pick_ = "weather" if WEATHER_Q.search(bare) and "weather" in names else \
+                        span = agenda_range(bare, datetime.now(KST)) if "agenda" in names else None
+                        pick_ = "agenda" if span else "weather" if WEATHER_Q.search(bare) and "weather" in names else \
                             "stock_quote" if re.search(r"주가|주식|종가|환율", bare) and "stock_quote" in names else \
                             "web_search" if "web_search" in names else None
                         if pick_:
-                            line = TOOL_TAG + " " + json.dumps({"name": pick_, "args": {} if pick_ == "weather" else
-                                                                {"query": bare[:60 if pick_ == "stock_quote" else 200]}},
-                                                               ensure_ascii=False)
+                            args = {"from": span[0].isoformat(), "to": span[1].isoformat()} if pick_ == "agenda" else \
+                                {} if pick_ == "weather" else {"query": bare[:60 if pick_ == "stock_quote" else 200]}
+                            line = TOOL_TAG + " " + json.dumps({"name": pick_, "args": args}, ensure_ascii=False)
                             looked.append(line)
                             result = await run_tool(line, session, None)
                             timings.setdefault("tools", []).append(0)
                             messages += [{"role": "assistant", "content": line},
                                          {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
                             continue
+                        await sentences.put(LOOKUP_FAILED)  # nothing to look it up with: say so, never just go quiet
+                        break
+                    if announced:  # still only a promise (no tool call, native or [TOOL]) after the tries above
+                        await sentences.put(LOOKUP_FAILED)
+                        break
                     if asked and not stubbed and stub(" ".join(said_round), user_title(settings, persona)):
                         stubbed = True  # "아, 그거!" to a question: ask for the rest, once (live 2026-11-22, 서아)
                         timings["stub"] = " ".join(said_round)[:40]
@@ -3283,7 +3309,7 @@ if __name__ == "__main__":
         now = datetime.now(KST)
         tomorrow = late_night.day_for(1, now).isoformat()
         calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘"))
-        assert calls == [("agenda", {"from": tomorrow, "to": tomorrow})], calls
+        assert calls == [("agenda", {"from": late_night.day_for(0, now).isoformat(), "to": tomorrow})], calls
         assert "치과 (구글 캘린더)" in contexts[0] and "고정 정기회의" in contexts[0] and said == ["내일은 치과와 정기회의가 있어요."]
         calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘", fail=True))
         assert calls and "치과" not in contexts[0] and said, (calls, said)  # agenda down: Claude still answers (its own tools)
@@ -4845,6 +4871,60 @@ if __name__ == "__main__":
                                                  "맑아요."])
             said = asyncio.run(run("서울 날씨 어때?", "s"))
             assert ran == [{"name": "weather", "args": {}}] and not any("<" in x for x, _ in said), said
+            # live 2026-11-22, brain 로컬: "…브리핑 해줘. 월요일 그러니까 내일 일정도…" got only a promise, then silence
+            ask = "좀 브리핑 해줘. 월요일 그러니까 내일 일정도 좀 알아야 될 것 같고."
+            promise = "구글 캘린더를 확인하고, 오늘과 내일의 수업 및 마감 일정도 함께 점검하겠습니다. 잠시만 기다려 주세요."
+            sunday = datetime(2026, 11, 22, 10, 0, tzinfo=KST)
+            assert agenda_range(ask, sunday) == (Date(2026, 11, 22), Date(2026, 11, 23))  # today through the named day
+            assert agenda_range("다음 주까지 일정 정리해 줘", sunday) == (Date(2026, 11, 22), Date(2026, 11, 29))
+            assert agenda_range("다음 주 수요일 약속 있어?", sunday) == (Date(2026, 11, 22), Date(2026, 11, 25))
+            span = agenda_range(ask, datetime.now(KST))
+            fetched_calls, saved_gw_tool = [], gateway_tool
+
+            async def gw_agenda(name, args, on_say=None):
+                fetched_calls.append((name, args))
+                if prefetch_down:
+                    raise RuntimeError("down")
+                return "일정 (구글 캘린더와 Gistra를 합친 것, KST)\n- 10:30~11:45 수업 컴파일러"
+            globals()["gateway_tool"] = gw_agenda
+
+            async def agenda_run_tool(raw, session, on_say=None):
+                ran.append(json.loads(raw[len(TOOL_TAG):]))
+                return "일정 (구글 캘린더와 Gistra를 합친 것, KST)\n- 10:30~11:45 수업 컴파일러"
+            globals()["run_tool"] = agenda_run_tool
+
+            async def local_run(text):
+                CALL_MODE.set("local")
+                return [x async for x, *_ in respond(text, "brief", time.perf_counter(), {})]
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"},
+                                                  {"name": "web_search", "description": "검색"}])
+            prefetch_down = False  # the fast path: the merged schedule is in Qwen's prompt before it says a word
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["내일 열 시 반에 컴파일러 수업이 있어요."])
+            said = asyncio.run(local_run(ask))
+            assert fetched_calls == [("agenda", {"from": span[0].isoformat(), "to": span[1].isoformat()})], fetched_calls
+            assert "수업 컴파일러" in ann[0][0]["content"] and said == ["내일 열 시 반에 컴파일러 수업이 있어요."], said
+            prefetch_down = True  # agenda read failed up front, Qwen only promises: re-asked once, then looked up for it
+            ann.clear(), ran.clear(), fetched_calls.clear()
+            globals()["llm_stream"] = announcer([promise, promise, "내일은 컴파일러 수업이 있어요."])
+            said = asyncio.run(local_run(ask))
+            assert TOOL_NUDGE in [m["content"] for m in ann[1]], ann
+            assert ran == [{"name": "agenda", "args": {"from": span[0].isoformat(), "to": span[1].isoformat()}}], ran
+            assert said == ["구글 캘린더를 확인하고, 오늘과 내일의 수업 및 마감 일정도 함께 점검하겠습니다.", "잠시만 기다려 주세요.",
+                            "내일은 컴파일러 수업이 있어요."], said  # the promise once, then the answer
+            gw_tools.update(at=time.time(), defs=[{"name": "call_user", "description": "전화"}])  # nothing to look with
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer([promise, promise])
+            said = asyncio.run(local_run(ask))
+            assert said[-1] == LOOKUP_FAILED and ran == [], said  # said plainly, never back to listening in silence
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            ann.clear(), ran.clear()  # a native call after the words is a tool call, not a promise
+            globals()["llm_stream"] = announcer(['확인할게요. <tool_call>{"name": "agenda", "arguments": {}}</tool_call>',
+                                                 "내일은 수업이 하나 있어요."])
+            said = asyncio.run(local_run(ask))
+            assert ran == [{"name": "agenda", "args": {}}] and TOOL_NUDGE not in [m["content"] for m in ann[-1]], ann
+            assert said == ["확인할게요.", "내일은 수업이 하나 있어요."], said
+            globals()["gateway_tool"] = saved_gw_tool
             gw_tools.clear(), gw_tools.update(saved_tools)
             globals()["run_tool"] = saved_run
             globals()["llm_stream"] = fake_llm
