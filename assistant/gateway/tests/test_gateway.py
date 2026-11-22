@@ -173,11 +173,11 @@ def test_tool_labels(gw):
         ("mcp__claude_ai_Gmail__search_threads", "메일 확인 중", "mail"),
         ("mcp__claude_ai_Notion__notion-search", "노션 보는 중", "notes"),
         ("mcp__macbook__run_command", "macbook에서 명령 실행 중", "terminal"),
-        ("mcp__albireo__read_file", "albireo 파일 보는 중", "files"),
+        ("mcp__albireo__read_file", "albireo 파일 읽는 중", "files"),
         ("mcp__albireo__list_dir", "albireo 파일 보는 중", "files"),
-        ("mcp__gienah__search", "gienah 파일 보는 중", "files"), ("mcp__macbook__browse", "웹페이지 읽는 중", "web"),
-        ("mcp__deneb__delegate", "deneb에 작업 맡기는 중", "terminal"),
-        ("mcp__macbook__job_status", "도구 준비 중", "generic"), ("ToolSearch", "도구 준비 중", "generic"),
+        ("mcp__gienah__search", "gienah 파일 찾는 중", "files"), ("mcp__macbook__browse", "웹페이지 읽는 중", "web"),
+        ("mcp__deneb__delegate", "deneb에서 작업 위임", "terminal"),
+        ("mcp__macbook__job_status", "macbook 작업 확인 중", "terminal"), ("ToolSearch", "도구 준비 중", "generic"),
         ("mcp__claude_ai_Cygnus_MCP__search", "도구 준비 중", "generic"), ("", "도구 준비 중", "generic"),
     ]:
         assert g.tool_info(name) == (label, kind), name
