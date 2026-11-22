@@ -200,3 +200,20 @@ final class OvernightTaskTests: XCTestCase {
         XCTAssertFalse(AppSettings.reportsOvernight(Data(#"{"default_model":"auto"}"#.utf8)))
     }
 }
+
+#if os(iOS)
+@MainActor
+final class LiveActivityApprovalTests: XCTestCase {
+    func testOldestPendingAndNoCommandInSecret() {
+        let a = ApprovalRequest(["id": "new", "device": "macbook", "command": "ls", "created_at": "2026-11-22T10:05:00Z"])
+        let b = ApprovalRequest(["id": "old", "device": "deneb", "command": "docker restart web", "created_at": "2026-11-22T10:00:00Z", "forced_once": true])
+        let p = LiveActivities.pendingApproval([a, b], secret: false)
+        XCTAssertEqual(p?.id, "old")
+        XCTAssertEqual(p?.command, "docker restart web")
+        XCTAssertEqual(p?.forcedOnce, true, "항상 greyed out")
+        XCTAssertNil(LiveActivities.pendingApproval([a], secret: true)?.command, "secret: only 승인 필요")
+        XCTAssertNil(LiveActivities.pendingApproval([], secret: false))
+        XCTAssertEqual(PendingApproval(id: "x", device: "m", command: String(repeating: "a", count: 60), forcedOnce: false).shortCommand?.count, 40)
+    }
+}
+#endif

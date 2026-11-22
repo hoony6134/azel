@@ -6,6 +6,8 @@ import UserNotifications
 /// with `schedule_id` + `occurrence` (ISO) or `task_id` in the payload.
 enum PushAction {
     static let scheduleCategory = "SCHEDULE", taskCategory = "TASK"
+    /// Approval pushes: APPROVAL with 항상 허용, APPROVAL_ONCE when the server allows only once.
+    static let approvalCategory = "APPROVAL", approvalOnceCategory = "APPROVAL_ONCE"
 
     static var categories: Set<UNNotificationCategory> {
         [UNNotificationCategory(identifier: scheduleCategory, actions: [
@@ -14,13 +16,23 @@ enum PushAction {
          ], intentIdentifiers: []),
          UNNotificationCategory(identifier: taskCategory, actions: [
             UNNotificationAction(identifier: "STOP", title: "작업 중지", options: [.destructive]),
+         ], intentIdentifiers: []),
+         // Approving can run a command on a device: ask for Face ID / passcode first.
+         UNNotificationCategory(identifier: approvalCategory, actions: [
+            UNNotificationAction(identifier: "APPROVE_ONCE", title: "허용", options: [.authenticationRequired]),
+            UNNotificationAction(identifier: "DENY", title: "거부", options: [.destructive]),
+            UNNotificationAction(identifier: "APPROVE_ALWAYS", title: "항상 허용", options: [.authenticationRequired]),
+         ], intentIdentifiers: []),
+         UNNotificationCategory(identifier: approvalOnceCategory, actions: [
+            UNNotificationAction(identifier: "APPROVE_ONCE", title: "허용", options: [.authenticationRequired]),
+            UNNotificationAction(identifier: "DENY", title: "거부", options: [.destructive]),
          ], intentIdentifiers: [])]
     }
 
     struct Request: Equatable {
         var method: String
         var path: String
-        var body: [String: String]?
+        var body: [String: AnyHashable]?   // real JSON types: `approve` must be a boolean, not "false"
     }
 
     static func request(action: String, userInfo: [AnyHashable: Any]) -> Request? {
@@ -31,6 +43,11 @@ enum PushAction {
             let path = ScheduleAPI.path(id) + "?occurrence=" + ScheduleAPI.query(occ)
             return action == "SKIP" ? Request(method: "DELETE", path: path)
                 : Request(method: "PUT", path: path, body: ["when_text": "10분 뒤", "scope": "occurrence"])
+        case "APPROVE_ONCE", "APPROVE_ALWAYS", "DENY":
+            guard let id = ApprovalCenter.approvalID(from: userInfo) else { return nil }
+            let d = action == "DENY" ? "deny" : action == "APPROVE_ALWAYS" ? "always" : "once"
+            return Request(method: "POST", path: "/v1/approvals/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id)",
+                           body: ApprovalAPI.body(ApprovalDecision(rawValue: d)!).mapValues { $0 as! AnyHashable })
         case "STOP":
             guard let id = TaskModel.taskID(from: userInfo) else { return nil }
             return Request(method: "POST", path: "/v1/tasks/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id)/cancel")
@@ -44,8 +61,10 @@ enum PushAction {
         guard let r = request(action: action, userInfo: userInfo) else { return }
         let note: String?
         do {
-            let result = ActionResult(try await Gateway.send(r.method, r.path, json: r.body))
+            let result = ActionResult(try await Gateway.send(r.method, r.path, json: r.body as [String: Any]?))
             note = result.needs?.question ?? (result.ok ? nil : result.spoken)
+        } catch let error where ApprovalCenter.alreadyDecided(error) {
+            note = nil   // decided on another device already: nothing to say
         } catch {
             note = (error as? GatewayError)?.errorDescription ?? FriendlyError.describe(error).title
         }

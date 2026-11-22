@@ -71,6 +71,11 @@ enum ApprovalWindow {
         ApprovalCenter.shared.start()
     }
 
+    static func close() {
+        window?.orderOut(nil)
+        ApprovalCenter.shared.presented = nil
+    }
+
     static func show(_ a: ApprovalRequest) {
         let w = window ?? {
             let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 420), styleMask: [.titled, .closable, .fullSizeContentView],
