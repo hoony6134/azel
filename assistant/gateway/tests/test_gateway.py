@@ -968,7 +968,7 @@ def auto_setup(g, monkeypatch, verdict):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
-    async def fake_llm(system, user):
+    async def fake_llm(system, user, max_tokens=300):
         asked.append(user)
         return verdict
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -994,6 +994,19 @@ def test_autonomous_tick_calls_logs_and_dedupes(gw, monkeypatch):
     log = c.get("/v1/proactive/log").json()
     assert [r["called"] for r in log] == [False, True] and log[0]["blocked_by"] == "duplicate"
     assert log[1]["signals"]["alerts"][0].startswith("NodeDown")
+
+
+def test_a_long_opening_is_said_in_full(gw, monkeypatch):
+    g, c, _ = gw
+    opening = ("대표님, 역사학특강 토론지 제출이 오늘 밤 11시 59분까지예요. 아직 제출 기록이 없어서 전화드렸어요. "
+               "주제는 동아시아 근대화 비교였고, 분량은 A4 두 장 이상이에요. ") * 8  # well over the old 200 cut
+    placed, _ = auto_setup(g, monkeypatch, {"call": True, "urgency": 5, "reason": "토론지 마감", "opening": opening})
+    now = datetime.now(g.KST).replace(hour=10, minute=0)
+    g.fake.now = lambda: now.timestamp()
+    entry = asyncio.run(g.autonomous_tick(now, A))
+    assert entry["called"] and placed == [("autonomous", opening)]  # nothing cut from what is said
+    assert len(g.fake.db["plog"][-1]["opening"]) <= 500  # the log keeps a short copy (the deployed limit)
+    assert "길어도 돼" in g.DECIDE_PROMPT and "짧은 한 구절" not in g.DECIDE_PROMPT
 
 
 def test_autonomous_never_calls_outside_the_window(gw, monkeypatch):

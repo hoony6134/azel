@@ -565,7 +565,7 @@ class ProactiveEntry(BaseModel):
     call: bool = False
     urgency: int = Field(0, ge=0, le=5)
     reason: str = Field("", max_length=500)
-    opening: str = Field("", max_length=500)
+    opening: str = Field("", max_length=4000)
     reason_hash: str = Field("", max_length=64)
     called: bool = False
     blocked_by: str | None = Field(None, max_length=40)

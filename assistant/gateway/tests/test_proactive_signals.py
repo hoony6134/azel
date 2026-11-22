@@ -48,6 +48,6 @@ def test_checkpoint_prompt_is_dated_with_the_night_rule(gw):  # noqa: F811
     assert "새벽 1시" in night and "'내일'은 오늘(11월 23일)" in night
 
 
-def test_the_opening_says_why_now(gw):  # noqa: F811
+def test_the_opening_says_what_needs_saying(gw):  # noqa: F811
     g, _, _ = gw
-    assert "왜 지금 거는지" in g.DECIDE_PROMPT
+    assert "다 말해" in g.DECIDE_PROMPT and "마크다운 없이" in g.DECIDE_PROMPT

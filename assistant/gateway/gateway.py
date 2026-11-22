@@ -1285,8 +1285,9 @@ DECIDE_PROMPT = (
     "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
     "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
-    '"opening": "전화 첫마디. 왜 지금 거는지를 짧은 한 구절로 먼저(예: \'토론지 마감이 오늘 자정이라 전화드렸어요\'), '
-    '이어서 필요한 것을 한 문장. 비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
+    '"opening": "전화를 받자마자 할 말. 전해야 할 내용을 다 말해: 무엇이, 언제까지인지, 지금 무엇을 하면 되는지까지 '
+    '필요한 만큼 길어도 돼. 왜 전화했는지만 짧게 말하고 끝내지 마. 말로 듣기 좋은 문장으로, 목록이나 마크다운 없이, '
+    '비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
 )
 
 
@@ -1442,10 +1443,10 @@ def fresh_note(note, now, max_age_s=6 * 3600):
         return True
 
 
-async def llm_json(system, user):
+async def llm_json(system, user, max_tokens=300):
     """One request to the local Qwen; the first {...} in its answer, or None."""
     async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(LLM_URL, json={"model": LLM_MODEL, "max_tokens": 300, "temperature": 0.2,
+        r = await c.post(LLM_URL, json={"model": LLM_MODEL, "max_tokens": max_tokens, "temperature": 0.2,
                                         "messages": [{"role": "system", "content": system},
                                                      {"role": "user", "content": user}]})
     r.raise_for_status()
@@ -1464,7 +1465,8 @@ async def qwen_decide(signals, now):
     try:
         persona = persona_block(await load_settings())  # the opening is said in Azel's voice
         d = await llm_json(DECIDE_PROMPT + f" opening은 이 비서의 말투로 써: {persona}",
-                           f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
+                           f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False),
+                           max_tokens=1500)  # room for an opening as long as it needs to be
     except Exception as e:
         print("autonomous decision failed:", type(e).__name__, flush=True)
         d = None
@@ -1474,7 +1476,7 @@ async def qwen_decide(signals, now):
     urgency = u if isinstance(u, int) and not isinstance(u, bool) and 0 <= u <= 5 else 0  # strict: no 4.9, no "5"
     reason = str(d.get("reason") or "")[:200]
     return {"call": d.get("call") is True, "urgency": urgency, "reason": reason,
-            "opening": str(d.get("opening") or reason)[:200]}
+            "opening": str(d.get("opening") or reason)[:4000]}  # said in full; 4000 only guards a runaway
 
 
 def reason_hash(reason):
@@ -1509,7 +1511,8 @@ async def autonomous_tick(now_dt, a):
     if not isinstance(recent, list):  # unreadable history = unknown cap and gap: fail closed, no call
         raise StateDown("proactive_log unreadable")
     blocked = guard(decision, now, recent, a)
-    entry = {**decision, "persona_id": primary_persona(await load_settings())["id"],
+    entry = {**decision, "opening": decision["opening"][:500],  # the log's copy only; the call says all of it
+             "persona_id": primary_persona(await load_settings())["id"],
              "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
              "blocked_by": blocked, "signals": {k: v[:10] for k, v in signals.items()}}
     if blocked is None:  # write the row first: if it cannot be recorded, the cap cannot count it, so no call
