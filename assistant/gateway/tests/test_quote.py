@@ -39,11 +39,11 @@ def client(seen):
 
 
 @pytest.mark.parametrize("asked,said,hosts", [
-    ("삼성전자 주가 지금 알려줘", "삼성전자 주가는 180,900원이에요. 11월 20일 기준이고, 전날보다 8.13% 내렸어요.",
+    ("삼성전자 주가 지금 알려줘", "네이버 증권 기준 11월 20일 삼성전자 주가는 180,900원이에요. 전날보다 8.13% 내렸어요.",
      ["ac.stock.naver.com", "polling.finance.naver.com"]),
-    ("Kakao", "카카오 주가는 30,650원이에요. 11월 20일 기준이고, 전날보다 3.92% 내렸어요.",
+    ("Kakao", "네이버 증권 기준 11월 20일 카카오 주가는 30,650원이에요. 전날보다 3.92% 내렸어요.",
      ["query2.finance.yahoo.com", "polling.finance.naver.com"]),
-    ("Anthropic", "Anthropic, PBC 주가는 88.91달러예요. 11월 21일 기준이고, 전날보다 8.50% 내렸어요.",
+    ("Anthropic", "야후 파이낸스 기준 11월 21일 Anthropic, PBC 주가는 88.91달러예요. 전날보다 8.50% 내렸어요.",
      ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]),
 ])
 def test_quotes(asked, said, hosts):
@@ -53,8 +53,8 @@ def test_quotes(asked, said, hosts):
 
 def test_exchange_rates():
     assert asyncio.run(quote.quote("지금 1달러 환율 얼마야?", client([])))["spoken"] == \
-        "1달러는 1,337.8원이에요. 11월 22일 기준이고, 전날보다 0.31% 올랐어요."
-    assert asyncio.run(quote.quote("엔화 환율", client([])))["spoken"].startswith("100엔은 846.8원이에요.")
+        "야후 파이낸스 기준 11월 22일 1달러는 1,337.8원이에요. 전날보다 0.31% 올랐어요."
+    assert asyncio.run(quote.quote("엔화 환율", client([])))["spoken"].startswith("야후 파이낸스 기준 11월 21일 100엔은 846.8원이에요.")
 
 
 def test_an_unlisted_company_says_so():
@@ -65,3 +65,19 @@ def test_an_unlisted_company_says_so():
 def test_clean_keeps_the_company():
     assert quote.clean("엔트로픽 주가 알려줘") == "엔트로픽" and quote.clean("삼성전자 주가 지금 얼마야?") == "삼성전자"
     assert quote.clean("엔비디아 주식 얼마야?") == "엔비디아"
+
+
+def test_a_korean_name_is_found_through_search_and_checked_by_sound():
+    async def search(q):  # what SearXNG returns for "엔트로픽 stock ticker" and for "테슬라 stock ticker" on a bad day
+        if "엔트로픽" in q:
+            return {"text": "Anthropic 주가", "sources": [{"title": "Home \\ Anthropic", "url": "https://www.anthropic.com/"},
+                                                        {"title": "Anthropic - 나무위키", "url": "https://namu.wiki/w/Anthropic"}]}
+        return {"text": "NASDAQ: INTC 인텔", "sources": [{"title": "Intel stock", "url": "https://www.intel.com/"}]}
+    SEARCH.update(anthropic=SEARCH["Anthropic"], INTC=[{"symbol": "INTC", "shortname": "Intel Corporation",
+                                                         "longname": "Intel Corporation", "quoteType": "EQUITY"}],
+                  intel=[{"symbol": "INTC", "shortname": "Intel Corporation", "quoteType": "EQUITY"}])
+    r = asyncio.run(quote.quote("엔트로픽 주가 알려줘", client([]), search=search))
+    assert r["spoken"].startswith("야후 파이낸스 기준 11월 21일 Anthropic, PBC 주가는 88.91달러예요.")
+    with pytest.raises(LookupError):  # Intel never answers for 테슬라: it does not sound like it
+        asyncio.run(quote.quote("테슬라 주가", client([]), search=search))
+    assert quote.sounds_like("엔트로픽", "anthropic") == 1 and quote.sounds_like("오픈에이아이", "dell") < quote.SOUND_MIN

@@ -324,7 +324,8 @@ class Bridge:
                 raise Fail("not_found", str(e))
             except Exception as e:  # noqa: BLE001  the quote sources down or slow
                 raise Fail("unavailable", f"지금은 주가를 가져오지 못했어요({type(e).__name__}).")
-            return r["spoken"], r, r["spoken"] + " (네이버 증권·Yahoo Finance 기준. 이 문장대로 답해.)"
+            return r["spoken"], r, r["spoken"] + " (이 문장대로, 출처와 날짜를 빼지 말고 답해. 날짜가 오늘이 아니면 그날 가격이라고 " \
+                "말하고 '지금'이라고 하지 마.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))

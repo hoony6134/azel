@@ -3968,7 +3968,7 @@ bridge = tools_bridge.Bridge(
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
     web_ok=lambda: searxng_ok(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
-    weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: stock_quotes.quote(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
@@ -4029,6 +4029,12 @@ async def web_search(query, n):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
     res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
     return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def quote_now(q):
+    """A quote; a Korean name neither source knows is looked up on the user's SearXNG (free) to find its ticker."""
+    url = (await load_settings()).get("searxng_url") or web.SEARXNG_URL
+    return await stock_quotes.quote(q, search=lambda s: web.searxng(s, 6, url, fetch_pages=False))
 
 
 async def weather_now(place, when):
