@@ -37,7 +37,11 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon # Shared/Assets.xcassets, from assistant/design/icon
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS[sdk=iphone*]: Azel/Azel-iOS.entitlements # aps-environment
+        CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]: Azel/Azel-iOS.entitlements # aps-environment
+        # CarPlay: simulator builds carry com.apple.developer.carplay-communication so the CarPlay screen
+        # runs in the CarPlay simulator. Device builds must NOT until Apple grants it to the App ID
+        # (signing fails otherwise); then set the iphoneos line above to Azel/Azel-iOS-CarPlay.entitlements.
+        CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]: Azel/Azel-iOS-CarPlay.entitlements
         CODE_SIGN_ENTITLEMENTS[sdk=macosx*]: Azel/Azel-macOS.entitlements # sandbox, network client, audio input
         ENABLE_HARDENED_RUNTIME[sdk=macosx*]: YES
     info:
@@ -72,6 +76,15 @@ targets:
         # Siri's calling intent, handled in the app ("아젤한테 전화해줘", also from a locked phone)
         INIntentsSupported: [INStartCallIntent]
         NSUserActivityTypes: [INStartCallIntent]
+        # The CarPlay screen (iOS/CarPlay). SwiftUI keeps managing the app's own window scene; this
+        # only adds the car's. Without the entitlement iOS never connects it, so it is harmless.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+          UISceneConfigurations:
+            CPTemplateApplicationSceneSessionRoleApplication:
+              - UISceneClassName: CPTemplateApplicationScene
+                UISceneConfigurationName: CarPlay
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).CarPlaySceneDelegate
         NSSupportsLiveActivitiesFrequentUpdates: true
         # macOS (ignored on iOS): menu-bar only, no Dock icon
         LSUIElement: true

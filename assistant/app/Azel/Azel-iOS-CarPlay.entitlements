@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Azel-iOS.entitlements plus the CarPlay communication entitlement. Used for SIMULATOR builds only
+     (project.yml), so the CarPlay screen can be tried in the CarPlay simulator. Once Apple grants
+     com.apple.developer.carplay-communication to the App ID, point device builds here too (see
+     project.yml) and keep this file in sync with Azel-iOS.entitlements. -->
+<plist version="1.0">
+<dict>
+	<key>aps-environment</key>
+	<string>development</string>
+	<key>com.apple.developer.siri</key>
+	<true/>
+	<key>com.apple.developer.healthkit</key>
+	<true/>
+	<key>com.apple.developer.healthkit.access</key>
+	<array/>
+	<key>com.apple.developer.healthkit.background-delivery</key>
+	<true/>
+	<key>com.apple.developer.carplay-communication</key>
+	<true/>
+</dict>
+</plist>
