@@ -30,7 +30,9 @@ NUM = r"(\d[\d,.]*|[일이삼사오육칠팔구십백천만억]{2,})"  # Qwen sa
 CASES = [  # (said, the tool it must use, what the answer must hold)
     ("광주 날씨 알려줄래?", "weather", rf"{NUM} ?도"),
     ("내일 서울 날씨 어때?", "weather", rf"{NUM} ?도|비|맑|흐"),
-    ("그러면 클로드 그 엔트로픽 있잖아 엔트로픽의 주가 지금 알려줘", "stock_quote", rf"{NUM} ?달러|상장"),
+    # a dated ANT price from the quote source (Anthropic listed on Nasdaq; "비상장" from memory was stale)
+    ("그러면 클로드 그 엔트로픽 있잖아 엔트로픽의 주가 지금 알려줘", "stock_quote",
+     rf"(?=.*{NUM} ?달러)(?=.*(\d+월 ?\d+일|기준))(?!.*비상장)"),
     ("삼성전자 주가 지금 얼마야?", "stock_quote", rf"{NUM} ?원"),
     ("엔비디아 주식 얼마야?", "stock_quote", rf"{NUM} ?달러"),
     ("지금 1달러 환율 얼마야?", "stock_quote", rf"{NUM} ?원"),
@@ -48,15 +50,21 @@ async def main():
     async def up():
         return True
 
+    kma = Path.home() / ".config/biseo/kma_key"  # 기상청 when the Mac has the key (never printed), else Open-Meteo
+    key = kma.read_text().strip() if kma.exists() else None
+
     async def wx(place, when):
-        return await weather.forecast(place, when, HOME)
+        return await weather.forecast(place, when, HOME, kma_key=key)
 
     async def sx(q, n):
         r = await web.searxng(q, n, os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL))
         if not r:
             raise RuntimeError("searxng found nothing")
         return r
-    b.d.update(weather=wx, stock_quote=quote.quote, web_search=sx, web_fetch=web.fetch, cygnus=lambda: ([], None), mode=local, web_ok=up)
+    async def sq(q):
+        return await quote.quote(q, search=lambda s: web.searxng(s, 6, os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),
+                                                               fetch_pages=False))
+    b.d.update(weather=wx, stock_quote=sq, web_search=sx, web_fetch=web.fetch, cygnus=lambda: ([], None), mode=local, web_ok=up)
 
     async def gateway_tool(name, args, on_say=None):  # the link to the gateway, as the bridge answers it
         used.append(name)

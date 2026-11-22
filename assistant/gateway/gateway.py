@@ -4539,7 +4539,7 @@ bridge = tools_bridge.Bridge(
     auto_end=lambda scope: end_grants(scope),
     end_call=lambda session, reason: link_send({"type": "end_call", "session": session, "reason": reason}),
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
-    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: stock_quotes.quote(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
@@ -4618,8 +4618,29 @@ async def agenda_text(f, t):
     return await agenda.merged(f, t, calendar, gistra)
 
 
+async def quote_now(q):
+    """A quote; a Korean name neither source knows is looked up on the user's SearXNG (free) to find its ticker."""
+    url = (await load_settings()).get("searxng_url") or web.SEARXNG_URL
+    return await stock_quotes.quote(q, search=lambda s: web.searxng(s, 6, url, fetch_pages=False))
+
+
+KMA_KEY_PATH = HOME / "kma_key"  # data.go.kr 기상청 key (Decoding), 0600, on the Mac's gateway only
+
+
+def kma_key():
+    """The 기상청 key, re-read on each use (rotating the file needs no restart); never on a limited or team gateway,
+    never if others can read it."""
+    if MODE != "full" or not KMA_KEY_PATH.exists() or KMA_KEY_PATH.stat().st_mode & 0o077:
+        return None
+    return KMA_KEY_PATH.read_text().strip() or None
+
+
+here_location = None  # async () -> {"lat", "lon"} | {"name"} | None: the phone's location, wired where phone data exists
+
+
 async def weather_now(place, when):
-    return await weather.forecast(place, when, (await load_settings())["weather_home"])
+    return await weather.forecast(place, when, (await load_settings())["weather_home"], kma_key=kma_key(),
+                                  here=here_location)
 
 
 async def persona_shares(pid):

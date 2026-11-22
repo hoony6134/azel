@@ -65,7 +65,8 @@ LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_toke
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
     "한국어로 자연스럽게 말해. 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. "
-    "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
+    "'네'나 '알겠습니다'만 하고 끝내지 마. 상장 여부, 주가, 환율, 날씨, 뉴스 같은 지금의 사실은 이번 대화의 도구 결과로만 말하고, "
+    "네가 원래 알던 지식으로는 말하지 마(오래됐을 수 있어). 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
     "없으니, 도구가 없으면 할 수 없다고 하고 다시 물어봐. "
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자는 한글로 풀어 쓰지 말고 아라비아 숫자와 단위로 써(1,333원, 2도, 18.5%, 3시 30분). "
@@ -822,7 +823,7 @@ def gateway_tools_text(defs):
                if "memory_recall" in names else "")
             + ("\n날씨는 weather로(장소를 말하지 않으면 place는 비워)." if "weather" in names else "")
             + ("\n주가와 환율은 stock_quote로(query는 회사 영어 이름이나 티커, 환율이면 '달러 환율')." if "stock_quote" in names else "")
-            + ("\n뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '네이버 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
+            + ("\n뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '○○ 기준으로'처럼 결과에 나온 사이트 이름만 말하고 주소는 읽지 마."
                if "web_search" in names else "")
             + "\n'찾아볼게요'라고만 하고 끝내지 마: 찾을 거면 바로 도구를 불러.")
 
@@ -1158,7 +1159,9 @@ LOOKUP_FAILED = "죄송해요, 지금은 그걸 찾아보지 못했어요."
 WEATHER_Q = re.compile(r"날씨|기온|몇\s*도|비\s*(와|올|오)|눈\s*(와|올|오)|우산|추워|더워|미세먼지")
 # Today's figures (rates, prices, weather): a number said before any lookup is a guess ("환율은 약 1,310원대",
 # live 2026-11-22), so it is held back and Qwen is asked to look it up (re-asked, never cut to a filler).
-LIVE_Q = re.compile(r"환율|주가|시세|가격|금리|유가|코스피|코스닥|나스닥|비트코인|날씨|기온|몇\s*도")
+LIVE_Q = re.compile(r"환율|주가|주식|시세|가격|금리|유가|코스피|코스닥|나스닥|비트코인|날씨|기온|몇\s*도|상장|IPO")
+# a listing claim from memory ("엔트로픽은 비상장이라"): live 2026-11-22 it was stale, ANT had listed on Nasdaq
+LISTING = re.compile(r"비상장|상장\s*(전|안|되지|않|된|됐|했|돼)|상장사|기업\s*공개|IPO")
 # a figure, in digits or in words ("천삼백삼십 원"): Qwen writes numbers both ways
 FIGURE = re.compile(r"\d|[일이삼사오육칠팔구십백천만억]{2,}\s*(원|달러|엔|도|퍼센트|%)")
 TOOL_NUDGE = (f"방금 찾아보겠다고만 하고 도구를 부르지 않았어. 지금 바로 도구를 불러: 다른 말 없이 {TOOL_TAG} "
@@ -2023,8 +2026,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if ACTION_CLAIM.search(s) and not confirmed["ok"] and asks_action(bare):
                     timings["unconfirmed"] = s[:80]
                     raise Recheck("action", s)
-                if not looked and live and FIGURE.search(s):
-                    guessed.append(s)  # today's figure before any lookup: a guess, never said
+                if not looked and live and (FIGURE.search(s) or LISTING.search(s)):
+                    guessed.append(s)  # today's figure or a listing claim before any lookup: from memory, never said
                     return
                 if not looked and (ctx or gw_defs) and ANNOUNCE.search(s):
                     announced.append(s)  # a promise to look: said only once the tool actually runs
@@ -4854,6 +4857,12 @@ if __name__ == "__main__":
             assert [x for x, _ in said] == ["네, 지금 환율 알려드릴게요.", "네이버 기준으로 1달러에 1,452원이에요."], said
             assert ran == [{"name": "web_search", "args": {"query": "원달러 환율"}}]  # the guess was never said
             assert not LIVE_Q.search("3 더하기 4는 얼마야?") and LIVE_Q.search("삼성전자 주가 알려줘")
+            ann.clear(), ran.clear()  # a listing claim from memory (stale live: ANT had listed) is never said
+            globals()["llm_stream"] = announcer(["엔트로픽은 아직 비상장이라 주가가 없어요.",
+                                                 '[TOOL] {"name": "web_search", "args": {"query": "Anthropic"}}',
+                                                 "Anthropic은 88.91달러예요. 11월 21일 기준이에요."])
+            said = asyncio.run(run("엔트로픽 주가 알려줘", "s"))
+            assert [x for x, _ in said] == ["Anthropic은 88.91달러예요.", "11월 21일 기준이에요."] and ran, said
             assert FIGURE.search("약 천삼백십 원대예요.") and not FIGURE.search("오늘 이야기해 볼게요.")
             # Qwen's native tool-call markup (live 2026-11-22: it was spoken aloud): run it, never say it
             assert json.loads(native_call("<tool_call> <function=weather> <parameter=place> 광주 </parameter> "

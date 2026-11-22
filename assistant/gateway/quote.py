@@ -48,13 +48,13 @@ async def naver_find(q, c):
     return None
 
 
-async def yahoo_find(q, c):
+async def yahoo_find(q, c, kinds=KINDS):
     try:
         r = await c.get(YAHOO_SEARCH, params={"q": q, "quotesCount": 6, "newsCount": 0})
         quotes = r.json().get("quotes") or []
     except (httpx.HTTPError, ValueError):
         return None
-    stocks = [x for x in quotes if x.get("quoteType") in KINDS]
+    stocks = [x for x in quotes if x.get("quoteType") in kinds]
     exact = [x for x in stocks if q.lower() in (str(x.get("shortname", "")).lower(), str(x.get("symbol", "")).lower())]
     best = (exact or stocks or [None])[0]  # "Kakao" is Kakao, not KakaoPay listed first
     if not best:
@@ -65,6 +65,76 @@ async def yahoo_find(q, c):
     return {"name": best.get("longname") or best.get("shortname") or sym, "symbol": sym}
 
 
+EXCHANGE_TICKER = re.compile(r"\b(NASDAQ|NYSE|NYSEARCA|AMEX|KOSPI|KOSDAQ|KRX)\s*[:：]\s*([A-Z][A-Z.]{0,5}|\d{6})\b")
+COMMON = {"home", "the", "news", "google", "wise", "investing", "yahoo", "finance", "naver", "wikipedia", "youtube", "namu",
+          "tistory", "blog", "daum", "kr", "m", "en", "ko", "tradingview", "reuters", "bloomberg", "cnbc", "brunch",
+          # sites that answer every query (SearXNG returns their pages for anything): never a company
+          "zhihu", "reddit", "quora", "medium", "twitter", "facebook", "instagram", "linkedin", "baidu", "bing", "msn",
+          "stock", "stocks", "price", "share", "shares", "inc", "corp", "com", "www", "and", "for", "today", "live", "chart"}
+
+
+INITIAL = "g kk n d tt r m b pp s ss _ j jj ch k t p h".split()
+MEDIAL = "a ae ya yae eo e yeo ye o wa wae oe yo u wo we wi yu eu ui i".split()
+FINAL = ["", *"k k k n n n t l k m l l l p l m p p t t ng t t k t p t".split()]
+SOUND_MIN = 0.6
+
+
+def romanize(ko):
+    out = []
+    for ch in ko:
+        o = ord(ch) - 0xAC00
+        if 0 <= o < 11172:
+            i, m, f = o // 588, o % 588 // 28, o % 28
+            out.append(INITIAL[i].replace("_", "") + MEDIAL[m] + FINAL[f])
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+    return "".join(out)
+
+
+def skeleton(latin):
+    """Consonants only, with the letters Korean hears alike made one: anthropic -> ntrpk, 엔트로픽 -> ntrpk."""
+    t = latin.lower()
+    for a, b in (("ph", "p"), ("th", "t"), ("ch", "c"), ("ck", "k"), ("c", "k"), ("q", "k"), ("x", "ks"), ("f", "p"),
+                 ("v", "b"), ("l", "r"), ("z", "j"), ("w", ""), ("y", ""), ("h", ""), ("ng", "n"), ("g", "k"), ("d", "t"),
+                 ("b", "p"), ("j", "c"), ("s", "s")):
+        t = t.replace(a, b)
+    t = re.sub(r"[aeiou]", "", t)
+    return re.sub(r"(.)\1+", r"\1", t)  # tt -> t
+
+
+def sounds_like(korean, english):
+    from difflib import SequenceMatcher
+    a, b = skeleton(romanize(korean)), skeleton(english)
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+async def search_find(q, c, search):
+    """A Korean name neither source knows ("엔트로픽"): ask the web, then take an explicit "NASDAQ:ANT", or an English
+    name from the top results that sounds like what was said (엔트로픽 ~ Anthropic), checked on Yahoo."""
+    core = q.split()[-1] if q.split() else q  # "그러면 엔트로픽" -> 엔트로픽
+    for words in (f"{core} stock ticker", f"{core} 주식"):
+        try:
+            r = await search(words)
+        except Exception:  # noqa: BLE001  no search: the name just isn't found
+            return None
+        if not r:
+            continue
+        text = r.get("text", "") + " " + " ".join(x.get("title", "") for x in r.get("sources", []))
+        seen = set()
+        for x in r.get("sources", [])[:6]:
+            host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", x.get("url", "")).split("/")[0]).split(".")[0]
+            seen |= {host.lower(), *(w.lower() for w in re.findall(r"\b[A-Za-z][A-Za-z&]{2,}\b", x.get("title", "")))}
+        names = [n for score, n in sorted(((sounds_like(core, n), n) for n in seen - COMMON), reverse=True)[:3]
+                 if score >= SOUND_MIN]
+        tickers = [m[2] for m in EXCHANGE_TICKER.finditer(text)][:3]  # "NASDAQ:ANT": checked like any other guess
+        for cand in [*names, *tickers]:
+            hit = await yahoo_find(cand, c, kinds=("EQUITY",))  # a company, not "an OpenAI ecosystem ETF"
+            # the company must sound like what was said: 테슬라 is never Intel, 오픈에이아이 never an energy stock
+            if hit and sounds_like(core, re.split(r"[\s,.]", hit["name"])[0]) >= SOUND_MIN:
+                return hit
+    return None
+
+
 async def naver_price(code, c):
     r = await c.get(NAVER_QUOTE.format(code=code))
     r.raise_for_status()
@@ -72,7 +142,8 @@ async def naver_price(code, c):
     num = lambda s: float(str(s).replace(",", ""))  # noqa: E731
     at = datetime.fromisoformat(d["localTradedAt"]).astimezone(KST) if d.get("localTradedAt") else None
     return {"name": d.get("stockName"), "price": num(d["closePrice"]), "change": num(d["compareToPreviousClosePrice"]),
-            "pct": num(d["fluctuationsRatio"]), "currency": "KRW", "open": d.get("marketStatus") == "OPEN", "at": at}
+            "pct": num(d["fluctuationsRatio"]), "currency": "KRW", "open": d.get("marketStatus") == "OPEN", "at": at,
+            "source": "네이버 증권"}
 
 
 async def yahoo_price(symbol, c):
@@ -83,7 +154,7 @@ async def yahoo_price(symbol, c):
     at = datetime.fromtimestamp(m["regularMarketTime"], KST) if m.get("regularMarketTime") else None
     return {"name": m.get("longName") or m.get("shortName") or symbol, "price": price, "currency": m.get("currency", "USD"),
             "change": price - prev if prev else None, "pct": (price - prev) / prev * 100 if prev else None,
-            "open": None, "at": at}
+            "open": None, "at": at, "source": "야후 파이낸스"}
 
 
 def figure(x, currency):
@@ -91,18 +162,16 @@ def figure(x, currency):
 
 
 def spoken(q):
-    """'삼성전자 주가는 180,900원이에요. 11월 20일 기준이고, 전날보다 8.13% 내렸어요.' (digits: the voice reads them)."""
+    """'네이버 증권 기준 11월 20일 삼성전자 주가는 180,900원이에요. 전날보다 8.13% 내렸어요.': the source and the date come
+    first, where a model keeps them (it dropped a trailing "11월 21일 기준" and said "지금" of a Friday close)."""
     unit = CURRENCY.get(q["currency"], q["currency"])
     last = unit[-1]
     cop = "이에요" if "가" <= last <= "힣" and (ord(last) - 0xAC00) % 28 else "예요"  # 원이에요, 달러예요
-    out = f"{q['name']} 주가는 {figure(q['price'], q['currency'])}{unit}{cop}."
-    when = f"{q['at'].month}월 {q['at'].day}일 기준" if q.get("at") else ""
-    move = ""
+    when = f" {q['at'].month}월 {q['at'].day}일" if q.get("at") else ""
+    out = f"{q.get('source', '시세')} 기준{when} {q['name']} {q.get('what', '주가')}는 {figure(q['price'], q['currency'])}{unit}{cop}."
     if q.get("pct") is not None and abs(q["pct"]) >= 0.01:
-        move = f"전날보다 {abs(q['pct']):.2f}% {'올랐어요' if q['pct'] > 0 else '내렸어요'}."
-    if when and move:
-        return f"{out} {when}이고, {move}"
-    return f"{out} {when + '이에요.' if when else move}".strip()
+        out += f" 전날보다 {abs(q['pct']):.2f}% {'올랐어요' if q['pct'] > 0 else '내렸어요'}."
+    return out
 
 
 async def fx(query, c):
@@ -114,14 +183,14 @@ async def fx(query, c):
     p = await yahoo_price(symbol, c)
     rate = p["price"] * per
     top = "은" if (ord(word[-1]) - 0xAC00) % 28 else "는"  # 100엔은, 1달러는
-    out = f"{per}{word}{top} {rate:,.2f}".rstrip("0").rstrip(".") + "원이에요."
-    when = f"{p['at'].month}월 {p['at'].day}일 기준" if p.get("at") else ""
-    move = f"전날보다 {abs(p['pct']):.2f}% {'올랐어요' if p['pct'] > 0 else '내렸어요'}." if p.get("pct") else ""
-    return {"spoken": " ".join(x for x in (out, f"{when}이고, {move}" if when and move else when + "이에요." if when
-                                           else move) if x), "data": {**p, "rate": rate, "per": per, "at": None}}
+    when = f" {p['at'].month}월 {p['at'].day}일" if p.get("at") else ""
+    out = f"야후 파이낸스 기준{when} {per}{word}{top} {rate:,.2f}".rstrip("0").rstrip(".") + "원이에요."
+    if p.get("pct"):
+        out += f" 전날보다 {abs(p['pct']):.2f}% {'올랐어요' if p['pct'] > 0 else '내렸어요'}."
+    return {"spoken": out, "data": {**p, "rate": rate, "per": per, "at": None}}
 
 
-async def quote(query, client=None):
+async def quote(query, client=None, search=None):
     """{"spoken", "data"} for a company name, ticker or code, or an exchange rate ("달러 환율"). LookupError when no
     listed stock matches."""
     q = clean(query) or str(query)
@@ -134,6 +203,8 @@ async def quote(query, client=None):
             hit = await naver_find(q, c)
         if not hit:
             hit = await yahoo_find(q, c)
+        if not hit and search and re.search(r"[가-힣]", q):
+            hit = await search_find(q, c, search)
         if not hit:
             raise LookupError(NOT_FOUND + (RETRY if re.search(r"[가-힣]", q) else ""))
         if hit.get("code"):
