@@ -16,6 +16,7 @@ struct BiseoApp: App {
         UNUserNotificationCenter.current().delegate = TaskNotificationHandler.shared
         UNUserNotificationCenter.current().setNotificationCategories(PushAction.categories)
         LiveActivities.shared.start()
+        PhoneDataSync.start()
         #if DEBUG
         if CommandLine.arguments.contains("-liveActivityPreview") { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { LiveActivities.shared.debugPreview() } }
         #endif
@@ -28,13 +29,13 @@ struct BiseoApp: App {
                 if let i = CommandLine.arguments.firstIndex(of: "-callPreview"), i + 1 < CommandLine.arguments.count {
                     CallScreen().onAppear { CallManager.shared.debugPreview(state: CommandLine.arguments[i + 1]) }
                 } else if model.configured {
-                    RootView(model: model, history: history, schedule: schedule)
+                    RootView(model: model, history: history, schedule: schedule).phoneDataFirstRun()
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
                 #else
                 if model.configured {
-                    RootView(model: model, history: history, schedule: schedule)
+                    RootView(model: model, history: history, schedule: schedule).phoneDataFirstRun()
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
@@ -46,6 +47,7 @@ struct BiseoApp: App {
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
                 if scenePhase == .active { ApprovalCenter.shared.start() } else { ApprovalCenter.shared.stop() }
+                if scenePhase == .active { Task { await PhoneDataSync.upload(force: false) } }
             }
         }
     }
@@ -74,7 +76,7 @@ struct RootView: View {
             NavigationStack { ApprovalsScreen(model: model) }
                 .tabItem { Label("승인", systemImage: "checkmark.shield") }.tag(2)
                 .badge(approvals.pending.count)
-            NavigationStack { SettingsScreen(model: model, history: history) }
+            NavigationStack { SettingsScreen(model: model, history: history) { PhoneDataCard() } }
                 .tabItem { Label("설정", systemImage: "gearshape") }.tag(3)
         }
         .fullScreenCover(isPresented: Binding(get: { call.inCall }, set: { if !$0 { call.hangUp() } })) {

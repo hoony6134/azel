@@ -45,6 +45,14 @@ CASES = {
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),
     "auto_approve": ("권한 줄 테니까 이번 통화 동안은 알아서 해", "model"),
     "web_task": ("네이버에서 도쿄 왕복 항공권 알아보고 비교표 PDF로 만들어줘", "model"),
+    "phone_health": ("오늘 걸음 수 얼마야?", "model"),
+    "phone_sleep": ("어제 몇 시간 잤어?", "model"),
+    "phone_workouts": ("이번 주 운동 얼마나 했어?", "model"),
+    "phone_calendar": ("아이폰 캘린더에 내일 뭐 있어?", "model"),
+    "phone_reminders": ("미리 알림에 뭐 있어?", "model"),
+    "phone_contacts": ("연락처에서 김철수 번호 찾아 줘", "model"),
+    "phone_location": ("나 지금 어디야?", "model"),
+    "phone_now_playing": ("지금 듣고 있는 노래 뭐야?", "model"),
 }
 
 

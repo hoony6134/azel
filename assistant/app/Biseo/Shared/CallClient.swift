@@ -3,6 +3,10 @@ import Foundation
 /// `WS /v1/call` (PROTOCOL.md §1): streams the mic up, plays replies, honours `interrupt`.
 /// The platform shell (CallKit on iOS, the floating panel on macOS) owns the call UI and lifecycle.
 final class CallClient {
+    /// iPhone data (PHONE_DATA.md §3a), set on iOS only: the `phone_hello` frame sent on connect, and the reply to a
+    /// `phone_query` frame. nil (macOS) = the phone offers nothing.
+    static var phoneHello: (() -> String)?
+    static var phoneQuery: ((Data) async -> String?)?
     enum StartError: LocalizedError {
         case notConfigured, badURL, audio
         var errorDescription: String? {
@@ -101,6 +105,7 @@ final class CallClient {
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
         Log.call.info("call start session=\(session, privacy: .public) intent=\(intent ?? "-", privacy: .public) host=\(task.originalRequest?.url?.host ?? "?", privacy: .public)")
         task.resume()
+        if let hello = Self.phoneHello?() { task.send(.string(hello)) { _ in } }
         audio.onConfigurationChange = { [weak self] in self?.routeChanged() }
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
@@ -194,6 +199,12 @@ final class CallClient {
             recorder?.assistant(pcm)
         case .string(let text):
             guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { return }
+            if event.type == "phone_query" {  // answered off the receive path; never shown or recorded
+                if let answer = Self.phoneQuery {
+                    Task { [weak self] in if let r = await answer(Data(text.utf8)) { self?.socket?.send(.string(r)) { _ in } } }
+                }
+                return
+            }
             if event.type != "activity" { Log.call.info("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public)") }
             if event.type == "error" { Log.call.error("server error: \(event.message ?? "", privacy: .public)") }
             // Event order matters for audio, so these run here, before the UI hop.

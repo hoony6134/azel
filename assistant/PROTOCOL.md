@@ -105,6 +105,11 @@ answering a call the assistant placed; the server then speaks that call's openin
   one. Shared setting `noise_mode` `normal`|`noisy`: noisy raises the thresholds (min voiced 400 ms) and
   turns voice barge-in off while the assistant speaks; tap-to-interrupt still works. Tunable by env:
   `VAD_THRESHOLD`, `NOISE_MARGIN_DB`, `MIN_VOICED_MS`, `BARGE_MIN_VOICED_MS` and their `NOISY_` variants.
+- iPhone data (PHONE_DATA.md §3a), iPhone only. Client → server `{"type":"phone_hello","kinds":[…]}` right after
+  connecting: the categories the phone answers in this call (`health`, `sleep`, `workouts`, `calendar`, `reminders`,
+  `contacts`, `location`, `now_playing`); `[]` in a secret call. Server → client `{"type":"phone_query","id","kind",
+  "args"}` (a gateway's question, relayed); client → server `{"type":"phone_result","id","ok","data"?,"error"?}`
+  (`error`: `off` = the category is off, `denied` = no iOS permission, `failed`). The voice server keeps none of it.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}` (every interrupt, voice or tap, ends
@@ -238,6 +243,10 @@ JSON text frames:
   retries). `{"type":"briefing_context","id"}` → gateway → voice `{"id","type":"briefing_context",
   "situation": "<azel-situation, or azel-checkpoint if that is stale; \"\" if neither is fresh>",
   "facts":["승인 대기 N건","다음 예약 전화: …","최근 24시간 서버 경보: …"]}`.
+- gateway → voice: `{"type":"phone_query","id","kind","args"}` (full links only; PHONE_DATA.md §3a). The voice server
+  passes it to the latest call whose `phone_hello` lists `kind`, and the phone's `phone_result` back to the link that
+  asked as `{"id","type":"phone_result","ok","data"?,"error"?}`; with no such call it answers at once with
+  `"ok":false,"error":"offline"`. Nothing is stored or logged.
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
@@ -510,6 +519,10 @@ device that created them.
   the app sends its PushKit token and/or its ordinary APNs token (missed-call notices, task pushes). macOS sends
   only `alert_token`. `bundle_id` must be `xyz.scian.biseo` and at least one token is required (400 otherwise). At
   most 10 tokens per kind are kept; registering an 11th evicts the oldest.
+- `PUT /v1/phone/days` `{"days":[…]}` (1–14 day summaries, fields in PHONE_DATA.md §3b; an unknown field or a value out
+  of range → 400) merges by date into kv `phone-days` and keeps the newest 30 days → `{"stored","updated"}`.
+  `GET /v1/phone/days` → `{"days":[…],"updated","keep_days":30}`. `DELETE /v1/phone/days` deletes them all → `{"deleted":true}`; with `?kind=health|sleep|workouts|cycle` only that category's fields (the app sends it when that toggle is turned off; a day left empty goes).
+  Full gateways only (403 on limited). The `phone_*` actions read these when no phone answers live.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:

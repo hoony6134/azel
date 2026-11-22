@@ -136,6 +136,7 @@ the tool name only.
 | Cygnus reads (`gistra_*`, `infra_*`, `planit_*`) | read-only school, infra, planner data | not on REST: the app has no view for them yet; tailnet `POST /v1/tools/call` | ✓ | — (personal; opt-in later) | (models) | — |
 | Google reads (`calendar_events`, `gmail_search`, `gmail_read`) | read-only, only with a live grant | not on REST, same reason | ✓ | — (personal) | (models) | — |
 | Spotify (`spotify_play`, `spotify_control`, `spotify_now_playing`, `spotify_devices`) | music by voice, only with a live grant (`SPOTIFY.md`) | not on REST: music is spoken; the app only connects it (`/v1/connectors/spotify/authorize`) | ✓ (also served to `claude -p` over `/v1/mcp`) | — | (models) | — |
+| iPhone reads (`phone_health`, `phone_sleep`, `phone_workouts`, `phone_calendar`, `phone_reminders`, `phone_contacts`, `phone_location`, `phone_now_playing`) | read-only iPhone data (PHONE_DATA.md): live from the phone in a call, health/sleep/workouts else from the synced daily summaries; `error.unavailable` with a spoken reason when neither | not on REST: the app reads its own phone (the summaries' own routes are `/v1/phone/days`) | ✓ | — (personal) | (models) | — |
 
 Not actions: `POST /v1/approvals/{id}` (human only); `POST /v1/approvals` (daemons file requests); settings, personas,
 history, connectors, push registration (configuration, not things the assistant does).
@@ -157,3 +158,8 @@ history, connectors, push registration (configuration, not things the assistant 
 - `create_task`: `goal` (required), `device`, `notify`, `backend` (claude_api | claude_code | nim | qwen; the default
   comes from settings, with recorded fallbacks).
 - `task_status`: `id`. `task_cancel`: `id` (required). `approval_status`: `id`.
+- `phone_health`: `metric` (required: summary, steps, distance, active_energy, exercise, heart_rate, resting_heart_rate, hrv,
+  mindful, weight, cycle), `range` (today, yesterday, this_week, last_week, last_7_days, this_month, or `YYYY-MM-DD`).
+  `phone_sleep`: `date` (the wake-up date; empty = the latest night). `phone_workouts`: `range`. `phone_calendar`: `range`
+  (today, tomorrow, this_week, next_week, `YYYY-MM-DD`). `phone_reminders`: `list`. `phone_contacts`: `name` (required).
+  `phone_location`, `phone_now_playing`: none.

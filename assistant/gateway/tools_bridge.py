@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 import cron as C
 import late_night as L
+import phone_data as P
 
 KST = timezone(timedelta(hours=9))
 APPROVAL_WAIT_S = 300
@@ -321,6 +322,13 @@ class Bridge:
                     "done": "끝남", "failed": "실패", "cancelled": "취소됨"}
             return f"밤사이 작업 {len(items)}개: " + ", ".join(
                 f"{i['goal'][:24]}({word.get(i['status'], i['status'])})" for i in items[:5]), items
+        if name in P.NAMES:  # read only: live from the phone in a call, else the synced daily summaries
+            try:
+                return await P.run(name, args, self.d["state"], self.d.get("phone_live"), self.now())
+            except P.Unavailable as e:
+                raise Fail("unavailable", str(e))
+            except ValueError as e:
+                raise Fail("invalid", str(e))
         if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
             return await getattr(self, name)(args, persona_id)
         if name in MAC_ACTIONS:
@@ -1078,7 +1086,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
              OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
-             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK)
+             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
@@ -1150,6 +1158,14 @@ for _n, _m in {
                    "examples": ({"name": "azel-movie"}, {})},
 }.items():
     ACTIONS[_n] = _m
+PHONE_EXAMPLES = {"phone_health": ({"metric": "steps", "range": "today"}, {"metric": "mood"}),
+                  "phone_sleep": ({}, {"date": "어제"}), "phone_workouts": ({"range": "this_week"}, {"range": "forever"}),
+                  "phone_calendar": ({"range": "tomorrow"}, {"range": "last_week"}),
+                  "phone_reminders": ({}, {"list": 3}), "phone_contacts": ({"name": "김철수"}, {"name": ""}),
+                  "phone_location": ({}, {"precise": True}), "phone_now_playing": ({}, {"x": 1})}
+for _n in P.NAMES:  # PHONE_DATA.md: personal, so never external; the app reads its own phone, so no app route
+    ACTIONS[_n] = {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                   "no_rest": "앱은 자기 아이폰 데이터를 직접 읽어요(모델 경로 전용).", "examples": PHONE_EXAMPLES[_n]}
 APP_ACTIONS = {n for n, m in ACTIONS.items() if "app" in m["scopes"]}
 NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); tailnet POST /v1/tools/call reaches them
     "device": "기기 작업은 앱에서 create_task로 맡겨요(명령 실행은 승인과 함께 모델 경로에서만).",
