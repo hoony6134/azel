@@ -320,6 +320,11 @@ def hard_deny(tokens: list[str], wd: Path) -> None:
                     raise Refused(f"path covers the assistant's, SSH, Claude, keychain or start-up files: {v}")
 
 
+def in_roots(p: Path) -> bool:
+    """Is this directory inside allowed_roots? Every approval request says so (the gateway auto-approves only then)."""
+    return any(p.is_relative_to(r) for r in CFG["roots"])
+
+
 def run_dir(cwd: str | None, approved: bool) -> Path:
     """Working directory: inside allowed_roots, or (approved runs and unlisted commands awaiting approval) any
     existing directory under $HOME. Relative paths start at the first root."""
@@ -533,10 +538,11 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
         approval_id = None  # the gateway already spent the approval and audits the run
     elif not approval_id and via_grant and (risky or unlisted):  # nobody is contacted: the gateway proxy files it
         return {"status": "needs_approval", "command": command, "cwd": str(wd), "device": CFG["id"],
-                "nonce": _issue_nonce()}
+                "in_roots": in_roots(wd), "nonce": _issue_nonce()}
     if not grant and not approval_id and (risky or unlisted):
         r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": "run_command", "command": command,
-                                              "cwd": str(wd), **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
+                                              "cwd": str(wd), "in_roots": in_roots(wd),
+                                              **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
         if r.get("status") != "approved":  # an "always" rule approves it on the spot
             return {"status": "pending_approval", "approval_id": r["approval_id"]}
         approval_id = r["approval_id"]
@@ -1227,6 +1233,7 @@ def _gate(command: str, cwd: str, approval_id: str | None) -> dict | None:
         raise Refused("browser approvals need approval_via = gateway")
     if not approval_id:
         r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": "browser", "command": command, "cwd": cwd,
+                                              "in_roots": False,  # a page or a printer is not a directory under the roots
                                               **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
         if r.get("status") != "approved":
             return {"status": "pending_approval", "approval_id": r["approval_id"], "needs": command}

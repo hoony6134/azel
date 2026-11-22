@@ -470,7 +470,8 @@ class Bridge:
         """A daemon that cannot reach us answered needs_approval: file the approval here (push, expiry, rules, audit),
         wait for the tap as always, spend it, then re-call with a grant the daemon can check with its own token."""
         aid = (await self.d["approval_create"]({"device": na["device"], "tool": "run_command", "command": na["command"],
-                                                "cwd": na["cwd"], "requester": self.d.get("who", lambda: "")()}))["approval_id"]
+                                                "cwd": na["cwd"], "requester": self.d.get("who", lambda: "")(),
+                                                **({"in_roots": na["in_roots"]} if isinstance(na.get("in_roots"), bool) else {})}))["approval_id"]
         if on_progress:
             await on_progress(ASK_APPROVAL)
         t0 = time.monotonic()
