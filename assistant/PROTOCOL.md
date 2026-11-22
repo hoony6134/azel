@@ -84,6 +84,12 @@ answering a call the assistant placed; the server then speaks that call's openin
     same objects between its `audio` lines.
   - `{"type":"turn_done","timings":{…},"audio_ends_in_ms":N}` — sent once playback has finished (see
     `state`); `audio_ends_in_ms` is how much audio was still queued when generation ended (diagnostic).
+    For a spoken turn, `timings.turn` is how the turn's speech arrived (diagnostic, also printed as a `turn-end`
+    line in the voice server's log): `{"by": "quiet"|"drop"|"interrupt"|"hangup", "audio_s", "wall_s", "max_gap_s",
+    "gap_at_s", "voiced_s"}`. `audio_s` is the audio received after speech began, `wall_s` the time from speech onset
+    to the turn's end, `max_gap_s` the longest gap between inbound audio messages, and `gap_at_s` when that gap began
+    (seconds into the call). A turn ends only after 500 ms of quiet frames, so a late end with a long `max_gap_s`
+    means audio stopped arriving.
   - `{"type":"error","message":"…"}`
 - Briefing (`intent=briefing`, without `call_id`): the server first asks a full gateway for the situation
   (`briefing_context` over the link, 2 s timeout). With a situation note, the local Qwen composes a
