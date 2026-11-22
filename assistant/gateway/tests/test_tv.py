@@ -116,10 +116,14 @@ SUNDAY = 1_795_000_000  # any instant: only the year logic uses it
 
 
 def test_v2_parsers_on_real_cygnus_text():
-    nodes = tv.parse_nodes(HEALTH, NOW)
-    assert nodes[0] == {"name": "albireo", "up": True, "seen": "2026-11-22T13:27:00+09:00", "cpu": 0, "ram": 69, "disk": 15, "temp": None}
-    assert nodes[1]["temp"] == 74 and nodes[2]["up"] is False and nodes[2]["cpu"] is None and nodes[2]["seen"] is None
-    assert tv.parse_down(STATUS) == [{"service": "Vuja De claw (NemoClaw)", "node": "vd-spark", "since": None}]
+    nodes, asof = tv.parse_hosts(HEALTH, NOW)
+    assert asof == "13:27"
+    assert nodes[0] == {"name": "albireo", "group": "cygnus", "status": "ok", "up": True, "seen": "2026-11-22T13:27:00+09:00",
+                        "cpu": 0, "mem": 69, "disk": 15, "temp": None, "load": "0.05/2", "uptime": "142d"}
+    assert nodes[1]["temp"] == 74 and nodes[2]["up"] is False and nodes[2]["status"] == "off"
+    assert nodes[2]["cpu"] is None and nodes[2]["seen"] is None
+    assert tv.parse_down(STATUS) == [{"service": "Vuja De claw (NemoClaw)", "node": "vd-spark", "group": "Vuja De GPU",
+                                      "type": "http", "state": "down", "note": "24h 0.00%", "since": None}]
     assert tv.parse_alerts("No firing alerts.") == []
     a = tv.parse_alerts("deneb disk 91% (warning)\nCRITICAL: gienah down")
     assert [x["level"] for x in a] == ["warn", "crit"] and [x["head"] for x in a] == ["디스크 부족", "응답 없음"]
@@ -158,7 +162,7 @@ def deps2(**over):
 def test_build2_shape_and_no_secrets():
     out = asyncio.run(tv.build2(deps2(), NOW))
     assert out["assistant"] == {"state": "idle", "persona": {"name": "세레나", "tint": "plum"}}
-    assert out["infra"]["nodes"][1]["name"] == "fawaris" and out["infra"]["down"][0]["node"] == "vd-spark"
+    assert out["infra"]["hosts"][1]["name"] == "fawaris" and out["infra"]["asof"] == "13:27" and out["infra"]["down"][0]["node"] == "vd-spark"
     t = out["tasks"]
     assert t["running"][0]["since"] and t["queued"] == {"count": 1, "next": "다음 일"}
     assert t["approvals"] == {"count": 1, "oldest": t["approvals"]["oldest"]} and t["approvals"]["oldest"]
@@ -220,3 +224,98 @@ def test_tv_deps_infra_calls_cygnus_with_args(monkeypatch):
 
     monkeypatch.setattr(cygnus, "call", fake_call)
     assert asyncio.run(gateway.tv_deps()["infra"]("infra_health")) == "ok" and seen == [("infra_health", {})]
+
+
+# ---- the text the gateway's tools really return (same shapes as the live output, invented names) ----
+LIVE_HEALTH = """As of 2026-11-22 17:04 KST (cpu = 5-min avg, disk = /)
+정상 albireo [cygnus] cpu 1% · mem 69% · disk 15% · load 0.08/2 · uptime 142d
+주의 fawaris [cygnus] cpu 3% · mem 49% · disk 91% · 67°C · load 0.07/4 · uptime 24d
+문제 sadr [cygnus] DOWN
+정상 vd-spark [vujade] cpu 2% · mem 78% · disk 19% · 42°C · load 0.30/20 · uptime 23h
+(maintenance window until 18:00)"""
+LIVE_STATUS = """# Cygnus · Ops (internal)
+## vd-spark · Vuja De GPU
+  문제 Vuja De claw (NemoClaw) (http) 멈춤 · 24h 0.00%
+  주의 searx (http) 느려짐 · 24h 97.10%"""
+LIVE_TODAY = """스냅샷: 11월 22일 (일) 15:41
+
+## 2026-11-22 기준
+
+### 수업
+없음
+
+### 7일 안 마감
+- 11월 23일 (월) 23:59 · 하우스 문서 — 문서 부착 공지
+- 11월 23일 (월) 23:59 · 할 일 — 컴파일러 프로젝트
+
+### 복습할 단원
+- 현대 예술의 이해 · 팝아트 (새로 배움) — 예정 10월 28일 (수)
+- 프로그래밍 언어 및 컴파일러 · Lexical Analysis (Token, Regex) (익히는 중) — 예정 11월 1일 (일)
+
+### LMS 알림 (최근 7일)
+- 11월 22일 (일) 현대 예술의 이해[01] · 강의 개요 — 새 토론글이 등록되었습니다.
+알 수 없는 줄 하나"""
+LIVE_ASSIGN = """스냅샷: 11월 22일 (일) 15:41
+
+## 남은 항목 (3)
+- ⬜ 11월 23일 (월) 23:59 · 하우스 문서 — 문서 부착 공지 [할 일]
+- ⬜ 11월 23일 (월) 23:59 · 컴파일러 프로젝트 [할 일]
+- ⬜ 마감 없음 · 대외부 — 대외부장 인수인계 기록지 작성 [할 일]"""
+LATER = 1_795_300_000  # 2026-11-22 ~15:00 KST
+
+
+def test_hosts_in_the_gateways_spoken_words_and_in_groups():
+    hosts, asof = tv.parse_hosts(LIVE_HEALTH, LATER)
+    assert asof == "17:04" and [h["name"] for h in hosts] == ["albireo", "fawaris", "sadr", "vd-spark"]
+    assert [h["status"] for h in hosts] == ["ok", "warn", "off", "ok"] and [h["group"] for h in hosts][-1] == "vujade"
+    assert hosts[1]["disk"] == 91 and hosts[1]["temp"] == 67 and hosts[3]["uptime"] == "23h" and hosts[3]["load"] == "0.30/20"
+    assert tv.parse_notes(LIVE_HEALTH) == ["(maintenance window until 18:00)"]  # an unknown line is kept, as text
+
+
+def test_services_and_alerts_headers_are_labels_not_alerts():
+    down = tv.parse_down(LIVE_STATUS)
+    assert [(d["service"], d["state"], d["node"], d["group"], d["note"]) for d in down] == [
+        ("Vuja De claw (NemoClaw)", "down", "vd-spark", "Vuja De GPU", "24h 0.00%"),
+        ("searx", "degraded", "vd-spark", "Vuja De GPU", "24h 97.10%")]
+    assert tv.parse_alerts("# Cygnus · Ops (internal)\n## vd-spark · Vuja De GPU\n지금 울리는 경보 없음.") == []
+    a = tv.parse_alerts("## vd-spark · Vuja De GPU\nspark 디스크 91% (warning)")
+    assert len(a) == 1 and a[0]["group"] == "vd-spark" and a[0]["head"] == "디스크 부족"
+
+
+def test_gistra_sections_items_and_empty_headers():
+    snap, secs = tv.parse_sections(LIVE_TODAY, LATER)
+    assert snap == "15:41"
+    assert [(s["title"], len(s["items"])) for s in secs] == [("수업", 0), ("7일 안 마감", 2), ("복습할 단원", 2),
+                                                          ("LMS 알림 (최근 7일)", 1 + 1)]  # 수업 is empty: no card
+    d = secs[1]["items"][0]
+    assert (d["when"], d["kind"], d["title"], d["due"][:16]) == ("11/23 23:59", "하우스 문서", "문서 부착 공지", "2026-11-23T23:59")
+    r = secs[2]["items"][1]
+    assert (r["kind"], r["title"], r["note"]) == ("프로그래밍 언어 및 컴파일러", "Lexical Analysis (Token, Regex)", "익히는 중 · 예정 11월 1일 (일)")
+    lms = secs[3]["items"][0]
+    assert (lms["when"], lms["kind"], lms["title"], lms["note"]) == ("11/22", "현대 예술의 이해[01]", "강의 개요", "새 토론글이 등록되었습니다.")
+    assert secs[3]["items"][1]["title"] == "알 수 없는 줄 하나"  # never dropped
+    snap2, left = tv.parse_sections(LIVE_ASSIGN, LATER)
+    assert snap2 == "15:41" and [s["title"] for s in left] == ["남은 항목"] and len(left[0]["items"]) == 3
+    assert left[0]["items"][2]["when"] == "마감 없음" and left[0]["items"][2]["due"] is None
+
+
+def test_next_deadline_from_gistra_or_the_calendar():
+    gistra = {"assignments": [], "todos": [{"text": "x", "title": "컴파일러 프로젝트", "kind": "", "due": "2026-11-23T23:59:00+09:00"}],
+              "sections": []}
+    nd = tv.next_deadline(gistra, [], LATER, "2026-11-22")
+    assert nd["title"] == "컴파일러 프로젝트" and nd["source"] == "gistra"
+    cal = [{"start": "19:30", "end": "19:45", "what": "토론지 LMS 업로드 확인 (마감 23:00)", "cal": "미리알림", "where": ""}]
+    assert tv.next_deadline(gistra, cal, LATER, "2026-11-22")["source"] == "calendar"  # tonight is earlier than tomorrow
+    assert tv.next_deadline(None, None, LATER, "2026-11-22") is None
+
+
+def test_build2_gives_hosts_sections_and_next_deadline():
+    async def raw(n, a=None):
+        return {"infra_health": LIVE_HEALTH, "infra_status": LIVE_STATUS, "infra_alerts": "지금 울리는 경보 없음.",
+                "gistra_assignments": LIVE_ASSIGN, "gistra_today": LIVE_TODAY}[n]
+
+    out = asyncio.run(tv.build2(deps2(infra_raw=raw), LATER))
+    assert out["infra"]["asof"] == "17:04" and len(out["infra"]["hosts"]) == 4 and out["infra"]["alerts"] == []
+    g = out["gistra"]
+    assert g["asof"] == "15:41" and [s["title"] for s in g["sections"]] == ["7일 안 마감", "복습할 단원", "LMS 알림 (최근 7일)", "남은 항목"]
+    assert out["next_deadline"]["title"] and out["next_deadline"]["due"].startswith("2026-11-2")
