@@ -324,7 +324,7 @@ struct GlazeBackground: View {
         let c = state.glow(tint) ?? Theme.text3
         ZStack {
             Theme.bg
-            if #available(iOS 18, macOS 15, *) {
+            if #available(iOS 18, macOS 15, watchOS 11, *) {
                 TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { tl in
                     let d = Float(reduceMotion ? 0 : 0.04 * sin(tl.date.timeIntervalSinceReferenceDate * 0.3))
                     MeshGradient(width: 3, height: 3, points: [

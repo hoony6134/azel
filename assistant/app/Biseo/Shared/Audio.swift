@@ -173,7 +173,9 @@ final class AudioIO {
         input.isVoiceProcessingBypassed = false
         input.isVoiceProcessingAGCEnabled = true
         // Duck other apps' audio as little as possible during the call (user bug, 2026-11-21).
+        #if !os(watchOS)
         input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
+        #endif
         let format = input.outputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0,
               let mono = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),

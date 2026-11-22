@@ -5,6 +5,7 @@ options:
   deploymentTarget:
     iOS: "17.0"
     macOS: "14.0"
+    watchOS: "10.0"
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -27,6 +28,8 @@ targets:
         destinationFilters: [macOS]
     dependencies:
       - target: AzelWidgets
+        destinationFilters: [iOS]
+      - target: AzelWatch
         destinationFilters: [iOS]
     settings:
       base:
@@ -83,11 +86,11 @@ targets:
         # 100.64.0.11 → -1022; iOS refuses both), so the app offers only the TLS addresses.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-  # Lock Screen / Dynamic Island Live Activities (call, running tasks). iPhone only.
+  # Lock Screen / Dynamic Island Live Activities (call, running tasks) and the Azel 부르기 widget. iPhone only.
   AzelWidgets:
     type: app-extension
     platform: iOS
-    sources: [Biseo/Widgets, Biseo/LiveActivity]
+    sources: [Biseo/Widgets, Biseo/LiveActivity, Biseo/CallWidget]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.widgets
@@ -96,6 +99,70 @@ targets:
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) WIDGET # ApprovalIntent: the app-only perform body
     info:
       path: Biseo/Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: Azel
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  # Apple Watch: its own CallKit call over `WS /v1/call` (watchOS only allows the socket during a
+  # call), Siri ("아젤 불러줘"), and the Azel 부르기 complication. The iPhone sends the token over
+  # WatchConnectivity (iOS/WatchSync.swift).
+  AzelWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - path: Biseo/Watch
+      - path: Biseo/Shared/CallClient.swift
+      - path: Biseo/Shared/Audio.swift
+      - path: Biseo/Shared/Config.swift
+      - path: Biseo/Shared/CallLog.swift
+      - path: Biseo/Shared/AssistantName.swift
+      - path: Biseo/Shared/Log.swift
+      - path: Biseo/Shared/CallEvent.swift
+      - path: Biseo/Shared/Activity.swift
+      - path: Biseo/Shared/Earcon.swift
+      - path: Biseo/Shared/Karaoke.swift
+      - path: Biseo/Shared/Recording.swift
+      - path: Biseo/Shared/Theme.swift
+      - path: Biseo/Shared/MoonJar.swift
+    dependencies:
+      - target: AzelWatchWidgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.watchkitapp
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: Biseo/Watch/Info.plist
+      properties:
+        CFBundleDisplayName: Azel
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: xyz.scian.biseo
+        NSMicrophoneUsageDescription: Azel로 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.
+        UIBackgroundModes: [voip, audio]
+        INAlternativeAppNames:
+          - INAlternativeAppName: 아젤
+            INAlternativeAppNamePronunciationHint: 아젤
+          - INAlternativeAppName: 비서
+            INAlternativeAppNamePronunciationHint: 비서
+        INIntentsSupported: [INStartCallIntent]
+        NSUserActivityTypes: [INStartCallIntent]
+        CFBundleURLTypes:
+          - CFBundleURLName: xyz.scian.biseo
+            CFBundleURLSchemes: [azel]
+  AzelWatchWidgets:
+    type: app-extension
+    platform: watchOS
+    sources: [Biseo/WatchWidgets, Biseo/CallWidget]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.watchkitapp.widgets
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: Biseo/WatchWidgets/Info.plist
       properties:
         CFBundleDisplayName: Azel
         CFBundleShortVersionString: "1.0"

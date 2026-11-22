@@ -2,55 +2,6 @@ import Foundation
 
 // MARK: - Contract types (PROTOCOL.md §1 and §3)
 
-/// One JSON text message from `WS /v1/call`.
-struct CallEvent: Decodable, Equatable {
-    let type: String          // state | transcript | reply | interrupt | turn_done | error | activity
-    var value: String?        // state
-    var text: String?         // transcript, reply
-    var route: String?        // reply
-    var message: String?      // error
-    var phase: String?        // activity: routing | tool_start | tool_end | thinking (others ignored)
-    var label: String?        // activity, server wording
-    var tool: String?         // activity
-    var kind: String?         // activity: calendar | mail | memory | … (DESIGN §13.2)
-    var reply_id: Int?        // reply_start
-    var mode: String?         // the active brain mode (state / mode events)
-    var context: Context?     // `context`: the first frame of a call placed for a task or a reminder
-    var caps: [String]?       // what this call's server supports (`hello` frame): text, mode, played…
-    var reason: String?       // text_rejected: too_long | too_fast
-    var secret: Bool?         // state frames: this call is secret (incognito)
-    var auto: Bool?           // state frames: an auto-approve grant is live for this call
-    var expires_at: Double?   // auto_approve: when the grant ends (epoch)
-    /// A boolean `value` (`{"type":"secret","value":true}`); `value` then stays nil.
-    var flag: Bool?
-
-    struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
-
-    private enum CodingKeys: String, CodingKey {
-        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at
-    }
-
-    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil) {
-        self.type = type; self.value = value; self.text = text; self.route = route
-    }
-
-    /// Field by field and tolerant: one odd field never drops the whole frame.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        type = try c.decode(String.self, forKey: .type)
-        if let s = try? c.decodeIfPresent(String.self, forKey: .value) { value = s } else { flag = try? c.decodeIfPresent(Bool.self, forKey: .value) }
-        func str(_ k: CodingKeys) -> String? { try? c.decodeIfPresent(String.self, forKey: k) }
-        text = str(.text); route = str(.route); message = str(.message); phase = str(.phase); label = str(.label)
-        tool = str(.tool); kind = str(.kind); mode = str(.mode); reason = str(.reason)
-        reply_id = try? c.decodeIfPresent(Int.self, forKey: .reply_id)
-        context = try? c.decodeIfPresent(Context.self, forKey: .context)
-        caps = try? c.decodeIfPresent([String].self, forKey: .caps)
-        secret = try? c.decodeIfPresent(Bool.self, forKey: .secret)
-        auto = try? c.decodeIfPresent(Bool.self, forKey: .auto)
-        expires_at = try? c.decodeIfPresent(Double.self, forKey: .expires_at)
-    }
-}
-
 struct AppSettings: Codable, Equatable {
     struct TaskDefault: Codable, Equatable { var model: String; var path: String? }
     /// When the assistant calls first. Decodes the old shape

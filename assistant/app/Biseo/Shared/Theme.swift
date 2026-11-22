@@ -1,7 +1,7 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
-#else
+#elseif os(macOS)
 import AppKit
 #endif
 
@@ -45,6 +45,8 @@ extension Color {
         #if os(iOS)
         self.init(uiColor: UIColor { $0.userInterfaceStyle == .dark
             ? UIColor(red: d.0, green: d.1, blue: d.2, alpha: 1) : UIColor(red: l.0, green: l.1, blue: l.2, alpha: 1) })
+        #elseif os(watchOS)
+        self.init(red: d.0, green: d.1, blue: d.2)   // the watch is always dark
         #else
         self.init(nsColor: NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(srgbRed: d.0, green: d.1, blue: d.2, alpha: 1) : NSColor(srgbRed: l.0, green: l.1, blue: l.2, alpha: 1) })
@@ -52,6 +54,7 @@ extension Color {
     }
 }
 
+#if !os(watchOS) // the watch uses only the tokens above
 // MARK: - Small shared pieces
 
 /// Grouped card (§4, §7.5): `card` on `bg`, 1 pt stroke, radius 22, light-mode shadow only.
@@ -184,3 +187,4 @@ enum FriendlyError {
         }
     }
 }
+#endif
