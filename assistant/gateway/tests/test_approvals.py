@@ -257,4 +257,4 @@ def test_kv_keys_fit_the_memory_service(agw, key, ok):
 def test_a_write_approval_push_says_always_is_not_offered(agw):
     g, c, pushes = agw
     c.post("/v1/approvals", json={**CMD, "command": "rm -rf build"})
-    assert pushes[-1][2]["category"] == "APPROVAL" and pushes[-1][2]["forced_once"] is True  # no 항상 허용 button
+    assert pushes[-1][2]["category"] == "APPROVAL_ONCE" and pushes[-1][2]["forced_once"] is True  # no 항상 허용 button

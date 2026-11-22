@@ -1184,7 +1184,7 @@ async def send_voip_push(payload):
 async def send_alert_push(title, body, category=None, **extra):
     """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token. `extra` rides at the
     payload's top level next to `aps` (a task push: `type: "task"`, `task_id`, so the app opens azel://task/<id>);
-    `category` picks the app's notification buttons (APPROVAL: 허용 / 거부 / 항상 허용)."""
+    `category` picks the app's notification buttons (APPROVAL: 허용 / 거부 / 항상 허용; APPROVAL_ONCE: 허용 / 거부)."""
     aps = {"alert": {"title": title, "body": body}, "sound": "default", **({"category": category} if category else {})}
     return await apns_send({"aps": aps, **extra}, "alert")
 
@@ -3225,7 +3225,7 @@ async def create_approval(body: dict):
     try:  # the app shows it; the command text only (never output), shortened
         # "항상 허용" is offered only where it could hold: a read-only command, not from a secret call
         once = not always_ok(row["command"]) or is_secret((requester or {}).get("session"))
-        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", category="APPROVAL",
+        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", category="APPROVAL_ONCE" if once else "APPROVAL",
                               type="approval", approval_id=aid,
                               **({"forced_once": True} if once else {}))  # the command only in the app, never here
     except Exception as e:
