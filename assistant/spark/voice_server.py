@@ -1877,9 +1877,14 @@ DEVICE_JOB = re.compile(r"(" + "|".join(_DEV) + r")\S*\s.{0,30}(정리|설치|�
 OVERNIGHT = re.compile(r"(자기 ?전에|밤새|밤사이|자는 ?동안|내일 ?아침까지).{0,40}(해 ?둬|해 ?놔|해 ?놓|해 ?줘|조사|정리|찾아|알아봐|만들어)")
 
 
+TASK_FILLER = re.compile(r"그러고|그리고|그다음(에)?|그 다음(에)?|그럼|그거|그 작업|작업|다|나한테|저한테|좀|[\s.,!?~]")
+
+
 def task_intent(text):
     """None, or how to report back ("call" / "push") when the request is a background task: an explicit
     "끝나면 알려 줘", or a job on a named device (several steps; the caller should not wait on the line)."""
+    if (m := TASK_NOTIFY.search(text)) and len(TASK_FILLER.sub("", text[:m.start()] + text[m.end():])) < 4:
+        return None  # "그러고 끝나고 전화해줘" alone has no work in it: the model answers it from the conversation
     if TASK_NOTIFY.search(text):
         return "push" if re.search(r"푸시|알림|메시지|문자", text) else "call"
     if OVERNIGHT.search(text):
@@ -2813,6 +2818,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if act == "ignore":
             return
         if act == "replace":
+            asked = current.get("asked")
+            if asked and not asked["spoke"] and not STOP_WORDS.search(text):
+                # nothing said yet: the user was still talking ("…보고서 만들어 줘" + "그러고 끝나고 전화해줘"), so it
+                # is one request. Cut off, the first half was dropped and a task of the second half alone ran
+                text = f"{asked['text']} {text}"
             await interrupt()  # cancels the answer being worked on (and anything else speaking)
         else:
             await asyncio.gather(prev, return_exceptions=True) if prev else None
@@ -2964,6 +2974,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 return
             if not typed:  # the app already shows what the user typed
                 await send({"type": "transcript", "text": text})
+            current["asked"] = asked = {"text": text, "spoke": False}  # followup() joins a cut-in to an unanswered turn
             started = False
             # aclosing: the reply's history turn exists before a cut below rewrites it (no GC-time finally)
             async with contextlib.aclosing(respond(text, session, t0, timings, on_event=on_event, kept=kept,
@@ -2974,7 +2985,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     if not started:
                         await send({"type": "state", "value": "speaking"})
                         await send({"type": "reply_start", "reply_id": gen}, gen=gen)  # new audio starts here
-                        started = True
+                        started = asked["spoke"] = True
                     turn["route"] = route
                     if s not in (FILLER, FILLER_LONG):
                         turn["assistant"].append(s)
@@ -5358,4 +5369,8 @@ if __name__ == "__main__":
         assert said[0] == AUTO_Q and said[1].startswith("네, 이번 통화 동안") and said[3].startswith("알겠어요")
         assert notified == [{"type": "auto_grant", "session": "azel:a", "value": True}]  # "아니" grants nothing
         assert not pending_auto
+        # a notify clause alone is no task; with the work it is (the cut-in joined to its unanswered turn)
+        assert task_intent("그러고 끝나고 전화해줘.") is None and task_intent("끝나면 알려줘") is None
+        assert task_intent("스탭메이트 시장 조사를 맥북에서 해서 다운로드 폴더에 저장해줘. 그러고 끝나고 전화해줘.") == "call"
+        assert task_intent("빌드 돌려 놓고 끝나면 푸시로 알려줘") == "push"
         print("voice_server checks ok")
