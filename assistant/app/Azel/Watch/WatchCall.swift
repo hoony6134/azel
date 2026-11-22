@@ -16,6 +16,13 @@ final class WatchCall: NSObject, ObservableObject {
     @Published private(set) var persona: WatchPersona?
     var displayState: String { CallClient.displayState(server: state, playing: playing) }
     var levels: Levels { client.audio.levels }
+    /// Which part of the reply has been heard, for the caption (same as the iPhone call screen).
+    func karaoke(stepped: Bool) -> (texts: [String], spoken: Double) {
+        let k = client.karaokeState()
+        return (k.texts, stepped ? k.stepped : k.spoken)
+    }
+    /// The step trail, for the working / tick / done / error earcons (the iPhone's flow).
+    private var activity = ActivityLog()
 
     private let provider: CXProvider
     private let controller = CXCallController()
@@ -57,6 +64,7 @@ final class WatchCall: NSObject, ObservableObject {
     }
 
     private func handle(_ event: CallEvent) {
+        if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         switch event.type {
         case "state": state = event.value ?? ""
         case "hangup", "end": fail(nil)
@@ -87,6 +95,7 @@ extension WatchCall: CXProviderDelegate {
         callUUID = action.callUUID
         inCall = true
         log = CallLog()
+        activity = ActivityLog()
         try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat)
         let named = CXCallUpdate()
         named.localizedCallerName = persona?.name ?? AssistantName.current

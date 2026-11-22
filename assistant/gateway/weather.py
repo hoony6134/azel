@@ -179,18 +179,27 @@ def kma_spoken(where, when, now, ncst, fcst, vilage):
     return (head + (f" {temps}예요." if temps else "")).strip()
 
 
+async def kma_now_items(p, key, c, now):
+    """(초단기실황, 초단기예보, 단기예보) items for `now` at place p. The observation is required (raises); the next hours and
+    the day's forecast are [] when they did not come. Shared by the voice answer and the TV's weather card."""
+    nx, ny = grid(p["lat"], p["lon"])
+    b_ncst, b_fcst, b_vil = bases(now)
+    ncst, fcst, vilage = await asyncio.gather(kma_items(c, "getUltraSrtNcst", key, b_ncst, nx, ny),
+                                              kma_items(c, "getUltraSrtFcst", key, b_fcst, nx, ny),
+                                              kma_items(c, "getVilageFcst", key, b_vil, nx, ny), return_exceptions=True)
+    if isinstance(ncst, BaseException):
+        raise ncst
+    fcst, vilage = [x if isinstance(x, list) else [] for x in (fcst, vilage)]
+    return ncst, fcst, vilage
+
+
 async def kma_forecast(p, when, key, c, now=None):
     from datetime import datetime, timedelta, timezone
     now = now or datetime.now(timezone(timedelta(hours=9)))
     nx, ny = grid(p["lat"], p["lon"])
     b_ncst, b_fcst, b_vil = bases(now)
     if when == "now":  # the observation is needed; the next hours and the day's high/low are said when they came
-        ncst, fcst, vilage = await asyncio.gather(kma_items(c, "getUltraSrtNcst", key, b_ncst, nx, ny),
-                                                  kma_items(c, "getUltraSrtFcst", key, b_fcst, nx, ny),
-                                                  kma_items(c, "getVilageFcst", key, b_vil, nx, ny), return_exceptions=True)
-        if isinstance(ncst, BaseException):
-            raise ncst
-        fcst, vilage = [x if isinstance(x, list) else [] for x in (fcst, vilage)]
+        ncst, fcst, vilage = await kma_now_items(p, key, c, now)
     else:
         ncst, fcst, vilage = None, None, await kma_items(c, "getVilageFcst", key, b_vil, nx, ny)
     where = re.sub(r"(광역시|특별시|특별자치시)$", "", p["name"]) or p["name"]

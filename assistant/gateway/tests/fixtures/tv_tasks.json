@@ -1,0 +1,541 @@
+[
+ {
+  "goal": "예시 작업 1: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "gpu-box",
+  "backend": "claude_api",
+  "started": 1795358976.1727989,
+  "finished": 1795359006.531805,
+  "result": "정훈님, 요청한 작업을 마쳤고 정상으로 확인했습니다.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795358981.265429,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795358995.0435882,
+    "kind": "approval_approved",
+    "tool": "device__run_command",
+    "label": null
+   },
+   {
+    "at": 1795358996.776661,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795358999.802229,
+    "kind": "approval_approved",
+    "tool": "device__run_command",
+    "label": null
+   },
+   {
+    "at": 1795359001.518867,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795359002.646462,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 2: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795354607.67503,
+  "finished": 1795354663.639049,
+  "result": "작업 2을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795354612.305003,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795354614.409864,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795354624.743934,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795354625.141761,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795354663.464034,
+    "kind": "job_done",
+    "label": "명령 실행 중",
+    "tool": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 3: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795352106.9850051,
+  "finished": 1795352128.767499,
+  "result": "작업 3을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795352111.268561,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795352114.70959,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795352123.954114,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 4: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795351484.799257,
+  "finished": 1795351748.88961,
+  "result": "작업 4을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795351489.1330318,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351491.050944,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351495.946999,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351498.1394691,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351502.053569,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351509.427646,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351509.646156,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795351748.702652,
+    "kind": "job_done",
+    "label": "명령 실행 중",
+    "tool": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 5: 요청을 처리하고 결과를 알린다.",
+  "status": "cancelled",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795350990.3291378,
+  "finished": 1795351373.381788,
+  "result": "취소됐어요.",
+  "error": "취소됐어요.",
+  "note": "메모",
+  "steps": [
+   {
+    "at": 1795350995.020437,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795350996.483834,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351109.263867,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351112.1499698,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351126.2252219,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795351126.595956,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 6: 요청을 처리하고 결과를 알린다.",
+  "status": "failed",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795343174.673322,
+  "finished": 1795344101.20529,
+  "result": "기기 작업이 권한 때문에 막혀서 끝내지 못했어요.",
+  "error": "기기 작업이 권한 때문에 막혀서 끝내지 못했어요(명령 실행). 보고서는 저장했어요.",
+  "note": "메모",
+  "steps": [
+   {
+    "at": 1795343180.828206,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795343183.902255,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795343187.0351,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795343207.8492422,
+    "kind": "approval_approved",
+    "tool": "device__run_command",
+    "label": null
+   },
+   {
+    "at": 1795343209.028127,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795343213.7003021,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795343214.09179,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795344101.205258,
+    "kind": "job_blocked",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795344101.205295,
+    "kind": "killed",
+    "tool": null,
+    "label": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 7: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": null,
+  "backend": "claude_api",
+  "started": 1795342918.951366,
+  "finished": 1795342924.0712378,
+  "result": "작업 7을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": []
+ },
+ {
+  "goal": "예시 작업 8: 요청을 처리하고 결과를 알린다.",
+  "status": "failed",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795340942.662611,
+  "finished": 1795341342.794997,
+  "result": "작업 8을 끝내지 못했어요.",
+  "error": "기기 작업이 권한 때문에 막혀서 끝내지 못했어요(명령 실행). 보고서는 저장했어요.",
+  "note": "메모",
+  "steps": [
+   {
+    "at": 1795340947.456047,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795340953.638121,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795340953.849853,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795341342.794919,
+    "kind": "job_blocked",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795341342.795177,
+    "kind": "killed",
+    "tool": null,
+    "label": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 9: 요청을 처리하고 결과를 알린다.",
+  "status": "failed",
+  "device": null,
+  "backend": "claude_api",
+  "started": 1795340422.2190778,
+  "finished": 1795340552.739807,
+  "result": "작업 9을 끝내지 못했어요.",
+  "error": "기기 작업이 권한 때문에 막혀서 끝내지 못했어요(명령 실행). 보고서는 저장했어요.",
+  "note": "메모",
+  "steps": [
+   {
+    "at": 1795340426.4036942,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795340516.2155719,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795340530.971353,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795340531.410584,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 10: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795335671.7000241,
+  "finished": 1795335805.980155,
+  "result": "작업 10을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795335676.450269,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795335686.6959481,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795335689.410497,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795335691.7249532,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795335710.123913,
+    "kind": "approval_approved",
+    "tool": "device__run_command",
+    "label": null
+   },
+   {
+    "at": 1795335715.945206,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795335716.259082,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795335805.639461,
+    "kind": "job_done",
+    "label": "명령 실행 중",
+    "tool": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 11: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795324181.204216,
+  "finished": 1795324236.643121,
+  "result": "작업 11을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795324185.191881,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795324190.9549801,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795324193.210845,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795324197.0327628,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795324197.314764,
+    "kind": "job",
+    "label": "명령 실행 중",
+    "tool": null
+   },
+   {
+    "at": 1795324236.4342778,
+    "kind": "job_done",
+    "label": "명령 실행 중",
+    "tool": null
+   }
+  ]
+ },
+ {
+  "goal": "예시 작업 12: 요청을 처리하고 결과를 알린다.",
+  "status": "done",
+  "device": "macbook",
+  "backend": "claude_api",
+  "started": 1795321996.14674,
+  "finished": 1795322016.757418,
+  "result": "작업 12을 마쳤어요.",
+  "error": null,
+  "note": null,
+  "steps": [
+   {
+    "at": 1795322001.1253288,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795322006.041137,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795322010.89319,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   },
+   {
+    "at": 1795322013.253388,
+    "kind": "tool",
+    "tool": "device__run_command",
+    "label": "명령 실행 중"
+   }
+  ]
+ }
+]

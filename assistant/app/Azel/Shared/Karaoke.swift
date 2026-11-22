@@ -108,7 +108,7 @@ enum KaraokeStyle {
     }
 }
 
-#if canImport(SwiftUI) && !os(watchOS) // the watch shows plain captions
+#if canImport(SwiftUI)
 import SwiftUI
 
 /// One reply sentence with the heard part bright and the rest dimmed.

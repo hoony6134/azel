@@ -221,6 +221,58 @@ async def quote(query, client=None, search=None):
     return {"spoken": spoken(p), "data": {**p, "at": p["at"].isoformat() if p.get("at") else None}}
 
 
+HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>[A-Z][A-Z.]{0,6}|\d{6})\)\s*$")
+
+
+async def closes(symbol, c, rng="5d"):
+    """Daily closes (oldest first) from Yahoo's chart, for a sparkline; [] when there are none."""
+    r = await c.get(YAHOO_CHART.format(symbol=symbol), params={"range": rng, "interval": "1d"})
+    r.raise_for_status()
+    res = (r.json()["chart"]["result"] or [{}])[0]
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    return [round(x, 2) for x in q.get("close") or [] if x is not None]
+
+
+async def holding(entry, client=None):
+    """One of the TV's 내 종목: `삼성전자 (005930)` / `애플 (AAPL)` (the ticker wins, the name is what is shown) or a bare
+    name, looked up like a voice question but without web search, so an unlisted company (토스) is simply
+    {"listed": False} instead of a guess. Price and change from Naver (Korean codes) or Yahoo, plus `spark`: 5 closes."""
+    m = HOLDING.match(entry.strip())
+    name, tick = (m["name"] or m["tick"], m["tick"]) if m else (entry.strip(), None)
+    c = client or httpx.AsyncClient(timeout=TIMEOUT_S, headers=UA, follow_redirects=True)
+    try:
+        if tick is None:
+            hit = (await naver_find(name, c) if re.search(r"[가-힣]", name) else None) or await yahoo_find(name, c)
+            if not hit:
+                return {"name": name, "listed": False}
+            tick = hit.get("code") or hit.get("symbol") or hit.get("ticker")
+        try:
+            if re.fullmatch(r"\d{6}", tick):
+                try:
+                    p = await naver_price(tick, c)
+                except (httpx.HTTPError, KeyError, ValueError, IndexError):
+                    p = await yahoo_price(f"{tick}.KS", c)
+                symbols = (f"{tick}.KS", f"{tick}.KQ")
+            else:
+                p, symbols = await yahoo_price(tick, c), (tick,)
+        except (httpx.HTTPError, KeyError, ValueError, IndexError, TypeError):
+            return {"name": name, "ticker": tick, "listed": True, "price": None}
+        spark = []
+        for sym in symbols:  # a KOSDAQ code is .KQ on Yahoo
+            try:
+                spark = await closes(sym, c)
+            except (httpx.HTTPError, KeyError, ValueError, IndexError, TypeError):
+                spark = []
+            if spark:
+                break
+    finally:
+        if client is None:
+            await c.aclose()
+    return {"name": name, "ticker": tick, "listed": True, "price": p["price"], "currency": p["currency"],
+            "change": p.get("change"), "pct": round(p["pct"], 2) if p.get("pct") is not None else None, "spark": spark,
+            "source": p.get("source"), "at": p["at"].isoformat() if p.get("at") else None}
+
+
 if __name__ == "__main__":  # a live look: python quote.py 삼성전자
     import sys
     print(asyncio.run(quote(" ".join(sys.argv[1:]) or "Samsung Electronics"))["spoken"])

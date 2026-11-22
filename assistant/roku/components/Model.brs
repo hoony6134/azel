@@ -6,6 +6,7 @@ function newCard(t as String, w as Integer) as Object
         t: t, w: w, head: "", hl: "", sent: "", meta: "", when: "", tail: "", soon: false, now: false, name: ""
         title: "", v: [-1, -1, -1, -1], down: "", n1: "", l1: "", m1: "", n2: "", l2: "", m2: ""
         status: "", load: "", upt: "", note: "", ts: 0, dtitle: "", dsub: "", dsoon: false, facts: []
+        series: [], labels: [], unit: ""
     }
 end function
 
@@ -40,7 +41,7 @@ end function
 
 function clean(s as String) as String
     s = s.Replace("<", "")
-    return s.Replace(">", "")
+    return s.Replace(">", "").Trim()
 end function
 
 function failCard(w as Integer, section as String, still as String) as Object
@@ -420,6 +421,9 @@ function buildV2(d as Object, now as Integer) as Object
     if cards.Count() = 0 then cards.Push(emptyCard(560, "오늘 남은 일정이 없어요"))
     sections.Push({title: "오늘", w: 560, cap: 3, note: "", cards: cards})
 
+    ' 날씨: now / high / low / rain, then the next 12 hours as two small bar charts (KMA only)
+    if d.weather <> invalid then sections.Push(weatherSection(d.weather))
+
     ' 인프라: one row per host group (the [cygnus] / [vujade] of the health text), the ones that need a look first
     if infra = invalid
         sections.Push({title: "인프라", w: 414, cap: 4, note: "", cards: [failCard(414, "인프라", "")]})
@@ -513,6 +517,15 @@ function buildV2(d as Object, now as Integer) as Object
         if cards.Count() = 0 then cards.Push(emptyCard(560, "진행 중인 작업이 없어요"))
     end if
     sections.Push({title: "Azel 작업", w: 560, cap: 3, note: "", cards: cards})
+
+    ' 내 종목: price, change and five days of closes per holding; an unlisted one is just its name and 비상장
+    if Type(d.holdings) = "roArray" and d.holdings.Count() > 0
+        cs = []
+        for each h in d.holdings
+            cs.Push(stockCard(h))
+        end for
+        sections.Push({title: "내 종목", w: 414, cap: 4, note: "", cards: cs})
+    end if
 
     ' 과제와 할 일 (남은 항목), then the other GISTRA lists as rows of their own: 7일 안 마감 (what is not already above),
     ' 복습할 단원, LMS 알림, and whatever else the server sends
@@ -735,6 +748,141 @@ function buildModel(d as Object, v as Integer, now as Integer) as Object
     return buildV1(d, now)
 end function
 
+function deg(v as Dynamic) as String
+    if v = invalid then return "—"
+    n = Int(v + 0.5)
+    if v < 0 then n = -Int(-v + 0.5)
+    if n < 0 then return "-" + (-n).ToStr() + "°"
+    return n.ToStr() + "°"
+end function
+
+function weatherSection(w as Object) as Object
+    c = newCard("wx", 560)
+    c.when = deg(w["now"])
+    c.tail = sv(w.sky)
+    parts = []
+    if w.high <> invalid then parts.Push("최고 " + deg(w.high))
+    if w.low <> invalid then parts.Push("최저 " + deg(w.low))
+    if w.pop <> invalid then parts.Push("비 올 확률 " + Int(w.pop).ToStr() + "%")
+    c.sent = parts.Join("  ·  ")
+    if w.pop <> invalid
+        c.soon = w.pop >= 60
+    end if
+    c.meta = sv(w.source) + " · " + sv(w.place)
+    c.dtitle = "지금 " + sv(w.place) + " " + c.when + " " + c.tail
+    c.dsub = c.sent
+    c.facts.Push(fact("출처", sv(w.source)))
+    cards = [c]
+    hrs = arr(w.hourly)
+    if hrs.Count() >= 3
+        t = newCard("chart", 560)
+        p = newCard("chart", 560)
+        t.title = "기온"
+        p.title = "비 올 확률"
+        for each h in hrs
+            t.series.Push(h.t)
+            pv = h.pop
+            if pv = invalid then pv = 0
+            p.series.Push(pv)
+            t.labels.Push(sv(h.h))
+            p.labels.Push(sv(h.h))
+        end for
+        lo = 1000.0
+        hi = -1000.0
+        for each v in t.series
+            if v <> invalid
+                if v < lo then lo = v
+                if v > hi then hi = v
+            end if
+        end for
+        t.tail = deg(lo) + " ~ " + deg(hi)
+        p.tail = "12시간"
+        t.meta = "앞으로 12시간"
+        p.meta = "60% 넘으면 호박색"
+        t.dtitle = "앞으로 12시간 기온 " + t.tail
+        p.dtitle = "앞으로 12시간 비 올 확률"
+        p.unit = "%"
+        t.unit = "°"
+        cards.Push(t)
+        cards.Push(p)
+    end if
+    return {title: "날씨", w: 560, cap: 3, note: "", cards: cards}
+end function
+
+function stockCard(h as Object) as Object
+    c = newCard("stock", 414)
+    c.name = sv(h.name)
+    c.dtitle = c.name
+    unlisted = false
+    if Type(h.listed) = "Boolean" or Type(h.listed) = "roBoolean"
+        unlisted = not h.listed
+    end if
+    if unlisted
+        c.status = "unlisted"
+        c.sent = "비상장"
+        return c
+    end if
+    if h.price = invalid
+        c.status = "noprice"
+        c.sent = "시세를 못 받았어요"
+        return c
+    end if
+    c.when = money(h.price, sv(h.currency))
+    if h.pct <> invalid
+        p = h.pct
+        if p > 0
+            c.hl = "up"
+            c.tail = fmt2(p) + "%"
+        else if p < 0
+            c.hl = "down"
+            c.tail = fmt2(-p) + "%"
+        else
+            c.tail = "0.00%"
+        end if
+    end if
+    for each v in arr(h.spark)
+        c.series.Push(v)
+    end for
+    c.meta = sv(h.source)
+    if sv(h.ticker) <> "" then c.meta = sv(h.ticker) + " · " + c.meta
+    sign = ""
+    if c.hl = "up" then sign = "+"
+    if c.hl = "down" then sign = "-"
+    c.dsub = c.when + "  " + sign + c.tail
+    c.facts.Push(fact("5일", sparkText(c.series, sv(h.currency))))
+    return c
+end function
+
+function fmt2(v as Float) as String
+    n = Int(v * 100 + 0.5)
+    return Int(n / 100).ToStr() + "." + Right("0" + (n mod 100).ToStr(), 2)
+end function
+
+' 180,900원 / $342.56
+function money(v as Float, cur as String) as String
+    if cur = "KRW" or cur = "JPY"
+        s = Int(v + 0.5).ToStr()
+        out = ""
+        while Len(s) > 3
+            out = "," + Right(s, 3) + out
+            s = Left(s, Len(s) - 3)
+        end while
+        unit = "원"
+        if cur = "JPY" then unit = "엔"
+        return s + out + unit
+    end if
+    if cur = "USD" then return "$" + fmt2(v)
+    return fmt2(v) + " " + cur
+end function
+
+function sparkText(series as Object, cur as String) as String
+    out = []
+    for each v in series
+        out.Push(money(v, cur))
+    end for
+    return out.Join(" → ")
+end function
+
 function makeContent(sections as Object) as Object
     root = CreateObject("roSGNode", "ContentNode")
     for each sec in sections
@@ -748,6 +896,7 @@ function makeContent(sections as Object) as Object
                 d_tail: c.tail, d_soon: c.soon, d_now: c.now, d_name: c.name, d_v1: c.v[0], d_v2: c.v[1]
                 d_v3: c.v[2], d_v4: c.v[3], d_down: c.down, d_n1: c.n1, d_l1: c.l1, d_m1: c.m1, d_n2: c.n2
                 d_l2: c.l2, d_m2: c.m2, d_status: c.status, d_load: c.load, d_upt: c.upt, d_title: c.title
+                d_series: c.series, d_labels: c.labels, d_unit: c.unit
             })
         end for
     end for

@@ -180,8 +180,14 @@ def test_build2_a_failing_part_is_null():
     assert out["infra"] is None and out["gistra"] is None and out["calendar"] is None and out["tasks"]["queued"]["count"] == 1
 
 
-def test_tv_route_versions(gw):
+def test_tv_route_versions(gw, monkeypatch):
     g, c, tmp = gw
+
+    async def offline():  # never the network in tests: weather and quotes have their own recorded-response tests
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(g, "tv_weather", offline)
+    monkeypatch.setattr(g, "tv_holdings", offline)
     assert "tasks" in c.get("/v1/tv").json() and "gistra" not in c.get("/v1/tv").json()  # v1 is unchanged
     v2 = c.get("/v1/tv?v=2")
     assert v2.status_code == 200 and v2.json().keys() >= {"at", "infra", "tasks", "gistra", "calls", "calendar", "assistant"}
@@ -319,3 +325,217 @@ def test_build2_gives_hosts_sections_and_next_deadline():
     g = out["gistra"]
     assert g["asof"] == "15:41" and [s["title"] for s in g["sections"]] == ["7일 안 마감", "복습할 단원", "LMS 알림 (최근 7일)", "남은 항목"]
     assert out["next_deadline"]["title"] and out["next_deadline"]["due"].startswith("2026-11-2")
+
+
+# ---------- real captured text (tests/fixtures/tv_*), 2026-11-23 ----------
+FIX = Path(__file__).resolve().parent / "fixtures"
+
+
+def test_activity_line_loses_its_emoji_and_keeps_the_time_as_when():
+    # captured gistra_today `### 활동 일정`: the 🔁 has no glyph in the TV font and showed as an indent
+    line = "- 🔁 20:00~22:00 지온나래 · 지온나래 정기회의 (정기 회의) · 구관 토론실"
+    it = tv.parse_item(line, NOW)
+    assert it["when"] == "20:00~22:00" and it["kind"] == "지온나래"
+    assert it["title"] == "지온나래 정기회의 (정기 회의)" and it["note"] == "구관 토론실"
+    snap, secs = tv.parse_sections("### 활동 일정\n" + line + "\n", NOW)
+    assert secs[0]["items"][0]["kind"] == "지온나래"
+
+
+def test_no_display_field_starts_with_a_symbol():
+    lines_ = ["- ⬜ 11월 23일 (월) 23:59 · 하우스 문서 — 문서 부착 공지 [할 일]", "- ✅ 마감 없음 · 대외부 — 인수인계 기록지 작성 [할 일]",
+              "- 🔁 20:00~22:00 지온나래 · 지온나래 정기회의 (정기 회의) · 구관 토론실"]
+    for line in lines_:
+        it = tv.parse_item(line, NOW)
+        for k in ("when", "kind", "title", "note"):
+            assert it[k] is None or (it[k] == it[k].strip() and not it[k].startswith(("⬜", "✅", "🔁", "\uFE0F"))), (k, it[k])
+    assert tv.plain(" 🔁  정기 회의 ") == "정기 회의" and tv.plain("69°C · 20:00~22:00") == "69°C · 20:00~22:00"
+    assert tv.calendar_events([{"start": "09:00", "title": "🎉 생일", "cal": "MyTT"}])[0]["what"] == "생일"
+
+
+def test_monitors_parse_the_whole_status_page():
+    groups = tv.parse_monitors((FIX / "tv_infra_status.txt").read_text())
+    assert [g["node"] for g in groups][:3] == ["deneb", "sadr", "albireo"] and groups[-1]["node"] == "external"
+    deneb = groups[0]
+    assert deneb["role"] == "Public Edge · Identity" and len(deneb["services"]) == 9
+    assert deneb["services"][0] == {"name": "Nginx Proxy Manager", "type": "http", "state": "up", "uptime": 100.0,
+                                    "ms": 15, "last_down": None}
+    restic = deneb["services"][1]
+    assert restic["type"] == "push" and restic["ms"] is None and restic["last_down"] == "2026-10-31 05:00"
+    assert deneb["services"][8]["name"] == "ntfy-relay · deneb (Kuma 알림 경로)"  # a name with its own ` · ` and parens
+    claw = next(s for g in groups for s in g["services"] if s["name"].startswith("Vuja De claw"))
+    assert claw == {"name": "Vuja De claw (NemoClaw)", "type": "http", "state": "down", "uptime": 2.85, "ms": None,
+                    "last_down": None}
+    assert all(s["state"] != "unknown" for g in groups for s in g["services"])  # every real line understood
+    assert sum(len(g["services"]) for g in groups) == 51  # every ✓/✗ line of the capture
+
+
+def test_infra_detail_joins_hosts_and_their_services():
+    health, status = (FIX / "tv_infra_health.txt").read_text(), (FIX / "tv_infra_status.txt").read_text()
+    asked = []
+
+    async def raw(n, extra=None):
+        asked.append((n, extra))
+        return {"infra_health": health, "infra_status": status, "infra_alerts": "No firing alerts."}[n]
+
+    out = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: True, "infra_raw": raw}, NOW))
+    assert ("infra_status", {"problems_only": False}) in asked  # the full page, not only problems
+    spark = next(h for h in out["hosts"] if h["name"] == "vd-spark")
+    assert spark["role"] == "Vuja De GPU" and spark["services"] == 4 and spark["services_down"] == 1
+    assert spark["temp"] == 62 and spark["status"] == "ok" and out["asof"] == "03:15" and out["alerts"] == []
+    assert len(out["hosts"]) == 8 and len(out["groups"]) == 9  # 8 nodes + external sites
+    off = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: False}, NOW))
+    assert off["hosts"] is None and off["groups"] is None
+
+
+def test_tasks_detail_from_real_rows():
+    import json
+    rows = json.loads((FIX / "tv_tasks.json").read_text())
+    running = {"goal": "🔁 스파크 로그 정리", "status": "running", "device": "spark", "backend": "claude_api",
+               "started": NOW - 60, "steps": [{"at": NOW - 5, "kind": "tool", "tool": "spark__run_command",
+                                                "label": "spark에서 명령 실행 중"}], "brief": "SECRET-BRIEF"}
+
+    async def tasks(n):
+        return [running, *rows]
+
+    async def approvals():
+        return [{"id": "x", "command": "rm -rf /secret"}]
+
+    out = asyncio.run(tv.build_tasks_detail({"tasks": tasks, "approvals": approvals}, NOW))
+    a = out["active"][0]
+    assert a["goal"] == "스파크 로그 정리" and a["engine"] == "Claude" and a["device"] == "spark"
+    assert a["step"] == "spark에서 명령 실행 중" and a["started"].endswith("+09:00")
+    assert len(out["recent"]) == 10 and out["approvals"] == 1
+    first = out["recent"][0]
+    assert first["status"] == "done" and first["result"] == "대표님, 스파크에서 네모클로 서비스 재시작을 마쳤고 정상으로 확인했습니다."
+    cancelled = next(r for r in out["recent"] if r["status"] == "cancelled")
+    assert cancelled["result"] == "취소됐어요."  # a failure shows its error, not the half-written result
+    failed = next(r for r in out["recent"] if r["status"] == "failed")
+    assert failed["result"].startswith("기기 작업이 권한 때문에 막혀서")
+    text = str(out)
+    assert "rm -rf" not in text and "SECRET-BRIEF" not in text and "`" not in text and "**" not in text
+
+
+def test_detail_query_is_open_to_the_tv_token(gw, monkeypatch):
+    g, c, tmp = gw
+
+    async def fake(d, now=None):
+        return {"ok": "tasks"}
+
+    monkeypatch.setattr(g.tv, "build_tasks_detail", fake)
+    g.tv_detail_cache["tasks"] = g.tv.Cache()
+    path = tmp / "tv_token"
+    path.write_text("t" * 40)
+    path.chmod(0o600)
+    tvh = {"Authorization": "Bearer " + "t" * 40}
+    r = c.get("/v1/tv?detail=tasks", headers=tvh)
+    assert r.status_code == 200 and r.json() == {"ok": "tasks"}
+    assert c.get("/v1/tv?detail=secrets", headers=tvh).status_code == 400
+    assert c.get("/v1/tasks", headers=tvh).status_code == 401  # still only the TV path
+
+
+# ---------- weather, holdings, history: recorded responses (tests/fixtures/tv_*), never the network ----------
+def test_weather_card_from_recorded_kma():
+    import json
+    from datetime import datetime
+    rec = json.loads((FIX / "tv_kma.json").read_text())
+    now = datetime.fromisoformat(rec["now"]).timestamp()
+    w = tv.weather_card({"source": "기상청", "place": "광주", **rec}, now)
+    t1h = float(next(i["obsrValue"] for i in rec["ncst"] if i["category"] == "T1H"))
+    assert w["source"] == "기상청" and w["now"] == t1h and w["place"] == "광주"
+    assert w["low"] <= t1h <= w["high"] and 0 <= w["pop"] <= 100 and w["sky"]
+    assert len(w["hourly"]) == 12 and w["hourly"][0]["h"] == rec["now"][11:13]  # from this hour on
+    assert all(isinstance(h["t"], float) and 0 <= h["pop"] <= 100 for h in w["hourly"])
+    assert not w["sky"].endswith("요")  # a TV word, not a spoken sentence
+
+
+def test_weather_card_falls_back_to_recorded_open_meteo():
+    import json
+    d = json.loads((FIX / "tv_openmeteo.json").read_text())
+    w = tv.weather_card({"source": "Open-Meteo", "place": "광주", **d}, NOW)
+    assert w["now"] == 1.7 and w["sky"] == "맑음" and w["hourly"] == []
+    assert w["high"] == d["daily"]["temperature_2m_max"][0] and w["low"] == d["daily"]["temperature_2m_min"][0]
+    assert tv.weather_card(None, NOW) is None
+
+
+def test_history_from_recorded_infra_query():
+    cpu = tv.parse_history((FIX / "tv_history_cpu.txt").read_text())
+    mem = tv.parse_history((FIX / "tv_history_mem.txt").read_text())
+    assert set(cpu) == set(mem) and len(cpu) == 8 and "vd-spark" in cpu
+    assert all(len(v) == 8 and None not in v and all(0 <= x <= 100 for x in v) for v in [*cpu.values(), *mem.values()])
+    assert mem["deneb"][0] == 71  # `{ago="21",node="deneb"} 71`: the oldest point comes first
+    q = tv.history_query("mem")
+    assert len(q) <= 2000 and q.count("offset") == 14 and '"ago", "0"' in q  # infra_query's limit; 7 offsets × 2 selectors
+
+
+def test_infra_detail_carries_24h_history():
+    health, status = (FIX / "tv_infra_health.txt").read_text(), (FIX / "tv_infra_status.txt").read_text()
+    cpu, mem = (FIX / "tv_history_cpu.txt").read_text(), (FIX / "tv_history_mem.txt").read_text()
+
+    async def raw(n, extra=None):
+        return {"infra_health": health, "infra_status": status, "infra_alerts": "No firing alerts."}[n]
+
+    async def query(q):
+        return mem if "MemAvailable" in q else cpu
+
+    out = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: True, "infra_raw": raw, "query": query}, NOW))
+    deneb = next(h for h in out["hosts"] if h["name"] == "deneb")
+    assert len(deneb["cpu_24h"]) == 8 and deneb["mem_24h"][0] == 71
+
+
+def quote_transport():
+    """Naver/Yahoo answered from tests/fixtures/tv_quotes.json; Naver's search is unreachable (as it was when recorded)
+    and Yahoo's search answers 400 to a Korean query (recorded)."""
+    import json
+    import httpx
+    rec = json.loads((FIX / "tv_quotes.json").read_text())
+
+    def handle(req):
+        url = str(req.url)
+        if "ac.stock.naver.com" in url:
+            raise httpx.ConnectTimeout("timed out", request=req)
+        if "finance/search" in url:
+            return httpx.Response(400, json={"finance": {"error": {"code": "Bad Request"}}})
+        if "polling.finance.naver.com" in url:
+            return httpx.Response(200, json=rec[f"naver:{url.rsplit('/', 1)[1]}"])
+        sym, rng = url.split("/chart/")[1].split("?")[0], req.url.params["range"]
+        key = f"chart:{sym}:{rng}"
+        return httpx.Response(200, json=rec[key]) if key in rec else httpx.Response(404, json={"chart": {"result": None}})
+    return httpx.MockTransport(handle)
+
+
+def test_holdings_from_recorded_quotes():
+    import httpx
+    import quote
+
+    async def run():
+        async with httpx.AsyncClient(transport=quote_transport()) as c:
+            return [await quote.holding(n, c) for n in ("삼성전자 (005930)", "애플 (AAPL)", "토스", "SK하이닉스 (000660)")]
+
+    sam, apple, toss, hynix = asyncio.run(run())
+    assert sam["name"] == "삼성전자" and sam["price"] == 180900 and sam["pct"] == -8.13 and sam["currency"] == "KRW"
+    assert sam["spark"] == [196800.0, 190300.0, 194700.0, 196900.0, 183100.0] and sam["source"] == "네이버 증권"
+    assert apple["name"] == "애플" and apple["ticker"] == "AAPL" and apple["currency"] == "USD" and len(apple["spark"]) == 5
+    assert toss == {"name": "토스", "listed": False}  # unlisted: quietly 비상장, no guess
+    assert hynix["price"] == 1100000 and hynix["spark"][-1] == 1113000.0
+
+
+def test_build2_adds_weather_and_holdings():
+    async def weather():
+        return {"source": "Open-Meteo", "place": "광주", "current": {"temperature_2m": 3.0, "weather_code": 3},
+                "daily": {"temperature_2m_max": [9.0], "temperature_2m_min": [-1.0], "precipitation_probability_max": [20]}}
+
+    async def holdings():
+        return [{"name": "토스", "listed": False}]
+
+    out = asyncio.run(tv.build2(deps2(weather=weather, holdings=holdings), NOW))
+    assert out["weather"]["now"] == 3.0 and out["weather"]["sky"] == "흐림" and out["holdings"] == [{"name": "토스", "listed": False}]
+    assert asyncio.run(tv.build2(deps2(), NOW))["weather"] is None  # a gateway without them: null parts
+
+
+def test_holdings_setting(gw):
+    g, c, _ = gw
+    assert c.get("/v1/settings").json()["holdings"][3] == "삼성전자 (005930)"
+    r = c.put("/v1/settings", json={"holdings": ["  애플   (AAPL) ", "카카오"]})
+    assert r.status_code == 200 and c.get("/v1/settings").json()["holdings"] == ["애플 (AAPL)", "카카오"]
+    for bad in ("애플", [""], ["x" * 41], ["a\nb"], ["a"] * 13):
+        assert c.put("/v1/settings", json={"holdings": bad}).status_code == 400, bad

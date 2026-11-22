@@ -9,6 +9,24 @@ sub run()
     while Right(base, 1) = "/"
         base = Left(base, Len(base) - 1)
     end while
+    if m.top.path <> ""  ' a detail screen: one GET of /v1/tv?detail=…, no version fallback
+        if Left(base, 4) = "demo"
+            m.top.result = {ok: true, v: 2, data: demoDetail(m.top.path)}
+            return
+        end if
+        r = doGet(base + m.top.path)
+        if r.code <> 200
+            m.top.result = {ok: false, code: r.code, error: "불러오지 못했어요"}
+        else
+            data = ParseJson(r.body)
+            if data = invalid
+                m.top.result = {ok: false, code: 200, error: "응답을 읽을 수 없어요"}
+            else
+                m.top.result = {ok: true, v: 2, data: data}
+            end if
+        end if
+        return
+    end if
     if base = "demo" or base = "demo-call"
         m.top.result = {ok: true, v: 2, data: demoData(base = "demo-call")}
         return
@@ -102,6 +120,7 @@ function demoData(inCall as Boolean) as Object
             assignments: [{title: "과제 4: 해시 테이블 구현", course: "자료구조", due: iso(now + 10800)}]
             todos: [{text: "하우스 문서 — 문서 부착 공지", title: "문서 부착 공지", kind: "하우스 문서", due: iso(now + 90000)}, {text: "컴파일러 프로젝트", title: "컴파일러 프로젝트", kind: "", due: iso(now + 90000)}, {text: "대외부 — 인수인계 기록지 작성", title: "인수인계 기록지 작성", kind: "대외부", due: invalid}]
             sections: [
+                {title: "활동 일정", items: [{when: "20:00~22:00", due: invalid, date: invalid, kind: "지온나래", title: "지온나래 정기회의 (정기 회의)", note: "구관 토론실", tag: invalid}]}
                 {title: "7일 안 마감", items: [{when: "11/23 23:59", due: iso(now + 90000), date: "2026-11-23", kind: "과기사관", title: "공결 확인서 전송 메일", note: "", tag: invalid}]}
                 {title: "복습할 단원", items: [{when: invalid, due: invalid, date: invalid, kind: "현대 예술의 이해", title: "팝아트", note: "새로 배움 · 예정 10월 28일 (수)", tag: invalid}, {when: invalid, due: invalid, date: invalid, kind: "프로그래밍 언어 및 컴파일러", title: "Lexical Analysis (Token, Regex)", note: "익히는 중 · 예정 11월 1일 (일)", tag: invalid}]}
                 {title: "LMS 알림 (최근 7일)", items: [{when: "11/22", due: invalid, date: "2026-11-22", kind: "현대 예술의 이해[01]", title: "강의 개요", note: "새 토론글이 등록되었습니다.", tag: invalid}]}
@@ -110,10 +129,45 @@ function demoData(inCall as Boolean) as Object
         calendar: [{start: hm(now - 1800), end: hm(now + 2700), what: "자료구조", cal: "MyTT", where: "대학 A동 212호"}, {start: hm(now + 7200), end: hm(now + 10800), what: "프로그래밍 언어 및 컴파일러 중간고사 대비 스터디 모임", cal: "MyTT", where: "도서관 3층 세미나실"}]
         calls: [{at: hm(now + 5400), what: "약 먹기"}]
         next_deadline: {title: "과제 4: 해시 테이블 구현", due: iso(now + 10800), course: "자료구조", source: "gistra"}
+        weather: {source: "기상청", place: "광주", now: -0.4, sky: "맑음", high: 15.0, low: -0.4, pop: 60, hourly: [
+            {h: "03", t: 1.0, pop: 0}, {h: "04", t: 2.0, pop: 0}, {h: "05", t: 2.0, pop: 0}, {h: "06", t: 3.0, pop: 30}
+            {h: "07", t: 4.0, pop: 30}, {h: "08", t: 5.0, pop: 20}, {h: "09", t: 7.0, pop: 0}, {h: "10", t: 10.0, pop: 0}
+            {h: "11", t: 12.0, pop: 10}, {h: "12", t: 14.0, pop: 60}, {h: "13", t: 15.0, pop: 70}, {h: "14", t: 14.0, pop: 40}]}
+        holdings: [
+            {name: "애플", ticker: "AAPL", listed: true, price: 342.56, currency: "USD", pct: -1.9, spark: [352.78, 351.91, 352.45, 349.21, 342.56], source: "야후 파이낸스"}
+            {name: "토스", listed: false}
+            {name: "엔비디아", ticker: "NVDA", listed: true, price: 125.53, currency: "USD", pct: 2.31, spark: [118.2, 120.5, 119.9, 122.7, 125.53], source: "야후 파이낸스"}
+            {name: "삼성전자", ticker: "005930", listed: true, price: 180900, currency: "KRW", pct: -8.13, spark: [196800, 190300, 194700, 196900, 183100], source: "네이버 증권"}
+            {name: "SK하이닉스", ticker: "000660", listed: true, price: 1100000, currency: "KRW", pct: -7.02, spark: [1120000, 1098000, 1144000, 1183000, 1113000], source: "네이버 증권"}
+        ]
     }
 end function
 
 function demoState(inCall as Boolean) as String
     if inCall then return "call"
     return "idle"
+end function
+
+' Preview data for the detail screens (server address "demo").
+function demoDetail(path as String) as Object
+    if Instr(1, path, "tasks") > 0
+        return {
+            active: [{goal: "블로그 초안 정리", status: "running", device: "macbook", engine: "Claude", started: "2026-11-23T02:40:00+09:00", step: "맥북에서 작업 진행 중", steps: 4}
+                {goal: "인프라 점검 보고서", status: "waiting_approval", device: "spark", engine: "Claude", started: "2026-11-23T02:55:00+09:00", step: "spark에서 명령 실행 중", steps: 2}]
+            recent: [{goal: "서버 로그 요약", status: "done", device: "spark", engine: "Claude", finished: "2026-11-23T01:10:00+09:00", result: "로그를 요약해 메모에 저장했어요."}
+                {goal: "보고서 PDF 만들기", status: "failed", device: "macbook", engine: "Claude", finished: "2026-11-22T23:10:00+09:00", result: "기기 작업이 권한 때문에 막혀서 끝내지 못했어요."}]
+            approvals: 1
+        }
+    end if
+    return {
+        asof: "03:15"
+        hosts: [{name: "deneb", status: "ok", up: true, cpu: 37, mem: 66, disk: 19, temp: invalid, uptime: "160d", role: "Public Edge · Identity", services: 3, services_down: 0, cpu_24h: [16, 8, 13, 11, 8, 10, 10, 37], mem_24h: [71, 70, 69, 68, 67, 66, 66, 66]}
+            {name: "vd-spark", status: "ok", up: true, cpu: 7, mem: 76, disk: 19, temp: 62, uptime: "1d", role: "Vuja De GPU", services: 2, services_down: 1, cpu_24h: [1, 1, 1, 2, 1, 1, 5, 7], mem_24h: [74, 75, 75, 76, 76, 76, 77, 76]}]
+        groups: [{node: "deneb", role: "Public Edge · Identity", services: [{name: "Nginx Proxy Manager", type: "http", state: "up", uptime: 100.0, ms: 15, last_down: invalid}
+                {name: "Restic Backup", type: "push", state: "up", uptime: 100.0, ms: invalid, last_down: "2026-10-31 05:00"}
+                {name: "Grafana", type: "http", state: "up", uptime: 99.86, ms: 110, last_down: invalid}]}
+            {node: "vd-spark", role: "Vuja De GPU", services: [{name: "Qwen LLM", type: "port", state: "up", uptime: 100.0, ms: 12, last_down: invalid}
+                {name: "Vuja De claw (NemoClaw)", type: "http", state: "down", uptime: 2.85, ms: invalid, last_down: invalid}]}]
+        alerts: []
+    }
 end function

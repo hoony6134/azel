@@ -1,0 +1,61 @@
+# Cygnus · Ops (internal)
+## edge1 · Public Edge · Identity
+  ✓ Nginx Proxy Manager (http) up · 24h 100.00% · 15ms
+  ✓ Restic Backup (push) up · 24h 100.00% · last down 2026-10-31 05:00
+  ✓ Portainer (http) up · 24h 100.00% · 17ms
+  ✓ Authelia SSO (keyword) up · 24h 100.00% · 14ms
+  ✓ lldap (http) up · 24h 100.00% · 2ms
+  ✓ OIDC Admin (http) up · 24h 100.00% · 74ms
+  ✓ Cygnus Bridge (http) up · 24h 100.00% · 10ms
+  ✓ Node Exporter (port) up · 24h 100.00% · 0ms
+  ✓ ntfy-relay · edge1 (Kuma 알림 경로) (http) up · 24h 100.00% · 2ms
+## core1 · Network Core
+  ✓ AdGuard Home · primary (http) up · 24h 100.00% · 85ms
+  ✓ Headscale (http) up · 24h 100.00% · 67ms
+  ✓ Node Exporter (port) up · 24h 100.00% · 1ms
+## exit1 · US Exit · Object Storage
+  ✓ Object Bucket · x1 (keyword) up · 24h 100.00% · 560ms
+  ✓ CDN · cdn.example.com (keyword) up · 24h 100.00% · 541ms
+  ✓ Cygnus-X1 Upload (keyword) up · 24h 100.00% · 267ms
+  ✓ Node Exporter (port) up · 24h 100.00% · 132ms
+## compute1 · Compute · Observatory
+  ✓ Grafana (http) up · 24h 99.86% · 110ms
+  ✓ Homebridge (http) up · 24h 100.00% · 103ms
+  ✓ Node Exporter (http) up · 24h 100.00% · 28ms
+  ✓ SearXNG (http) up · 24h 100.00% · 31ms
+  ✓ IT-Tools (http) up · 24h 100.00% · 87ms
+  ✓ Pingvin Share (http) up · 24h 100.00% · 34ms
+  ✓ Redis (redis) up · 24h 100.00% · 39ms
+  ✓ Cygnus MCP Gateway (keyword) up · 24h 100.00% · 69ms
+  ✓ ntfy-relay · compute1 (Alertmanager 알림 경로) (http) up · 24h 100.00% · 24ms
+  ✓ Offsite backup · compute1 memory (push) up · 24h 100.00%
+## lab1 · DNS Redundancy
+  ✓ Node Exporter (http) up · 24h 100.00% · 37ms
+  ✓ Homepage (http) up · 24h 100.00% · 907ms
+  ✓ AdGuard Home · secondary (http) up · 24h 100.00% · 71ms
+  ✓ ntfy (http) up · 24h 100.00% · 37ms
+  ✓ Vaultwarden (http) up · 24h 100.00% · 45ms
+## status1 · Database
+  ✓ PostgreSQL (port) up · 24h 99.93% · 128ms
+  ✓ Node Exporter (http) up · 24h 100.00% · 724ms
+  ✓ Offsite backup · status1 postgres (push) up · 24h 100.00%
+## gpu-core · Vuja De Core
+  ✓ Caddy + Authelia SSO (port) up · 24h 100.00% · 12ms
+  ✓ Node Exporter (port) up · 24h 100.00% · 13ms
+  ✓ Vuja De SSO (keyword) up · 24h 99.93% · 58ms
+  ✓ PentAGI (http) up · 24h 100.00% · 59ms
+  ✓ Vuja De Talk (Matrix) (http) up · 24h 100.00% · 51ms
+  ✓ Vuja De Chat (Open WebUI) (http) up · 24h 100.00% · 52ms
+  ✓ Vuja De MAS (http) up · 24h 100.00% · 52ms
+  ✓ Vuja De LiveKit RTC (port) up · 24h 100.00% · 13ms
+  ✓ VD Embed (bge-m3 · memory) (http) up · 24h 100.00% · 29ms
+## gpu-spark · GPU Lab
+  ✓ Qwen LLM (port) up · 24h 100.00% · 12ms
+  ✓ Node Exporter (port) up · 24h 100.00% · 12ms
+  ✓ GPU Exporter (port) up · 24h 100.00% · 12ms
+  ✗ GPU claw (Svc) (http) DOWN · 24h 2.85%
+## external · Sites
+  ✓ 단축링크 · i.example.com (http) up · 24h 100.00% · 201ms
+  ✓ 포트폴리오 · me.example.com (http) up · 24h 100.00% · 193ms
+  ✓ 블로그 · example.com (http) up · 24h 100.00% · 203ms
+  ✓ blueleaf 마크다운 (http) up · 24h 100.00% · 189ms

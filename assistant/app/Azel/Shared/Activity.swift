@@ -36,37 +36,86 @@ struct Activity: Equatable, Codable {
 /// Sounds the activity flow asks for (§13.1); the earcon scheduler decides whether they play.
 enum Cue: CaseIterable { case working, tick, done, error, wake, ack, pulse }
 
-/// "들었어요" ack when the server starts thinking, then a small heartbeat ("두근") about every 1.2 s once thinking has
-/// lasted 1 s, until the first reply audio, an error or an interrupt (user, 2026-11-23: was a pulse every 3 s).
+/// "들었어요" ack when the server starts thinking, then a small heartbeat ("두근") about every 1.2 s once a
+/// wait has lasted 1 s (user, 2026-11-23: was a pulse every 3 s). A wait is any silence inside an open
+/// turn: before the first reply audio, and (user, 2026-11-23) also mid-reply, when the playback queue
+/// runs dry while the next sentence is generated or a tool runs. Reply audio, a server pause, and the
+/// end of the turn (turn_done, interrupt, error, transcript, listening, hangup) stop it.
 struct ThinkingCues {
     static let pulseAfter = 1.0, pulseEvery = 1.2
-    /// After 30 s of thinking the heartbeat slows to every 2.4 s (long Claude tasks shouldn't tick like a metronome).
+    /// After 30 s of waiting the heartbeat slows to every 2.4 s (long Claude tasks shouldn't tick like a metronome).
     static let slowAfter = 30.0, slowEvery = 2.4
 
     private(set) var since: Double?
     private var lastPulse: Double?
+    /// A turn is under way: from thinking (or a tool starting) until it ends.
+    private var turnOpen = false
+    /// In the thinking phase (one ack each time it starts).
+    private var thinkingPhase = false
+    /// Reply audio is queued or playing (the playback layer's signal).
+    private var playing = false
+    /// The server paused playback: the user may be talking.
+    private var paused = false
+    /// Tools started and not yet ended; they keep the turn open.
+    private(set) var tools = 0
 
     var active: Bool { since != nil }
 
-    mutating func event(_ type: String, value: String?, now: Double) -> Cue? {
+    private mutating func waitFrom(_ now: Double) {
+        guard since == nil, turnOpen, !playing, !paused else { return }
+        since = now
+        lastPulse = nil
+    }
+
+    private mutating func endTurn() {
+        turnOpen = false; thinkingPhase = false; tools = 0; since = nil; paused = false
+    }
+
+    mutating func event(_ type: String, value: String?, now: Double, phase: String? = nil) -> Cue? {
         switch type {
         case "state":
-            if value == "thinking" {
-                guard since == nil else { return nil }
-                since = now
-                lastPulse = nil
+            switch value {
+            case "thinking":
+                turnOpen = true
+                guard !thinkingPhase else { return nil }
+                thinkingPhase = true
+                since = nil
+                waitFrom(now)
                 return .ack
+            case "speaking":
+                // Audio is on its way: the wait ends here and starts again only when the queue runs dry.
+                thinkingPhase = false
+                since = nil
+            default:
+                endTurn()   // listening and the like
             }
+        case "interrupt", "error", "turn_done", "transcript", "hangup", "end":
+            endTurn()
+        case "pause", "duck":
+            paused = true
             since = nil
-        case "interrupt", "error", "turn_done", "transcript":
-            since = nil
+        case "resume", "unduck":
+            paused = false
+            waitFrom(now)
+        case "activity" where phase == "tool_start":
+            tools += 1
+            turnOpen = true   // a running tool is always a wait, before or after the first audio
+            waitFrom(now)
+        case "activity" where phase == "tool_end":
+            tools = max(0, tools - 1)
         default: break
         }
         return nil
     }
 
-    /// The first reply audio ends the wait.
-    mutating func audioArrived() { since = nil }
+    /// Reply audio arrived: the wait ends.
+    mutating func audioArrived() { since = nil; thinkingPhase = false }
+
+    /// The playback queue started or ran dry (`AudioIO.speechPlaying`).
+    mutating func playback(_ isPlaying: Bool, now: Double) {
+        playing = isPlaying
+        if isPlaying { since = nil } else { waitFrom(now) }
+    }
 
     mutating func tick(now: Double) -> Cue? {
         guard let since, now - since >= Self.pulseAfter else { return nil }

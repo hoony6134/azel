@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- A full-screen detail page under the header: 인프라 (every host and service, like the Cygnus status page) or
+     Azel 작업 (the queue and the last finished tasks). Data from GET /v1/tv?detail=infra|tasks. -->
+<component name="DetailPage" extends="Group">
+    <interface>
+        <field id="kind" type="string" />
+        <field id="focusName" type="string" />
+        <field id="state" type="string" value="loading" onChange="render" />
+        <field id="data" type="assocarray" onChange="render" />
+        <field id="closed" type="boolean" alwaysNotify="true" />
+        <field id="refresh" type="boolean" alwaysNotify="true" />
+    </interface>
+    <script type="text/brightscript" uri="pkg:/components/Common.brs" />
+    <script type="text/brightscript" uri="pkg:/components/Model.brs" />
+    <script type="text/brightscript" uri="pkg:/components/DetailPage.brs" />
+</component>
