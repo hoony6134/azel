@@ -4651,6 +4651,8 @@ def kma_key():
 async def here_location():
     """"지금 여기" for the weather tool: the phone's place in a call (live, up to phone_data.LOCATION_S), as {"name": the
     city or province}. The phone sends place names only, never coordinates (PHONE_DATA.md), and nothing is stored."""
+    if not call_warm_keys:  # no live call: no phone to ask, so no 12 s wait for an answer that can't come
+        return None
     r = await phone_live("location", {}, phone_data.LOCATION_S)
     parts = str(((r.get("data") or {}) if r.get("ok") else {}).get("place") or "").split()
     return {"name": parts[0]} if parts else None

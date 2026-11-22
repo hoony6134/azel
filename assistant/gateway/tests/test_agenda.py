@@ -109,7 +109,20 @@ def test_here_is_the_phones_city_in_a_call_and_nothing_otherwise(tmp_path, monke
         asked.append((kind, timeout))
         return reply
     monkeypatch.setattr(g, "phone_live", live)
+    reply = {"ok": True, "data": {"place": "서울특별시 중구"}}
+    assert asyncio.run(g.here_location()) is None and asked == []  # no live call: the phone is never asked (no 12 s)
+    g.call_warm_keys["call-1"] = "azel:call-1"
     reply = {"ok": True, "data": {"name": "GIST", "place": "광주광역시 북구 오룡동", "activity": "walking"}}
     assert asyncio.run(g.here_location()) == {"name": "광주광역시"} and asked == [("location", g.phone_data.LOCATION_S)]
     for reply in ({"ok": False, "error": "offline"}, {"ok": True, "data": {}}):
         assert asyncio.run(g.here_location()) is None  # no call, or no fix: the weather tool falls back to weather_home
+
+
+def test_a_long_range_keeps_whole_days_and_names_the_cut():
+    rows = [{"day": Date(2026, 12, d), "start": f"{h:02d}:00", "end": "", "text": f"수업 아주 긴 과목 이름 {d}-{h} — 오룡관 강의실",
+             "src": "gistra"} for d in range(1, 31) for h in range(9, 15)]
+    out = agenda.render(rows, Date(2026, 12, 1), Date(2026, 12, 30), ["(구글 캘린더는 지금 못 읽었어요: x.)"])
+    assert len(out) < 6000 and "(이후 생략: 12/" in out and out.endswith("못 읽었어요: x.)")
+    last = out.split("(이후 생략: ")[1].split("까지만")[0]
+    body = out.split("\n(이후 생략")[0]
+    assert body.count(f"### {last}") == 1 and body.split(f"### {last}")[1].count("\n- ") == 6  # that day is whole
