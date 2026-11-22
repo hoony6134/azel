@@ -315,8 +315,8 @@ sub updateAmbient()
     if td <> invalid and td.today <> invalid and td.today.Count() > 0 then lines.push(td.today[0])
     if m.err <> "" then lines.push("연결 끊김")
     m.aText.text = joinLines(lines, "")
-    ' move a little every minute so nothing burns in
-    spots = [[120, 140], [700, 90], [1000, 300], [200, 500], [800, 560], [420, 280]]
+    ' move a little every minute so nothing burns in (all spots stay inside the 5% title-safe area)
+    spots = [[120, 140], [700, 90], [800, 300], [200, 480], [600, 500], [420, 280]]
     p = spots[m.minutes mod 6]
     m.aClock.translation = [p[0], p[1]]
     m.aText.translation = [p[0] + 8, p[1] + 250]
