@@ -184,8 +184,9 @@ final class OvernightTaskTests: XCTestCase {
         XCTAssertEqual(night["auto_approve"] as? Bool, true)
         let at = ISO8601DateFormatter().date(from: "2026-11-23T14:00:00Z")!
         XCTAssertEqual(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, when: .at(at))["when"] as? String, "2026-11-23T23:00:00+09:00")
-        XCTAssertNil(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, autoApprove: true)["auto_approve"],
-                     "a now task's auto-approve is a grant, not this field")
+        XCTAssertEqual(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, autoApprove: true)["auto_approve"] as? Bool, true,
+                       "any task: the field opens the task's grant (brain aeb70e6)")
+        XCTAssertNil(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push)["auto_approve"])
     }
 
     func testScheduledTaskAndPush() throws {

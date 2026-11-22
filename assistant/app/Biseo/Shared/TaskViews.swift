@@ -255,9 +255,7 @@ struct TaskCreateView: View {
                     Toggle("자동 승인", isOn: $autoApprove)
                 }
                 if autoApprove {
-                    Text(whenChoice == 0 ? "위험하지 않은 명령은 묻지 않고 실행해요. 위험한 건 여전히 물어봐요."
-                                         : "읽기만 하는 명령은 묻지 않고 실행해요. 나머지는 아침에 물어봐요.")
-                        .font(.footnote).foregroundStyle(Theme.text3)
+                    Text("위험하지 않은 명령은 묻지 않고 실행해요. 위험한 건 여전히 물어봐요.").font(.footnote).foregroundStyle(Theme.text3)
                 }
             }
             if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
@@ -271,9 +269,12 @@ struct TaskCreateView: View {
                     saving = true
                     Task {
                         do {
+                            // A gateway with the overnight queue takes auto_approve on the task itself;
+                            // an older one gets a separate grant right after.
+                            let inBody = AppSettings.supportsOvernight
                             let t = try await tasks.create(goal: goal, device: device, persona: PersonaModel.shared.personas.count > 1 ? persona : nil,
-                                                           notify: notify, when: when, autoApprove: autoApprove)
-                            if autoApprove, when == .now, let id = t?.id {
+                                                           notify: notify, when: when, autoApprove: autoApprove && inBody)
+                            if autoApprove, !inBody, let id = t?.id {
                                 if case .success(let g?) = await attempt({ try await AutoApproveAPI.grant(task: id, devices: device.map { [$0] }) }) {
                                     AutoGrantCenter.remember(g.id)
                                 }
