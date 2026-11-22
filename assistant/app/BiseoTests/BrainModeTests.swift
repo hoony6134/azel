@@ -84,3 +84,23 @@ final class TypedTurnTests: XCTestCase {
     }
     #endif
 }
+
+final class TypedRejectionTests: XCTestCase {
+    func testRejectedTypedLineLeavesTheCaptions() throws {
+        var log = CallLog()
+        log.typed("a")
+        log.apply(try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"text_rejected","reason":"too_fast"}"#.utf8)))
+        XCTAssertTrue(log.lines.isEmpty)
+        XCTAssertEqual(CallLog.rejection("too_long"), "1000자까지 보낼 수 있어요")
+        XCTAssertEqual(CallLog.rejection("too_fast"), "조금 천천히 보내 주세요")
+    }
+
+    /// The confirmed order: hello, then context, then mode; context needn't be first.
+    func testFramesInTheConfirmedOrder() throws {
+        let d = JSONDecoder()
+        let hello = try d.decode(CallEvent.self, from: Data(#"{"type":"hello","caps":["text","played","mode"]}"#.utf8))
+        let ctx = try d.decode(CallEvent.self, from: Data(#"{"type":"context","context":{"kind":"schedule","label":"약 먹기","id":"s1"}}"#.utf8))
+        XCTAssertEqual(CallClient.caps(hello), ["text", "played", "mode"])
+        XCTAssertEqual(CallContext.from(event: ctx)?.chip, "예약: 약 먹기")
+    }
+}

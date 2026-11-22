@@ -26,8 +26,25 @@ struct CallLog: Equatable {
         pendingTyped = text
     }
 
+    /// `text_rejected`: the server ignored the typed line, so it leaves the captions.
+    mutating func rejectTyped() {
+        if let i = lines.indices.last, lines[i].typed == true { lines.remove(at: i) }
+        pendingTyped = nil
+    }
+
+    /// The hint for `{"type":"text_rejected","reason":…}`.
+    static func rejection(_ reason: String?) -> String {
+        switch reason {
+        case "too_long": return "1000자까지 보낼 수 있어요"
+        case "too_fast": return "조금 천천히 보내 주세요"
+        default: return "입력을 보내지 못했어요"
+        }
+    }
+
     mutating func apply(_ event: CallEvent) {
         switch event.type {
+        case "text_rejected":
+            rejectTyped()
         case "transcript":
             guard let t = LegacyText.clean(event.text) else { return }
             replyOpen = false

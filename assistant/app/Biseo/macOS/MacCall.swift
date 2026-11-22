@@ -298,6 +298,14 @@ final class MacCall: ObservableObject {
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
         if let caps = CallClient.caps(event) { canType = caps.contains("text") }
+        if event.type == "text_rejected" {
+            let hint = CallLog.rejection(event.reason)
+            error = hint
+            Task { [weak self] in   // a hint, not a failure: it goes away by itself
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if self?.error == hint { self?.error = nil }
+            }
+        }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         scheduleIdle()
         switch event.type {

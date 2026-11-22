@@ -17,6 +17,7 @@ struct CallEvent: Decodable, Equatable {
     var mode: String?         // the active brain mode (state / mode events)
     var context: Context?     // `context`: the first frame of a call placed for a task or a reminder
     var caps: [String]?       // what this call's server supports (`hello` frame): text, mode, played…
+    var reason: String?       // text_rejected: too_long | too_fast
 
     struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
 }
