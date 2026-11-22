@@ -61,8 +61,10 @@ enum PushAction {
         guard let r = request(action: action, userInfo: userInfo) else { return }
         let note: String?
         do {
-            let result = ActionResult(try await Gateway.send(r.method, r.path, json: r.body as [String: Any]?))
-            note = result.needs?.question ?? (result.ok ? nil : result.spoken)
+            let data = try await Gateway.send(r.method, r.path, json: r.body as [String: Any]?)
+            let result = ActionResult(data)
+            // An "always" the server held to once (a writing command, or from a secret call): say why.
+            note = result.needs?.question ?? ApprovalAPI.forcedNote(data) ?? (result.ok ? nil : result.spoken)
         } catch let error where ApprovalCenter.alreadyDecided(error) {
             note = nil   // decided on another device already: nothing to say
         } catch {

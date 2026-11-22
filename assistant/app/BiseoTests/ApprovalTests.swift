@@ -303,3 +303,10 @@ final class ApprovalButtonsTests: XCTestCase {
     }
     #endif
 }
+
+final class ForcedPushNoteTests: XCTestCase {
+    func testAnAlwaysHeldToOnceIsExplained() {
+        let body = Data(#"{"decision":"once","forced_once":true,"forced_reason":"파일을 바꾸는 명령이라 이번 한 번만 허용했어요."}"#.utf8)
+        XCTAssertEqual(ApprovalAPI.forcedNote(body), "파일을 바꾸는 명령이라 이번 한 번만 허용했어요.")
+    }
+}
