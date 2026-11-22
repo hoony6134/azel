@@ -735,8 +735,10 @@ def gateway_tools_text(defs):
             + ("\n사용자, 주변 사람, 지난 일, 취향, 계획을 물으면 '모르겠어요' 하기 전에 memory_recall이나 people_lookup을 먼저 "
                "불러. 결과에 없는 사실은 지어내지 마. '기억해', '잊지 마'라고 하면 remember로 저장하고 결과 문장을 그대로 말해."
                if "memory_recall" in names else "")
-            + ("\n날씨, 뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '기상청 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
-               if "web_search" in names else ""))
+            + ("\n날씨는 weather로(장소를 말하지 않으면 place는 비워)." if "weather" in names else "")
+            + ("\n뉴스, 주가, 환율, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '네이버 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
+               if "web_search" in names else "")
+            + "\n'찾아볼게요'라고만 하고 끝내지 마: 찾을 거면 바로 도구를 불러.")
 
 
 async def gateway_tool(name, args, on_say=None):
@@ -1061,6 +1063,17 @@ ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알
                        r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
 TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|여보세요|여보|"
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
+# "엔트로픽 주가 찾아볼게요." with no tool call: a promise, not an answer. Held back, spoken only once a tool runs.
+ANNOUNCE = re.compile(r"(찾아|알아|확인해|검색해|살펴|조회해)\s*(볼게요|보겠습니다|드릴게요)|(확인|검색|조회)(할게요|하겠습니다)"
+                      r"|알려\s*드릴게요")
+WEATHER_Q = re.compile(r"날씨|기온|몇\s*도|비\s*(와|올|오)|눈\s*(와|올|오)|우산|추워|더워|미세먼지")
+# Today's figures (rates, prices, weather): a number said before any lookup is a guess ("환율은 약 1,310원대",
+# live 2026-11-22), so it is held back and Qwen is asked to look it up (re-asked, never cut to a filler).
+LIVE_Q = re.compile(r"환율|주가|시세|가격|금리|유가|코스피|코스닥|나스닥|비트코인|날씨|기온|몇\s*도")
+# a figure, in digits or in words ("천삼백삼십 원"): Qwen writes numbers both ways
+FIGURE = re.compile(r"\d|[일이삼사오육칠팔구십백천만억]{2,}\s*(원|달러|엔|도|퍼센트|%)")
+TOOL_NUDGE = (f"방금 찾아보겠다고만 하고 도구를 부르지 않았어. 지금 바로 도구를 불러: 다른 말 없이 {TOOL_TAG} "
+              '{"name": "도구 이름", "args": {…}} 한 줄만 출력해. 날씨는 weather, 그 밖의 지금 정보(주가, 환율, 가격, 뉴스)는 web_search.')
 RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일을 한 도구가 없었어. 하지 않은 일을 했다고 하지 말고, 그 말은 빼고 "
                       "이어서 자연스럽게 다시 말해. 이미 한 말은 반복하지 마.",
            "personal": "방금 '{s}'라고 했는데, 사용자의 일정이나 개인 정보는 확인된 게 없어. 지어내지 말고 그 말은 빼고 이어서 "
@@ -1867,6 +1880,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             # an action claimed with no action tool, and the user's own plans stated with no source.
             asked = needs_answer(bare)  # a real question (not "여보세요?", "응"): a bare interjection is asked again once
             rechecked, stubbed, notes = False, False, set()  # notes: our own re-ask texts, never a source
+            announced, guessed, looked, tool_nudged = [], [], [], False  # "찾아볼게요" / a figure before any lookup
+            live = asked and bool(LIVE_Q.search(bare)) and any(t["name"] in ("web_search", "weather") for t in gw_defs)
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
 
             async def say(s):
@@ -1877,6 +1892,12 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if ACTION_CLAIM.search(s) and not confirmed["ok"] and asks_action(bare):
                     timings["unconfirmed"] = s[:80]
                     raise Recheck("action", s)
+                if not looked and live and FIGURE.search(s):
+                    guessed.append(s)  # today's figure before any lookup: a guess, never said
+                    return
+                if not looked and asked and (ctx or gw_defs) and ANNOUNCE.search(s):
+                    announced.append(s)  # a promise to look: said only once the tool actually runs
+                    return
                 await sentences.put(s)
 
             try:
@@ -1920,6 +1941,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                 said_round.append(text)
                                 await sentences.put(text)
                             line = buf.strip().split("\n")[0]
+                            for x in announced:  # "찾아볼게요" as the filler while the tool runs
+                                await sentences.put(x)
+                            announced.clear()
+                            looked.append(line)
                             result = await run_tool(line, session, tool_say)
                             tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
                             if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
@@ -1942,6 +1967,29 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         notes.add(note)
                         messages += [{"role": "assistant", "content": said or "…"}, {"role": "user", "content": note}]
                         continue
+                    if (announced or guessed) and not looked and rounds < 3:  # promised or guessed, looked nothing up
+                        timings["announce_only"] = timings.get("announce_only", 0) + 1
+                        timings.setdefault("raw_announce", buf[:200])  # the raw output, to see a mangled tool call
+                        for x in announced:  # the filler while Qwen tries again
+                            await sentences.put(x)
+                        announced.clear(), guessed.clear()
+                        if not tool_nudged:
+                            tool_nudged = True
+                            messages += [{"role": "assistant", "content": " ".join(said_round)},
+                                         {"role": "user", "content": TOOL_NUDGE}]
+                            continue
+                        names = {t["name"] for t in gw_defs}  # twice: look it up for Qwen, then let it answer
+                        pick_ = "weather" if WEATHER_Q.search(bare) and "weather" in names else \
+                            "web_search" if "web_search" in names else None
+                        if pick_:
+                            line = TOOL_TAG + " " + json.dumps({"name": pick_, "args": {} if pick_ == "weather" else
+                                                                {"query": bare[:200]}}, ensure_ascii=False)
+                            looked.append(line)
+                            result = await run_tool(line, session, None)
+                            timings.setdefault("tools", []).append(0)
+                            messages += [{"role": "assistant", "content": line},
+                                         {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
+                            continue
                     if asked and not stubbed and stub(" ".join(said_round), user_title(settings, persona)):
                         stubbed = True  # "아, 그거!" to a question: ask for the rest, once (live 2026-11-22, 서아)
                         timings["stub"] = " ".join(said_round)[:40]
@@ -4524,6 +4572,45 @@ if __name__ == "__main__":
             said = asyncio.run(run("랩미팅 어떻게 됐지?", "s"))
             assert all("TOOL" not in x and "{" not in x for x, _ in said) and said[-1] == ("다음 주로 미루셨어요.", "qwen"), said
             assert "랩미팅 발표는 다음 주로" in late[1][-1]["content"]
+            # "네, 엔트로픽 주가 찾아볼게요." and nothing else: not the end of the turn. Qwen is told to call the tool now;
+            # the promise is said only as the filler while it does. Twice in a row: the lookup is done for it.
+            ann, ran = [], []
+            saved_tools, saved_run = dict(gw_tools), run_tool
+
+            async def fake_run_tool(raw, session, on_say=None):
+                ran.append(json.loads(raw[len(TOOL_TAG):]))
+                return "앤트로픽은 비상장 회사라 주가가 없어요(네이버 기준)."
+            gw_tools.update(at=time.time(), defs=[{"name": "web_search", "description": "검색"},
+                                                  {"name": "weather", "description": "날씨"}])
+            globals()["run_tool"] = fake_run_tool
+
+            def announcer(then):
+                async def llm(messages, max_tokens=600):
+                    ann.append(messages)
+                    yield then[min(len(ann), len(then)) - 1]
+                return llm
+            globals()["llm_stream"] = announcer(["네, 엔트로픽 주가 찾아볼게요.",
+                                                 '[TOOL] {"name": "web_search", "args": {"query": "앤트로픽 주가"}}',
+                                                 "앤트로픽은 비상장이라 주가가 없어요."])
+            said = asyncio.run(run("그러면 엔트로픽 주가 지금 알려줘", "s"))
+            assert [x for x, _ in said] == ["네, 엔트로픽 주가 찾아볼게요.", "앤트로픽은 비상장이라 주가가 없어요."], said
+            assert TOOL_NUDGE in [m["content"] for m in ann[1]] and ran == [{"name": "web_search", "args": {"query": "앤트로픽 주가"}}]
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["광주 날씨 확인해 볼게요.", "확인해 볼게요.", "지금 광주는 9도예요."])
+            said = asyncio.run(run("광주 날씨 알려줄래?", "s"))
+            assert ran == [{"name": "weather", "args": {}}] and said[-1][0] == "지금 광주는 9도예요.", (ran, said)
+            assert [x for x, _ in said].count("광주 날씨 확인해 볼게요.") == 1
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["네, 지금 환율 알려드릴게요. 원/달러 환율은 약 1,310원대입니다.",
+                                                 '[TOOL] {"name": "web_search", "args": {"query": "원달러 환율"}}',
+                                                 "네이버 기준으로 1달러에 1,452원이에요."])
+            said = asyncio.run(run("지금 1달러 환율 얼마야?", "s"))
+            assert [x for x, _ in said] == ["네, 지금 환율 알려드릴게요.", "네이버 기준으로 1달러에 1,452원이에요."], said
+            assert ran == [{"name": "web_search", "args": {"query": "원달러 환율"}}]  # the guess was never said
+            assert not LIVE_Q.search("3 더하기 4는 얼마야?") and LIVE_Q.search("삼성전자 주가 알려줘")
+            assert FIGURE.search("약 천삼백십 원대예요.") and not FIGURE.search("오늘 이야기해 볼게요.")
+            gw_tools.clear(), gw_tools.update(saved_tools)
+            globals()["run_tool"] = saved_run
             globals()["llm_stream"] = fake_llm
             prompts.clear()
             t = time.perf_counter()

@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import agent_loop
 import cron
 import late_night
+import weather
 import web
 import openings
 import connectors
@@ -111,6 +112,8 @@ DEFAULTS = {
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "brain_mode": "auto",
+    # weather tool's default place when none is said (Open-Meteo; GIST in 광주)
+    "weather_home": {"name": "광주", "lat": 35.2285, "lon": 126.8434},
     "search_backend": "searxng",  # searxng (the user's own, free; local Qwen may use it) | haiku (paid Claude search)
     "searxng_url": os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
@@ -2266,6 +2269,13 @@ async def put_settings(body: dict):
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
             raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
+    if "weather_home" in body:
+        h = body["weather_home"]
+        if not (isinstance(h, dict) and isinstance(h.get("name"), str) and 0 < len(h["name"]) <= 40
+                and all(isinstance(h.get(k), (int, float)) for k in ("lat", "lon"))
+                and -90 <= h["lat"] <= 90 and -180 <= h["lon"] <= 180):
+            raise HTTPException(400, "weather_home: {name, lat, lon}")
+        body["weather_home"] = {k: h[k] for k in ("name", "lat", "lon")}
     if "search_backend" in body and body["search_backend"] not in ("searxng", "haiku"):
         raise HTTPException(400, "search_backend: searxng or haiku")
     if "searxng_url" in body and not (isinstance(body["searxng_url"], str)
@@ -3957,7 +3967,7 @@ bridge = tools_bridge.Bridge(
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
     web_ok=lambda: searxng_ok(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
-    web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    weather=lambda place, when: weather_now(place, when), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
@@ -4018,6 +4028,10 @@ async def web_search(query, n):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
     res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
     return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def weather_now(place, when):
+    return await weather.forecast(place, when, (await load_settings())["weather_home"])
 
 
 async def persona_shares(pid):
