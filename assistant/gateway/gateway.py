@@ -729,14 +729,32 @@ TOOL_LABELS = [("gistra_", "학사 일정 확인 중", "schedule"), ("planit_", 
 SERVER_LABELS = [("google_calendar", "캘린더 확인 중", "calendar"), ("gmail", "메일 확인 중", "mail"),
                  ("notion", "노션 보는 중", "notes")]
 DEVICE_LABELS = {"run_command": ("{}에서 명령 실행 중", "terminal"), "list_dir": ("{} 파일 보는 중", "files"),
-                 "read_file": ("{} 파일 보는 중", "files"), "search": ("{} 파일 보는 중", "files"),
-                 "browse": ("웹페이지 읽는 중", "web"), "delegate": ("{}에 작업 맡기는 중", "terminal")}
+                 "read_file": ("{} 파일 읽는 중", "files"), "search": ("{} 파일 찾는 중", "files"),
+                 "browse": ("웹페이지 읽는 중", "web"), "delegate": ("{}에서 작업 위임", "terminal"),
+                 "job_status": ("{} 작업 확인 중", "terminal"), "list_jobs": ("{} 작업 확인 중", "terminal"),
+                 "browser": ("{} 브라우저 쓰는 중", "web"), "music": ("{}에서 음악 조작 중", "generic"),
+                 "home": ("집 기기 조작 중", "generic")}
+OWN_LABELS = {"memory_recall": "기억 찾는 중", "people_lookup": "사람 찾는 중", "remember": "기억해 두는 중",
+              "forget": "기억 지우는 중", "memory_list": "기억 보는 중", "web_search": "웹 검색 중",
+              "web_fetch": "웹페이지 읽는 중", "call_user": "전화 예약 중", "schedule_list": "예약 확인 중",
+              "schedule_cancel": "예약 취소 중", "schedule_update": "예약 바꾸는 중", "schedule_create": "예약하는 중",
+              "create_task": "작업 맡기는 중", "task_status": "작업 확인 중", "task_cancel": "작업 멈추는 중",
+              "approval_status": "승인 확인 중", "calendar_events": "캘린더 확인 중", "gmail_search": "메일 찾는 중",
+              "gmail_read": "메일 읽는 중", "music_play": "음악 트는 중", "music_control": "음악 조작 중",
+              "home_scene": "집 기기 조작 중"}
 GENERIC = ("도구 준비 중", "generic")
 
 
 def tool_info(name):
     """(Korean label, kind) for a tool, from its name alone (never its arguments or result)."""
-    server, _, tool = name.removeprefix("mcp__").partition("__") if name.startswith("mcp__") else ("", "", name)
+    if name.startswith("mcp__"):
+        server, _, tool = name.removeprefix("mcp__").partition("__")
+    elif "__" in name:  # the API, NIM and Qwen loops name device tools "<device>__<tool>"
+        server, _, tool = name.partition("__")
+    else:
+        server, tool = "", name
+    if not server and tool in OWN_LABELS:
+        return OWN_LABELS[tool], "generic"
     for prefix, label, kind in TOOL_LABELS:
         if tool.startswith(prefix):
             return label, kind
@@ -950,6 +968,8 @@ async def run_tool(block, where):
             raise RuntimeError("delegate is not allowed on a limited device")
         res = await mcp(url, "tools/call", {"name": name, "arguments": block["input"]})
         text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
+        if name == "delegate" and (req := requester_ctx.get()).startswith("task:"):
+            note_job(task_live.get(req[5:]), block["name"].split("__")[0], text)
         return {"type": "tool_result", "tool_use_id": block["id"], "content": text[:20000] or "(empty)",
                 "is_error": bool(res.get("isError"))}
     except Exception as e:
@@ -3627,6 +3647,10 @@ def task_prompt(t, devices):
     if t["device"] and t["device"] in limited:
         note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
     note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
+    note += (" 간단하고 짧은 일은 기기 도구(read_file, list_dir, run_command, browser)로 직접 해. 여러 파일을 고치는 코딩이나"
+             " 파일을 써 가며 하는 깊은 조사처럼 그 기기에서 오래, 여러 단계가 필요한 일은 그 기기의 delegate로 그 기기의"
+             " Claude Code에 맡겨. 맡겼으면 기다리지 말고 job_id를 남기고 끝내: 시스템이 그 작업이 끝날 때까지 기다렸다가 그"
+             " 결과로 마무리해. 한도 기기(팀 기기)와 sadr에는 delegate를 쓰지 마.")
     asked = datetime.fromtimestamp(t.get("created") or time.time(), KST)  # "내일 아침까지" said at 01:00 = this morning
     night = late_night.prompt_rule(asked)
     return f"{where}{note}" + (f"\n이 일은 {asked:%-m월 %-d일 %H:%M}에 맡겨졌어.{night}" if night else "") + \
@@ -3655,6 +3679,7 @@ async def task_round(t, prompt, resume, deadline):
                                                 limit=2**24)
     pin, pout = PRICES[model]
     spent_before, session, pending, said = t["cost_usd"], resume, None, ""
+    tool_names: dict[str, str] = {}  # tool_use id -> tool name, to know which result came from a delegate
     try:
         while True:
             left = deadline - time.monotonic()
@@ -3677,6 +3702,7 @@ async def task_round(t, prompt, resume, deadline):
                 for b in msg.get("content") or []:
                     if b.get("type") == "tool_use":
                         task_step(t, "tool", tool=b.get("name", ""), label=tool_label(b.get("name", "")))
+                        tool_names[b.get("id", "")] = b.get("name", "")
                     elif b.get("type") == "text" and b.get("text", "").strip():
                         said = b["text"].strip()
                 u = msg.get("usage") or {}
@@ -3687,6 +3713,9 @@ async def task_round(t, prompt, resume, deadline):
             elif e.get("type") == "user":
                 for b in (e.get("message") or {}).get("content") or []:
                     if b.get("type") == "tool_result":  # only an approval this task's own run created
+                        name = tool_names.get(b.get("tool_use_id", ""), "")
+                        if name.startswith("mcp__") and name.endswith("__delegate"):  # a job the device now runs
+                            note_job(t, name.split("__")[1], json.dumps(b.get("content"), ensure_ascii=False))
                         found = PENDING_RE.findall(json.dumps(b.get("content"), ensure_ascii=False).replace('\\"', '"'))
                         pending = next((a for a in found if a in task_approvals.get(t["id"], ())), pending)
             elif e.get("type") == "result":
@@ -3705,6 +3734,67 @@ async def task_round(t, prompt, resume, deadline):
             os.unlink(cfg)
     t["result"] = re.sub(r"APPROVAL_PENDING\s+\S+", "", said).strip()[:2000] or None
     return session, pending
+
+
+JOB_POLL_S = 15
+JOB_ID_RE = re.compile(r'"job_id"\s*:\s*\\?"([0-9a-f]{12})')
+META_LINES = re.compile(r"[^.!?\n]*(전화(를|는)?\s*(제가\s*)?(직접\s*)?(걸|드릴)\s*수\s*(가\s*)?없|시스템이\s*(알려|전화|연락)|"
+                        r"알림은\s*(시스템|자동)|전화\s*도구가|확인받고\s*걸|제가\s*직접\s*전화)[^.!?\n]*[.!?]?\s*")
+
+
+def note_job(t, device, text):
+    """A delegate call's result: the job the device now runs for this task (polled to the end by await_jobs)."""
+    if t is None or not (m := JOB_ID_RE.search(text or "")):
+        return
+    jobs = t.setdefault("jobs", [])
+    if all(j["job_id"] != m.group(1) for j in jobs):
+        jobs.append({"device": device, "job_id": m.group(1), "status": "running"})
+        task_step(t, "job", label=f"{DEVICE_WORD.get(device, device)}에서 작업 진행 중", job_id=m.group(1))
+
+
+def strip_meta(text):
+    """Model talk about notifying ("저는 전화를 직접 걸 수 없어요", "시스템이 알려 드릴 거예요") out of a result:
+    the runner notifies."""
+    return (META_LINES.sub("", text or "").strip() or None) if text else text
+
+
+async def await_jobs(t, deadline):
+    """Keep the task running while a job it delegated runs on the device: poll <device>__job_status until done or
+    failed, within the task's time cap (and its cancel). The task's result becomes the job's result."""
+    open_jobs = [j for j in t.get("jobs", []) if j["status"] == "running"]
+    if not open_jobs:
+        return
+    t["note"] = "기기에서 작업이 끝나길 기다리는 중"
+    await task_save(t)
+    while open_jobs:
+        if time.monotonic() >= deadline:
+            raise TaskLimit("time", f"{t['max_minutes']:g}분 안에 기기 작업이 끝나지 않았어요.")
+        if (await state.call("GET", task_key(t["id"])) or {}).get("cancel_requested"):
+            raise asyncio.CancelledError
+        _, where = await device_tools(await fresh_devices())
+        for j in list(open_jobs):
+            name = f"{j['device']}__job_status"
+            if name not in where:
+                continue  # the device is away: try again next round
+            res = await run_tool({"id": "job", "name": name, "input": {"job_id": j["job_id"]}}, where)
+            try:
+                got = json.loads(res["content"][res["content"].index("{"):res["content"].rindex("}") + 1])
+            except ValueError:
+                continue
+            state_ = got.get("job_status") or got.get("status")
+            if state_ in ("done", "failed"):
+                j["status"] = state_
+                open_jobs.remove(j)
+                out = str(got.get("result") or got.get("summary") or "").strip()
+                task_step(t, "job_" + state_, label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업 "
+                          f"{'끝남' if state_ == 'done' else '실패'}", job_id=j["job_id"])
+                if state_ == "failed":
+                    raise TaskLimit("error", f"기기 작업이 실패했어요. {out[:300]}".strip())
+                t["result"] = out[:4000] or t.get("result")
+        await task_save(t)
+        if open_jobs:
+            await asyncio.sleep(JOB_POLL_S)
+    t["note"] = None
 
 
 class ApiAuth(Exception):
@@ -3788,6 +3878,8 @@ async def run_task(t):
                 deadline += time.monotonic() - waited
                 prompt = (f"승인됐어 (approval_id={pending}). 같은 명령을 approval_id와 함께 다시 실행하고 이어서 해." if ok else
                           "사용자가 그 명령을 거절했어. 그 명령 없이 할 수 있는 만큼 하고 결과를 요약해.")
+            await await_jobs(t, deadline)  # a job it handed to a device: done only when that job is
+            t["result"] = strip_meta(t.get("result"))
             t.update(status="done", finished=time.time())
     except asyncio.CancelledError:
         t.update(status="cancelled", finished=time.time(), error="취소됐어요.")
@@ -3864,9 +3956,9 @@ async def task_briefing(t, title):
         return task_summary(t, title)
     goal = openings.purpose_rule(t["goal"]) or "작업"
     try:
-        d = await llm_json(BRIEFING_PROMPT.replace("{goal}", goal), f"작업: {goal}\n결과:\n{t['result'][:6000]}",
+        d = await llm_json(BRIEFING_PROMPT.replace("{goal}", goal), f"작업: {goal}\n결과:\n{strip_meta(t['result'])[:6000]}",
                            max_tokens=1500)
-        say = strip_marks(str((d or {}).get("say") or "")).strip()
+        say = strip_meta(strip_marks(str((d or {}).get("say") or ""))) or ""
     except Exception as e:
         print("task briefing failed:", t["id"], type(e).__name__, flush=True)
         say = ""
@@ -4618,8 +4710,9 @@ async def run_task_api(t):
         elif ev["type"] == "activity" and ev["phase"].startswith("approval_"):
             task_step(t, ev["phase"], tool=ev["tool"])
         elif ev["type"] == "done":
-            t.update(status="done", finished=time.time(), result=ev["result"] or None,
-                     cost_usd=t["cost_usd"] + ev["cost_usd"])
+            t.update(result=ev["result"] or None, cost_usd=t["cost_usd"] + ev["cost_usd"])
+            await await_jobs(t, time.monotonic() + t["max_minutes"] * 60)  # a delegated job: done only when it is
+            t.update(status="done", finished=time.time(), result=strip_meta(t.get("result")))
         elif ev["type"] == "failed":
             t["cost_usd"] += ev["cost_usd"]
             if ev["kind"] == "cancelled":
