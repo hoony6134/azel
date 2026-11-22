@@ -780,8 +780,8 @@ def test_schedule_api_validates_and_confirms(gw):
                                           "note": "회의"}).json()
     assert weekly["repeat"] == f"weekly:{dow}" and weekly["created_by"] == "app"
     assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"], item["id"]]  # soonest first
-    gone = c.delete(f"/v1/schedule/{item['id']}").json()
-    assert gone == {**item, "status": "cancelled"}
+    gone = c.delete(f"/v1/schedule/{item['id']}").json()  # the whole result: the app never reads it, errors show text
+    assert gone["ok"] and gone["data"] == {**item, "status": "cancelled"}
     assert c.delete(f"/v1/schedule/{item['id']}").status_code == 404
     assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"]]  # default: pending and fired
     assert {i["id"] for i in c.get("/v1/schedule?include=all").json()} == {weekly["id"], item["id"]}
@@ -1583,7 +1583,7 @@ def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatc
     monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))  # no PAT in tests
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         evs = events(c.post("/v1/ask", json={"text": "홈 폴더 봐 줘", "session": "s", "path": "api", "model": "haiku"}))
-    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "web_search", "web_fetch", "music_play", "music_control", "home_scene"]
+    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "overnight_list", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "agenda", "weather", "stock_quote", "web_search", "web_fetch", "music_play", "music_control", "home_scene", "auto_approve", "web_task", *(t["name"] for t in g.tools_bridge.P.TOOLS), "end_call"]
     assert "Cygnus 도구" in seen["system"] and g.PERSONAL_REFUSAL not in seen["system"] and seen["result"] == "a b c"
     assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
     done = evs[-1]

@@ -129,12 +129,15 @@ the tool name only.
 | `task_status` | one task or the recent ones | `GET /v1/tasks`, `GET /v1/tasks/{id}` | ✓ | — | "맡긴 거 어떻게 됐어?" | — |
 | `task_cancel` | stop a running task | `POST /v1/tasks/{id}/cancel` | ✓ (new tool) | — | "그 작업 그만해" | `STOP` on a running-task push |
 | `approval_status` | pending approvals and their state (read only) | `GET /v1/approvals`, `GET /v1/approvals/{id}` | ✓ | — (personal device commands) | "승인 기다리는 거 있어?" | — |
+| `end_call` | hang up the call after a short goodbye, when the user says so (never mid-question, never from a task) | — (in-call only; the app hangs up itself) | ✓ | — | "이제 됐어 끊어" | — |
+| `auto_approve` | the user's own "알아서 해": safe device commands run without a tap for this call (≤ 2 h), risky ones still ask; read back once, refused after a web/mail/memory read and in tasks | the app's toggle is `POST /v1/auto-approve` (and the call's `auto_approve` frame) | ✓ | — | "권한 줄 테니 알아서 해" | — |
 | `music_play`, `music_control` | Apple Music on the user's Mac through the daemon's `music` tool (fixed AppleScript templates; no approval) | not on REST: no app screen | ✓ (no approval for qwen) | — | (models) | — |
 | `home_scene` | run an allowlisted HomeKit scene (a Shortcut named in the daemon's `home_shortcuts`); after a web/mail/memory read it needs `confirmed` | not on REST | ✓ | — | (models) | — |
 | `<device>__<tool>` | daemon tools (list_dir, read_file, run_command, …) | not on REST: the app hands device work to `create_task`; tailnet `POST /v1/tools/call` | internal ✓; qwen read tools, run_command only after an approval, no delegate | — | — | — |
 | Cygnus reads (`gistra_*`, `infra_*`, `planit_*`) | read-only school, infra, planner data | not on REST: the app has no view for them yet; tailnet `POST /v1/tools/call` | ✓ | — (personal; opt-in later) | (models) | — |
 | Google reads (`calendar_events`, `gmail_search`, `gmail_read`) | read-only, only with a live grant | not on REST, same reason | ✓ | — (personal) | (models) | — |
 | Spotify (`spotify_play`, `spotify_control`, `spotify_now_playing`, `spotify_devices`) | music by voice, only with a live grant (`SPOTIFY.md`) | not on REST: music is spoken; the app only connects it (`/v1/connectors/spotify/authorize`) | ✓ (also served to `claude -p` over `/v1/mcp`) | — | (models) | — |
+| iPhone reads (`phone_health`, `phone_sleep`, `phone_workouts`, `phone_calendar`, `phone_reminders`, `phone_contacts`, `phone_location`, `phone_now_playing`) | read-only iPhone data (PHONE_DATA.md): live from the phone in a call, health/sleep/workouts else from the synced daily summaries; `error.unavailable` with a spoken reason when neither | not on REST: the app reads its own phone (the summaries' own routes are `/v1/phone/days`) | ✓ | — (personal) | (models) | — |
 
 Not actions: `POST /v1/approvals/{id}` (human only); `POST /v1/approvals` (daemons file requests); settings, personas,
 history, connectors, push registration (configuration, not things the assistant does).
@@ -156,3 +159,8 @@ history, connectors, push registration (configuration, not things the assistant 
 - `create_task`: `goal` (required), `device`, `notify`, `backend` (claude_api | claude_code | nim | qwen; the default
   comes from settings, with recorded fallbacks).
 - `task_status`: `id`. `task_cancel`: `id` (required). `approval_status`: `id`.
+- `phone_health`: `metric` (required: summary, steps, distance, active_energy, exercise, heart_rate, resting_heart_rate, hrv,
+  mindful, weight, cycle), `range` (today, yesterday, this_week, last_week, last_7_days, this_month, or `YYYY-MM-DD`).
+  `phone_sleep`: `date` (the wake-up date; empty = the latest night). `phone_workouts`: `range`. `phone_calendar`: `range`
+  (today, tomorrow, this_week, next_week, `YYYY-MM-DD`). `phone_reminders`: `list`. `phone_contacts`: `name` (required).
+  `phone_location`, `phone_now_playing`: none.

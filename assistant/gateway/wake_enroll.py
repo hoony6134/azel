@@ -107,7 +107,9 @@ def status():
         s = {**s, "status": "failed", "error": "학습이 중단됐어요"}
     return {"clips": n, "min_clips": MIN_CLIPS, "trained_at": s.get("trained_at"),
             "status": s.get("status", "none") if n else "none", "improved": s.get("improved"),
-            "metrics": s.get("metrics"), "error": s.get("error")}
+            "metrics": {k: v for k, v in (s.get("metrics") or {}).items()  # the app decodes [String: Double?]: no
+                        if isinstance(v, (int, float)) and not isinstance(v, bool)} or None,  # bools, no nested object
+            "error": s.get("error")}
 
 
 def write_status(**s):

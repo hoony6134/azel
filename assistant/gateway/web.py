@@ -124,6 +124,10 @@ async def fetch(url, client=None):
 SEARXNG_URL = "https://search.infra.scian.xyz/search"
 SEARXNG_TIMEOUT_S = 6
 THIN = 240  # fewer snippet characters than this across the top results: read the top pages too
+# A question whose answer is a number: snippets rarely carry today's figure ("삼성전자 주가 - 네이버 증권"), so the
+# top pages are read too, whatever the snippets' length.
+NUMERIC_Q = re.compile(r"주가|환율|시세|가격|얼마|금리|유가|코스피|코스닥|나스닥|다우|비트코인|몇\s*(원|달러|엔|퍼센트|%)")
+PAGES_S = 8  # both top pages together, at most this long
 
 
 def site_of(url):
@@ -148,13 +152,17 @@ async def searxng(query, n=5, url=SEARXNG_URL, client=None, fetch_pages=True):
         return None
     lines = [*answers, *boxes] + [f"- {x.get('title', '')[:80]} ({site_of(x['url'])}): {str(x.get('content', ''))[:300]}"
                                   for x in hits]
-    if fetch_pages and sum(len(str(x.get("content", ""))) for x in hits[:3]) < THIN:
-        for x in hits[:2]:  # the snippets say little ("날씨 지도. 광주."): what the top pages themselves say
+    if fetch_pages and (sum(len(str(x.get("content", ""))) for x in hits[:3]) < THIN or NUMERIC_Q.search(str(query))):
+        async def page(x):  # the snippets say little ("날씨 지도. 광주."): what the top pages themselves say
             try:
-                page = await fetch(x["url"])
-                lines.append(f"[{site_of(x['url'])} 본문] {page['text'][:1200]}")
+                return f"[{site_of(x['url'])} 본문] {(await fetch(x['url']))['text'][:1200]}"
             except Exception:  # noqa: BLE001  a page that won't load: the snippets still stand
-                continue
+                return None
+        try:
+            pages = await asyncio.wait_for(asyncio.gather(*(page(x) for x in hits[:2])), PAGES_S)
+        except asyncio.TimeoutError:
+            pages = []
+        lines += [p for p in pages if p]
     return {"text": "\n".join(lines)[:4000], "sources": [{"title": x.get("title", "")[:80], "url": x["url"]} for x in hits],
             "cost_usd": 0.0, "usage": {}, "engine": "searxng",
             "unresponsive": [e[0] if isinstance(e, list) else str(e) for e in d.get("unresponsive_engines") or []]}

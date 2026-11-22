@@ -30,6 +30,8 @@ from urllib.parse import urlsplit
 
 import oauth
 
+NO_DELEGATE = {"sadr"}  # devices never handed a delegate (team devices may, since batch 8)
+
 DEFAULT_ON = ("Cygnus MCP", "Google Calendar", "Gmail")
 SLUG = re.compile(r"[A-Za-z0-9_-]{1,40}")
 LIST_RE = re.compile(r"^claude\.ai (.+?): (\S+) - (.*)$")
@@ -206,7 +208,7 @@ def run_args(conn, disc, devices, token, home, tokens=None, extra=None, own_only
     for s in servers:  # a custom server with an allowlist grants only those tools (shortcut: globs rely on Claude Code's own matching)
         allowed += [f"mcp__{s}__{p}" for p in pats[s]] if pats.get(s) else [f"mcp__{s}"]
     settings = {"enabledPlugins": {p: False for p in disc.plugins}}
-    if deny := [f"mcp__{d['id']}__delegate" for d in devices if d.get("limited")]:
+    if deny := [f"mcp__{d['id']}__delegate" for d in devices if d["id"] in NO_DELEGATE]:
         settings["permissions"] = {"deny": deny}
     if disc.connectors or own_only:  # shortcut: until discovery ran, every claude.ai connector loads (slow, but nothing missing)
         settings["allowedMcpServers"] = [{"serverUrl": c["url"]} for c in ai] + \

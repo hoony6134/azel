@@ -106,7 +106,7 @@ def test_cancel(tgw):
     g, c, notes = tgw
     tid = c.post("/v1/tasks", json={"goal": "TASK-SLOW 취소할 작업", "notify": "call"}).json()["id"]
     wait_for(c, tid, ("running",))
-    assert c.post(f"/v1/tasks/{tid}/cancel").json()["status"] == "cancelled"
+    assert c.post(f"/v1/tasks/{tid}/cancel").json()["data"]["status"] == "cancelled"
     assert c.post(f"/v1/tasks/{tid}/cancel").status_code == 409
     assert notes == []  # a cancelled task does not call
 
@@ -356,3 +356,21 @@ def test_call_context_and_notify_change(tgw, monkeypatch):
                                                 "notify": "call"}, "app")
     c.portal.call(g.attempt, g.fake.db["schedule"][item["id"]], time.time())
     assert pushes[-1]["context"] == {"kind": "schedule", "label": "알림: 약 먹기", "id": item["id"]}
+
+
+def test_a_brief_runs_the_task_but_the_user_sees_their_goal(tgw):
+    g, c, _ = tgw
+    brief = g.tools_bridge.BROWSER_BRIEF
+    _, view = c.portal.call(g.bridge.create_task, {"goal": "도쿄 항공권 비교해 줘", "brief": brief, "notify": "none",
+                                                   "when": "overnight"}, None, "api")
+    tid = view["id"]
+    stored = c.portal.call(g.state.call, "GET", g.task_key(tid))
+    assert stored["goal"] == "도쿄 항공권 비교해 줘" and stored["brief"] == brief
+    shown = [c.get(f"/v1/tasks/{tid}").json(), *c.get("/v1/tasks").json(), *c.get("/v1/tasks/overnight").json()]
+    assert all(x["goal"] == "도쿄 항공권 비교해 줘" and "brief" not in x for x in shown if x["id"] == tid)
+    text, _ = c.portal.call(g.overnight_report)
+    assert "도쿄 항공권" in text and "브라우저" not in text
+    prompt = g.task_prompt(stored, [])
+    assert brief in prompt and prompt.endswith("목표: 도쿄 항공권 비교해 줘")
+    r = c.post("/v1/tasks", json={"goal": "x", "brief": "다른 지시"}, headers={"X-Azel-Result": "2"})
+    assert r.status_code == 400 and "brief" in r.json()["detail"]  # only web_task sets one

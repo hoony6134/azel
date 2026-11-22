@@ -6,6 +6,10 @@
    For the `browse` tool: `uv run playwright install chromium` (downloads ~100 MB into the Playwright cache in
    your home, `~/Library/Caches/ms-playwright` on macOS, `~/.cache/ms-playwright` on Linux; Linux may also need
    `uv run playwright install-deps chromium`). Without it `browse` returns an error; other tools are unaffected.
+   The `browser` tool (Mac only) uses the same Chromium: set `browser_enabled = true` in `daemon.toml`. Its profile is
+   `~/.config/biseo/browser-profile` (0700, never for logins: cookies are cleared at every browser start); downloads, PDFs and screenshots go to `~/Downloads/azel`. Sites such as Naver
+   and Google may show a human check to a headless browser: the tool reports `bot_check` and stops; open the page with
+   `show=true` and pass the check yourself.
 3. macOS, from this directory: fill in the checkout path, then load it. Logs: `~/Library/Logs/biseo-daemon.log`.
    ```sh
    sed "s|__DAEMON_DIR__|$PWD|g" xyz.scian.biseo-daemon.plist > ~/Library/LaunchAgents/xyz.scian.biseo-daemon.plist

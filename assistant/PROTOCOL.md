@@ -105,6 +105,11 @@ answering a call the assistant placed; the server then speaks that call's openin
   one. Shared setting `noise_mode` `normal`|`noisy`: noisy raises the thresholds (min voiced 400 ms) and
   turns voice barge-in off while the assistant speaks; tap-to-interrupt still works. Tunable by env:
   `VAD_THRESHOLD`, `NOISE_MARGIN_DB`, `MIN_VOICED_MS`, `BARGE_MIN_VOICED_MS` and their `NOISY_` variants.
+- iPhone data (PHONE_DATA.md §3a), iPhone only. Client → server `{"type":"phone_hello","kinds":[…]}` right after
+  connecting: the categories the phone answers in this call (`health`, `sleep`, `workouts`, `calendar`, `reminders`,
+  `contacts`, `location`, `now_playing`); `[]` in a secret call. Server → client `{"type":"phone_query","id","kind",
+  "args"}` (a gateway's question, relayed); client → server `{"type":"phone_result","id","ok","data"?,"error"?}`
+  (`error`: `off` = the category is off, `denied` = no iOS permission, `failed`). The voice server keeps none of it.
 - Client → server **text**: `{"type":"hangup"}` (or just close); `{"type":"interrupt"}` (tap-to-interrupt):
   handled like a voice barge-in, so the current reply and its Claude run are cancelled and the server
   answers `{"type":"interrupt"}` then `{"type":"state","value":"listening"}` (every interrupt, voice or tap, ends
@@ -119,6 +124,41 @@ answering a call the assistant placed; the server then speaks that call's openin
   the assistant speaks or thinks it interrupts first, like a tap (`interrupt`, then the new reply). `speak:false`
   (default true): the reply comes as `reply` captions and `turn_done` with no audio and no filler lines. The mic
   stays live: speech during a typed turn is handled as usual.
+- **The assistant hangs up**: server → client `{"type":"hangup","reason":"<short text, may be empty>"}`, then the server
+  closes the socket. It comes after the goodbye the assistant just said has finished playing ("네, 끝나면 전화드릴게요."),
+  when the user said "끊어", "이제 됐어 끊어", "끊을게" or "맡겨 놓고 끊어" (the model's `end_call` action; never while a
+  confirm/clarify question waits for an answer, never from a task). The app ends the call as if the user hung up; the
+  reason is for logs, the app need not show it.
+- **Continuing a task from its finish call**: an instruction given in a task's finish call (within 3 h, e.g. "그거 이렇게
+  고쳐서 다시 해 줘") creates a continuation task: `parent_task` = the finished task, the same device, notify inherited, and
+  when the parent delegated, `resume` = that device's Claude Code session (`session_id`, `cwd` from the job), so the
+  device's Claude Code keeps its own context (`<device>__delegate` with `resume`, same `cwd`). Questions in the call are
+  answered from the result, as before. A task that delegates waits for the job (`job_status`) before it counts as done.
+- **Approval pushes** carry `aps.category = "APPROVAL"` (허용 / 거부 / 항상 허용 buttons) with `approval_id`, and
+  `forced_once: true` when "always" can't hold (a command that writes, or a secret call): hide that button.
+- Team devices (vd-spark, vd-core) may be handed a `delegate` (their own Claude Code); only `sadr` never is.
+- **Auto-approve** (like Claude Code's auto mode, only when the user grants it): while a grant is live, a device
+  command whose run (this call, or a task started in it, or a task granted directly) asks for approval runs at once
+  when it classifies **safe**; **risky** ones still need a tap, and the daemons' hard_deny is unchanged. Browser-tool
+  approvals (`tool: "browser"`: a committing click, a first print) are never auto-approved.
+  - Grant from the call: client → `{"type":"auto_approve","value":true|false,"minutes"?,"devices"?}`; the server answers
+    `{"type":"auto_approve","value","expires_at"}` when the gateway confirms, and every `state` frame carries
+    `"auto": true|false`. `hello.caps` lists `"auto_approve"`. The grant ends at hangup, after `minutes` (≤ 120), or on
+    `value:false`. By voice: the model's `auto_approve` action, only for the call's own ask (never a task), refused
+    right after a web, mail, Cygnus or memory read in the same run, and always read back once ("이번 통화 동안 위험하지
+    않은 명령은 묻지 않고 바로 실행할게요. …맞죠?").
+  - Gateway REST (app): `POST /v1/auto-approve` `{"session"|"task","devices"?,"minutes"?}` → `{"id","scope","devices",
+    "by","created","expires_at","ran"}`; `GET /v1/auto-approve` (live grants); `GET /v1/auto-approve/{id}` (with `log`:
+    device, command, at, stage, also after it ended); `DELETE /v1/auto-approve/{id}` → 204. A task's grant ends with
+    the task.
+  - Tiers (`gateway/risk.py`): deterministic rules first (reads, status, a single named service or container restart,
+    files inside the working directory, `open -a` → safe; any delete (rm, rmdir, unlink, trash), recursive or mass delete, service stop/disable/reboot,
+    installs, users and permissions, sending data off-host, secrets-adjacent paths, git push/force, docker rm/prune/
+    volume rm, kill -9, osascript and the like → risky), then the local Qwen, then Haiku (never in local brain mode),
+    then risky. Cached per command+cwd+device; the gateway log says which stage decided.
+  - Audit: the approval's meta has `decision: "auto"`, `grant_id`, `stage`; the grant keeps the list. When a grant with
+    runs ends, a push "자동으로 실행한 명령 N개가 있어요" (type `auto_summary`, `grant_id`; no command text on the lock
+    screen). Secret calls: the grant works but lives in memory only, is never listed, and sends no summary.
 - **Secret calls**: `/v1/call?secret=1`, or `{"type":"secret","value":true}` during a call (the server answers
   `{"type":"secret","value":true}`; turning it off is refused with the same frame: a secret call stays secret). Every
   `state` frame carries `"secret": true|false`. In a secret call:
@@ -216,6 +256,10 @@ JSON text frames:
   retries). `{"type":"briefing_context","id"}` → gateway → voice `{"id","type":"briefing_context",
   "situation": "<azel-situation, or azel-checkpoint if that is stale; \"\" if neither is fresh>",
   "facts":["승인 대기 N건","다음 예약 전화: …","최근 24시간 서버 경보: …"]}`.
+- gateway → voice: `{"type":"phone_query","id","kind","args"}` (full links only; PHONE_DATA.md §3a). The voice server
+  passes it to the latest call whose `phone_hello` lists `kind`, and the phone's `phone_result` back to the link that
+  asked as `{"id","type":"phone_result","ok","data"?,"error"?}`; with no such call it answers at once with
+  `"ok":false,"error":"offline"`. Nothing is stored or logged.
 - voice → gateway: `{"type":"ask","id","text","session","model","task"}`,
   `{"type":"cancel","id"}` (barge-in or timeout: the gateway kills that Claude run; sent on the link
   that got the ask).
@@ -254,7 +298,8 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
   `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
   `GET|POST|DELETE /v1/wake/enroll`, `GET /v1/providers/nim/models`, `PUT /v1/providers/nim/key`,
-  `GET|POST /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` (bearer header).
+  `GET|POST /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` (bearer header);
+  `GET /v1/tv` (the TV token; needs adding to the proxy's list).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -488,6 +533,10 @@ device that created them.
   the app sends its PushKit token and/or its ordinary APNs token (missed-call notices, task pushes). macOS sends
   only `alert_token`. `bundle_id` must be `xyz.scian.biseo` and at least one token is required (400 otherwise). At
   most 10 tokens per kind are kept; registering an 11th evicts the oldest.
+- `PUT /v1/phone/days` `{"days":[…]}` (1–14 day summaries, fields in PHONE_DATA.md §3b; an unknown field or a value out
+  of range → 400) merges by date into kv `phone-days` and keeps the newest 30 days → `{"stored","updated"}`.
+  `GET /v1/phone/days` → `{"days":[…],"updated","keep_days":30}`. `DELETE /v1/phone/days` deletes them all → `{"deleted":true}`; with `?kind=health|sleep|workouts|cycle` only that category's fields (the app sends it when that toggle is turned off; a day left empty goes).
+  Full gateways only (403 on limited). The `phone_*` actions read these when no phone answers live.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).
 - Personas (full gateways only; limited → 403): several assistants, exactly one `primary`. Persona:
@@ -616,6 +665,22 @@ device that created them.
   - In a call, Claude says "앱에서 허용해 주세요", then calls `run_command` again with the `approval_id`, which waits for
     the decision (below); rejected or expired → it tells the user it was not allowed. Tasks wait as described under
     Tasks.
+- TV dashboard (`gateway/tv.py`, the Roku channel in `roku/`): `GET /v1/tv` → one compact, read-only JSON, cached 30 s
+  (full gateways only):
+  ```json
+  {"at": "2026-11-22T20:15:00+09:00",
+   "infra": {"health": ["…"], "problems": ["…"], "alerts": ["…"]} | null,
+   "tasks": {"running": [{"goal","status"}], "queued": 1, "recent": [{"goal","status"}], "approvals": 0} | null,
+   "todo": {"today": ["…"], "assignments": ["…"]} | null,
+   "calls": [{"at": "21:00", "what": "약 먹기"}] | null,
+   "calendar": ["…"] | null,
+   "assistant": {"name": "아젤", "state": "idle"|"call"} | null}
+  ```
+  Each part is `null` when its source is missing or fails (the rest still answers). Lists are short display lines
+  (≤ 10 lines of ≤ 90 characters). No command, approval detail, task result or message body is ever included.
+  **Auth**: the gateway token, or the TV token in `~/.config/biseo/tv_token` (0600, ≥ 32 characters; read on every
+  request, so deleting or rotating it revokes at once; ignored unless 0600). The TV token opens **only** `GET /v1/tv`
+  (anything else → 401).
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
