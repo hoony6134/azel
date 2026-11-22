@@ -415,7 +415,8 @@ def test_connectors_app_shape(gw, monkeypatch):
     g.discovery.at = time.time()
     got = c.get("/v1/connectors").json()
     assert got == {"claude_ai": [{"name": "Gmail", "enabled": True, "status": "connected"},
-                                 {"name": "Notion", "enabled": False, "status": "needs_auth"}], "custom": []}
+                                 {"name": "Notion", "enabled": False, "status": "needs_auth"}], "custom": [],
+                   "oauth": {"spotify": "needs_consent"}}
     put = {"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
            "custom": [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True}]}
     got = c.put("/v1/connectors", json=put).json()
@@ -1695,3 +1696,37 @@ def test_main_block_is_last():
     tree = ast.parse(pathlib.Path(__file__).resolve().parents[1].joinpath("gateway.py").read_text())
     last = tree.body[-1]
     assert isinstance(last, ast.If) and "__main__" in ast.unparse(last.test)
+
+
+def test_oauth_routes_consent_through_the_gateway_callback(gw, monkeypatch):
+    """authorize -> the browser's redirect to GET /v1/oauth/callback (no token) -> connected; tokens never leave."""
+    import base64 as b64
+    import hashlib
+    from urllib.parse import parse_qs, urlsplit
+    g, c, tmp = gw
+    seen = {}
+
+    def provider(req):
+        f = parse_qs(req.content.decode())
+        want = b64.urlsafe_b64encode(hashlib.sha256(f["code_verifier"][0].encode()).digest()).rstrip(b"=").decode()
+        if f["code"] != ["abc"] or want != seen["challenge"]:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        return httpx.Response(200, json={"access_token": "SECRET-AT", "refresh_token": "SECRET-RT", "expires_in": 3600})
+    real = httpx.AsyncClient
+    monkeypatch.setattr(g.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(provider)))
+    assert c.post("/v1/connectors/nope/authorize", json={}).status_code == 404
+    assert c.post("/v1/connectors/spotify/authorize", json={}).status_code == 400  # no client id yet
+    a = c.post("/v1/connectors/spotify/authorize", json={"client_id": "cid", "redirect_uri": g.gateway_callback()[0]}).json()
+    seen["challenge"] = parse_qs(urlsplit(a["url"]).query)["code_challenge"][0]
+    r = c.get(f"/v1/oauth/callback?code=abc&state={a['state']}", headers={"Authorization": ""})
+    assert r.status_code == 200 and "연결을 마쳤어요" in r.text and "abc" not in r.text
+    assert c.get(f"/v1/oauth/callback?code=abc&state={a['state']}", headers={"Authorization": ""}).status_code == 400  # replay
+    got = c.get("/v1/connectors").json()
+    assert got["oauth"] == {"spotify": "connected"} and c.get("/v1/connectors/spotify/oauth").json()["status"] == "connected"
+    assert not any(s in json.dumps(got) + json.dumps(a) for s in ("SECRET-AT", "SECRET-RT"))
+    assert c.get("/v1/settings", headers={"Authorization": ""}).status_code == 401  # the exemption is the callback only
+    b = c.post("/v1/connectors/spotify/authorize", json={}).json()  # the stored client id is reused
+    assert parse_qs(urlsplit(b["url"]).query)["client_id"] == ["cid"]
+    assert c.post("/v1/connectors/spotify/authorize/finish", json={"code": "x", "state": "bogus"}).status_code == 400
+    assert c.delete("/v1/connectors/spotify/oauth").status_code == 204
+    assert c.get("/v1/connectors/spotify/oauth").json()["status"] == "needs_consent"

@@ -41,6 +41,8 @@ import connectors
 import google_tools
 import tools_bridge
 import nim
+import oauth
+import spotify
 import wake_enroll
 import claude_api
 from claude_warm import Pool, base_cmd
@@ -613,6 +615,9 @@ def external_token():
         return ""
 
 
+OAUTH_CALLBACK_PATH = "/v1/oauth/callback"
+
+
 def auth(request: Request):
     got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     if hmac.compare_digest(got.encode(), TOKEN.encode()):
@@ -622,6 +627,9 @@ def auth(request: Request):
     if ext and len(ext) >= 32 and hmac.compare_digest(got.encode(), ext.encode()) \
             and request.method == "POST" and request.url.path == "/v1/mcp":
         request.state.scope = "external"
+        return
+    if request.method == "GET" and request.url.path == OAUTH_CALLBACK_PATH:
+        request.state.scope = "oauth_callback"  # a browser redirect carries no token: its single-use state is the check
         return
     raise HTTPException(401, "bad token")
 
@@ -2074,6 +2082,12 @@ async def reap_warm():
             await warm_pool.reap()
         except Exception as e:
             print("warm reap failed:", type(e).__name__, flush=True)
+        if MODE == "full":  # OAuth grants expiring soon: refreshed here so a run's --mcp-config finds a live token
+            try:
+                async with httpx.AsyncClient(timeout=15) as c:
+                    await oauth.refresh_due(HOME, c)
+            except Exception as e:
+                print("oauth refresh failed:", type(e).__name__, flush=True)
 
 
 app = FastAPI(title="biseo-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
@@ -2494,7 +2508,9 @@ def connectors_out(conn):
     return {"claude_ai": [{"name": c["name"], "enabled": c["enabled"],
                            "status": "connected" if c["status"] == "connected" else "needs_auth"} for c in v["claude_ai"]],
             "custom": [{"name": c["name"], "url": c["url"], "transport": c.get("transport", "http"),
-                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"]} for c in v["custom"]]}
+                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"],
+                        **({"oauth": True} if c.get("oauth") else {})} for c in v["custom"]],
+            "oauth": oauth_names(conn)}  # needs_consent | connected | expired, per OAuth connector
 
 
 def connectors_in(body):
@@ -2527,6 +2543,98 @@ async def connectors_put(body: dict):
     full_only()
     await put_settings({"connectors": connectors_in(body)})
     return connectors_out((await load_settings())["connectors"])
+
+
+def oauth_names(conn):
+    """Built-in OAuth providers and the custom servers marked oauth, with each one's status."""
+    names = [*oauth.PROVIDERS, *(c["name"] for c in conn.get("custom", []) if c.get("oauth"))]
+    return {n: oauth.status(HOME, n) for n in names}
+
+
+PUBLIC_URL = os.environ.get("BISEO_PUBLIC_URL", "").rstrip("/")  # e.g. https://azel.scian.xyz (the proxy)
+
+
+def gateway_callback():
+    """This gateway's redirect URIs: the tailnet one, plus the public HTTPS one when the proxy passes the callback."""
+    tailnet = f"http://{HOST}:{PORT}{OAUTH_CALLBACK_PATH}"
+    return (tailnet, f"{PUBLIC_URL}{OAUTH_CALLBACK_PATH}") if PUBLIC_URL.startswith("https://") else (tailnet,)
+
+
+@app.post("/v1/connectors/{name}/authorize")
+async def connectors_authorize(name: str, body: dict | None = None):
+    """Start consent: {"client_id"?, "redirect_uri"?} -> {"url", "state", "redirect_uri", "expires_in"}. The app
+    opens `url`; the code comes back to finish (app scheme or loopback) or to GET /v1/oauth/callback."""
+    full_only()
+    body = body or {}
+    conn = (await load_settings()).get("connectors") or {}
+    custom = next((c for c in conn.get("custom", []) if c["name"] == name and c.get("oauth")), None)
+    if name not in oauth.PROVIDERS and not custom:
+        raise HTTPException(404, f"no OAuth connector named {name[:40]}")
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            return await oauth.authorize(HOME, name, c, gateway_callback(), server_url=custom["url"] if custom else None,
+                                         client_id=body.get("client_id"), redirect_uri=body.get("redirect_uri"))
+    except (ValueError, LookupError) as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"the provider did not answer ({type(e).__name__})")
+
+
+async def oauth_finish(name, code, state):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            st = await oauth.finish(HOME, name, code, state, c)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"the provider did not answer ({type(e).__name__})")
+    await warm_pool.close_all()  # warm processes hold the old --mcp-config
+    return {"name": name, "status": st}
+
+
+@app.post("/v1/connectors/{name}/authorize/finish")
+async def connectors_authorize_finish(name: str, body: dict):
+    """{"code", "state"} from the redirect -> {"name", "status"}. Tokens are stored here and never returned."""
+    full_only()
+    return await oauth_finish(name, body.get("code"), body.get("state"))
+
+
+@app.get(OAUTH_CALLBACK_PATH)
+async def oauth_callback(code: str = "", state: str = "", error: str = ""):
+    """The provider's redirect, for providers that accept this gateway's tailnet address. No token: the pending,
+    single-use state is the check. Never echoes the code."""
+    full_only()
+    name = oauth.pending_name(state)
+    ok = False
+    if name and code and not error:
+        try:
+            ok = (await oauth_finish(name, code, state))["status"] == "connected"
+        except HTTPException:
+            ok = False
+    text = "Azel: 연결을 마쳤어요. 이 창은 닫아도 돼요." if ok else "Azel: 연결하지 못했어요. 앱에서 다시 시도해 주세요."
+    return Response(f"<!doctype html><meta charset=utf-8><p>{text}</p>", media_type="text/html",
+                    status_code=200 if ok else 400)
+
+
+@app.get("/v1/connectors/{name}/oauth")
+async def connectors_oauth_status(name: str):
+    full_only()
+    try:
+        return {"name": name, "status": oauth.status(HOME, name)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/v1/connectors/{name}/oauth")
+async def connectors_oauth_forget(name: str):
+    """Disconnect: delete the stored grant (revoke it at the provider's account page too)."""
+    full_only()
+    try:
+        oauth.forget(HOME, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    await warm_pool.close_all()
+    return Response(status_code=204)
 
 
 @app.put("/v1/connectors/secret/{name}")
@@ -3463,7 +3571,8 @@ bridge = tools_bridge.Bridge(
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
-    google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
+    google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
+    spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
 
 async def none():

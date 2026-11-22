@@ -9,7 +9,7 @@ plus `ENABLE_TOOL_SEARCH=false`, so the few tools left load up front and no Tool
 
 Setting (PROTOCOL.md section 3):
   {"claude_ai": {"<connector name>": bool}, "custom": [{"name", "url", "transport": "http"|"sse", "enabled",
-   "auth_ref"?}]}
+   "auth_ref"?, "oauth"?}]}
 Connector names are claude.ai's display names without the "claude.ai " prefix ("Gmail"). A name missing from
 `claude_ai` takes its default: DEFAULT_ON on, everything else off. Custom servers' secrets never go into settings:
 `auth_ref` names a 0600 file under ~/.config/biseo/mcp/ on each full gateway (a raw token → `Authorization: Bearer`,
@@ -23,6 +23,8 @@ import re
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+
+import oauth
 
 DEFAULT_ON = ("Cygnus MCP", "Google Calendar", "Gmail")
 SLUG = re.compile(r"[A-Za-z0-9_-]{1,40}")
@@ -85,8 +87,10 @@ def check(conn):
         raise ValueError("connectors.custom: a list of at most 20 servers")
     names = set()
     for c in custom:
-        if not isinstance(c, dict) or set(c) - {"name", "url", "transport", "enabled", "auth_ref"}:
-            raise ValueError("connectors.custom[]: name, url, transport, enabled, auth_ref")
+        if not isinstance(c, dict) or set(c) - {"name", "url", "transport", "enabled", "auth_ref", "oauth"}:
+            raise ValueError("connectors.custom[]: name, url, transport, enabled, auth_ref, oauth")
+        if not isinstance(c.get("oauth", False), bool):
+            raise ValueError("connectors.custom[].oauth: true for a server that signs in with OAuth")
         if not (isinstance(c.get("name"), str) and SLUG.fullmatch(c["name"])) or c["name"] in names:
             raise ValueError("connectors.custom[].name: a unique ASCII slug")
         names.add(c["name"])
@@ -165,7 +169,9 @@ def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
                          "headers": {"Authorization": f"Bearer {tokens.get(d['url'], token)}", **(extra or {})}}
                for d in devices}
     for c in conn.get("custom", []):
-        h = _headers(home, c.get("auth_ref"))
+        # an OAuth server: its live access token (oauth.py refreshes it each minute); none yet: skipped like a
+        # server whose secret is missing
+        h = oauth.bearer(home, c["name"]) if c.get("oauth") else _headers(home, c.get("auth_ref"))
         if c.get("enabled", True) and h is not None and c["name"] not in servers:
             servers[c["name"]] = {"type": c.get("transport", "http"), "url": c["url"], **({"headers": h} if h else {})}
     ai = [c for c in disc.connectors if enabled(conn, c["name"])]
