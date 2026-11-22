@@ -1813,7 +1813,10 @@ def gap_free(now, buffered_s, pending, inflight=None):
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
-    sentence = ko_read.speakable(sentence)  # "1,333원" is captioned as written and spoken "천삼백삼십삼 원"
+    try:
+        sentence = ko_read.speakable(sentence)  # "1,333원" is captioned as written and spoken "천삼백삼십삼 원"
+    except Exception:  # a 25+ digit id outruns 만/억/조/경; speak it as written rather than lose the sentence
+        pass
     p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
     # Fillers and short openers ("네, 알겠습니다.") repeat constantly: synthesize them once (per voice). Under
