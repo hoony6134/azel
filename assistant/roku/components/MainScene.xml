@@ -2,7 +2,7 @@
 <component name="MainScene" extends="Scene">
     <script type="text/brightscript" uri="pkg:/components/MainScene.brs" />
     <children>
-        <Rectangle id="bg" width="1280" height="720" color="0x0B0F14FF" />
+        <Rectangle id="bg" width="1920" height="1080" color="0x0B0F14FF" />
         <Group id="dash" />
         <Group id="ambient" visible="false" />
         <Group id="settings" visible="false" />

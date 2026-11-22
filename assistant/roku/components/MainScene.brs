@@ -1,8 +1,9 @@
-' Azel TV dashboard (1280x720 design size, light on memory): three pages (left/right), ambient mode after 5 idle minutes, a settings screen (* key).
+' Azel TV dashboard (designed in 1280x720 units, drawn at 1920x1080, light on memory): three pages (left/right), ambient mode after 5 idle minutes, a settings screen (* key).
 ' View-only: the only input is paging. Everything is drawn from code so one font (bundled Pretendard, which has
 ' Hangul) is used for every label.
 
 sub init()
+    m.k = 1.5 ' layout is written in 1280x720 units and drawn at 1920x1080
     m.reg = CreateObject("roRegistrySection", "azel")
     m.url = m.reg.Read("url")
     m.token = m.reg.Read("token")
@@ -39,13 +40,13 @@ end sub
 
 function mkLabel(parent as Object, x as Integer, y as Integer, w as Integer, h as Integer, size as Integer, color as String) as Object
     l = CreateObject("roSGNode", "Label")
-    l.translation = [x, y]
-    l.width = w
-    l.height = h
+    l.translation = [Int(x * m.k), Int(y * m.k)]
+    l.width = Int(w * m.k)
+    l.height = Int(h * m.k)
     l.color = color
     f = CreateObject("roSGNode", "Font")
     f.uri = "pkg:/fonts/PretendardKR-Regular.otf"
-    f.size = size
+    f.size = Int(size * m.k)
     l.font = f
     parent.appendChild(l)
     return l
@@ -323,8 +324,8 @@ sub updateAmbient()
     ' move a little every minute so nothing burns in (all spots stay inside the title-safe area)
     spots = [[80, 90], [460, 60], [520, 200], [130, 320], [400, 330], [280, 190]]
     p = spots[m.minutes mod 6]
-    m.aClock.translation = [p[0], p[1]]
-    m.aText.translation = [p[0] + 6, p[1] + 165]
+    m.aClock.translation = [Int(p[0] * m.k), Int(p[1] * m.k)]
+    m.aText.translation = [Int((p[0] + 6) * m.k), Int((p[1] + 165) * m.k)]
 end sub
 
 ' ---------- input ----------
