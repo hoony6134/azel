@@ -976,6 +976,7 @@ struct TranscriptView: View {
             }
             .padding(20)
         }
+        .defaultScrollAnchor(.bottom)  // opened mid-call: the latest lines, not the start
         .background(Theme.bg.ignoresSafeArea())
     }
 }

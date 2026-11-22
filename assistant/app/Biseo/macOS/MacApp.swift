@@ -459,6 +459,8 @@ struct MacHome: View {
     }
 
     private var captions: some View {
+        ScrollViewReader { proxy in
+        ScrollView {
         VStack(alignment: .leading, spacing: Theme.m) {
             ForEach(call.lines.suffix(4)) { line in
                 Group {
@@ -467,6 +469,10 @@ struct MacHome: View {
                             let k = call.karaoke(stepped: reduceMotion)
                             if k.texts.joined(separator: " ") == line.text {
                                 KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
+                                    .onChange(of: k.current) { _, cur in
+                                        guard let cur else { return }
+                                        withAnimation(Theme.caption) { proxy.scrollTo(line.id, anchor: KaraokeText.follow(k.texts, current: cur)) }
+                                    }
                             } else {
                                 Text(line.text + (line.interrupted ? " …" : ""))
                             }
@@ -479,9 +485,17 @@ struct MacHome: View {
                     .foregroundStyle(line.mine ? Theme.text2 : line.interrupted ? Theme.text3 : Theme.text)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
+                    .id(line.id)
             }
         }
         .animation(Theme.caption, value: call.lines)
+        }
+        .frame(maxHeight: 280)  // a long reply scrolls here instead of pushing the dock off the window
+        .onChange(of: call.lines.last?.id) {
+            guard let last = call.lines.last else { return }
+            withAnimation(Theme.caption) { proxy.scrollTo(last.id, anchor: last.mine ? .bottom : .top) }
+        }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("대화 내용")
     }

@@ -7,6 +7,7 @@ struct CallScreen: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showTranscript = false
+    @State private var following = true  // captions follow the reply until the user scrolls them
     @State private var banner: String?
     @State private var askRecord = false
     @State private var typing = false
@@ -142,6 +143,10 @@ struct CallScreen: View {
                                     let k = call.karaoke(stepped: reduceMotion)
                                     if k.texts.joined(separator: " ") == line.text {
                                         KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
+                                            .onChange(of: k.current) { _, cur in
+                                                guard following, let cur else { return }
+                                                withAnimation(Theme.caption) { proxy.scrollTo(line.id, anchor: KaraokeText.follow(k.texts, current: cur)) }
+                                            }
                                     } else {
                                         Text(line.text + (line.interrupted ? " …" : ""))
                                     }
@@ -167,7 +172,13 @@ struct CallScreen: View {
             .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.18)], startPoint: .top, endPoint: .bottom))
             .background(Theme.bg.opacity(0.55).blur(radius: 20))
             .frame(maxHeight: UIScreen.main.bounds.height * 0.3)
-            .onChange(of: call.lines) { if let last = call.lines.last { withAnimation(Theme.caption) { proxy.scrollTo(last.id, anchor: .bottom) } } }
+            .simultaneousGesture(DragGesture().onChanged { _ in following = false })  // the user scrolls: stop following
+            .onChange(of: call.lines.last?.id) {
+                // A new line: follow again. The user's line: the bottom. A reply: its start, then the sentence heard.
+                following = true
+                guard let last = call.lines.last else { return }
+                withAnimation(Theme.caption) { proxy.scrollTo(last.id, anchor: last.mine ? .bottom : .top) }
+            }
             .contentShape(Rectangle())
             .onTapGesture { showTranscript = true }
             .accessibilityElement(children: .contain)
