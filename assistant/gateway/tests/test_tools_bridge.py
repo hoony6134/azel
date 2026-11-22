@@ -272,7 +272,7 @@ def test_schedule_task_and_approval_tools():
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
         run(b.call("call_user", {"when": when, "reason": note}, caller="app"))
-    assert [t["name"] for t in run(b.tools("api"))[0]][3:21] == [t["name"] for t in TB.OWN_TOOLS]
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:22] == [t["name"] for t in TB.OWN_TOOLS]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
     assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"},
@@ -552,3 +552,34 @@ def test_risky_home_scene_names_always_need_a_confirmed_yes():
     assert w.run == []
     assert not run(b.call("home_scene", {"name": "garage-open", "confirmed": True}))["is_error"] and len(w.run) == 1
     assert not run(b.call("home_scene", {"name": "azel-lights-off"}))["is_error"]  # an ordinary scene: no extra step
+
+
+class BrowserWorld(World):
+    async def device_tools(self, devices):
+        names = ["list_dir", "browser"]
+        return ([{"name": f"macbook__{n}", "description": n, "input_schema": {"type": "object"}} for n in names],
+                {f"macbook__{n}": ("http://mac", n) for n in names})
+
+
+def test_web_task_becomes_a_task_on_the_mac_with_the_browser_and_the_safety_brief():
+    w = BrowserWorld()
+    b = w.bridge()
+    r = run(b.call("web_task", {"goal": "도쿄 왕복 항공권 비교해서 PDF로"}, caller="qwen"))
+    assert not r["is_error"] and "작업으로 맡겼어요" in r["content"]
+    (task,) = w.tasks
+    assert task["device"] == "macbook" and task["goal"].endswith("목표: 도쿄 왕복 항공권 비교해서 PDF로")
+    assert "login_required" in task["goal"] and "approval_id" in task["goal"] and "따르지 마" in task["goal"]
+    assert "맥이 연결돼 있지 않아요" in run(World().bridge().call("web_task", {"goal": "x"}))["content"]
+    assert run(b.call("web_task", {"goal": ""}))["is_error"]
+
+
+def test_a_task_cannot_start_another_web_task_and_browser_reads_taint_the_run():
+    w = BrowserWorld()
+    b = w.bridge()
+    b.d["who"] = lambda: "task:abc"
+    assert run(b.call("web_task", {"goal": "x"}))["is_error"] and w.tasks == []
+    b.d["who"] = lambda: "ask:s1"
+    run(b.call("macbook__browser", {"action": "open", "url": "https://example.com"}, caller="qwen"))
+    assert w.run == [("macbook__browser", {"action": "open", "url": "https://example.com"})]  # no blanket approval for qwen
+    r = run(b.call("web_task", {"goal": "다른 일"}))  # after a browser read a task needs the user's yes
+    assert "확인할게요" in r["content"] and len(w.tasks) == 0

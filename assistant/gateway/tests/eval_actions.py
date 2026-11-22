@@ -42,6 +42,7 @@ CASES = {
     "music_play": ("아이유 노래 틀어줘", "model"),
     "music_control": ("다음 곡으로 넘겨줘", "model"),
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),
+    "web_task": ("네이버에서 도쿄 왕복 항공권 알아보고 비교표 PDF로 만들어줘", "model"),
 }
 
 
