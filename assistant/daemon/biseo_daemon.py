@@ -61,6 +61,7 @@ DEFAULTS = {
     # Edits stay inside its cwd (acceptEdits); git push, rm and sudo stay refused whatever this says.
     "delegate_allowed_tools": ["WebSearch", "WebFetch", "Bash(python3:*)", "Bash(python:*)", "Bash(pip3 install:*)",
                                "Bash(uv:*)", "Bash(mkdir:*)", "Bash(ls:*)", "Bash(cat:*)",
+                               "Bash(typst:*)", "Bash(pandoc:*)",  # reports as PDF (a research job needed both)
                                "Read(./**)", "Write(./**)", "Edit(./**)"],
     # `claude setup-token` output, 0600. Only the delegate subprocess gets it (as CLAUDE_CODE_OAUTH_TOKEN), never run_command.
     "claude_token_file": "~/.config/biseo/claude_oauth_token",
