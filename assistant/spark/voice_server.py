@@ -797,9 +797,19 @@ GW_TOOL_WAIT_S = 330  # an approval may take the user up to 5 minutes
 gw_tools: dict = {"at": 0.0, "defs": []}
 
 
+GW_TOOLS_FIRST_S = 3.0  # with no list at all, a turn waits this long for one
+
+
 async def gateway_tools():
-    """The gateway's tool list from the cache, never waited for: a stale list is refreshed in the background (an
-    older gateway that does not know tools_list just leaves it empty)."""
+    """The gateway's tool list from the cache: a stale list is refreshed in the background, but with none at all the
+    turn waits for it (live 2026-11-23 03:13: the first turn after a restart ran with no tools, so "서버 확인해 볼게요"
+    could neither call nor be held, and nothing followed)."""
+    if not gw_tools["defs"] and time.time() - gw_tools.get("first_try", 0) > 30:  # no gateway: one wait per 30 s
+        gw_tools["first_try"] = time.time()
+        try:
+            await asyncio.wait_for(_refresh_gateway_tools(), GW_TOOLS_FIRST_S)
+        except asyncio.TimeoutError:
+            pass
     if time.time() - gw_tools["at"] > GW_TOOLS_TTL_S and time.time() - gw_tools.get("refreshing", 0) > 10:
         gw_tools["refreshing"] = time.time()  # a refresh that never finished (cancelled) blocks nothing past 10 s
         asyncio.get_running_loop().create_task(_refresh_gateway_tools())
@@ -1339,6 +1349,57 @@ RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일�
                       "이어서 자연스럽게 다시 말해. 이미 한 말은 반복하지 마.",
            "personal": "방금 '{s}'라고 했는데, 사용자의 일정이나 개인 정보는 확인된 게 없어. 지어내지 말고 그 말은 빼고 이어서 "
                         "자연스럽게 다시 말해. 이미 한 말은 반복하지 마."}
+# ---------- tool-first for read-only lookups (PM decision 2026-11-23): before Qwen answers, a short Qwen call decides
+# whether the words need data from a read-only tool. If so the tool runs first and Qwen answers from its result, so a
+# lookup no longer depends on Qwen choosing to call one mid-answer. Action tools keep the [TOOL] path.
+# shortcut: the read-only set is named here (the gateway's tool list carries no read_only flag); add it there if this drifts
+READ_ONLY = re.compile(r"^(infra_|phone_|gistra_|planit_get|planit_search|calendar_|gmail_)|^(agenda|weather|stock_quote|"
+                       r"memory_recall|memory_list|people_lookup|web_search|web_fetch|recent_calls|schedule_list|"
+                       r"task_status|overnight_list|approval_status)$")
+ROUTE_S = 4.0  # the decision (~0.8 s alone, slower beside Qwen's own answer on the shared GPU); then as before
+LOOKUP_S = 8.0  # the lookup itself; past this, it is said that it failed
+ROUTE_SYSTEM = ("너는 음성 비서의 조회 판단기야. 사용자의 마지막 말에 답하려면 아래 읽기 도구로 지금 데이터를 봐야 하는지 정해. "
+                "필요하면 다른 말 없이 JSON 한 줄 {\"name\": 도구, \"args\": {…}}, 필요 없으면 NONE 한 단어만 출력해. "
+                "잡담, 감정, 농담, 게임, 상식, 계산, 비서 자신에 대한 질문은 NONE. 확실하지 않으면 NONE.\n도구:\n")
+LOOKUP_ACK = "네, 볼게요."
+LOOKUP_SLOW = "죄송해요, 조회가 늦어져서 지금은 가져오지 못했어요."  # said only while a lookup that already started is still running
+LOOKUP_SLOW_S = 1.2
+
+
+def route_lines(tools):
+    """One line per tool with what each argument takes (its choices or description): "내일 서울 날씨" got when=today
+    when the router saw only the argument names."""
+    def arg(k, p):
+        p = p if isinstance(p, dict) else {}
+        what = "|".join(map(str, p["enum"])) if p.get("enum") else str(p.get("description", ""))[:60]
+        return f"{k}: {what}" if what else k
+    out = []
+    for t in tools:
+        props = (t.get("input_schema") or {}).get("properties") or {}
+        args = "; ".join(arg(k, p) for k, p in props.items())
+        out.append(f"- {t['name']}({args}): {str(t.get('description', ''))[:150]}")
+    return "\n".join(out)
+
+
+async def route_lookup(text, recent, tools):
+    """{"name", "args"} of the read-only tool these words need now, or None (chat, or not sure)."""
+    msgs = [{"role": "system", "content": ROUTE_SYSTEM + route_lines(tools) + now_kst()},
+            *[m for m in recent if m.get("role") in ("user", "assistant")][-2:], {"role": "user", "content": text}]
+    body = {"model": LLM_MODEL, "messages": msgs, "max_tokens": 80, "temperature": 0}
+    r = await client.post(LLM_URL, json=body)
+    r.raise_for_status()
+    out = re.sub(r"(?s)<think>.*?</think>", "", r.json()["choices"][0]["message"].get("content") or "").strip()
+    line = native_call(out) if NATIVE_TAG in out else out
+    try:
+        d = json.loads(line[line.index("{"):line.rindex("}") + 1])
+    except ValueError:
+        return None
+    names = {t["name"] for t in tools}
+    if d.get("name") not in names:
+        return None
+    return {"name": d["name"], "args": d.get("args") or d.get("arguments") or {}}
+
+
 PROMISE_NOTE = "방금은 하겠다는 말만 하고 내용이 없었어. 같은 말은 반복하지 말고, 지금 바로 그 내용을 말로 이어서 해."
 STUB_NOTE = "방금 답이 너무 짧아서 아무 내용이 없었어. 이미 한 말은 반복하지 말고, 질문에 네 성격대로 내용을 담아 이어서 답해."
 INTERJECTION = re.compile(r"아+|어+|오+|음+|응+|네+|예|그거|그게|뭐+|헐|와+|우와|아이고|진짜|정말|그러니까|있잖아|맞다|글쎄")
@@ -2284,12 +2345,20 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             live = asked and bool(LIVE_Q.search(bare)) and any(t["name"] in ("web_search", "weather") for t in gw_defs)
             wants_lookup = bool(LIVE_Q.search(bare) or WEB_LIVE.search(bare) or agenda_range(bare, datetime.now(KST)))
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
-            promised = set()
-
-            async def promise_once(x):  # the same "확인하겠습니다" twice in one turn is said once
-                if x not in promised:
-                    promised.add(x)
-                    await sentences.put(x)
+            async def lookup(line, on_say=None):
+                """Run a tool line. A read-only lookup gets an ack past LOOKUP_SLOW_S and gives up at LOOKUP_S (None);
+                an action tool keeps its own wait (an approval can take minutes)."""
+                name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
+                job = asyncio.create_task(run_tool(line, session, on_say))
+                if "__" in name or not READ_ONLY.search(name):  # device tools and actions: their own wait
+                    return await job
+                if not (await asyncio.wait({job}, timeout=LOOKUP_SLOW_S))[0]:
+                    await sentences.put(LOOKUP_ACK)  # the lookup is already running: an ack, not a promise
+                try:
+                    return await asyncio.wait_for(job, LOOKUP_S - LOOKUP_SLOW_S)
+                except asyncio.TimeoutError:
+                    timings["tool_timeout"] = name
+                    return None
 
             async def say(s):
                 sources = ctx + fetched["agenda"] + "\n".join(m["content"] for m in messages if m["role"] == "user" and m["content"] not in notes)
@@ -2302,18 +2371,58 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if not looked and live and (FIGURE.search(s) or LISTING.search(s)):
                     guessed.append(s)  # today's figure or a listing claim before any lookup: from memory, never said
                     return
-                if not looked and (ctx or gw_defs) and (is_promise(s, wants_lookup) or
-                                                        (requested and wanted and future(s))):
+                if not looked and (is_promise(s, wants_lookup) or (requested and wanted and future(s))):
+                    # held with or without tools: a promise is never spoken before its result exists
                     announced.append(s)  # a promise to look: said only once the tool actually runs
                     return
                 await sentences.put(s)
 
+            # tool-first: the decision runs beside Qwen's own first answer, which is held (not spoken) until it is in
+            ro_tools = [t for t in gw_defs if "__" not in t["name"] and READ_ONLY.search(t["name"])]
+            first_stream = None
+            if ro_tools and requested and not play:
+                pump_q: asyncio.Queue = asyncio.Queue()
+
+                async def pump(msgs):
+                    try:
+                        async for d in llm_stream(msgs, LENGTH_TOKENS[length]):
+                            await pump_q.put(d)
+                    except Exception as e:  # noqa: BLE001  handed to the reader, raised where the stream is read
+                        await pump_q.put(e)
+                    finally:
+                        await pump_q.put(None)
+                pump_task = asyncio.create_task(pump(list(messages)))
+                try:
+                    pick = await asyncio.wait_for(route_lookup(request_text, prior, ro_tools), ROUTE_S)
+                except (asyncio.TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError):
+                    pick = None  # undecided: the turn goes on as before
+                if pick:
+                    pump_task.cancel()
+                    timings["tool_first"] = pick["name"]
+                    line = TOOL_TAG + " " + json.dumps(pick, ensure_ascii=False)
+                    looked.append(line)
+                    pending_lookup.pop(hkey, None)
+                    t_tool = time.perf_counter()
+                    if (result := await lookup(line)) is None:
+                        await sentences.put(LOOKUP_SLOW)  # never silence after a lookup started
+                        return
+                    timings.setdefault("tools", []).append(ms(t_tool))
+                    messages += [{"role": "assistant", "content": line},
+                                 {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 말에 답해."}]
+                else:
+                    async def from_pump():
+                        while (d := await pump_q.get()) is not None:
+                            if isinstance(d, Exception):
+                                raise d
+                            yield d
+                    first_stream = from_pump()
             try:
                 for rounds in range(4):  # at most two tool calls and one re-ask, then an answer
                     buf, state, said_round = "", "maybe", []
                     thinking.append(Unthink())
+                    stream, first_stream = first_stream or llm_stream(messages, LENGTH_TOKENS[length]), None
                     try:
-                        async for delta in unthink(llm_stream(messages, LENGTH_TOKENS[length]), thinking[-1]):
+                        async for delta in unthink(stream, thinking[-1]):
                             timings.setdefault("llm_first_token_ms", ms(t0))
                             buf += delta
                             if state not in ("tool", "no"):
@@ -2351,12 +2460,12 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                 said_round.append(text)
                                 await sentences.put(text)
                             line = (native_call(buf) or "") if NATIVE_TAG in buf else buf.strip().split("\n")[0]
-                            for x in announced:  # "찾아볼게요" as the filler while the tool runs
-                                await promise_once(x)
-                            announced.clear()
+                            announced.clear()  # a promise is never said: the ack covers a slow lookup instead
                             looked.append(line)
                             pending_lookup.pop(hkey, None)  # the request got its tool
-                            result = await run_tool(line, session, tool_say)
+                            if (result := await lookup(line, tool_say)) is None:
+                                await sentences.put(LOOKUP_SLOW)
+                                return
                             tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
                             if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
                                 confirmed["ok"] = True
@@ -2383,9 +2492,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     if (announced or guessed) and not looked and rounds < 3:  # promised or guessed, looked nothing up
                         timings["announce_only"] = timings.get("announce_only", 0) + 1
                         timings.setdefault("raw_announce", buf[:200])  # the raw output, to see a mangled tool call
-                        for x in announced:  # the filler while Qwen tries again
-                            await promise_once(x)
-                        announced.clear(), guessed.clear()
+                        announced.clear(), guessed.clear()  # never said: no result exists yet
                         if not tool_nudged:
                             tool_nudged = True
                             hint = f" 이 요청에는 {wanted['name']}{arg_hint(wanted)}가 맞아." if wanted else ""
@@ -2404,7 +2511,9 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                             line = TOOL_TAG + " " + json.dumps({"name": pick_, "args": args}, ensure_ascii=False)
                             looked.append(line)
                             pending_lookup.pop(hkey, None)
-                            result = await run_tool(line, session, None)
+                            if (result := await lookup(line)) is None:
+                                await sentences.put(LOOKUP_SLOW)
+                                return
                             timings.setdefault("tools", []).append(0)
                             messages += [{"role": "assistant", "content": line},
                                          {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
@@ -3341,6 +3450,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
+        real_route_lookup = route_lookup
+
+        async def no_route(*a, **k):  # no network in the checks: the tool-first decision is stubbed where it is tested
+            return None
+        route_lookup = no_route
         # live 2026-11-23: a greeting Whisper made up over the reply is noise, and a second announcement is dropped
         assert all(GREETING_ONLY.match(x) for x in ("안녕하세요.", "안녕하세요", "여보세요?", "Hello"))
         assert not GREETING_ONLY.match("안녕하세요 오늘 일정 알려줘") and followup_action("안녕하세요.") == "ignore"
@@ -3809,7 +3923,7 @@ if __name__ == "__main__":
         said, calls = asyncio.run(ack_check(["네.", "물은 100도에서 끓어요."]))
         assert said == ["네.", "물은 100도에서 끓어요."] and STUB_NOTE in [m["content"] for m in calls[1]], said  # asked once more
         said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
-        assert said == ["네.", "네, 확인해 볼게요."] and len(calls) == 2, said  # once only, then the reply stands
+        assert said == ["네.", LOOKUP_FAILED], said  # a promise with nothing behind it is never said; the turn says so
         said, _ = asyncio.run(ack_check(["네, 100도예요."]))
         assert said == ["네, 100도예요."], said
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
@@ -5329,19 +5443,19 @@ if __name__ == "__main__":
                                                  '[TOOL] {"name": "web_search", "args": {"query": "앤트로픽 주가"}}',
                                                  "앤트로픽은 비상장이라 주가가 없어요."])
             said = asyncio.run(run("그러면 엔트로픽 주가 지금 알려줘", "s"))
-            assert [x for x, _ in said] == ["네, 엔트로픽 주가 찾아볼게요.", "앤트로픽은 비상장이라 주가가 없어요."], said
+            assert [x for x, _ in said] == ["앤트로픽은 비상장이라 주가가 없어요."], said  # the promise is never said
             assert TOOL_NUDGE in [m["content"] for m in ann[1]] and ran == [{"name": "web_search", "args": {"query": "앤트로픽 주가"}}]
             ann.clear(), ran.clear()
             globals()["llm_stream"] = announcer(["광주 날씨 확인해 볼게요.", "확인해 볼게요.", "지금 광주는 9도예요."])
             said = asyncio.run(run("광주 날씨 알려줄래?", "s"))
             assert ran == [{"name": "weather", "args": {}}] and said[-1][0] == "지금 광주는 9도예요.", (ran, said)
-            assert [x for x, _ in said].count("광주 날씨 확인해 볼게요.") == 1
+            assert [x for x, _ in said].count("광주 날씨 확인해 볼게요.") == 0
             ann.clear(), ran.clear()
             globals()["llm_stream"] = announcer(["네, 지금 환율 알려드릴게요. 원/달러 환율은 약 1,310원대입니다.",
                                                  '[TOOL] {"name": "web_search", "args": {"query": "원달러 환율"}}',
                                                  "네이버 기준으로 1달러에 1,452원이에요."])
             said = asyncio.run(run("지금 1달러 환율 얼마야?", "s"))
-            assert [x for x, _ in said] == ["네, 지금 환율 알려드릴게요.", "네이버 기준으로 1달러에 1,452원이에요."], said
+            assert [x for x, _ in said] == ["네이버 기준으로 1달러에 1,452원이에요."], said
             assert ran == [{"name": "web_search", "args": {"query": "원달러 환율"}}]  # the guess was never said
             assert not LIVE_Q.search("3 더하기 4는 얼마야?") and LIVE_Q.search("삼성전자 주가 알려줘")
             ann.clear(), ran.clear()  # a listing claim from memory (stale live: ANT had listed) is never said
@@ -5406,8 +5520,7 @@ if __name__ == "__main__":
             said = asyncio.run(local_run(ask))
             assert TOOL_NUDGE in [m["content"] for m in ann[1]], ann
             assert ran == [{"name": "agenda", "args": {"from": span[0].isoformat(), "to": span[1].isoformat()}}], ran
-            assert said == ["구글 캘린더를 확인하고, 오늘과 내일의 수업 및 마감 일정도 함께 점검하겠습니다.", "잠시만 기다려 주세요.",
-                            "내일은 컴파일러 수업이 있어요."], said  # the promise once, then the answer
+            assert said == ["내일은 컴파일러 수업이 있어요."], said  # the promise is never said, only the answer
             gw_tools.update(at=time.time(), defs=[{"name": "call_user", "description": "전화"}])  # nothing to look with
             ann.clear(), ran.clear()
             globals()["llm_stream"] = announcer([promise, promise])
@@ -5419,7 +5532,7 @@ if __name__ == "__main__":
                                                  "내일은 수업이 하나 있어요."])
             said = asyncio.run(local_run(ask))
             assert ran == [{"name": "agenda", "args": {}}] and TOOL_NUDGE not in [m["content"] for m in ann[-1]], ann
-            assert said == ["확인할게요.", "내일은 수업이 하나 있어요."], said
+            assert said == ["내일은 수업이 하나 있어요."], said  # "확인할게요" before the call: held, never said
             ann.clear(), ran.clear()  # small talk: "잠깐만요." is just words, never a nudge or a forced lookup
             globals()["llm_stream"] = announcer(["잠깐만요. 따뜻한 차 한 잔 하고 쉬어요."])
             said = asyncio.run(local_run("나 오늘 좀 피곤하다"))
@@ -5462,6 +5575,47 @@ if __name__ == "__main__":
             assert [x for x, _ in said] == ["카레는 내가 사줄게."] and ran == [] and len(ann) == 1, said
             text = gateway_tools_text(gw_tools["defs"], "일주일 동안 수면시간 확인해줘")
             assert "- phone_sleep(date, range): 아이폰·애플워치 수면 기록" in text
+            # tool-first (live 2026-11-23 03:13, "야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐"): the read-only lookup runs before
+            # Qwen answers; a promise is never said; a slow lookup gets an ack, then a plain failure sentence
+            global route_lookup, LOOKUP_SLOW_S, LOOKUP_S
+            infra = {"name": "infra_health", "description": "서버·인프라 상태", "input_schema": {"type": "object", "properties": {}}}
+            gw_tools.update(at=time.time(), defs=[infra, {"name": "call_user", "description": "전화"}])
+            routed = []
+
+            async def lrun(text, session):  # local mode, as the call went
+                CALL_MODE.set("local")
+                return [x async for x in respond(text, session, time.perf_counter(), {})]
+
+            async def route_infra(text, recent, tools):
+                routed.append((text, [t["name"] for t in tools]))
+                return {"name": "infra_health", "args": {}} if "서버" in text else None
+            route_lookup = route_infra
+            ran.clear(), ann.clear()
+            globals()["llm_stream"] = announcer(["서버는 여섯 대 모두 켜져 있고 문제없어요."])
+            said = asyncio.run(lrun("야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "tf1"))
+            assert ran == [{"name": "infra_health", "args": {}}] and routed[0][1] == ["infra_health"], (ran, routed)
+            assert [x for x, *_ in said] == ["서버는 여섯 대 모두 켜져 있고 문제없어요."], said
+            assert len(ann) == 1 and "[도구 결과]" in ann[0][-1]["content"]  # Qwen answered from the result, once
+            ran.clear(), ann.clear()
+            globals()["llm_stream"] = announcer(["저도 대표님 좋아해요."])
+            said = asyncio.run(lrun("너 나 좋아해?", "tf2"))  # routed NONE: Qwen's own first answer, held then released
+            assert [x for x, *_ in said] == ["저도 대표님 좋아해요."] and ran == [] and len(ann) == 1, said
+
+            async def slow_tool(raw, session, on_say=None):
+                ran.append(json.loads(raw[len(TOOL_TAG):]))
+                await asyncio.sleep(5)
+            globals()["run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = slow_tool, (0.05, 0.3)
+            ran.clear(), ann.clear()
+            said = asyncio.run(lrun("서버 괜찮아?", "tf3"))
+            assert [x for x, *_ in said] == [LOOKUP_ACK, LOOKUP_SLOW] and ann == [], said  # never silent, never a guess
+            globals()["run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = fake_run_tool, (1.2, 8.0)
+            route_lookup = no_route
+            # the call as it went: no tools at all, and Qwen only promised. Held, and the turn says it could not look
+            gw_tools.update(at=time.time(), defs=[])
+            ann.clear()
+            globals()["llm_stream"] = announcer(["대표님, 네, 지금 서버 상태 바로 확인해 볼게요. 잠시만요."])
+            said = [x for x, *_ in asyncio.run(lrun("야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "tf4"))]
+            assert not any("확인해 볼게요" in x for x in said) and said[-1] == LOOKUP_FAILED, said
             gw_tools.clear(), gw_tools.update(saved_tools)
             globals()["run_tool"] = saved_run
             globals()["llm_stream"] = fake_llm
