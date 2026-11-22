@@ -192,6 +192,10 @@ struct TaskDetailView: View {
     private func decide(_ item: [String: Any], _ approve: Bool) {
         Task {
             do { try await app.decide(item, approve); await tasks.refresh() }
+            catch let error where ApprovalCenter.alreadyDecided(error) {
+                message = "다른 기기에서 이미 처리했어요"
+                await app.refresh(); await tasks.refresh()
+            }
             catch { message = FriendlyError.describe(error).title }
         }
     }

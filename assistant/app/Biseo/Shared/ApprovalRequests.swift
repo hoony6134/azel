@@ -198,10 +198,35 @@ final class ApprovalCenter: ObservableObject {
     /// The latest copy of an approval from the last poll; nil when the poll didn't list it.
     func live(_ id: String) -> ApprovalRequest? { all.first { $0.id == id } }
 
-    /// Push tap (`type: "approval"`, `approval_id`).
+    /// A fresher copy of one approval (the open sheet's own check): replaces it in the list, so
+    /// the pending list and the badges drop it at once.
+    func update(_ a: ApprovalRequest) {
+        if let i = all.firstIndex(where: { $0.id == a.id }) { all[i] = a } else { all.append(a) }
+    }
+
+    /// What the other device did, for a sheet that was still open here.
+    nonisolated static func elsewhereText(_ a: ApprovalRequest) -> String {
+        switch a.decision ?? a.status {
+        case "once", "always", "approved", "used": return "다른 기기에서 허용했어요"
+        case "deny", "denied": return "다른 기기에서 거부했어요"
+        case "expired": return "만료됐어요"
+        default: return a.isExpired() ? "만료됐어요" : "이미 처리됐어요"
+        }
+    }
+
+    /// The server's "already decided" (409, or a 400 saying so).
+    nonisolated static func alreadyDecided(_ error: Error) -> Bool {
+        if case GatewayError.http(409) = error { return true }
+        if case GatewayError.rejected(let d) = error { let l = d.lowercased(); return l.contains("already") || d.contains("이미") }
+        return false
+    }
+
+    /// Push tap (`type: "approval"`, `approval_id`). Decided already (here or elsewhere): ignored.
     func open(id: String) async {
-        if let a = all.first(where: { $0.id == id }) { show(a); return }
-        if case .success(let a?) = await attempt({ try await ApprovalAPI.get(id) }) { show(a) }
+        let fresh: ApprovalRequest?
+        if case .success(let a?) = await attempt({ try await ApprovalAPI.get(id) }) { fresh = a; update(a) } else { fresh = all.first { $0.id == id } }
+        guard let a = fresh, a.isPending, !a.isExpired() else { return }
+        show(a)
     }
 
     @discardableResult
@@ -228,6 +253,9 @@ struct ApprovalSheet: View {
     @State private var working = false
     /// The server allowed only once (`forced_reason`): shown with 닫기 instead of closing.
     @State private var forced: String?
+    /// Decided on another device (or expired) while open here: shown briefly, then the sheet closes.
+    @State private var elsewhere: String?
+    @State private var decidedHere = false
 
     /// Decided or expired on the server: the sheet says so and offers 닫기 instead of closing by
     /// itself. A poll that merely misses the item changes nothing.
@@ -267,7 +295,10 @@ struct ApprovalSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                if let forced {
+                if let elsewhere {
+                    Label(elsewhere, systemImage: "checkmark.circle").foregroundStyle(Theme.text2)
+                        .frame(maxWidth: .infinity).frame(height: 48)
+                } else if let forced {
                     VStack(spacing: Theme.s) {
                         Label(forced, systemImage: "checkmark.circle").foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
                         Button("닫기") { onDone() }.frame(maxWidth: .infinity).frame(height: 40)
@@ -300,15 +331,43 @@ struct ApprovalSheet: View {
         .background(Theme.bgRaised.ignoresSafeArea())
         .accessibilityElement(children: .contain)
         .onAppear { ApprovalCenter.shared.markShown(request.id) }
+        .task(id: request.id) { await watch() }
+    }
+
+    /// While open: check this approval every 2 s; once it's decided elsewhere or expired, say so
+    /// for 1.5 s and close (user bug, 2026-11-22: the Mac kept a sheet the iPhone had answered).
+    private func watch() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled, !working, !decidedHere, forced == nil, elsewhere == nil else { continue }
+            if case .success(let a?) = await attempt({ try await ApprovalAPI.get(request.id) }) {
+                center.update(a)
+                if !a.isPending || a.isExpired() { await closeSaying(ApprovalCenter.elsewhereText(a)); return }
+            } else if request.isExpired() {
+                await closeSaying("만료됐어요"); return
+            }
+        }
+    }
+
+    private func closeSaying(_ text: String) async {
+        elsewhere = text
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        onDone()
     }
 
     private func decide(_ d: ApprovalDecision) {
         working = true
         Task {
             do {
+                decidedHere = true
                 if let note = try await ApprovalCenter.shared.decide(request, d) { forced = note } else { onDone() }
+            } catch let error where ApprovalCenter.alreadyDecided(error) {
+                // Someone answered on another device first: no error, just say what happened.
+                let fresh = (try? await ApprovalAPI.get(request.id)) ?? nil
+                if let fresh { center.update(fresh) }
+                await closeSaying(fresh.map(ApprovalCenter.elsewhereText) ?? "이미 처리됐어요")
             }
-            catch { message = "보내지 못했어요: " + FriendlyError.describe(error).title }
+            catch { decidedHere = false; message = "보내지 못했어요: " + FriendlyError.describe(error).title }
             working = false
         }
     }

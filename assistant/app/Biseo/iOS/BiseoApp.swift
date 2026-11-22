@@ -45,7 +45,10 @@ struct BiseoApp: App {
             .onOpenURL { url in if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } } }
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
-                if scenePhase == .active { ApprovalCenter.shared.start() } else { ApprovalCenter.shared.stop() }
+                if scenePhase == .active {
+                    ApprovalCenter.shared.start()
+                    Task { await ApprovalCenter.shared.refresh() }   // stale sheets never survive a return
+                } else { ApprovalCenter.shared.stop() }
             }
         }
     }
