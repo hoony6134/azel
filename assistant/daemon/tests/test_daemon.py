@@ -329,8 +329,8 @@ def test_browse_real_page(cfg, site):
 
 
 @pytest.mark.parametrize("cmd", [
-    "sudo ls", "su root", "doas ls", "env sudo ls", "/usr/bin/sudo ls",
-    "cat ~/.config/biseo/token", "ls ~/.ssh", "cp ~/.ssh/id_ed25519 /tmp/x", "ls ~/.claude", "head --file=~/.ssh/config",
+    "su root", "doas ls", "env sudo ls", "sudo -u root ls", "sudo -s", "sudo su", "sudo sh -c ls", "sudo rm -rf ~",
+    "sudo cat ~/.ssh/id_ed25519", "sudo sudo ls", "cat ~/.config/biseo/token", "ls ~/.ssh", "cp ~/.ssh/id_ed25519 /tmp/x", "ls ~/.claude", "head --file=~/.ssh/config",
     "security find-generic-password -s x", "ls ~/Library/Keychains",
     "rm -rf ~", "rm -r /", "rm -fr $HOME", "rm --recursive ~/", "rm -rf ~/..",
     "diskutil eraseDisk APFS X disk2", "diskutil eraseVolume APFS X disk2s1", "mkfs.ext4 /dev/sdb1", "newfs_apfs /dev/disk2",
@@ -435,7 +435,7 @@ def test_approval_for_another_device_or_replayed(cfg, gw, tmp_path):
 
 
 @pytest.mark.parametrize("cmd", [
-    "SUDO ls", "Sudo ls", "BASH -c ls", "Security dump-keychain", "env -S 'sudo ls'", "env --split-string='bash -c ls'",
+    "SUDO -i", "Sudo -E ls", "BASH -c ls", "Security dump-keychain", "env -S 'sudo ls'", "env --split-string='bash -c ls'",
     "env -Sbash\\ -c\\ ls", "xargs sudo ls", "nice -n 5 bash -c ls", "nohup zsh -c ls", "time sh -c ls",
     "timeout 5 bash -c ls", "caffeinate -i sh -c ls", "command bash -c ls", "find . -exec sh -c ls ;",
     "find ~ -delete", "find / -name x -delete", "env rm -rf ~", "xargs rm -rf /", "nice dd if=/dev/zero of=/dev/disk3",
@@ -1101,3 +1101,25 @@ def test_prompt_server_speaks_mcp_over_stdio(cfg):
     names, out = asyncio.run(go())
     assert names == ["approve"]  # nothing else of the daemon is reachable from a delegated run
     assert out["behavior"] == "deny" and "승인을 요청하지 못했어요" in out["message"]  # gateway.invalid: refused, never allowed
+
+
+def test_sudo_runs_only_after_a_tap_as_sudo_n(cfg, gw, monkeypatch):
+    """sudo as the whole command: always an approval (marked sudo), run as `sudo -n`, never typed a password."""
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 1, b"", b"sudo: a password is required\n")
+    monkeypatch.setattr(d.subprocess, "run", fake_run)
+    res = d.run_command(command="sudo ls", cwd="proj")
+    assert res["status"] == "pending_approval" and not seen
+    body = next(c[2] for c in gw[0] if c[1] == "/v1/approvals")
+    assert body["command"] == "sudo -n ls" and body["sudo"] is True  # the exact form that runs
+    gw[1]["ap1"] = {"status": "approved", "device": d.CFG["id"], "command": "sudo -n ls", "cwd": body["cwd"]}
+    res = d.run_command(command="sudo ls", cwd="proj", approval_id=res["approval_id"])
+    assert seen == [["sudo", "-n", "ls"]] and res["error"] == d.SUDO_NO_PASSWORD
+    monkeypatch.setitem(d.CFG, "approval_via", "gateway-grant")
+    na = d.run_command(command="sudo -n ls", cwd="proj")
+    assert na["status"] == "needs_approval" and na["sudo"] is True and na["command"] == "sudo -n ls"
+    assert d.as_sudo(["ls"]) is None and d.decide_prompt("Bash", {"command": "sudo ls"}, str(cfg["roots"][0]),
+                                                         poll_s=0)["behavior"] == "deny"
