@@ -23,11 +23,17 @@ enum BrainMode: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The call-screen chip: nil for 자동.
-    static func chip(_ raw: String?) -> String? {
-        guard let raw, let m = BrainMode(rawValue: raw), m != .auto else { return nil }
-        return m == .local ? "로컬만" : m.label
+    /// The call header's mode text: 자동 / 로컬 / Claude API / Claude Code.
+    var short: String {
+        switch self {
+        case .auto: return "자동"
+        case .local: return "로컬"
+        case .claude_api: return "Claude API"
+        case .claude_code: return "Claude Code"
+        }
     }
+
+    static func current(_ raw: String?) -> BrainMode { raw.flatMap(BrainMode.init(rawValue:)) ?? .auto }
 }
 
 /// The per-call choice from the long-press picker, and whether the gateway knows modes at all.
@@ -89,5 +95,72 @@ struct BrainModeMenu: ViewModifier {
 extension View {
     func brainModeMenu(current: String?, pick: @escaping (BrainMode) -> Void) -> some View {
         modifier(BrainModeMenu(current: current, pick: pick))
+    }
+}
+
+/// The call header's quiet mode control: the mode as plain text with a chevron, opening a native
+/// menu with a check on the current one (PM, 2026-11-22: no pill, no sub-text).
+struct BrainModeControl: View {
+    @ObservedObject private var choice = BrainModeChoice.shared
+    var current: String?
+    var pick: (BrainMode) -> Void
+
+    var body: some View {
+        if choice.supported {
+            let m = BrainMode.current(current)
+            Menu {
+                Picker("두뇌", selection: Binding(get: { m }, set: { pick($0) })) {
+                    ForEach(BrainMode.allCases) { Text($0.short).tag($0) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                HStack(spacing: 3) {
+                    Text(m.short)
+                    Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                }
+                .font(.footnote)
+                .foregroundStyle(m == .auto ? Theme.text3 : Theme.text2)
+            }
+            #if os(macOS)
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            #endif
+            .accessibilityLabel("두뇌: \(m.short)")
+        }
+    }
+}
+
+/// Typing during a call: a field that sends on return, and 말로 답하기.
+struct CallTypingField: View {
+    @Binding var text: String
+    @AppStorage("typedSpeak") private var speak = true
+    var focus: FocusState<Bool>.Binding
+    var send: (String, Bool) -> Void
+    var close: () -> Void
+
+    var body: some View {
+        VStack(spacing: Theme.xs) {
+            HStack(spacing: Theme.s) {
+                TextField("입력해서 말하기", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .focused(focus)
+                    .onSubmit(submit)
+                    .submitLabel(.send)
+                Button { submit() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
+                    .buttonStyle(.plain).foregroundStyle(Theme.celadon)
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityLabel("보내기")
+                Button { close() } label: { Image(systemName: "xmark.circle.fill").font(.title3) }
+                    .buttonStyle(.plain).foregroundStyle(Theme.text3).accessibilityLabel("입력 닫기")
+            }
+            Toggle("말로 답하기", isOn: $speak).font(.footnote).foregroundStyle(Theme.text2)
+                .toggleStyle(.switch).controlSize(.mini)
+        }
+    }
+
+    private func submit() {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        send(t, speak)
+        text = ""
     }
 }

@@ -4,10 +4,10 @@ import XCTest
 @MainActor
 final class BrainModeTests: XCTestCase {
     func testChipsHintsAndSettingsGuard() throws {
-        XCTAssertNil(BrainMode.chip("auto"))
-        XCTAssertNil(BrainMode.chip(nil))
-        XCTAssertEqual(BrainMode.chip("local"), "로컬만")
-        XCTAssertEqual(BrainMode.chip("claude_code"), "Claude Code")
+        XCTAssertEqual(BrainMode.current(nil), .auto, "no report yet: 자동")
+        XCTAssertEqual(BrainMode.current("local").short, "로컬")
+        XCTAssertEqual(BrainMode.current("claude_code").short, "Claude Code")
+        XCTAssertEqual(BrainMode.current("bogus"), .auto)
         XCTAssertEqual(BrainMode.local.hint, "Claude를 쓰지 않아요, 무료")
         XCTAssertTrue(BrainModeChoice.reports(Data(#"{"brain_mode":"auto"}"#.utf8)))
         XCTAssertFalse(BrainModeChoice.reports(Data(#"{"default_model":"auto"}"#.utf8)), "old gateway: pickers hidden")
@@ -47,4 +47,40 @@ final class BrainModeFrameTests: XCTestCase {
         XCTAssertEqual(items.first { $0.name == "mode" }?.value, "local")
         XCTAssertEqual(items.first { $0.name == "persona" }?.value, "p1")
     }
+}
+
+final class TypedTurnTests: XCTestCase {
+    func testTypedLineShowsOnceEvenIfEchoed() throws {
+        var log = CallLog()
+        log.typed("내일 일정 알려줘")
+        let echo = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"transcript","text":"내일 일정 알려줘"}"#.utf8))
+        log.apply(echo)
+        XCTAssertEqual(log.lines.count, 1, "the server's echo doesn't duplicate it")
+        XCTAssertEqual(log.lines[0].typed, true)
+        XCTAssertTrue(log.lines[0].mine)
+        log.apply(try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"transcript","text":"고마워"}"#.utf8)))
+        XCTAssertEqual(log.lines.count, 2)
+        XCTAssertNil(log.lines[1].typed, "spoken lines carry no keyboard mark")
+    }
+
+    func testSavedLinesWithoutTheFieldStillDecode() throws {
+        let line = try JSONDecoder().decode(CallLine.self, from: Data(#"{"id":"6F0E2B8A-1C3D-4E5F-8A9B-0C1D2E3F4A5B","mine":true,"text":"x","interrupted":false}"#.utf8))
+        XCTAssertNil(line.typed)
+    }
+
+    func testCapsFrameEnablesTyping() throws {
+        let hello = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"hello","caps":["text","mode","played"]}"#.utf8))
+        XCTAssertEqual(CallClient.caps(hello)?.contains("text"), true)
+        let state = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening"}"#.utf8))
+        XCTAssertNil(CallClient.caps(state), "no caps: keep what we had")
+    }
+
+    #if os(macOS)
+    @MainActor func testPanelKeysOpenTheFieldOnlyWhenTypingIsSupported() {
+        let call = MacCall.shared
+        XCTAssertFalse(call.typeKey("a"), "server without text: keys pass through")
+        XCTAssertEqual(MacCall.panelHeight(typing: false), 112)
+        XCTAssertGreaterThan(MacCall.panelHeight(typing: true), 112)
+    }
+    #endif
 }

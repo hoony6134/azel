@@ -52,6 +52,8 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var callContext: CallContext?
     /// The brain answering this call (server-reported; the picked one until it says).
     @Published private(set) var brainMode: String?
+    /// The server takes typed turns on this call (`text` in its caps).
+    @Published private(set) var canType = false
     private var activeSession: String?
     /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
     @Published private(set) var activePersona: Persona?
@@ -86,6 +88,12 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     // MARK: UI actions
+
+    func sendTyped(_ text: String, speak: Bool) {
+        guard inCall else { return }
+        client.sendText(text, speak: speak)
+        log.typed(text)
+    }
 
     @MainActor func chooseBrain(_ m: BrainMode) {
         BrainModeChoice.shared.choose(m, inCall: inCall, client: client, current: { [weak self] in self?.brainMode }) { [weak self] in self?.error = $0 }
@@ -189,6 +197,7 @@ final class CallManager: NSObject, ObservableObject {
         connectedAt = nil
         error = nil
         brainMode = nil
+        canType = false
         let session = AVAudioSession.sharedInstance()
         // .allowBluetooth: AirPods and other headsets (HFP, mic and speaker) can carry the call;
         // without it the route picker lists them but the route never moves (user bug, 2026-11-22).
@@ -223,6 +232,7 @@ final class CallManager: NSObject, ObservableObject {
 
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
+        if let caps = CallClient.caps(event) { canType = caps.contains("text") }
         if let c = CallContext.from(event: event) { callContext = c; return }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         switch event.type {

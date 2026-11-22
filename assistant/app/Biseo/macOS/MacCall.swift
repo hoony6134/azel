@@ -69,6 +69,11 @@ final class MacCall: ObservableObject {
     @Published private(set) var talking = false
     /// The brain answering this call (server-reported; the picked one until it says).
     @Published private(set) var brainMode: String?
+    /// The server takes typed turns on this call (`text` in its caps).
+    @Published private(set) var canType = false
+    /// The panel's text field is open (it grows to fit).
+    @Published var typing = false { didSet { if typing != oldValue { resizePanel() } } }
+    @Published var typedDraft = ""
     private var pttCall = false
     /// Started by the wake word: the mic is live from the start and the call ends after 30 s of quiet.
     private var wakeCall = false
@@ -197,6 +202,34 @@ final class MacCall: ObservableObject {
 
     func hangUp() { end(error: nil, keepPanel: false) }
 
+    func sendTyped(_ text: String, speak: Bool) {
+        guard inCall else { return }
+        client.sendText(text, speak: speak)
+        log.typed(text)
+        turnDone = false; drainedAt = nil; fadeTask?.cancel()   // a new turn, like speaking
+        scheduleIdle()
+    }
+
+    /// A key typed while the panel is key: opens the field with that character. Space and
+    /// control keys keep their meaning (mute, Esc).
+    func typeKey(_ chars: String) -> Bool {
+        guard canType, !typing, let c = chars.unicodeScalars.first,
+              !CharacterSet.whitespacesAndNewlines.contains(c), !CharacterSet.controlCharacters.contains(c) else { return false }
+        typedDraft = chars
+        typing = true
+        return true
+    }
+
+    static func panelHeight(typing: Bool) -> CGFloat { typing ? 176 : 112 }
+
+    private func resizePanel() {
+        guard let p = panel else { return }
+        var f = p.frame
+        f.size.height = Self.panelHeight(typing: typing)   // grows upward from the bottom edge
+        p.setFrame(f, display: true, animate: false)
+        if typing { p.makeKey() }
+    }
+
     func chooseBrain(_ m: BrainMode) {
         BrainModeChoice.shared.choose(m, inCall: inCall, client: client, current: { [weak self] in self?.brainMode }) { [weak self] in self?.error = $0 }
     }
@@ -264,6 +297,7 @@ final class MacCall: ObservableObject {
 
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
+        if let caps = CallClient.caps(event) { canType = caps.contains("text") }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         scheduleIdle()
         switch event.type {
@@ -304,6 +338,9 @@ final class MacCall: ObservableObject {
         pendingUtterance = nil
         AzelFiles.micLive.remove()
         brainMode = nil
+        canType = false
+        typing = false
+        typedDraft = ""
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
     }
@@ -342,6 +379,12 @@ final class MacCall: ObservableObject {
 /// Esc (cancelOperation) hangs up; Space toggles mute.
 final class CallPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    /// Typing on the focused panel opens the text field (when the server takes typed turns).
+    override func keyDown(with event: NSEvent) {
+        let handled = event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+            && MainActor.assumeIsolated { MacCall.shared.typeKey(event.characters ?? "") }
+        if !handled { super.keyDown(with: event) }
+    }
     override func cancelOperation(_ sender: Any?) { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
     override func close() { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
 }
@@ -349,6 +392,7 @@ final class CallPanel: NSPanel {
 /// DESIGN §8.2: jar · captions · route chip and close, on material, radius 30.
 struct CallPanelView: View {
     @ObservedObject var call: MacCall
+    @FocusState private var typingFocus: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var jarState: JarState { call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : .offline }
@@ -378,7 +422,9 @@ struct CallPanelView: View {
                     }
                     .lineLimit(1)
                     .accessibilityElement(children: .combine)
-                } else if let user { Text(user).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
+                } else if let u = call.lines.last(where: { $0.mine }) {
+                    Text(u.typed == true ? "\(Image(systemName: "keyboard")) \(u.text)" : u.text).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
+                }
                 if let reply { PanelReply(call: call, reply: reply) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -387,7 +433,9 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     if call.recording { Circle().fill(Theme.danger).frame(width: 8, height: 8).accessibilityLabel("녹음 중") }
                     Menu {
-                        Button(call.muted ? "음소거 해제" : "음소거") { call.toggleMute() }.keyboardShortcut(.space, modifiers: [])
+                        Button(call.muted ? "음소거 해제" : "음소거") { call.toggleMute() }
+                            .keyboardShortcut(call.typing ? nil : KeyboardShortcut(.space, modifiers: []))
+                        if call.canType { Button("입력하기") { call.typing = true } }
                         Button(call.held ? "대기 해제" : "대기") { call.toggleHold() }
                         Button(call.recording ? "녹음 중지" : "녹음") { call.toggleRecording() }
                     } label: { Image(systemName: "ellipsis.circle") }
@@ -401,17 +449,23 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     // §17.8: the persona's name before the route chip.
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
-                    if let m = BrainMode.chip(call.brainMode) {
-                        Text(m).font(.caption.weight(.semibold)).foregroundStyle(Theme.indigo)
-                            .onTapGesture { if call.brainMode == BrainMode.local.rawValue { call.chooseBrain(.auto) } }
-                            .help(call.brainMode == BrainMode.local.rawValue ? "클릭하면 자동으로 바꿔요" : "")
-                    }
+                    BrainModeControl(current: call.brainMode) { call.chooseBrain($0) }
                     if let r = call.log.lastRoute { RouteChip(route: r) }
                 }
             }
         }
         .padding(.horizontal, Theme.l)
         .frame(width: 460, height: 112)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .overlay(alignment: .bottom) {
+            if call.typing {
+                CallTypingField(text: $call.typedDraft, focus: $typingFocus, send: { call.sendTyped($0, speak: $1) },
+                                close: { call.typing = false })
+                    .padding(.horizontal, Theme.l).padding(.bottom, Theme.m)
+                    .onAppear { typingFocus = true }
+            }
+        }
+        .frame(width: 460, height: MacCall.panelHeight(typing: call.typing))
         .background {
             if reduceTransparency { Theme.bgRaised } else { Rectangle().fill(.ultraThinMaterial) }
         }

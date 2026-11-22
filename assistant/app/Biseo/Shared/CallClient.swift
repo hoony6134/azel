@@ -397,6 +397,17 @@ final class CallClient {
         statsLock.lock(); sentBytes += pcm16.count; sentPeak = max(sentPeak, Self.peak(pcm16)); statsLock.unlock()
     }
 
+    /// A typed user turn (`{"type":"text","text":…,"speak":…}`): answered like speech, with
+    /// audio when `speak`, as text only otherwise.
+    func sendText(_ text: String, speak: Bool) {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["type": "text", "text": text, "speak": speak]),
+              let s = String(data: data, encoding: .utf8) else { return }
+        socket?.send(.string(s)) { _ in }
+    }
+
+    /// The server's capabilities when a frame lists them (`hello`).
+    static func caps(_ e: CallEvent) -> [String]? { e.caps }
+
     /// Mid-call brain switch (`{"type":"mode","value":…}`); the server confirms with a mode event.
     func switchMode(_ mode: String) {
         socket?.send(.string(#"{"type":"mode","value":"\#(mode)"}"#)) { _ in }
