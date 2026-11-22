@@ -490,7 +490,7 @@ device that created them.
   most 10 tokens per kind are kept; registering an 11th evicts the oldest.
 - `PUT /v1/phone/days` `{"days":[…]}` (1–14 day summaries, fields in PHONE_DATA.md §3b; an unknown field or a value out
   of range → 400) merges by date into kv `phone-days` and keeps the newest 30 days → `{"stored","updated"}`.
-  `GET /v1/phone/days` → `{"days":[…],"updated","keep_days":30}`. `DELETE /v1/phone/days` deletes them all → `{"deleted":true}`.
+  `GET /v1/phone/days` → `{"days":[…],"updated","keep_days":30}`. `DELETE /v1/phone/days` deletes them all → `{"deleted":true}`; with `?kind=health|sleep|workouts|cycle` only that category's fields (the app sends it when that toggle is turned off; a day left empty goes).
   Full gateways only (403 on limited). The `phone_*` actions read these when no phone answers live.
 - `POST /v1/calls` `{"reason","opening"?}` → places a call (VoIP push). Returns
   `{"call_id"}`. `GET /v1/calls/{id}` → `{"opening":"…"}` (voice server reads it).

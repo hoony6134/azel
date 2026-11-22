@@ -21,23 +21,55 @@ enum PhoneCategory: String, CaseIterable, Identifiable {
         case .sync: "요약을 서버에 올리기"
         }
     }
+    /// One line on what Azel can read (first-run setup and settings).
+    var detail: String {
+        switch self {
+        case .health: "오늘 걸음 수, 걸은 거리, 활동 칼로리, 심박수와 몸무게"
+        case .sleep: "몇 시에 자고 일어났는지, 깊은 잠과 렘수면"
+        case .workouts: "운동 종류, 시간, 칼로리"
+        case .cycle: "생리 기록이 있는 날"
+        case .calendar: "아이폰 캘린더의 일정 제목과 시간"
+        case .reminders: "미리 알림에서 아직 안 끝낸 항목"
+        case .contacts: "이름으로 찾은 사람의 전화번호, 이메일, 생일"
+        case .location: "물어볼 때 한 번, 지금 있는 동네와 장소 이름(저장·추적 안 함)"
+        case .motion: "위치를 물을 때 걷는 중인지, 차로 이동 중인지"
+        case .music: "지금 듣는 곡과 최근에 들은 곡"
+        case .sync: "건강·수면·운동의 하루 요약을 올려 통화 밖에서도 답하기"
+        }
+    }
     /// Everything starts off except `sync`, which does nothing until a synced category is on.
     var defaultOn: Bool { self == .sync }
     static let synced: [PhoneCategory] = [.health, .sleep, .workouts, .cycle]
+    /// The first-run screen's list and its "모두 켜기" (생리 주기 and 움직임 stay separate opt-ins in Settings).
+    static let setup: [PhoneCategory] = [.health, .sleep, .workouts, .calendar, .reminders, .contacts, .location, .music]
+    /// `DELETE /v1/phone/days?kind=` when this toggle is turned off; nil = nothing of it is synced.
+    var syncedKind: String? { PhoneCategory.synced.contains(self) ? rawValue : nil }
 }
 
-/// Toggles and the secret-call pause. `paused` is set by whoever starts a secret call: then the phone offers
-/// nothing, answers nothing and uploads nothing.
+/// What iOS says about a category's permission. HealthKit never tells whether reading was denied, so a
+/// HealthKit category that was asked shows as `granted`.
+enum PhoneAuth: Equatable {
+    case granted, denied, notAsked
+    /// The row's status text, and whether to offer "설정 앱에서 허용" (iOS never asks twice).
+    static func status(on: Bool, auth: PhoneAuth) -> (text: String, openSettings: Bool) {
+        switch (on, auth) {
+        case (_, .denied): ("iOS에서 거부됨", true)
+        case (true, .granted): ("켜짐", false)
+        case (true, .notAsked): ("아직 안 물어봄", false)
+        case (false, _): ("꺼짐", false)
+        }
+    }
+}
+
+/// The toggles. A secret call may read (nothing is stored from a live answer), so there is no pause for it.
 enum PhoneData {
     static var defaults: UserDefaults = .standard
-    static var paused = false
     static func key(_ c: PhoneCategory) -> String { "phone.\(c.rawValue)" }
     static func isOn(_ c: PhoneCategory) -> Bool { defaults.object(forKey: key(c)) as? Bool ?? c.defaultOn }
     static func set(_ c: PhoneCategory, _ on: Bool) { defaults.set(on, forKey: key(c)) }
 
     /// The query kinds this phone answers now (`phone_hello`).
     static func kinds() -> [String] {
-        if paused { return [] }
         let map: [(String, PhoneCategory)] = [("health", .health), ("sleep", .sleep), ("workouts", .workouts),
                                               ("calendar", .calendar), ("reminders", .reminders), ("contacts", .contacts),
                                               ("location", .location), ("now_playing", .music)]
@@ -217,7 +249,6 @@ enum PhoneSummary {
 struct PhoneResponder {
     var stores: PhoneStores
     var isOn: (PhoneCategory) -> Bool = PhoneData.isOn
-    var paused: () -> Bool = { PhoneData.paused }
 
     /// The reply frame for a `phone_query` frame, or nil when it is not one.
     func reply(to frame: Data) async -> String? {
@@ -230,7 +261,6 @@ struct PhoneResponder {
     }
 
     func answer(kind: String, args: [String: Any]) async -> [String: Any] {
-        if paused() { return ["ok": false, "error": "off"] }
         let from = (args["from"] as? String).flatMap(PhoneData.day) ?? PhoneData.calendar.startOfDay(for: Date())
         let to = (args["to"] as? String).flatMap(PhoneData.day) ?? from
         func fail(_ e: Error) -> [String: Any] { ["ok": false, "error": e is PhoneDataError ? "denied" : "failed"] }

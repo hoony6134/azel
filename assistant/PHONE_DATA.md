@@ -20,8 +20,13 @@ Lets the assistant answer "어제 몇 시간 잤어?", "이번 주 운동 얼마
 | `music` 음악 | MediaPlayer (`systemMusicPlayer`, `MPMediaQuery` by last played) | now playing (title, artist, album, playing), last 5 played from the library | off |
 | `sync` 요약 올리기 | — | upload daily summaries of health/sleep/workouts/cycle (§3b) | on (does nothing until one of those is on) |
 
-Everything is off until turned on in Settings → "아이폰 데이터". Turning a category on triggers that category's iOS
-prompt at that moment, never at launch. A denied permission shows "설정 앱에서 허용해 주세요" on the row.
+Everything is off until turned on. On first launch a skippable sheet lists the eight main categories (건강·수면·운동·
+캘린더·미리 알림·연락처·위치·음악) with one line each on what Azel reads, plus 모두 켜기 / 모두 끄기; 생리 주기 and 움직임 are
+separate opt-ins in Settings → "아이폰 데이터", where every toggle stays available. Turning a category on triggers its iOS
+prompt at that moment, never at launch. Each row shows the real iOS state: 켜짐 / iOS에서 거부됨 / 아직 안 물어봄 (HealthKit
+never reveals a read denial, so an asked HealthKit category shows 켜짐); a denied row offers "설정 앱에서 허용", which opens
+the app's page in the Settings app, since iOS never asks twice. Turning a category off stops it at once and deletes its
+synced fields (`DELETE /v1/phone/days?kind=…`).
 
 **Not possible** (no public API, or no read access): Screen Time usage numbers (DeviceActivity only hands opaque
 tokens to an extension, never readable numbers), Messages/iMessage, the call log, Mail, Notes, Safari history, other
@@ -61,8 +66,8 @@ model tool call → gateway bridge → link {"type":"phone_query","id","kind","a
   → the app's /v1/call socket {"type":"phone_query","id","kind","args"} → app queries on the phone
   → {"type":"phone_result","id","ok","data"|"error"} → voice server → link → gateway → spoken result
 ```
-- After connecting, the app sends `{"type":"phone_hello","kinds":[…]}` listing the categories that are on. In a
-  secret call it sends `kinds: []` (or nothing), so nothing is ever asked of the phone then.
+- After connecting, the app sends `{"type":"phone_hello","kinds":[…]}` listing the categories that are on. Secret calls
+  may read like any call (as memory recall does); nothing from a live answer is stored anywhere, in any call.
 - The voice server forwards a query only to the latest call socket whose hello lists that kind; otherwise it answers
   at once `{"ok":false,"error":"offline"}`. The gateway waits at most 8 s (location: 12 s).
 - `kind` ∈ health, sleep, workouts, calendar, reminders, contacts, location, now_playing. `args`: dates already resolved
@@ -78,27 +83,26 @@ model tool call → gateway bridge → link {"type":"phone_query","id","kind","a
   rem_min, awake_min}, workouts:[{type, start, minutes, kcal, distance_m}]}]}`. Keys of categories that are off are
   absent. The last 7 days are sent each time (late Watch syncs fix older days).
 - When: on app foreground, on HealthKit background delivery (observer queries on steps, sleep, workouts; hourly at
-  most), and a `BGAppRefreshTask` (`xyz.scian.biseo.phone-sync`) asking for every ~4 hours. Paused while a secret call
-  is up. Off when `sync` is off.
+  most), and a `BGAppRefreshTask` (`xyz.scian.biseo.phone-sync`) asking for every ~4 hours. Off when `sync` (its own
+  toggle, separate from live reads) is off; not tied to calls.
 - The gateway validates every field (known keys and ranges only), merges by date into kv `phone-days`, and keeps the
   newest **30 days**. `GET /v1/phone/days` shows what is stored; `DELETE /v1/phone/days` deletes it all (Settings →
-  아이폰 데이터 → "서버에 올린 요약 모두 지우기"). Turning `sync` off also deletes.
-- Off the tailnet the app needs `/v1/phone/days` on the public proxy allowlist (PM/user approval).
+  아이폰 데이터 → "모든 데이터 삭제"), `?kind=health|sleep|workouts|cycle` one category. Turning `sync` off also deletes.
+- `/v1/phone/days` (GET/PUT/DELETE) goes on the public proxy allowlist at deploy (approved 2026-11-22).
 
 ## 4. Privacy rules
 - Per-category toggles; permission prompts only when a toggle is turned on.
-- Secret calls: no `phone_hello` kinds, no answers to queries, no uploads.
+- Secret calls: live reads allowed, nothing stored or logged (the same as every call: live answers are never kept).
 - Location: one fix per request, when-in-use permission only, never uploaded, no background location.
 - Raw samples, events, reminders, contacts, location and music never leave the phone except inside one live answer.
 - Summaries: 30 days on the server, delete-all in the app; only on full (jh-only) gateways, never limited ones.
 
 ## 5. App structure (`assistant/app/Biseo/iOS/PhoneData/`)
-- `PhoneDataSettings.swift` — toggles (`@AppStorage`), permission requests, the settings screen.
-- `PhoneDataStores.swift` — protocols (`HealthReading`, `EventReading`, `ContactReading`, `PlaceReading`,
-  `MusicReading`) with the real Apple implementations; tests use fakes.
-- `PhoneDataService.swift` — `answer(kind,args) -> [String: Any]` and `daySummaries(from,to)`; pure aggregation
-  (samples → day summary) lives here and is unit tested.
-- `PhoneDataSync.swift` — HealthKit observers, background delivery, BGTask, upload.
-- Shared edits: `CallClient` gets two hooks (send `phone_hello` on start, route `phone_query` frames); the iOS settings
-  screen gets one row. Entitlements: `com.apple.developer.healthkit`, `…healthkit.background-delivery`; Info.plist
+- `Shared/PhoneDataCore.swift` — categories and toggles, `PhoneAuth` (row states), the `PhoneStores` protocol, pure
+  aggregation (samples → day summary) and `PhoneResponder` (query → `phone_result`). Unit tested with fake stores.
+- `iOS/PhoneData/AppleStores.swift` — the real stores (HealthKit, EventKit, Contacts, CoreLocation, CoreMotion, MediaPlayer).
+- `iOS/PhoneData/PhoneDataSettings.swift` — permission requests and status mapping, the settings screen, the first-run sheet.
+- `iOS/PhoneData/PhoneDataSync.swift` — call-socket hooks, HealthKit observers, background delivery, BGTask, upload, delete.
+- Shared edits: `CallClient` gets two static hooks (`phoneHello` sent on start, `phoneQuery` answers `phone_query`
+  frames); `BiseoApp` calls `PhoneDataSync.start()`, uploads on foreground, adds `.phoneDataFirstRun()` and the settings row. Entitlements: `com.apple.developer.healthkit`, `…healthkit.background-delivery`; Info.plist
   usage strings (Korean) and `BGTaskSchedulerPermittedIdentifiers`, background mode `fetch`.

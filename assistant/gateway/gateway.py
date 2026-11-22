@@ -2363,11 +2363,15 @@ async def phone_days_get():
 
 
 @app.delete("/v1/phone/days")
-async def phone_days_delete():
-    """Settings → 아이폰 데이터 → delete all (also when sync is turned off)."""
+async def phone_days_delete(kind: str = ""):
+    """Settings → 아이폰 데이터: delete all, or one category's fields (`?kind=health|sleep|workouts|cycle`) when its toggle
+    is turned off."""
     full_only()
-    await state.call("PUT", phone_data.KV, {"days": {}, "updated": None})
-    return {"deleted": True}
+    if kind and kind not in phone_data.FIELDS:
+        raise HTTPException(400, "kind: " + ", ".join(phone_data.FIELDS))
+    value = phone_data.strip(await state.call("GET", phone_data.KV), kind) if kind else {"days": {}, "updated": None}
+    await state.call("PUT", phone_data.KV, value)
+    return {"deleted": True, **({"kind": kind} if kind else {})}
 
 
 @app.get("/v1/providers/nim/models")

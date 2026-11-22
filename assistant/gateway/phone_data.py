@@ -136,6 +136,16 @@ def merge(stored, days, today, now_ts):
     return {"days": {k: keep[k] for k in sorted(keep) if k >= cut}, "updated": now_ts}
 
 
+FIELDS = {"health": set(NUM), "sleep": {"sleep"}, "workouts": {"workouts"}, "cycle": {"cycle"}}
+
+
+def strip(stored, kind):
+    """The kv value without one category's fields (that toggle was turned off in the app)."""
+    drop = FIELDS[kind]
+    days = {k: {f: v for f, v in d.items() if f not in drop} for k, d in (stored or {}).get("days", {}).items()}
+    return {"days": {k: d for k, d in days.items() if len(d) > 1}, "updated": (stored or {}).get("updated")}
+
+
 # ---------- dates ----------
 def span(rng, today, cal=False):
     """(first, last) dates of a range word or one YYYY-MM-DD; ValueError otherwise."""

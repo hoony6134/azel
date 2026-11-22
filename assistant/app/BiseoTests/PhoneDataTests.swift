@@ -39,13 +39,12 @@ final class PhoneDataTests: XCTestCase {
         defaults = UserDefaults(suiteName: "PhoneDataTests")!
         defaults.removePersistentDomain(forName: "PhoneDataTests")
         PhoneData.defaults = defaults
-        PhoneData.paused = false
     }
 
-    override func tearDown() { PhoneData.defaults = .standard; PhoneData.paused = false }
+    override func tearDown() { PhoneData.defaults = .standard }
 
     private func responder(_ s: FakeStores, on: Set<PhoneCategory>) -> PhoneResponder {
-        PhoneResponder(stores: s, isOn: { on.contains($0) }, paused: { PhoneData.paused })
+        PhoneResponder(stores: s, isOn: { on.contains($0) })
     }
 
     func testUnionCountsOverlapsOnce() {
@@ -108,16 +107,30 @@ final class PhoneDataTests: XCTestCase {
         XCTAssertEqual((((c2["data"] as? [String: Any])?["days"] as? [[String: Any]])?.first)?["cycle"] as? String, "light")
     }
 
-    func testOffDeniedAndPaused() async {
+    func testOffAndDenied() async {
         let s = FakeStores()
         let off = await responder(s, on: []).answer(kind: "calendar", args: [:])
         XCTAssertEqual(off["error"] as? String, "off")
         s.deny = true
         let denied = await responder(s, on: [.calendar]).answer(kind: "calendar", args: [:])
         XCTAssertEqual(denied["error"] as? String, "denied")
-        PhoneData.paused = true
-        let paused = await responder(s, on: [.location]).answer(kind: "location", args: [:])
-        XCTAssertEqual(paused["error"] as? String, "off")
+    }
+
+    func testRowStatus() {
+        XCTAssertEqual(PhoneAuth.status(on: true, auth: .granted).text, "켜짐")
+        XCTAssertEqual(PhoneAuth.status(on: true, auth: .notAsked).text, "아직 안 물어봄")
+        XCTAssertEqual(PhoneAuth.status(on: false, auth: .granted).text, "꺼짐")
+        for on in [true, false] {
+            let s = PhoneAuth.status(on: on, auth: .denied)
+            XCTAssertEqual(s.text, "iOS에서 거부됨")
+            XCTAssertTrue(s.openSettings, "iOS never asks twice: offer the Settings app")
+        }
+        XCTAssertFalse(PhoneAuth.status(on: true, auth: .notAsked).openSettings)
+        XCTAssertEqual(PhoneCategory.setup.count, 8)
+        XCTAssertFalse(PhoneCategory.setup.contains(.cycle), "생리 주기 is its own opt-in, never in 모두 켜기")
+        XCTAssertEqual(PhoneCategory.sleep.syncedKind, "sleep")
+        XCTAssertNil(PhoneCategory.location.syncedKind, "location is never uploaded")
+        XCTAssertTrue(PhoneCategory.allCases.allSatisfy { !$0.detail.isEmpty })
     }
 
     func testLiveOnlyKinds() async throws {
@@ -158,8 +171,36 @@ final class PhoneDataTests: XCTestCase {
         XCTAssertEqual(PhoneData.kinds(), [], "everything starts off")
         PhoneData.set(.sleep, true); PhoneData.set(.cycle, true); PhoneData.set(.music, true)
         XCTAssertEqual(PhoneData.kinds(), ["health", "sleep", "now_playing"])
-        PhoneData.paused = true
-        XCTAssertEqual(PhoneData.kinds(), [], "a secret call offers nothing")
         XCTAssertTrue(PhoneData.helloFrame().contains("\"phone_hello\""))
     }
 }
+
+#if os(iOS)
+import Contacts
+import CoreLocation
+import CoreMotion
+import EventKit
+import HealthKit
+import MediaPlayer
+
+/// Each framework's own status words → 켜짐 / iOS에서 거부됨 / 아직 안 물어봄.
+final class PhonePermissionMappingTests: XCTestCase {
+    func testMappings() {
+        XCTAssertEqual(PhonePermissions.of(health: .shouldRequest), .notAsked)
+        XCTAssertEqual(PhonePermissions.of(health: .unnecessary), .granted)
+        XCTAssertEqual(PhonePermissions.of(health: .unknown), .notAsked)
+        XCTAssertEqual(PhonePermissions.of(EKAuthorizationStatus.notDetermined), .notAsked)
+        XCTAssertEqual(PhonePermissions.of(EKAuthorizationStatus.fullAccess), .granted)
+        XCTAssertEqual(PhonePermissions.of(EKAuthorizationStatus.writeOnly), .denied, "write-only can't read")
+        XCTAssertEqual(PhonePermissions.of(EKAuthorizationStatus.denied), .denied)
+        XCTAssertEqual(PhonePermissions.of(CNAuthorizationStatus.authorized), .granted)
+        XCTAssertEqual(PhonePermissions.of(CNAuthorizationStatus.restricted), .denied)
+        XCTAssertEqual(PhonePermissions.of(CLAuthorizationStatus.authorizedWhenInUse), .granted)
+        XCTAssertEqual(PhonePermissions.of(CLAuthorizationStatus.denied), .denied)
+        XCTAssertEqual(PhonePermissions.of(CLAuthorizationStatus.notDetermined), .notAsked)
+        XCTAssertEqual(PhonePermissions.of(CMAuthorizationStatus.authorized), .granted)
+        XCTAssertEqual(PhonePermissions.of(MPMediaLibraryAuthorizationStatus.restricted), .denied)
+        XCTAssertEqual(PhonePermissions.of(MPMediaLibraryAuthorizationStatus.notDetermined), .notAsked)
+    }
+}
+#endif

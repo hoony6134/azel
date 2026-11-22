@@ -29,13 +29,13 @@ struct BiseoApp: App {
                 if let i = CommandLine.arguments.firstIndex(of: "-callPreview"), i + 1 < CommandLine.arguments.count {
                     CallScreen().onAppear { CallManager.shared.debugPreview(state: CommandLine.arguments[i + 1]) }
                 } else if model.configured {
-                    RootView(model: model, history: history, schedule: schedule)
+                    RootView(model: model, history: history, schedule: schedule).phoneDataFirstRun()
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }
                 #else
                 if model.configured {
-                    RootView(model: model, history: history, schedule: schedule)
+                    RootView(model: model, history: history, schedule: schedule).phoneDataFirstRun()
                 } else {
                     SetupFlow { model.configured = Config.token != nil; Task { await model.refresh() } }
                 }

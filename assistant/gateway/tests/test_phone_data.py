@@ -176,6 +176,13 @@ def test_days_routes_and_tool(tgw):  # noqa: F811
     assert c.get("/v1/phone/days").json()["days"] == [day(today, steps=1234)]
     r = asyncio.run(g.bridge.run("phone_health", {"metric": "steps"}, caller="qwen"))
     assert r["ok"] and r["spoken"].startswith("오늘 걸음 수는 1,234걸음이에요.") and r["data"]["source"] == "sync"
+    c.put("/v1/phone/days", json={"days": [day(today, steps=1234, sleep={"asleep_min": 400})]})
+    assert c.delete("/v1/phone/days", params={"kind": "mood"}).status_code == 400
+    assert c.delete("/v1/phone/days", params={"kind": "health"}).json() == {"deleted": True, "kind": "health"}
+    assert c.get("/v1/phone/days").json()["days"] == [day(today, sleep={"asleep_min": 400})]
+    c.delete("/v1/phone/days", params={"kind": "sleep"})
+    assert c.get("/v1/phone/days").json()["days"] == []  # a day with nothing left goes
+    c.put("/v1/phone/days", json={"days": [day(today, steps=1)]})
     assert c.delete("/v1/phone/days").json() == {"deleted": True}
     assert c.get("/v1/phone/days").json()["days"] == []
     assert "phone_health" in {t["name"] for t in tailnet(g).post(
