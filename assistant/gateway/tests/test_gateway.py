@@ -1768,3 +1768,22 @@ def test_moving_an_oauth_connector_forgets_its_grant(gw):
     body["custom"][0]["url"] = "https://other.example.com/mcp"
     assert c.put("/v1/connectors", json=body).status_code == 200 and g.oauth.load(tmp, "notes") is None
     assert c.put("/v1/connectors", json={"claude_ai": [], "custom": [{"name": "spotify", "url": "https://x.example/mcp"}]}).status_code == 400
+
+
+def test_state_retries_an_idempotent_request_once_on_a_dropped_connection(gw):
+    g, _, _ = gw
+    import httpx
+    seen = []
+
+    def handler(req):
+        seen.append(req.method)
+        if len(seen) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"ok": True})
+    st = g.State("http://state")
+    st.client = httpx.AsyncClient(base_url="http://state", transport=httpx.MockTransport(handler))
+    assert asyncio.run(st.call("GET", "/v1/x")) == {"ok": True} and seen == ["GET", "GET"]
+    seen.clear()
+    with pytest.raises(g.StateDown):  # a POST may already have run: it is not sent again
+        asyncio.run(st.call("POST", "/v1/x", {}))
+    assert seen == ["POST"]
