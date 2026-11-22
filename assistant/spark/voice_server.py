@@ -1335,6 +1335,7 @@ TOOL_REFUSED = re.compile(r"이미 통화 중|다 걸었어요|없는 도구|쓸
 ASK_WHEN = "몇 분 뒤에 걸어 드릴까요?"
 ACTION_TOOLS = {"call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo"}
 CLAIM_FALLBACK = "그건 제가 직접 처리하지 못했어요. 어떻게 할지 다시 말씀해 주시겠어요?"
+LOOKUP_TOOL = re.compile(r"task_status|schedule_list|overnight_list|list_jobs|job_status$")
 
 
 def asks_action(text):
@@ -1901,6 +1902,7 @@ def task_intent(text):
 AUTO_ON = re.compile(r"알아서\s*(해|하|진행|처리|실행|돌려)|묻지\s*말고|물어보지\s*말고|자동\s*(으로\s*)?(승인|실행|허용)")
 AUTO_OFF = re.compile(r"자동\s*(으로\s*)?(승인|실행|허용)\s*(꺼|끄|그만|멈|중지|해제)|이제\s*(하나하나|매번)\s*물어")
 AUTO_Q = "이번 통화 동안 위험하지 않은 명령은 묻지 않고 바로 실행할게요. 지우기나 설치 같은 건 여전히 여쭤볼게요. 맞죠?"
+AUTO_GO = re.compile(r"진행|맡겨|시작|해서|하고")
 AUTO_MAX_CHARS = 30  # longer utterances carry a request of their own ("재시작하고 알아서 해"): the model answers those
 pending_auto: dict[str, float] = {}  # call key -> when the read-back was asked
 
@@ -1910,7 +1912,7 @@ def auto_intent(text, key):
     asked = pending_auto.get(key)
     if asked and time.time() - asked < 90 and (YES.search(text) or NO.search(text)):
         return "answer"
-    if len(text) > AUTO_MAX_CHARS:
+    if len(text) > AUTO_MAX_CHARS or AUTO_GO.search(text):  # "자동 승인으로 해서 진행해줘": a yes to the task, for the model
         return None
     return "off" if AUTO_OFF.search(text) else "on" if AUTO_ON.search(text) else None
 
@@ -2121,8 +2123,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         acted, claimed = {"ok": False}, {"n": 0}
 
         async def watch(ev):  # Claude, the API path and NIM all report their tool calls as activity
-            if ev.get("phase") == "tool_start" and action_tool(ev.get("tool", "")):
-                acted["ok"] = True
+            if ev.get("phase") == "tool_start" and (action_tool(ev.get("tool", "")) or LOOKUP_TOOL.search(ev.get("tool", ""))):
+                acted["ok"] = True  # a lookup grounds "이미 맡기셨어요" about work that exists
             if on_event:
                 await on_event(ev)
 
@@ -2130,9 +2132,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             if ACTION_CLAIM.search(s) and not acted["ok"] and asks_action(text):
                 timings["unconfirmed"] = s[:80]
                 claimed["n"] += 1
-                if claimed["n"] == 1:
+                if claimed["n"] == 1 and not claimed.get("said"):  # after a real answer the claim is just dropped
                     await sentences.put(CLAIM_FALLBACK)
                 return
+            claimed["said"] = True
             await sentences.put(s)
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
@@ -2270,6 +2273,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                             tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
                             if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
                                 confirmed["ok"] = True
+                            if tool_name == "end_call" and not TOOL_REFUSED.search(result.strip()):
+                                return  # the goodbye was said before the call: another round said it twice
                             timings.setdefault("tools", []).append(ms(t_tool))
                             messages += [{"role": "assistant", "content": buf.strip()},
                                          {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
@@ -3078,8 +3083,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         async def on_end_call(m):
             """Let the reply in progress (the goodbye) finish playing, then tell the app and close the socket."""
             await asyncio.sleep(0.3)  # the goodbye's reply task starts right after the tool answered
-            while (current["task"] and not current["task"].done()) or current["paused_at"] is not None \
-                    or time.monotonic() < current["play_end"]:
+            # every reply, not only current["task"]: a noise "follow-up" that returned at once had replaced it and the
+            # call hung up before the handoff was confirmed (2026-11-22 21:36)
+            while any(t and not t.done() for t in {current["task"], *current["replies"]}) \
+                    or current["paused_at"] is not None or time.monotonic() < current["play_end"]:
                 await asyncio.sleep(0.2)
             await send({"type": "hangup", "reason": str(m.get("reason") or "")[:40]})
             await ws.close()
@@ -5322,6 +5329,18 @@ if __name__ == "__main__":
             globals().update(claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
             return out
         assert claude_claim_check([]) == [CLAIM_FALLBACK, "다른 건 없으세요?"]  # nothing scheduled it
+
+        def claim_after_answer():
+            async def claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                yield "그 작업은 이미 맥북에서 진행 중이에요. 그래서 다시 맡겼어요."
+
+            async def fake_tts(sentence, *a, **k):
+                return b"", 24000
+            globals().update(claude_stream=claude, tts=fake_tts, FILLER_AFTER_S=5)
+            out = asyncio.run(_collect(respond("오퍼스로 그 조사 맡겨 줘", "cca", time.perf_counter(), {})))
+            globals().update(claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
+            return out
+        assert claim_after_answer() == ["그 작업은 이미 맥북에서 진행 중이에요."]  # dropped, no fallback after an answer
         tool = {"type": "activity", "phase": "tool_start", "tool": "mcp__azel__call_user", "label": "", "kind": "generic"}
         assert claude_claim_check([tool]) == ["네, 10분 뒤에 전화드릴게요.", "다른 건 없으세요?"]
         assert action_tool("macbook__run_command") and not action_tool("mcp__claude_ai_Cygnus_MCP__gistra_today")
@@ -5399,4 +5418,6 @@ if __name__ == "__main__":
         assert task_intent("그러고 끝나고 전화해줘.") is None and task_intent("끝나면 알려줘") is None
         assert task_intent("스탭메이트 시장 조사를 맥북에서 해서 다운로드 폴더에 저장해줘. 그러고 끝나고 전화해줘.") == "call"
         assert task_intent("빌드 돌려 놓고 끝나면 푸시로 알려줘") == "push"
+        assert auto_intent("자동 승인으로 해서 진행해줘", "azel:z") is None and auto_intent("알아서 해", "azel:z") == "on"
+        pending_auto.clear()
         print("voice_server checks ok")

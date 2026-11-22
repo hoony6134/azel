@@ -278,6 +278,9 @@ VOICE_BASE = (
     "기기 명령이 pending_approval을 돌려주면 먼저 '앱에서 허용해 주세요'라고 짧게 말한 다음, 같은 명령을 그 "
     "approval_id와 함께 다시 호출해서 승인을 기다려. 거절되거나(rejected) 만료되면(expired) 허용되지 않았다고 말해. "
 )
+# "기획서 하나 써서 다운로드에 받아줘" was asked back ("…맡길까요?") before anything started (2026-11-22)
+VOICE_BASE += ("사용자가 일을 맡기면(…해 줘, 만들어 줘, 조사해 줘) 되묻지 말고 바로 create_task로 맡겨. 주제나 형식을 "
+               "정하지 않았으면 작업이 알아서 정하게 하고, 맡긴 뒤 무엇을 맡겼는지 한 문장으로 말해. ")
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
     "macbook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
@@ -1368,6 +1371,7 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
     opening = with_title(opening, user_title(settings, persona))  # every placed call opens with the title
     try:
         await state.call("POST", "/v1/state/calls", {"id": call_id, "reason": reason, "opening": opening or ""})
+        await remember_placed(call_id, reason, call_label(reason, (context or {}).get("label")), opening or "")
     except StateDown:
         pass  # the opening still reaches the voice server over the link, which is what the call needs
     # The opening must reach the voice server before the phone can answer and connect.
@@ -2202,10 +2206,29 @@ async def missed(item, now, late=False):
                               f"{spoken_when(item['at'], None, now)} {what}{how}.")
 
 
+PLACED_KEY = "/v1/state/kv/placed-calls"
+
+
+async def remember_placed(call_id, reason, label, opening):
+    """Every call the assistant places (kept 24 h, at most 30), so "방금 왜 전화했어?" has an answer (recent_calls)."""
+    rows = [r for r in await state.call("GET", PLACED_KEY) or [] if time.time() - r["at"] < 86400][-29:]
+    await state.call("PUT", PLACED_KEY, rows + [{"id": call_id, "at": time.time(), "reason": reason, "label": label,
+                                                  "opening": opening[:400], "answered": False}])
+
+
+async def placed_recent():
+    """The last 24 h of placed calls, newest first."""
+    rows = [r for r in await state.call("GET", PLACED_KEY) or [] if time.time() - r["at"] < 86400]
+    return sorted(rows, key=lambda r: -r["at"])
+
+
 async def call_answered(call_id):
     """The voice server saw /v1/call with this call_id: a fired scheduled call was answered."""
     if MODE != "full" or not isinstance(call_id, str):
         return
+    rows = await state.call("GET", PLACED_KEY) or []
+    if any(r["id"] == call_id for r in rows):
+        await state.call("PUT", PLACED_KEY, [{**r, "answered": True} if r["id"] == call_id else r for r in rows])
     for item in await schedule_list():
         if item["status"] == "fired" and item["call_id"] == call_id:
             await finish(item, time.time(), "answered")
@@ -4778,7 +4801,7 @@ bridge = tools_bridge.Bridge(
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
-    web_ok=lambda: searxng_ok(), overnight_list=lambda: overnight_list(),
+    web_ok=lambda: searxng_ok(), overnight_list=lambda: overnight_list(), recent_calls=lambda: placed_recent(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
     auto_grant=lambda scope, devices, minutes: grant_create(scope, devices, minutes, by="voice"),
     auto_end=lambda scope: end_grants(scope),
