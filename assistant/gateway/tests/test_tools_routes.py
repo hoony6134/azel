@@ -191,6 +191,7 @@ def test_claude_code_tasks_get_their_origin_and_never_chain(tgw):  # noqa: F811
     full = tailnet(g)
     r = full.post("/v1/mcp", headers={"X-Azel-Origin": "azel:iphone-2026-11-22"},
                   json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                        "params": {"name": "create_task", "arguments": {"goal": "맥북 정리", "notify": "call"}}})
+                        "params": {"name": "create_task", "arguments": {"goal": "맥북 정리", "notify": "call",
+                                                                                  "auto_approve": False}}})
     tid = re.search(r"[0-9a-f]{12}", json.dumps(r.json(), ensure_ascii=False)).group(0)
     assert g.fake.db["kv"][f"task-{tid}"]["origin_session"] == "azel:iphone-2026-11-22"

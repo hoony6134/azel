@@ -119,6 +119,8 @@ DEFAULTS = {
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
     "overnight": {"window": ["01:00", "06:00"], "report_push": True, "report_call": False, "budget_usd": 5.0},
+    # a voice-made task that works on a device: ask (one question first) | auto | ask_each. The app's sheet has its own toggle
+    "task_auto_approve_default": "ask",
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "brain_mode": "auto",
@@ -2377,6 +2379,8 @@ async def put_settings(body: dict):
             raise HTTPException(400, "overnight: {window: [HH:MM, HH:MM], report_push: bool, report_call: bool, "
                                      "budget_usd: 0-100}")
         body["overnight"] = {k: o[k] for k in DEFAULTS["overnight"]}
+    if "task_auto_approve_default" in body and body["task_auto_approve_default"] not in tools_bridge.TASK_APPROVE_DEFAULTS:
+        raise HTTPException(400, f"task_auto_approve_default: one of {list(tools_bridge.TASK_APPROVE_DEFAULTS)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
         raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
     if body.get("task_backend") == "nim":  # the shared default must be able to run
@@ -4588,6 +4592,8 @@ bridge = tools_bridge.Bridge(
     auto_end=lambda scope: end_grants(scope),
     end_call=lambda session, reason: link_send({"type": "end_call", "session": session, "reason": reason}),
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
+    task_approve_default=lambda: task_approve_default(),
+    set_task_approve_default=lambda v: put_settings({"task_auto_approve_default": v}),
     agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
@@ -4649,6 +4655,10 @@ async def web_search(query, n):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
     res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
     return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def task_approve_default():
+    return (await load_settings()).get("task_auto_approve_default") or "ask"
 
 
 async def agenda_text(f, t):

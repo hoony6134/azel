@@ -147,8 +147,18 @@ CREATE_TASK = {
         "when": {"type": "string", "maxLength": 40, "description": (
             "now(기본) | overnight: '자기 전에 해 둬', '밤새 조사해 놔', '자는 동안'처럼 밤사이에 하라는 말이면 overnight. "
             "밤에 차례로 하고 아침 브리핑에서 알린다. 정확한 시각(ISO)은 앱만 보낸다")},
-        "auto_approve": {"type": "boolean", "description": "앱 전용. 모델은 넣지 마"}}},
+        "auto_approve": {"type": "boolean", "description": (
+            "기기에서 하는 작업(맥북·서버에서 실행, 파일, 브라우저, 위임)은 진행 중 승인이 필요할 때 자동 승인할지. 사용자가 "
+            "'자동으로 해'면 true, '물어보고 해'면 false. 말하지 않았으면 비워 둬: 도구가 한 번 물어볼 질문을 돌려준다")},
+        "remember_choice": {"type": "boolean", "description": "'앞으로는 다 자동으로 해'/'앞으로는 물어봐'처럼 앞으로도 그렇게 하라고 했을 때만 true"}}},
 }
+# create_task's one question before device work, when the user hasn't said how approvals go (PM 2026-11-23)
+TASK_APPROVE_Q = "진행하다 승인이 필요하면 자동 승인으로 할까요, 아니면 그때마다 물어볼까요?"
+DEVICE_WORK = re.compile(r"맥북|macbook|맥에서|서버|스파크|spark|코어|기기|노트북|컴퓨터|파일|폴더|문서|pdf|PDF|저장|다운로드|"
+                         r"실행|설치|빌드|코드|레포|스크립트|터미널|브라우저|사이트에서|웹사이트|위임|만들어(서|줘)|작성해", re.I)
+SAYS_AUTO = re.compile(r"자동(으로|\s*승인)|알아서\s*(승인|허용|진행|해)|묻지\s*말고|물어보지\s*말고")
+SAYS_ASK = re.compile(r"물어(보고|봐\s*줘|보면서)|그때(마다|그때)|하나(하나|씩)\s*(물어|확인)|승인\s*받고")
+TASK_APPROVE_DEFAULTS = ("ask", "auto", "ask_each")
 OVERNIGHT_LIST = {"name": "overnight_list", "description": "밤사이 하기로 맡긴 작업 목록과 상태('밤새 할 거 뭐 있어?', '어젯밤 맡긴 거').",
                   "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
 
@@ -205,6 +215,7 @@ class Bridge:
         self.tainted = {}  # run id (ask:<session> | task:<id>) -> monotonic of its last web/mail/Cygnus/memory read
         self.auto_asked = {}  # run id -> when auto_approve's read-back was asked (confirmed only counts after it)
         self.confirming = {}  # run id -> when a confirm/clarify question went out (end_call waits for the answer)
+        self.task_asked = {}  # run id -> when create_task asked how approvals should go
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -897,7 +908,7 @@ class Bridge:
         macs = sorted(n for n, (_, t) in where.items() if t == "browser")
         if not macs:
             raise Fail("unavailable", "지금은 브라우저를 쓸 수 있는 맥이 연결돼 있지 않아요.")
-        return await self.create_task({"goal": goal, "brief": BROWSER_BRIEF, "device": macs[0].split("__")[0],
+        return await self.create_task({"goal": goal, "brief": BROWSER_BRIEF, "browser_only": True, "device": macs[0].split("__")[0],
                                        **({"notify": args["notify"]} if args.get("notify") else {})}, persona_id, caller)
 
     async def create_task(self, args, persona_id, caller):
@@ -913,9 +924,8 @@ class Bridge:
         when = args.get("when") or "now"
         if when not in ("now", "overnight") and caller != "app":  # only a person picks an exact time (ACTIONS.md §3)
             raise Fail("invalid", "작업 시각은 now나 overnight만 돼요. 정확한 시각은 앱에서 골라 주세요.")
-        if args.get("auto_approve") and caller != "app":
-            raise Fail("invalid", "자동 승인은 앱에서만 켤 수 있어요.")
-        body.update(when=when, auto_approve=bool(args.get("auto_approve")))
+        auto = bool(args.get("auto_approve")) if caller == "app" else await self.task_auto(args, goal, caller)
+        body.update(when=when, auto_approve=auto)
         try:
             t = await self.d["task_create"](body, "app" if caller == "app" else "tool")
         except Exception as e:  # task_create's own 400s (a bad ISO time) as the action's invalid
@@ -932,6 +942,40 @@ class Bridge:
                 self.d.get("task_view", lambda t, full=False: t)(t, True)
         return " ".join(x for x in (t.get("note"), f"작업으로 맡겼어요. {how}".strip()) if x) + f" (작업 {t['id']})", \
             self.d.get("task_view", lambda t, full=False: t)(t, True)
+
+
+    async def task_auto(self, args, goal, caller):
+        """auto_approve for a model's create_task. Device work asks once how approvals should go unless the user said
+        (in this goal or by answering that question), or set a default. A model's true counts only after this run asked
+        (a forged true asks anyway), never right after reading outside text, and never on a task's own sub-task."""
+        who = self.d.get("who", lambda: "")()
+        if who.startswith("task:") or args.get("browser_only"):  # browser rows are never auto-approved anyway
+            return False
+        if args.get("auto_approve") is False:  # the safe way needs no proof
+            if args.get("remember_choice") and "set_task_approve_default" in self.d:
+                await self.d["set_task_approve_default"]("ask_each")
+            return False
+        tainted = time.monotonic() - self.tainted.get(who, -1e9) < TAINT_S
+        default = await self.d["task_approve_default"]() if "task_approve_default" in self.d else "ask"
+        said_auto, said_ask = bool(SAYS_AUTO.search(goal)), bool(SAYS_ASK.search(goal))
+        asked = self.task_asked.pop(who, None) if who else None
+        answered = asked is not None and time.monotonic() - asked < TAINT_S and isinstance(args.get("auto_approve"), bool)
+        if answered or said_auto or said_ask:
+            auto = args["auto_approve"] if answered else said_auto and not said_ask
+            if args.get("remember_choice") and "set_task_approve_default" in self.d:
+                await self.d["set_task_approve_default"]("auto" if auto else "ask_each")
+            return auto and not tainted
+        if default in ("auto", "ask_each"):
+            return default == "auto" and not tainted
+        if args.get("device") or DEVICE_WORK.search(goal):  # device work, nothing said, default ask: ask once
+            if who:
+                self.task_asked[who] = time.monotonic()
+            raise Need("choose", TASK_APPROVE_Q, f"아직 맡기지 않았어요. 사용자에게 '{TASK_APPROVE_Q}'라고 묻고, 자동이면 "
+                       "auto_approve=true, 물어보라면 false로 같은 내용을 다시 불러. 앞으로도 그렇게 하라고 하면 "
+                       "remember_choice=true도 넣어.", options=[{"id": "auto", "spoken": "자동 승인"},
+                                                            {"id": "ask", "spoken": "그때마다 물어보기"}],
+                       resend={**args, "auto_approve": True})
+        return False  # not device work (a summary, research by the model itself): nothing to approve
 
 
 class Need(Exception):
