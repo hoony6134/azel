@@ -23,6 +23,7 @@ sub init()
     m.detailCol = 0
     m.errIdx = 0
     m.setIdx = 0
+    m.pageTask = invalid
     m.glaze = pal("celadon")
     m.inCall = false
     m.header = m.top.findNode("header")
@@ -30,6 +31,9 @@ sub init()
     m.rows = m.top.findNode("rows")
     m.rowsClip = m.top.findNode("rowsClip")
     m.detail = m.top.findNode("detail")
+    m.page = m.top.findNode("page")
+    m.page.observeField("closed", "closePage")
+    m.page.observeField("refresh", "fetchPage")
     m.ambientG = m.top.findNode("ambientG")
     m.ambBase = m.top.findNode("ambBase")
     m.errorG = m.top.findNode("errorG")
@@ -227,6 +231,7 @@ sub hideAllModes()
     m.strip.visible = false
     m.rowsClip.visible = false
     m.detail.visible = false
+    m.page.visible = false
     m.ambientG.visible = false
     m.errorG.visible = false
     m.settings.visible = false
@@ -393,7 +398,7 @@ sub onPoll()
 end sub
 
 sub onIdle()
-    if m.mode = "dash" or m.mode = "detail" then showAmbient()
+    if m.mode = "dash" or m.mode = "detail" or m.mode = "page" then showAmbient()
 end sub
 
 sub onTick()
@@ -595,8 +600,62 @@ sub onSelected()
     if m.mode = "detail"
         closeDetail()
     else if m.mode = "dash"
-        showDetail(f[0], f[1])
+        title = ""
+        if f[0] < m.sectionTitles.Count() then title = m.sectionTitles[f[0]]
+        if Left(title, 3) = "인프라"
+            name = ""
+            k = m.model.sections[f[0]].cards[f[1]]
+            if k.t = "node" then name = k.name
+            openPage("infra", name)
+        else if title = "Azel 작업"
+            openPage("tasks", "")
+        else
+            showDetail(f[0], f[1])
+        end if
     end if
+end sub
+
+' ---------- detail pages (인프라, Azel 작업): GET /v1/tv?detail=… ----------
+
+sub openPage(kind as String, focusName as String)
+    m.mode = "page"
+    m.strip.visible = false
+    m.rowsClip.visible = false
+    m.detail.visible = false
+    m.page.kind = kind
+    m.page.focusName = focusName
+    m.page.state = "loading"
+    m.page.visible = true
+    m.page.setFocus(true)
+    fetchPage()
+end sub
+
+sub fetchPage()
+    if m.pageTask <> invalid then m.pageTask.unobserveField("result")
+    t = CreateObject("roSGNode", "FetchTask")
+    t.baseUrl = m.url
+    t.token = m.token
+    t.path = "/v1/tv?detail=" + m.page.kind
+    t.observeField("result", "onPageFetch")
+    m.pageTask = t
+    t.control = "RUN"
+end sub
+
+sub onPageFetch(ev as Object)
+    r = ev.getData()
+    if m.mode <> "page" then return
+    if r.ok
+        m.page.data = r.data
+        m.page.state = "ok"
+    else
+        m.page.state = "error"
+    end if
+end sub
+
+sub closePage()
+    if m.pageTask <> invalid then m.pageTask.unobserveField("result")
+    m.pageTask = invalid
+    showDash()
 end sub
 
 sub onFocused()

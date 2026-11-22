@@ -40,7 +40,7 @@ end function
 
 function clean(s as String) as String
     s = s.Replace("<", "")
-    return s.Replace(">", "")
+    return s.Replace(">", "").Trim()
 end function
 
 function failCard(w as Integer, section as String, still as String) as Object
