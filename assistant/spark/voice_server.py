@@ -1353,7 +1353,7 @@ RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일�
 # whether the words need data from a read-only tool. If so the tool runs first and Qwen answers from its result, so a
 # lookup no longer depends on Qwen choosing to call one mid-answer. Action tools keep the [TOOL] path.
 # shortcut: the read-only set is named here (the gateway's tool list carries no read_only flag); add it there if this drifts
-READ_ONLY = re.compile(r"^(infra_|phone_|gistra_|planit_get|planit_search|calendar_|gmail_)|^(agenda|weather|stock_quote|"
+READ_ONLY = re.compile(r"^(infra_|phone_|gistra_|planit_get|planit_search|calendar_|gmail_)|^(agenda|weather|stock_quote|portfolio|"
                        r"memory_recall|memory_list|people_lookup|web_search|web_fetch|recent_calls|schedule_list|"
                        r"task_status|overnight_list|approval_status)$")
 ROUTE_S = 4.0  # the decision (~0.8 s alone, slower beside Qwen's own answer on the shared GPU); then as before
@@ -1365,11 +1365,13 @@ ROUTE_SYSTEM = ("너는 음성 비서의 조회 판단기야. 사용자의 마�
 ROUTE_MAX = 6
 # the user's own things ("내가 가진 주식", "내 포트폴리오"): what they are is in memory, so it is read before the domain
 # tools (live 2026-11-23: "내 주식 얼마나 올랐어?" quoted one stock, or said nothing was saved, with the holdings in memory)
-MINE = re.compile(r"내가\s*(갖고|가지고|가진|보유|산|들고|하는|다니는|키우는)|내\s*(주식|종목|포트폴리오|자산|계좌|보유|구독|차|집|친구)|"
+HOLDINGS_Q = re.compile(r"주식|종목|포트폴리오|보유|주가|수익|손익|평가")
+MINE = re.compile(r"포트폴리오|내가\s*(갖고|가지고|가진|보유|산|들고|하는|다니는|키우는)|내\s*(주식|종목|포트폴리오|자산|계좌|보유|구독|차|집|친구)|"
                   r"보유\s*(한|하고|현황|종목|주식)|우리\s*(집|가족|회사)")
 # "서버 괜찮아?" read host load only and answered "모두 정상" while a service was down (live 2026-11-23 03:14): any
 # server question reads hosts, problem services and alerts together, and the answer leads with what is wrong
 INFRA_READ = ("infra_status", "infra_alerts", "infra_health")
+INFRA_Q = re.compile(r"서버|인프라|노드|홈서버|컨테이너|경보|알림 떴|다운|죽었|터졌")
 INFRA_HEAD = {"infra_status": "문제 있는 서비스", "infra_alerts": "울리는 경보", "infra_health": "서버별 상태"}
 INFRA_NOTE = ("(멈추거나 문제 있는 서비스와 경보가 있으면 그것부터, 어느 서버에서 언제부터인지 말하고, 나머지 서버 상태는 그다음에 "
               "짧게 말해. '모두 정상'은 세 항목 모두 문제가 없을 때만 말해. 사용자가 말한 경보나 서비스 이름이 있으면 여기서 찾아 답해.)")
@@ -1377,7 +1379,8 @@ TOOL_ACTIVITY = (("infra_", "서버 상태 확인 중", "server"), ("phone_", "�
                  ("agenda", "일정 확인 중", "calendar"), ("gistra_", "학사 일정 확인 중", "calendar"),
                  ("calendar_", "캘린더 확인 중", "calendar"), ("gmail_", "메일 확인 중", "mail"),
                  ("memory_", "기억 찾는 중", "memory"), ("people_", "기억 찾는 중", "memory"),
-                 ("weather", "날씨 확인 중", "web"), ("stock_quote", "시세 확인 중", "web"), ("web_", "웹에서 찾는 중", "web"))
+                 ("weather", "날씨 확인 중", "web"), ("stock_quote", "시세 확인 중", "web"), ("portfolio", "보유 종목 확인 중", "web"),
+                 ("web_", "웹에서 찾는 중", "web"))
 
 
 def tool_activity(name):
@@ -1392,8 +1395,9 @@ async def infra_read(names, session):
     return "\n".join(parts) + "\n" + INFRA_NOTE
 
 
-LOOKUP_ACK = "네, 볼게요."
-LOOKUP_SLOW = "죄송해요, 조회가 늦어져서 지금은 가져오지 못했어요."  # said only while a lookup that already started is still running
+LOOKUP_ACK = "네, 바로 볼게요."  # said as a lookup starts: 5+ syllables (shorter garbles, and waited for the answer)
+FILLERS = (FILLER, FILLER_LONG, LOOKUP_ACK)  # played as they come (no hold gate, no merging), cached, not captioned
+LOOKUP_SLOW = "죄송해요, 조회가 늦어져서 지금은 가져오지 못했어요."  # a lookup past LOOKUP_S: said, never silence
 LOOKUP_SLOW_S = 1.2
 
 
@@ -2178,7 +2182,7 @@ async def tts(sentence: str) -> tuple[bytes, int]:
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
     # Fillers and short openers ("네, 알겠습니다.") repeat constantly: synthesize them once (per voice). Under
     # MIN_SYL is never cached (such a chunk is only ever a whole reply, and garbles more often).
-    cacheable = sentence in (FILLER, FILLER_LONG) or MIN_SYL <= syllables(sentence) <= 8
+    cacheable = sentence in FILLERS or MIN_SYL <= syllables(sentence) <= 8
     key = (voice, style, sentence)
     if cacheable and key in _tts_cache:
         return _tts_cache[key]
@@ -2385,7 +2389,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             requested = bool(needs_answer(bare) or REQUEST.search(bare) or PUSH.search(bare))
             system = (local_prompt if offline or play else str)(system_prompt(
                 name, length, ctx, persona_text(persona, settings), user_title(settings, persona))) \
-                + gateway_tools_text(gw_defs, request_text) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
+                + (tool_text := gateway_tools_text(gw_defs, request_text)) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
                 + fetched["agenda"] + play
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             # No-tool turns pass through as the model said them (user decision 2026-11-22: "툴콜을 안 할 때의 안전장치는
@@ -2492,15 +2496,29 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         await pump_q.put(e)
                     finally:
                         await pump_q.put(None)
-                pump_task = asyncio.create_task(pump(list(messages)))
+                # Qwen's own answer is held beside the router only when the words may well be chat: beside a likely
+                # lookup it only slowed the router (2.0 s instead of 0.8 on the shared GPU, measured 2026-11-23)
+                likely = bool(wanted or WEATHER_Q.search(bare) or LIVE_Q.search(bare) or WEB_LIVE.search(bare)
+                              or INFRA_Q.search(bare) or MINE.search(request_text) or agenda_range(bare, datetime.now(KST)))
+                pump_task = None if likely else asyncio.create_task(pump(list(messages)))
                 ro_names = {t["name"] for t in ro_tools}
-                mine = bool(MINE.search(request_text)) and "memory_recall" in ro_names
+                # "내 주식": the gateway's portfolio (the holdings setting) answers every holding in one call; memory and a
+                # quote per holding only when that tool is not there
+                own_stocks = bool(MINE.search(request_text) and HOLDINGS_Q.search(request_text))
+                portfolio = [{"name": "portfolio", "args": {}}] if own_stocks and "portfolio" in ro_names else None
+                mine = not portfolio and bool(MINE.search(request_text)) and "memory_recall" in ro_names
                 try:
-                    picks = None if mine else await asyncio.wait_for(route_lookup(request_text, prior, ro_tools), ROUTE_S)
+                    t_route = time.perf_counter()
+                    picks = portfolio or (None if mine else
+                                          await asyncio.wait_for(route_lookup(request_text, prior, ro_tools), ROUTE_S))
+                    timings["route_ms"] = ms(t_route)
                 except (asyncio.TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError):
                     picks = None  # undecided: the turn goes on as before
                 if picks or mine:
-                    pump_task.cancel()
+                    if pump_task:
+                        pump_task.cancel()
+                    acked.append(1)
+                    await sentences.put(LOOKUP_ACK)  # at once: the first sound comes with the decision, not the data
                     t_tool, found = time.perf_counter(), []
                     if mine:  # the user's own things: memory says what they are, then the domain tools look them up
                         got = await lookups([{"name": "memory_recall", "args": {"query": request_text[:200]}}])
@@ -2520,12 +2538,17 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         return
                     timings["tool_first"] = ",".join(json.loads(x[len(TOOL_TAG):])["name"] for x in looked)[:80]
                     timings.setdefault("tools", []).append(ms(t_tool))
+                    timings["result_at_ms"] = ms(t0)
+                    # answering from data in hand needs no tool list: 4,300 characters less to read, the first word
+                    # 0.7 s sooner (1.15 -> 0.41 s on the live Qwen, 2026-11-23)
+                    base_system = base_system.replace(tool_text, "", 1)
+                    messages[0] = {"role": "system", "content": base_system}
                     for lines, result in found:
                         messages += [{"role": "assistant", "content": "\n".join(lines)},
                                      {"role": "user", "content": f"[도구 결과]\n{result}"}]
                     messages[-1]["content"] += ("\n\n이 결과로 방금 말에 답해. 여러 항목이면 하나씩 빠짐없이 말하고, 기억에 있는데 "
                                                 "결과가 없는 항목은 찾지 못했다고(비상장일 수 있다고) 말해.")
-                else:
+                elif pump_task:
                     async def from_pump():
                         while (d := await pump_q.get()) is not None:
                             if isinstance(d, Exception):
@@ -2695,7 +2718,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     def repeat(x):
         """A sentence this reply already said (a re-asked or restarted model began again: "네, 수능! … 네, 수능!"),
         or a second announcement ("일정 알려드릴게요" again after a re-ask, live 2026-11-23)."""
-        if x is None or x in (FILLER, FILLER_LONG):
+        if x is None or x in FILLERS:
             return False
         if INTRO_ANNOUNCE.search(x):
             if "\0announce" in uttered:
@@ -2717,13 +2740,13 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             s = await sentences.get()
             while repeat(s):
                 s = await sentences.get()
-            if s is None or s in (FILLER, FILLER_LONG):
+            if s is None or s in FILLERS:
                 return s
             if not (s := ko_read.strip_foreign(s)) or (ko_read.english_only(s) and not ASKS_ENGLISH.search(text)):
                 return await next_chunk()  # nothing but stray Chinese/Japanese, or a model's English working note
             if not (s := address(s)):
                 return await next_chunk()  # only the title again: nothing to say
-        if s is None or s in (FILLER, FILLER_LONG):
+        if s is None or s in FILLERS:
             return s
         # as much as the audio ahead covers (the held audio before playback starts), never more than MAX_CHUNK_SYL.
         # A short first sentence stays its own chunk (its own caption): the start gate holds it until what
@@ -2736,10 +2759,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             if nxt not in (None, FILLER, FILLER_LONG) and (
                     not (nxt := ko_read.strip_foreign(nxt)) or (ko_read.english_only(nxt) and not ASKS_ENGLISH.search(text))):
                 continue
-            nxt = nxt if nxt is None or nxt in (FILLER, FILLER_LONG) else address(nxt)
+            nxt = nxt if nxt is None or nxt in FILLERS else address(nxt)
             if nxt == "":
                 continue
-            if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
+            if nxt is None or nxt in FILLERS or syllables(s) + syllables(nxt) > room:
                 back.append(nxt)
                 break
             s = f"{s} {nxt}"
@@ -2747,7 +2770,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
 
     def pending_syl():
         """Syllables of the sentences known but not synthesized yet, plus one assumed sentence while the LLM writes."""
-        known = [x for x in [*back, *list(sentences._queue)] if x is not None and x not in (FILLER, FILLER_LONG)]
+        known = [x for x in [*back, *list(sentences._queue)] if x is not None and x not in FILLERS]
         more = not producer.done() and None not in back and None not in sentences._queue
         return [syllables(x) for x in known] + ([FUTURE_SYL] if more else [])
 
@@ -2760,7 +2783,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     def take(s, pcm, sr):
         nonlocal play_end
         play_end = max(time.monotonic(), play_end) + len(pcm) / 2 / sr  # when the phone finishes this chunk
-        if s not in (FILLER, FILLER_LONG):
+        if s not in FILLERS:
             spoken.append(s)
         return s, route["value"], pcm, sr
 
@@ -2768,7 +2791,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         while True:
             if held and ready_to_play():
                 timings.setdefault("first_audio_ms", ms(t0))
-                timings.setdefault("held_ms", round((time.monotonic() - held_since[0]) * 1000))
+                # held_since[0] is -1e9 once the gate gave up: that is "release now", not a time (held_ms was 10^12)
+                timings.setdefault("held_ms", round((time.monotonic() - held_since[0]) * 1000) if held_since[0] > 0 else 0)
                 while held:
                     yield take(*held.pop(0))
                 opened[0] = True
@@ -2780,15 +2804,15 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 continue
             if s is None:
                 break
-            if not speak and s in (FILLER, FILLER_LONG):
+            if not speak and s in FILLERS:
                 continue  # a muted (typed) turn: captions only, and "잠시만요" is not a caption
-            if held and not opened[0] and s not in (FILLER, FILLER_LONG) and \
+            if held and not opened[0] and s not in FILLERS and \
                     time.monotonic() - held_since[0] + synth_est(syllables(s)) > HOLD_MAX_S:
                 back.append(s)  # synthesizing this first would hold the ready audio too long (live: 13 s of silence)
                 held_since[0] = -1e9
                 continue
             pcm, sr = await tts(s) if speak else (b"", 24000)
-            if opened[0] or s in (FILLER, FILLER_LONG):
+            if opened[0] or s in FILLERS:
                 timings.setdefault("first_audio_ms", ms(t0))
                 yield take(s, pcm, sr)  # playing already (its buffer is on the phone), or a filler: as it comes
             else:
@@ -3252,14 +3276,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             p = current_persona(st)
             title = user_title(st, p)
             async for s in briefing_sentences(f"{p['id']}:{session}", p["name"], send, persona_text(p, st), title):
-                if s not in (FILLER, FILLER_LONG) and not spoken:
+                if s not in FILLERS and not spoken:
                     s = with_title(s, title)  # the briefing's first words always use the title
                 pcm, sr = await tts(s)
                 await send({"type": "reply", "text": s, "route": "briefing"}, gen=gen)
-                if s not in (FILLER, FILLER_LONG):
+                if s not in FILLERS:
                     queue_audio(sent, s, pcm, sr)
                 await send(audio=pcm, gen=gen)
-                if s not in (FILLER, FILLER_LONG):
+                if s not in FILLERS:
                     spoken.append(s)
         except asyncio.CancelledError:
             cut = True
@@ -3385,7 +3409,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                         await send({"type": "reply_start", "reply_id": gen}, gen=gen)  # new audio starts here
                         started = asked["spoke"] = True
                     turn["route"] = route
-                    if s not in (FILLER, FILLER_LONG):
+                    if s not in FILLERS:
                         turn["assistant"].append(s)
                         queue_audio(sent, s, pcm, sr)
                     await send({"type": "reply", "text": s, "route": route}, gen=gen)
@@ -5734,7 +5758,7 @@ if __name__ == "__main__":
             globals()["llm_stream"] = announcer(["서버는 여섯 대 모두 켜져 있고 문제없어요."])
             said = asyncio.run(lrun("야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "tf1"))
             assert ran == [{"name": "infra_health", "args": {}}] and routed[0][1] == ["infra_health"], (ran, routed)
-            assert [x for x, *_ in said] == ["서버는 여섯 대 모두 켜져 있고 문제없어요."], said
+            assert [x for x, *_ in said] == [LOOKUP_ACK, "서버는 여섯 대 모두 켜져 있고 문제없어요."], said  # the ack at once
             assert len(ann) == 1 and "[도구 결과]" in ann[0][-1]["content"]  # Qwen answered from the result, once
             ran.clear(), ann.clear()
             globals()["llm_stream"] = announcer(["저도 대표님 좋아해요."])
@@ -5821,6 +5845,21 @@ if __name__ == "__main__":
             assert [d["name"] for d in ran] == ["memory_recall"] + ["stock_quote"] * 5, ran
             prompt = " ".join(m["content"] for m in ann[0])
             assert all(v in prompt for v in quotes.values()) and "빠짐없이" in prompt, prompt[-400:]
+            # with the gateway's portfolio tool (the holdings setting): that one call, no memory, no router
+            gw_tools.update(at=time.time(), defs=[{"name": "memory_recall", "description": "기억"},
+                                                  {"name": "stock_quote", "description": "주가"},
+                                                  {"name": "portfolio", "description": "보유 종목 시세"}])
+
+            async def pf_tool(raw, session, on_say=None):
+                d = json.loads(raw[len(TOOL_TAG):])
+                ran.append(d)
+                return "애플 342.56달러 -1.90%, 엔비디아 125.53달러 -14.01% (11월 21일)"
+            globals()["run_tool"], route_lookup = pf_tool, route_holdings
+            ran.clear(), ann.clear()
+            globals()["llm_stream"] = announcer(["애플은 1.9%, 엔비디아는 14.01% 내렸어요."])
+            said = [x for x, *_ in asyncio.run(lrun("내가 가진 주식 얼마나 올랐어?", "tf10"))]
+            assert ran == [{"name": "portfolio", "args": {}}] and said == [LOOKUP_ACK, "애플은 1.9%, 엔비디아는 14.01% 내렸어요."], \
+                (ran, said)
             globals()["run_tool"], route_lookup = fake_run_tool, no_route
             # the call as it went: no tools at all, and Qwen only promised. Held, and the turn says it could not look
             gw_tools.update(at=time.time(), defs=[])
