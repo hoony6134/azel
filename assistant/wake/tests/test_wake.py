@@ -66,7 +66,7 @@ def make(tmp_path, handler=None, wall=None, open_url=None, **cfg):
     c = bw.DEFAULTS | {"log_path": str(tmp_path / "wake.jsonl"), "handoff": "headless",
                        "in_call_path": str(tmp_path / "in-call"), "enrolling_path": str(tmp_path / "enrolling"),
                        "utterance_dir": str(tmp_path / "azel"), "mic_live_path": str(tmp_path / "mic-live")} | cfg
-    extra = {k: v for k, v in {"wall": wall, "open_url": open_url}.items() if v}
+    extra = {k: v for k, v in {"wall": wall, "open_url": open_url}.items() if v} | {"spawn": lambda f, *a: f(*a)}
     lis = Listener(c, FakeOww(), FakeVad(), http, play, ack=(np.zeros(8000, np.int16), 16000),
                    flush=lambda: flushed.append(1), clock=clock, **extra)
     return lis, clock, played, flushed, requests
@@ -249,7 +249,7 @@ def test_wake_opens_the_app_with_the_primary_persona_and_stays_headless_free(tmp
                                     open_url=lambda u: opened.append(u) or True)
     lis.run(frames(clock, [(WAKE, 1), *utterance(), (SIL, 40)]))
     assert len(opened) == 1 and opened[0].startswith("azel://wake?persona=sohee_x&utterance=")
-    assert played == []  # no ack in one-breath mode, no /v1/turn, no reply audio
+    assert played == [16000]  # the ack only (no /v1/turn, no reply audio)
     assert [r.url.path for r in reqs] == ["/v1/personas"]
     assert log_lines(tmp_path)[0]["handoff"] == "app"
 
@@ -376,7 +376,8 @@ def test_one_breath_command_is_captured_after_the_wake_word_and_handed_over(tmp_
     assert f.stat().st_mode & 0o777 == 0o600
     assert (pcm == SPEECH).sum() == 5 * FRAME           # the command, not the wake word
     assert (pcm == WAKE).sum() == 0
-    assert not played and not any(r.url.path == '/v1/turn' for r in requests)                  # no ack over the user's speech, no headless turn
+    assert played == [16000] and not any(r.url.path == '/v1/turn' for r in requests)  # the ack, no headless turn
+    assert flushed == []  # the mic is not flushed: the command being said is kept
     assert log_lines(tmp_path)[0]["utterance"] == uid_of(opened[0])
 
 
@@ -466,3 +467,23 @@ def test_unwritable_utterance_dir_hands_over_without_the_file(tmp_path, capsys):
     lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
     assert opened == ["azel://wake?persona=azel"]  # no utterance= the app would wait for
     assert "utterance file failed" in capsys.readouterr().out and "utterance" not in log_lines(tmp_path)[0]
+
+
+def test_ack_plays_at_once_in_one_breath_mode_and_the_command_is_still_captured(tmp_path):
+    order, opened = [], []
+    lis, clock, played, flushed, _ = make(tmp_path, handoff="app", open_url=lambda u: order.append("open") or opened.append(u) or True)
+    real = lis._play
+    lis._play = lambda pcm, sr: order.append("ack") or real(pcm, sr)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 40)]))
+    assert order == ["ack", "open"]  # heard before the app is asked to open
+    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{opened[0].split('utterance=')[1]}.pcm").read_bytes(), "<i2")
+    assert (pcm == SPEECH).sum() == 4 * FRAME and flushed == []
+
+
+def test_without_a_fetched_ack_the_system_beep_plays_in_one_breath_mode(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(bw.subprocess, "run", lambda argv, **k: ran.append(argv))
+    lis, clock, played, *_ = make(tmp_path, handoff="app", open_url=lambda u: True)
+    lis.ack = None
+    lis.run(frames(clock, [(WAKE, 1), (SIL, 40)]))
+    assert played == [] and ran == [["afplay", "/System/Library/Sounds/Tink.aiff"]]

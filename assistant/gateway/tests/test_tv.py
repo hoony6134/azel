@@ -206,3 +206,17 @@ def test_build2_uses_the_structured_calendar_when_there_is():
 
     out = asyncio.run(tv.build2(deps2(calendar_rows=rows), NOW))
     assert out["calendar"] == [{"start": "21:00", "end": "22:00", "what": "스터디", "cal": "공부", "where": ""}]
+
+
+def test_tv_deps_infra_calls_cygnus_with_args(monkeypatch):
+    """tv.py asks d["infra"](name); cygnus.call takes (name, args). A one-arg fake once hid the TypeError (empty infra)."""
+    import cygnus
+    import gateway
+    seen = []
+
+    async def fake_call(name, args):
+        seen.append((name, args))
+        return "ok"
+
+    monkeypatch.setattr(cygnus, "call", fake_call)
+    assert asyncio.run(gateway.tv_deps()["infra"]("infra_health")) == "ok" and seen == [("infra_health", {})]

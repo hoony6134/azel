@@ -2455,7 +2455,7 @@ def tv_deps():
         n = sum(1 for t in rows if t and t.get("when") == "overnight" and t.get("status") == "scheduled")
         return {"count": n, "starts": (await load_settings())["overnight"]["window"][0]}
 
-    return {"infra": cyg.call, "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
+    return {"infra": lambda name: cyg.call(name, {}), "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
             "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
             "google_ok": lambda: google_status() == "connected", "calendar": calendar,
             "infra_raw": lambda n, a=None: cyg.call(n, a or {}, raw=True), "persona2": persona2, "overnight": overnight,
