@@ -24,7 +24,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 import uvicorn
@@ -700,6 +700,46 @@ end tell
 }
 
 
+# Spotify (no Premium, so no Web API): its own AppleScript commands for transport, `open -a Spotify <uri>` for play.
+OPEN = "/usr/bin/open"
+SPOTIFY_URI = re.compile(r"spotify:(?:search:[A-Za-z0-9%._~-]{1,200}|(?:track|album|artist|playlist):[A-Za-z0-9]{10,40})")
+_SP_NOT_RUNNING = 'if application "Spotify" is not running then return "not running"\n'
+SPOTIFY_SCRIPTS = {
+    "pause": _SP_NOT_RUNNING + 'tell application "Spotify" to pause\nreturn "paused"\n',
+    "resume": _SP_NOT_RUNNING + 'tell application "Spotify" to play\nreturn "playing"\n',
+    "next": _SP_NOT_RUNNING + 'tell application "Spotify" to next track\nreturn "next"\n',
+    "previous": _SP_NOT_RUNNING + 'tell application "Spotify" to previous track\nreturn "previous"\n',
+    "now_playing": _SP_NOT_RUNNING + """tell application "Spotify"
+  if player state is stopped then return "stopped"
+  return (player state as text) & ": " & (name of current track) & " - " & (artist of current track)
+end tell
+""",
+}
+SYSTEM_VOLUME = """on run argv
+set volume output volume (item 1 of argv as integer)
+return "volume " & (item 1 of argv)
+end run
+"""
+
+
+def spotify_uri(query: str | None, uri: str | None) -> str:
+    """The one URI Spotify may be opened with: a checked track/album/artist/playlist, or a search for the user's words."""
+    if uri:
+        if not SPOTIFY_URI.fullmatch(uri):
+            raise Refused("uri must be spotify:search:<encoded query> or spotify:track|album|artist|playlist:<id>")
+        return uri
+    q = " ".join((query or "").split())[:MUSIC_QUERY_MAX]
+    while len(quote(q, safe="")) > 200:
+        q = q[:-1]
+    return "spotify:search:" + quote(q, safe="") if q else ""
+
+
+def _spotify_open(uri: str) -> None:
+    r = subprocess.run([OPEN, "-a", "Spotify", uri], capture_output=True, text=True, timeout=15)
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip() or f"open exit {r.returncode}")[:300])
+
+
 def _osascript(script: str, *argv: str) -> str:
     r = subprocess.run([OSASCRIPT, "-", *argv], input=script, capture_output=True, text=True, timeout=15)
     if r.returncode:
@@ -711,13 +751,29 @@ def _osascript(script: str, *argv: str) -> str:
 
 
 @logged
-def music(action: str, query: str | None = None, volume: int | None = None) -> dict:
-    """Control Apple Music on this Mac. action: play (with `query`: a playlist, track, artist or album in the library;
-    without: continue), pause, resume, next, previous, volume (0-100, clamped), now_playing."""
+def music(action: str, query: str | None = None, volume: int | None = None, app: str = "apple",
+          uri: str | None = None) -> dict:
+    """Control music on this Mac. app: apple (Apple Music) or spotify. action: play (apple: `query` names a playlist,
+    track, artist or album in the library; spotify: opens a Spotify search for `query`, or a checked `uri`, which the
+    user then starts; neither: continue), pause, resume, next, previous, volume (0-100, clamped), now_playing."""
     if sys.platform != "darwin" or not CFG["music_enabled"]:
         raise Refused("music is only available on a Mac with music_enabled")
     if action not in MUSIC_ACTIONS:
         raise Refused(f"action must be one of {', '.join(MUSIC_ACTIONS)}")
+    if app not in ("apple", "spotify"):
+        raise Refused("app must be apple or spotify")
+    if app == "spotify":
+        if action == "volume":
+            if volume is None:
+                raise Refused("volume needs a number from 0 to 100")  # the system output volume
+            return {"status": "ok", "result": _osascript(SYSTEM_VOLUME, str(max(0, min(100, int(volume)))))}
+        if action == "play":
+            target = spotify_uri(query, uri)
+            if not target:
+                return {"status": "ok", "result": _osascript(SPOTIFY_SCRIPTS["resume"])}
+            _spotify_open(target)
+            return {"status": "ok", "result": f"opened {target} in Spotify; press play on the result"}
+        return {"status": "ok", "result": _osascript(SPOTIFY_SCRIPTS[action])}
     if action == "play":
         q = " ".join((query or "").split())[:MUSIC_QUERY_MAX]
         out = _osascript(MUSIC_SCRIPTS["play"], q) if q else _osascript(MUSIC_SCRIPTS["play_any"])

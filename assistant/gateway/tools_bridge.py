@@ -290,8 +290,9 @@ class Bridge:
         macs = sorted(n for n, (_, t) in where.items() if t == tool)
         if not macs:
             raise Fail("unavailable", "지금은 음악과 집 제어를 할 수 있는 맥이 연결돼 있지 않아요.")
-        call = {"music_play": lambda: {"action": "play", "query": str(args.get("query") or "")},
-                "music_control": lambda: {k: args[k] for k in ("action", "volume") if args.get(k) is not None},
+        call = {"music_play": lambda: {"action": "play", "query": str(args.get("query") or ""),
+                                       **({"app": args["app"]} if args.get("app") else {})},
+                "music_control": lambda: {k: args[k] for k in ("action", "volume", "app") if args.get(k) is not None},
                 "home_scene": lambda: {"scene": str(args["name"])}}[name]()
         res = await self.d["run_tool"]({"id": "bridge", "name": macs[0], "input": call}, where)
         text = str(res.get("content", ""))
@@ -852,13 +853,16 @@ MUSIC_PLAY = {
     "description": ("맥의 Apple Music으로 노래를 튼다. query는 사용자가 말한 노래·가수·앨범·플레이리스트 이름 그대로(라이브러리에서 "
                     "찾는다). query 없이 부르면 멈춘 곡을 이어서 튼다. 못 찾으면 못 찾았다고 말해."),
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
-        "query": {"type": "string", "maxLength": 100}}}}
+        "query": {"type": "string", "maxLength": 100},
+        "app": {"type": "string", "enum": ["apple", "spotify"],
+                "description": "apple(기본) 또는 spotify. spotify는 검색 화면을 열 뿐이라 사용자가 재생을 눌러야 한다고 알려 줘"}}}}
 MUSIC_CONTROL = {
     "name": "music_control",
     "description": "Apple Music 조작: pause(일시정지), resume(이어서), next(다음 곡), previous(이전 곡), volume(0~100), now_playing(지금 나오는 곡).",
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["action"], "properties": {
         "action": {"type": "string", "enum": ["pause", "resume", "next", "previous", "volume", "now_playing"]},
-        "volume": {"type": "integer", "description": "action이 volume일 때 0~100(벗어나면 맞춰 줌)"}}}}
+        "volume": {"type": "integer", "description": "action이 volume일 때 0~100(벗어나면 맞춰 줌; spotify는 시스템 볼륨)"},
+        "app": {"type": "string", "enum": ["apple", "spotify"]}}}}
 HOME_SCENE = {
     "name": "home_scene",
     "description": "사용자가 미리 허용해 둔 집 장면(조명 끄기, 영화 모드 등)을 실행한다. name은 허용된 장면 이름 그대로; 모르면 도구가 목록을 알려 준다.",
