@@ -57,6 +57,8 @@ DEFAULTS = {
     "command_timeout": 120,
     "delegate_timeout": 3600,
     "claude_bin": "claude",
+    # `claude setup-token` output, 0600. Only the delegate subprocess gets it (as CLAUDE_CODE_OAUTH_TOKEN), never run_command.
+    "claude_token_file": "~/.config/biseo/claude_oauth_token",
     "browse_enabled": True,
     "browse_timeout_s": 20,
     "browse_max_chars": 20_000,
@@ -566,9 +568,22 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     return res
 
 
-def _run_job(job: dict, argv: list[str], cwd: Path) -> None:
+def _claude_env() -> dict:
+    """The environment for `claude -p`: the daemon's own plus, when claude_token_file exists, the long-lived Claude
+    token. A file that others can read is refused, like the gateway does."""
+    env = dict(os.environ)
+    p = Path(CFG["claude_token_file"]).expanduser()
+    if p.is_file():
+        if p.stat().st_mode & 0o077:
+            raise Refused(f"{p} must not be readable by others (chmod 600)")
+        if tok := p.read_text().strip():
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    return env
+
+
+def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
     try:
-        out = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=CFG["delegate_timeout"])
+        out = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=CFG["delegate_timeout"])
         job["exit_code"] = out.returncode
         try:
             data = json.loads(out.stdout)
@@ -591,6 +606,7 @@ def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | Non
     if harness != "claude_code":
         raise Refused(f"unsupported harness: {harness}")
     wd = safe_path(cwd)
+    env = _claude_env()
     argv = [CFG["claude_bin"], "-p", task, "--permission-mode", "acceptEdits",
             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
             "--output-format", "json", "--append-system-prompt", NO_ATTRIBUTION]
@@ -600,7 +616,7 @@ def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | Non
     job = {"job_id": uuid.uuid4().hex[:12], "status": "running", "task": task, "cwd": str(wd),
            "model": model, "started": time.time()}
     JOBS[job["job_id"]] = job
-    threading.Thread(target=_run_job, args=(job, argv, wd), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job, argv, wd, env), daemon=True).start()
     return {"status": "ok", "job_id": job["job_id"]}
 
 
