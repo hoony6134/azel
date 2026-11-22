@@ -57,7 +57,7 @@ def test_task_runs_logs_steps_and_calls(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:  # the status is saved a moment before the call goes out
         time.sleep(0.02)
-    assert notes == [("call", "task", "맡기신 맥북 다운로드 폴더 정리 끝났어요. 파일 세 개를 정리했어요.", "azel")]
+    assert notes == [("call", "task", "맡기신 맥북 다운로드 폴더 정리 끝났어요. 파일 세 개를 정리했어요. 더 궁금한 거 있으면 물어보세요.", "azel")]
     assert t["backend"] == "claude_code" and t["fallback_reason"] == "API 키가 없어 Claude Code로 했어요."  # no key here
     assert [x["id"] for x in c.get("/v1/tasks").json()] == [t["id"]]
     row = g.fake.db["usage"][-1]  # a task runs on claude -p: counted as the subscription path, labelled as a task
@@ -346,12 +346,13 @@ def test_call_context_and_notify_change(tgw, monkeypatch):
     assert g.task_live[tid]["notify"] == "call"  # the runner's own copy changed
     asyncio.run(g.task_notify({**g.task_live[tid], "status": "done", "result": "끝"}))  # as the runner would at the end
     ctx = pushes[-1]["context"]
-    assert ctx["kind"] == "task" and ctx["id"] == tid and "과제" in ctx["label"] and "해줘" not in ctx["label"]
-    assert [f for f in frames if f.get("type") == "call"][-1]["context"] == ctx
+    assert ctx["kind"] == "task" and ctx["id"] == tid and ctx["label"].startswith("작업 완료: ") and "해줘" not in ctx["label"]
+    chip = [f for f in frames if f.get("type") == "call"][-1]["context"]  # the call screen's chip: the purpose itself
+    assert chip["id"] == tid and "과제" in chip["label"] and len(ctx["label"]) <= 14
     c.post(f"/v1/tasks/{tid}/cancel")
     assert c.patch(f"/v1/tasks/{tid}", json={"notify": "push"}).status_code == 409  # finished: nothing to change
     at = (g.datetime.now(g.KST) + g.timedelta(hours=1)).replace(microsecond=0).isoformat()
     item, _ = c.portal.call(g.schedule_create, {"at": at, "kind": "reminder", "note": "약 먹으라고 전화해줘",
                                                 "notify": "call"}, "app")
     c.portal.call(g.attempt, g.fake.db["schedule"][item["id"]], time.time())
-    assert pushes[-1]["context"] == {"kind": "schedule", "label": "약 먹기", "id": item["id"]}
+    assert pushes[-1]["context"] == {"kind": "schedule", "label": "알림: 약 먹기", "id": item["id"]}

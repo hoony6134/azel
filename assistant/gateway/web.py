@@ -118,3 +118,43 @@ async def fetch(url, client=None):
     finally:
         if client is None:
             await c.aclose()
+
+
+# ---------- SearXNG: the user's own metasearch (free, so local Qwen can search) ----------
+SEARXNG_URL = "https://search.infra.scian.xyz/search"
+SEARXNG_TIMEOUT_S = 6
+THIN = 240  # fewer snippet characters than this across the top results: read the top pages too
+
+
+def site_of(url):
+    return re.sub(r"^www\.", "", urlsplit(url).hostname or "")
+
+
+async def searxng(query, n=5, url=SEARXNG_URL, client=None, fetch_pages=True):
+    """{"text", "sources", "cost_usd": 0, "usage": {}, "engine": "searxng", "unresponsive": [...]}, or None when
+    it returned nothing. Engines that fail inside SearXNG (rate limits, CAPTCHAs) only show in "unresponsive"."""
+    c = client or httpx.AsyncClient(timeout=SEARXNG_TIMEOUT_S, follow_redirects=True)
+    try:
+        r = await c.get(url, params={"q": str(query)[:300], "format": "json", "language": "ko"})
+        r.raise_for_status()
+        d = r.json()
+    finally:
+        if client is None:
+            await c.aclose()
+    hits = [x for x in d.get("results") or [] if x.get("url", "").startswith(("http://", "https://"))][:max(1, min(n, 8))]
+    answers = [str(a.get("answer", a) if isinstance(a, dict) else a)[:300] for a in d.get("answers") or []]
+    boxes = [f"{b.get('infobox', '')}: {str(b.get('content', ''))[:300]}" for b in d.get("infoboxes") or []]
+    if not hits and not answers and not boxes:
+        return None
+    lines = [*answers, *boxes] + [f"- {x.get('title', '')[:80]} ({site_of(x['url'])}): {str(x.get('content', ''))[:300]}"
+                                  for x in hits]
+    if fetch_pages and sum(len(str(x.get("content", ""))) for x in hits[:3]) < THIN:
+        for x in hits[:2]:  # the snippets say little ("날씨 지도. 광주."): what the top pages themselves say
+            try:
+                page = await fetch(x["url"])
+                lines.append(f"[{site_of(x['url'])} 본문] {page['text'][:1200]}")
+            except Exception:  # noqa: BLE001  a page that won't load: the snippets still stand
+                continue
+    return {"text": "\n".join(lines)[:4000], "sources": [{"title": x.get("title", "")[:80], "url": x["url"]} for x in hits],
+            "cost_usd": 0.0, "usage": {}, "engine": "searxng",
+            "unresponsive": [e[0] if isinstance(e, list) else str(e) for e in d.get("unresponsive_engines") or []]}

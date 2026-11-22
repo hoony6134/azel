@@ -45,7 +45,7 @@ def test_mcp_server_for_claude_code(tgw):  # noqa: F811
     init = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).json()
     assert init["result"]["serverInfo"]["name"] == "azel"
     tools = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).json()["result"]["tools"]
-    assert [t["name"] for t in tools] == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "web_search", "web_fetch", "schedule_create"]
+    assert [t["name"] for t in tools] == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "web_search", "web_fetch", "music_play", "music_control", "home_scene", "schedule_create"]
     assert c.post("/v1/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"}).status_code == 202
     assert c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
         "name": "call_user", "arguments": {"reason": "다 됐어요"}}}).json()["result"]["isError"] is False
@@ -81,7 +81,7 @@ def test_api_backed_task_calls_when_done(tgw, monkeypatch):  # noqa: F811
     t = wait_for(c, r.json()["id"], ("done", "failed"))
     assert t["status"] == "done" and t["backend"] == "qwen" and t["result"] == "정리했어요." and t["cost_usd"] == 0.02
     assert seen["backend"] == "qwen" and seen["cfg"]["url"].endswith("/v1/chat/completions") and seen["persona"] == "azel"
-    assert notes == [("call", "task", "맡기신 다운로드 정리 끝났어요. 정리했어요.", "azel")]  # "call" on finish rings
+    assert notes == [("call", "task", "맡기신 다운로드 정리 끝났어요. 정리했어요. 더 궁금한 거 있으면 물어보세요.", "azel")]  # "call" on finish rings
     assert t["fallback_reason"] is None
     assert c.post("/v1/tasks", json={"goal": "x", "backend": "gpt"}).status_code == 400
 

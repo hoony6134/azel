@@ -15,6 +15,11 @@ approval_required = ["rm", "git push", "git reset --hard", "mv", "chmod", "chown
 # request in the app instead of a refusal. false on vd-spark, vd-core and sadr. sudo, secrets, wipes and sh -c are
 # refused either way.
 approve_unlisted = false
+# "gateway" (default): this daemon files and checks approvals with the gateway. "gateway-grant": for team devices
+# (vd-spark, vd-core) the gateway can reach but that cannot reach it: run_command answers needs_approval with a nonce
+# and runs only against a grant (approval id, device, command, cwd, nonce, exp, HMAC-SHA256 with this daemon's token)
+# the gateway signs after the user's tap. A grant never bypasses the hard denies.
+approval_via = "gateway"
 approval_wait_s = 120
 log_path = "~/.local/state/biseo/daemon.jsonl"   # tool-call JSON lines; used_approvals.txt sits beside it
 read_max_bytes = 256000
@@ -28,3 +33,9 @@ browse_enabled = true
 browse_timeout_s = 20     # capped at 20
 browse_max_chars = 20000
 browse_allow_private = []
+# macOS only. music(action, query?, volume?): Apple Music through fixed AppleScript templates (the query goes in as
+# argv). macOS asks once to let the daemon control Music (Automation). run_command still cannot run osascript.
+music_enabled = true
+# home(scene): runs `shortcuts run <name>` for these exact names only (one Shortcut per HomeKit scene, built in
+# the Shortcuts app). Empty = home refuses. Keep locks, garage doors and alarms out of this list.
+home_shortcuts = []   # e.g. ["azel-lights-off", "azel-movie"]

@@ -16,6 +16,8 @@ import time
 
 import httpx
 
+import tools_bridge as TB
+
 import claude_api
 from tools_bridge import args_of, openai_tools
 
@@ -37,7 +39,8 @@ async def run(backend, system, goal, bridge, cfg, budget_usd, max_minutes, cance
     deadline, spent, steps = time.monotonic() + max_minutes * 60, 0.0, 0
     caller = "qwen" if backend == "qwen" else "api"
     defs, where = await bridge.tools(caller)
-    defs = [d for d in defs if d["name"] != "create_task"]  # a task never starts another task
+    # a task never starts another task, rings, schedules or notifies: the runner reports back per the task's notify
+    defs = [d for d in defs if d["name"] not in TB.TASK_NEVER]
     try:
         if backend == "claude_api":
             loop = _claude(system, goal, defs, cfg)

@@ -81,7 +81,7 @@ def test_never_delegate_to_a_limited_device(sgw, monkeypatch):
     assert res["is_error"] and not any(m == "tools/call" for _, m, _ in calls)
     servers, allowed, run_settings, _ = g.run_args(asyncio.run(g.load_settings()), devs)
     assert servers["spark"]["headers"]["Authorization"] == "Bearer spark-daemon-tok"
-    assert json.loads(run_settings)["permissions"]["deny"] == ["mcp__spark__delegate"]
+    assert json.loads(run_settings)["permissions"]["deny"] == ["mcp__spark__delegate", "mcp__spark__home", "mcp__spark__music"]
 
 
 def test_static_entry_must_be_limited(tmp_path, monkeypatch):

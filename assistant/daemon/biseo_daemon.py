@@ -18,12 +18,13 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tomllib
 import uuid
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 import uvicorn
@@ -45,6 +46,10 @@ DEFAULTS = {
     # true on jh-only devices: a command not in allowed_commands becomes an approval request instead of a refusal.
     # Team devices (vd-spark, vd-core) and sadr keep false.
     "approve_unlisted": False,
+    # "gateway": the daemon files and checks approvals with the gateway itself. "gateway-grant": for devices the gateway
+    # can reach but that cannot reach it: the daemon answers needs_approval and runs only against a grant
+    # (HMAC with this daemon's token) the gateway signs after the user's tap.
+    "approval_via": "gateway",
     "approval_wait_s": 120,  # run_command(…, approval_id) on a still-pending approval waits this long for the tap
     "log_path": "~/.local/state/biseo/daemon.jsonl",
     "read_max_bytes": 256_000,
@@ -56,6 +61,8 @@ DEFAULTS = {
     "browse_timeout_s": 20,
     "browse_max_chars": 20_000,
     "browse_allow_private": [],
+    "music_enabled": True,  # macOS only: Apple Music through fixed AppleScript templates
+    "home_shortcuts": [],  # macOS only: the only Shortcuts home(scene) may run, by exact name; empty = home refuses
 }
 NO_ATTRIBUTION = "Never add Co-Authored-By or any AI attribution to commits, PRs or files."
 
@@ -338,6 +345,71 @@ def _used_file() -> Path:
     return CFG["log_path"].with_name("used_approvals.txt")
 
 
+GRANT_MAX_S = 600  # a grant may be valid for at most this long
+NONCE_TTL_S = 900  # an issued nonce is forgotten after this
+_issued: dict[str, float] = {}  # nonce -> issue time (memory only: a restart makes the gateway ask again)
+
+
+def grant_mac(token: str, approval_id: str, device: str, command: str, cwd: str, nonce: str, exp: int) -> str:
+    """HMAC-SHA256 over the grant's fields, keyed by the device's daemon token (the gateway computes the same)."""
+    msg = "azel-grant-v1\n" + json.dumps([approval_id, device, command, cwd, nonce, int(exp)],
+                                         ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(token.encode(), msg.encode(), "sha256").hexdigest()
+
+
+def _issue_nonce() -> str:
+    now = time.time()
+    with _lock:
+        for n in [n for n, t in _issued.items() if now - t > NONCE_TTL_S]:
+            del _issued[n]
+        if len(_issued) >= 500:
+            _issued.pop(min(_issued, key=_issued.get))
+        n = uuid.uuid4().hex
+        _issued[n] = now
+        return n
+
+
+def _used_nonces_file() -> Path:
+    return CFG["log_path"].with_name("used_nonces.txt")
+
+
+def _claim_nonce(nonce: str) -> None:
+    """Spend an issued nonce once; the used list is persisted (0600) so a restart cannot replay a grant."""
+    f = _used_nonces_file()
+    with _lock:
+        if nonce not in _issued:
+            raise Refused("grant nonce unknown or expired")
+        if f.exists() and nonce in f.read_text().split():
+            raise Refused("grant already used")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(nonce + "\n")
+        del _issued[nonce]
+
+
+def check_grant(grant: dict, command: str, wd: Path) -> None:
+    """Refuse unless the grant is the gateway's (HMAC), for exactly this device/command/cwd, unexpired, and its nonce
+    is one this daemon issued. Does not spend it."""
+    keys = ("approval_id", "device", "command", "cwd", "nonce", "exp", "mac")
+    if not isinstance(grant, dict) or any(k not in grant for k in keys):
+        raise Refused("malformed grant")
+    aid, dev, cmd, cwd, nonce, exp, mac = (grant[k] for k in keys)
+    if not all(isinstance(v, str) and v for v in (aid, dev, cmd, cwd, nonce, mac)) or isinstance(exp, bool) \
+            or not isinstance(exp, int):
+        raise Refused("malformed grant")
+    good = grant_mac(CFG["token"], aid, dev, cmd, cwd, nonce, exp)
+    if not hmac.compare_digest(good, mac):
+        raise Refused("grant signature does not match")
+    now = time.time()
+    if now > exp:
+        raise Refused("grant expired")
+    if exp - now > GRANT_MAX_S + 5:
+        raise Refused("grant is valid for too long")
+    if dev != CFG["id"] or cmd != command or cwd != str(wd):
+        raise Refused("grant does not match this device/command/cwd")
+
+
 def _claim_approval(approval_id: str) -> None:
     """Mark an approval id used (persisted, so a restart can't replay it)."""
     f = _used_file()
@@ -428,9 +500,11 @@ def search(query: str, path: str | None = None) -> dict:
 
 
 @logged
-def run_command(command: str, cwd: str | None = None, approval_id: str | None = None) -> dict:
+def run_command(command: str, cwd: str | None = None, approval_id: str | None = None,
+                grant: dict | None = None) -> dict:
     """Run an allowlisted command (no shell). Risky commands need the user's approval via the gateway:
-    the first call returns pending_approval; call again with the approval_id once approved."""
+    the first call returns pending_approval (or needs_approval with a nonce when this device uses grants);
+    call again with the approval_id, or with the gateway's signed `grant`, once approved."""
     tokens = shlex.split(command)
     if not tokens:
         raise Refused("empty command")
@@ -439,9 +513,21 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     unlisted = not listed and not risky
     if unlisted and not CFG["approve_unlisted"]:  # an approval id cannot unlock it here either
         raise Refused("command not in allowed_commands")
-    wd = run_dir(cwd, approved=bool(approval_id) or (unlisted and CFG["approve_unlisted"]))
-    hard_deny(tokens, wd)  # before any approval is created, and for approved runs too
-    if not approval_id and (risky or unlisted):
+    via_grant = CFG["approval_via"] == "gateway-grant"
+    if grant and approval_id:
+        raise Refused("send a grant or an approval id, not both")
+    if approval_id and via_grant:
+        raise Refused("this device takes a signed grant, not an approval id")
+    wd = run_dir(cwd, approved=bool(approval_id or grant) or (unlisted and CFG["approve_unlisted"]))
+    hard_deny(tokens, wd)  # before any approval is created, and for approved and granted runs too
+    if grant:
+        check_grant(grant, command, wd)
+        _claim_nonce(grant["nonce"])
+        approval_id = None  # the gateway already spent the approval and audits the run
+    elif not approval_id and via_grant and (risky or unlisted):  # nobody is contacted: the gateway proxy files it
+        return {"status": "needs_approval", "command": command, "cwd": str(wd), "device": CFG["id"],
+                "nonce": _issue_nonce()}
+    if not grant and not approval_id and (risky or unlisted):
         r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": "run_command", "command": command,
                                               "cwd": str(wd), **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
         if r.get("status") != "approved":  # an "always" rule approves it on the spot
@@ -464,7 +550,7 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
         except httpx.HTTPStatusError:
             raise Refused("approval already used, stale or not for this device")
         _claim_approval(approval_id)
-    else:
+    elif not grant:
         check_args(tokens, wd)
     try:
         out = subprocess.run(tokens, cwd=wd, capture_output=True, timeout=CFG["command_timeout"])
@@ -651,7 +737,153 @@ def browse(url: str, selector: str | None = None, wait_for: str | None = None, m
     return fut.result(timeout=limit + 30)
 
 
+# ---------- music and home (macOS only) ----------
+# osascript is denied in run_command; these two tools run it themselves from fixed templates. The script comes in on
+# stdin and the only caller-controlled text (the search query) as argv, never inside the script, so it cannot inject.
+
+OSASCRIPT, SHORTCUTS = "/usr/bin/osascript", "/usr/bin/shortcuts"
+MUSIC_ACTIONS = ("play", "pause", "resume", "next", "previous", "volume", "now_playing")
+MUSIC_QUERY_MAX = 100
+_NOT_RUNNING = 'if application "Music" is not running then return "not running"\n'
+MUSIC_SCRIPTS = {
+    # first user playlist whose name contains the query, else a library track by name, artist or album
+    "play": """on run argv
+set q to item 1 of argv
+tell application "Music"
+  set pls to (every user playlist whose name contains q)
+  if (count of pls) > 0 then
+    play item 1 of pls
+    return "playlist: " & (name of item 1 of pls)
+  end if
+  set ts to (every track of library playlist 1 whose name contains q)
+  if (count of ts) = 0 then set ts to (every track of library playlist 1 whose artist contains q)
+  if (count of ts) = 0 then set ts to (every track of library playlist 1 whose album contains q)
+  if (count of ts) = 0 then return "not found"
+  play item 1 of ts
+  return "track: " & (name of item 1 of ts) & " - " & (artist of item 1 of ts)
+end tell
+end run
+""",
+    "play_any": 'tell application "Music" to play\nreturn "playing"\n',
+    "pause": _NOT_RUNNING + 'tell application "Music" to pause\nreturn "paused"\n',
+    "resume": _NOT_RUNNING + 'tell application "Music" to play\nreturn "playing"\n',
+    "next": _NOT_RUNNING + 'tell application "Music" to next track\nreturn "next"\n',
+    "previous": _NOT_RUNNING + 'tell application "Music" to previous track\nreturn "previous"\n',
+    "volume": """on run argv
+if application "Music" is not running then return "not running"
+tell application "Music" to set sound volume to (item 1 of argv as integer)
+return "volume " & (item 1 of argv)
+end run
+""",
+    "now_playing": _NOT_RUNNING + """tell application "Music"
+  if player state is stopped then return "stopped"
+  return (player state as text) & ": " & (name of current track) & " - " & (artist of current track)
+end tell
+""",
+}
+
+
+# Spotify (no Premium, so no Web API): its own AppleScript commands for transport, `open -a Spotify <uri>` for play.
+OPEN = "/usr/bin/open"
+SPOTIFY_URI = re.compile(r"spotify:(?:search:[A-Za-z0-9%._~-]{1,200}|(?:track|album|artist|playlist):[A-Za-z0-9]{10,40})")
+_SP_NOT_RUNNING = 'if application "Spotify" is not running then return "not running"\n'
+SPOTIFY_SCRIPTS = {
+    "pause": _SP_NOT_RUNNING + 'tell application "Spotify" to pause\nreturn "paused"\n',
+    "resume": _SP_NOT_RUNNING + 'tell application "Spotify" to play\nreturn "playing"\n',
+    "next": _SP_NOT_RUNNING + 'tell application "Spotify" to next track\nreturn "next"\n',
+    "previous": _SP_NOT_RUNNING + 'tell application "Spotify" to previous track\nreturn "previous"\n',
+    "now_playing": _SP_NOT_RUNNING + """tell application "Spotify"
+  if player state is stopped then return "stopped"
+  return (player state as text) & ": " & (name of current track) & " - " & (artist of current track)
+end tell
+""",
+}
+SYSTEM_VOLUME = """on run argv
+set volume output volume (item 1 of argv as integer)
+return "volume " & (item 1 of argv)
+end run
+"""
+
+
+def spotify_uri(query: str | None, uri: str | None) -> str:
+    """The one URI Spotify may be opened with: a checked track/album/artist/playlist, or a search for the user's words."""
+    if uri:
+        if not SPOTIFY_URI.fullmatch(uri):
+            raise Refused("uri must be spotify:search:<encoded query> or spotify:track|album|artist|playlist:<id>")
+        return uri
+    q = " ".join((query or "").split())[:MUSIC_QUERY_MAX]
+    while len(quote(q, safe="")) > 200:
+        q = q[:-1]
+    return "spotify:search:" + quote(q, safe="") if q else ""
+
+
+def _spotify_open(uri: str) -> None:
+    r = subprocess.run([OPEN, "-a", "Spotify", uri], capture_output=True, text=True, timeout=15)
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip() or f"open exit {r.returncode}")[:300])
+
+
+def _osascript(script: str, *argv: str) -> str:
+    r = subprocess.run([OSASCRIPT, "-", *argv], input=script, capture_output=True, text=True, timeout=15)
+    if r.returncode:
+        err = r.stderr.strip()
+        if "-1743" in err or "not allowed" in err.lower():
+            raise Refused("macOS has not allowed this daemon to control Music (System Settings > Privacy & Security > Automation)")
+        raise RuntimeError(err[:300] or f"osascript exit {r.returncode}")
+    return r.stdout.strip()
+
+
+@logged
+def music(action: str, query: str | None = None, volume: int | None = None, app: str = "apple",
+          uri: str | None = None) -> dict:
+    """Control music on this Mac. app: apple (Apple Music) or spotify. action: play (apple: `query` names a playlist,
+    track, artist or album in the library; spotify: opens a Spotify search for `query`, or a checked `uri`, which the
+    user then starts; neither: continue), pause, resume, next, previous, volume (0-100, clamped), now_playing."""
+    if sys.platform != "darwin" or not CFG["music_enabled"]:
+        raise Refused("music is only available on a Mac with music_enabled")
+    if action not in MUSIC_ACTIONS:
+        raise Refused(f"action must be one of {', '.join(MUSIC_ACTIONS)}")
+    if app not in ("apple", "spotify"):
+        raise Refused("app must be apple or spotify")
+    if app == "spotify":
+        if action == "volume":
+            if volume is None:
+                raise Refused("volume needs a number from 0 to 100")  # the system output volume
+            return {"status": "ok", "result": _osascript(SYSTEM_VOLUME, str(max(0, min(100, int(volume)))))}
+        if action == "play":
+            target = spotify_uri(query, uri)
+            if not target:
+                return {"status": "ok", "result": _osascript(SPOTIFY_SCRIPTS["resume"])}
+            _spotify_open(target)
+            return {"status": "ok", "result": f"opened {target} in Spotify; press play on the result"}
+        return {"status": "ok", "result": _osascript(SPOTIFY_SCRIPTS[action])}
+    if action == "play":
+        q = " ".join((query or "").split())[:MUSIC_QUERY_MAX]
+        out = _osascript(MUSIC_SCRIPTS["play"], q) if q else _osascript(MUSIC_SCRIPTS["play_any"])
+        return {"status": "not_found" if out == "not found" else "ok", "result": out}
+    if action == "volume":
+        if volume is None:
+            raise Refused("volume needs a number from 0 to 100")
+        return {"status": "ok", "result": _osascript(MUSIC_SCRIPTS["volume"], str(max(0, min(100, int(volume)))))}
+    return {"status": "ok", "result": _osascript(MUSIC_SCRIPTS["now_playing" if action == "now_playing" else action])}
+
+
+@logged
+def home(scene: str) -> dict:
+    """Run one of the user's allowed HomeKit scenes (a Shortcut in the daemon's home_shortcuts list, exact name)."""
+    names = CFG["home_shortcuts"]
+    if sys.platform != "darwin" or not names:
+        raise Refused("home is only available on a Mac with home_shortcuts set")
+    if scene not in names or scene.startswith("-"):
+        raise Refused(f"unknown scene; allowed: {', '.join(names)}")
+    r = subprocess.run([SHORTCUTS, "run", scene], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip() or f"shortcuts exit {r.returncode}")[:300])
+    return {"status": "ok", "scene": scene, "result": r.stdout.strip()[:300]}
+
+
 TOOLS = [list_dir, read_file, search, run_command, delegate, job_status, list_jobs, browse]
+MAC_TOOLS = [music, home]  # registered on macOS only
 
 
 # ---------- HTTP app ----------
@@ -684,7 +916,7 @@ def build_app(cfg: dict):
     CFG.clear()
     CFG.update(cfg)
     server = MCPServer(name=f"biseo-daemon-{cfg['id']}")
-    for t in TOOLS:
+    for t in [*TOOLS, *(MAC_TOOLS if sys.platform == "darwin" else [])]:
         server.tool()(t)
     # Host-header check (DNS rebinding) for our bind address; the bearer token is the real gate.
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=True,

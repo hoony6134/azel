@@ -482,11 +482,12 @@ def get_approval(aid: str):
 
 class Decision(BaseModel):
     approve: bool
+    expire: bool = False  # nobody decided in time: the gateway marks it expired (not "rejected")
 
 
 @app.post("/v1/state/approvals/{aid}", dependencies=[v1])
 def decide_approval(aid: str, d: Decision):
-    status = "approved" if d.approve else "rejected"
+    status = "expired" if d.expire else "approved" if d.approve else "rejected"
     if not db(f"update {STATE}.approvals set status=%s, decided=now() where id=%s and status='pending' returning id",
               (status, aid)):
         raise HTTPException(409, "not pending")
@@ -564,7 +565,7 @@ class ProactiveEntry(BaseModel):
     call: bool = False
     urgency: int = Field(0, ge=0, le=5)
     reason: str = Field("", max_length=500)
-    opening: str = Field("", max_length=500)
+    opening: str = Field("", max_length=4000)
     reason_hash: str = Field("", max_length=64)
     called: bool = False
     blocked_by: str | None = Field(None, max_length=40)

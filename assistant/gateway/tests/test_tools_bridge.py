@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -227,7 +228,7 @@ def test_agent_loop_openai_backend_runs_tools_and_caps(monkeypatch):
     assert [e["tool"] for e in evs if e.get("phase") == "tool_start"] == ["infra_health", "call_user"]
     assert w.calls[0][2] == "luna" and seen[1]["messages"][-1]["role"] == "tool"
     names = {t["function"]["name"] for t in seen[0]["tools"]}
-    assert "macbook__delegate" not in names and "call_user" in names  # qwen's tool set
+    assert "macbook__delegate" not in names and "call_user" not in names  # a task never rings: the runner does
 
     seen, transport = fake_openai([[("infra_health", {})]] * 50)
     evs = collect(agent_loop.run("nim", "S", "loop", w.bridge(), cfg | {"key": "k"}, 0.003, 30, never))
@@ -271,7 +272,7 @@ def test_schedule_task_and_approval_tools():
     b = w.bridge()
     for note, when in (("약 먹기", "2026-11-22T08:00:00+09:00"), ("회의 준비", "2026-11-22T09:00:00+09:00")):
         run(b.call("call_user", {"when": when, "reason": note}, caller="app"))
-    assert [t["name"] for t in run(b.tools("api"))[0]][3:18] == [t["name"] for t in TB.OWN_TOOLS]
+    assert [t["name"] for t in run(b.tools("api"))[0]][3:21] == [t["name"] for t in TB.OWN_TOOLS]
     assert run(b.call("schedule_list", {}))["content"] == "예약된 전화가 2개 있어요."
     assert run(b.call("schedule_cancel", {"description": "준비"}))["content"] == "내일 8시 예약을 취소했어요."
     assert "골라 주세요" in run(b.call("call_user", {"when": "2026-11-22T10:00:00+09:00", "reason": "약 먹기 두번째"},
@@ -485,3 +486,149 @@ def test_injected_actions_need_a_confirmed_read_back():
     assert r["ok"]
     b.d["who"] = lambda: "ask:azel:call-2"  # another run, nothing read: acts as before
     assert run(b.run("create_task", {"goal": "정리", "notify": "none"}, caller="qwen"))["ok"]
+
+
+class MacWorld(World):
+    """macbook with the daemon's music and home tools; answers like the daemon does."""
+    reply = {"status": "ok", "result": "playing"}
+
+    async def device_tools(self, devices):
+        names = ["list_dir", "music", "home"]
+        return ([{"name": f"macbook__{n}", "description": n, "input_schema": {"type": "object"}} for n in names],
+                {f"macbook__{n}": ("http://mac", n) for n in names})
+
+    async def run_tool(self, block, where):
+        self.run.append((block["name"], dict(block["input"])))
+        return {"content": json.dumps(self.reply), "is_error": False}
+
+
+def test_music_and_home_actions_reach_the_mac_daemon_without_approval_and_hide_the_raw_tools():
+    w = MacWorld()
+    b = w.bridge()
+    for caller in ("api", "qwen"):
+        names = [t["name"] for t in run(b.tools(caller))[0]]
+        assert {"music_play", "music_control", "home_scene", "macbook__list_dir"} <= set(names)
+        assert "macbook__music" not in names and "macbook__home" not in names
+    r = run(b.call("music_play", {"query": "아이유"}, caller="qwen"))  # the local model needs no approval for this
+    assert r["content"] == "playing" and not r["is_error"]
+    run(b.call("music_control", {"action": "volume", "volume": 300}))
+    run(b.call("music_control", {"action": "next"}))
+    w.reply = {"status": "ok", "result": "scene done"}
+    run(b.call("home_scene", {"name": "azel-movie"}))
+    assert w.run == [("macbook__music", {"action": "play", "query": "아이유"}),
+                     ("macbook__music", {"action": "volume", "volume": 300}),
+                     ("macbook__music", {"action": "next"}),
+                     ("macbook__home", {"scene": "azel-movie"})]
+
+
+def test_music_and_home_errors_become_spoken_failures():
+    w = MacWorld()
+    b = w.bridge()
+    w.reply = {"status": "not_found", "result": "not found"}
+    assert "못 찾았어요" in run(b.call("music_play", {"query": "없는 곡"}))["content"]
+    w.reply = {"status": "refused", "reason": "unknown scene; allowed: azel-movie"}
+    r = run(b.call("home_scene", {"name": "no-such-scene"}))
+    assert r["is_error"] and "allowed: azel-movie" in r["content"]
+    assert run(b.call("music_control", {"action": "explode"}))["is_error"]  # schema: not in the enum
+    w2 = World()  # no daemon with music: say so
+    assert "맥이 연결돼 있지 않아요" in run(w2.bridge().call("music_control", {"action": "pause"}))["content"]
+
+
+def test_home_scene_after_a_web_read_needs_the_user_to_confirm():
+    w = MacWorld()
+    b = w.bridge()
+    b.d["who"] = lambda: "ask:s1"
+    b.tainted["ask:s1"] = time.monotonic()
+    r = run(b.call("home_scene", {"name": "azel-movie"}))
+    assert "확인할게요" in r["content"] and w.run == []
+    assert not run(b.call("home_scene", {"name": "azel-movie", "confirmed": True}))["is_error"] and len(w.run) == 1
+
+
+def test_risky_home_scene_names_always_need_a_confirmed_yes():
+    w = MacWorld()
+    b = w.bridge()
+    for scene in ("front door unlock", "garage-open", "보안 해제", "azel-alarm-off"):
+        assert "확인할게요" in run(b.call("home_scene", {"name": scene}))["content"], scene
+    assert w.run == []
+    assert not run(b.call("home_scene", {"name": "garage-open", "confirmed": True}))["is_error"] and len(w.run) == 1
+    assert not run(b.call("home_scene", {"name": "azel-lights-off"}))["is_error"]  # an ordinary scene: no extra step
+
+
+def test_grant_mac_matches_the_daemons_golden_value():
+    assert TB.grant_mac("tok", "ap-1", "vd-spark", "ls -la", "/home/u/x", "n0nce", 1700000000) == "78a6c4f27e365ff9965f2d61eb1bfeec26de56c0587bd4ab0a6013c5eea7f0f7"
+
+
+class GrantWorld(World):
+    """vd-spark: a daemon that cannot reach us. needs_approval first, a verified grant second."""
+    verdicts: list
+
+    def __init__(self):
+        super().__init__()
+        self.verdicts, self.created, self.used, self.audit, self.decision = [], [], [], [], "approved"
+
+    async def device_tools(self, devices):
+        return ([{"name": "spark__run_command", "description": "x", "input_schema": {"type": "object"}}],
+                {"spark__run_command": ("http://spark", "run_command")})
+
+    async def run_tool(self, block, where):
+        inp = block["input"]
+        self.run.append((block["name"], dict(inp)))
+        g = inp.get("grant")
+        if not g:
+            return {"content": json.dumps({"status": "needs_approval", "command": inp["command"], "cwd": "/home/u/proj",
+                                           "device": "vd-spark", "nonce": "nonce1"}), "is_error": False}
+        want = TB.grant_mac("spark-token", g["approval_id"], g["device"], g["command"], g["cwd"], g["nonce"], g["exp"])
+        self.verdicts.append(want == g["mac"] and g["exp"] - time.time() <= 600)
+        return {"content": json.dumps({"status": "ok", "exit_code": 0, "stdout": "done"}), "is_error": False}
+
+    async def state(self, method, path, body=None, **params):
+        if path.startswith("/v1/state/approvals/") and path.endswith("/use"):
+            self.used.append((path, body))
+            return {"status": "used"}
+        if path.startswith("/v1/state/approvals/") and method == "GET":
+            return {"status": self.decision}
+        return await super().state(method, path, body, **params)
+
+    def bridge(self):
+        b = super().bridge()
+
+        async def create(body):
+            self.created.append(body)
+            return {"approval_id": "ap-9", "status": "pending"}
+
+        async def ran(aid, body):
+            self.audit.append((aid, body))
+        b.d.update(approval_create=create, approval_ran=ran, device_token=lambda url: "spark-token",
+                   who=lambda: "ask:s1")
+        return b
+
+
+def test_needs_approval_becomes_an_approval_row_then_a_signed_grant(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = GrantWorld()
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert r["content"] and json.loads(r["content"])["stdout"] == "done" and not r["is_error"]
+    assert w.created == [{"device": "vd-spark", "tool": "run_command", "command": "pwd", "cwd": "/home/u/proj",
+                          "requester": "ask:s1"}]
+    assert w.used[0][1] == {"device": "vd-spark", "command": "pwd", "cwd": "/home/u/proj", "window_s": 600}
+    assert w.verdicts == [True]  # the daemon would accept this signature
+    sent = w.run[1][1]
+    assert sent["cwd"] == "/home/u/proj" and sent["grant"]["approval_id"] == "ap-9" and "approval_id" not in sent
+    assert w.audit == [("ap-9", {"exit_code": 0, "status": "ok"})]
+    assert r["approval"] == "approved"
+
+
+def test_a_denied_grant_request_runs_nothing(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = GrantWorld()
+    w.decision = "rejected"
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert r["is_error"] and r["approval"] == "denied" and len(w.run) == 1 and w.used == []
+
+
+def test_needs_approval_parser_ignores_look_alikes():
+    assert TB.needs_approval("ran ls") is None
+    assert TB.needs_approval(json.dumps({"status": "needs_approval", "command": "x"})) is None  # missing fields
+    ok = {"status": "needs_approval", "command": "x", "cwd": "/c", "device": "d", "nonce": "n"}
+    assert TB.needs_approval(json.dumps(ok)) == ok
+    assert TB.needs_approval("stdout: needs_approval") is None

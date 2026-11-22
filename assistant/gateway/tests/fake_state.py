@@ -111,7 +111,8 @@ def make():
         a = db["approvals"].get(aid)
         if not a or a["status"] != "pending":
             raise HTTPException(409, "not pending")
-        a.update(status="approved" if body["approve"] else "rejected", decided=time.time())
+        a.update(status="expired" if body.get("expire") else "approved" if body["approve"] else "rejected",
+                 decided=time.time())
         return {"id": aid, "status": a["status"]}
 
     @app.post("/v1/state/approvals/{aid}/use")

@@ -14,6 +14,8 @@ Tools:
 The gateway wires it with its own functions (Bridge(...)), so this module holds the rules, not the plumbing.
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import re
 import time
@@ -28,6 +30,29 @@ APPROVAL_POLL_S = 2
 CALL_CAP = 20  # user-requested calls a day, apart from the autonomous-call limits
 ASK_APPROVAL = "앱에서 허용해 주세요."
 PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
+GRANT_S = 300  # a signed grant is valid this long (the daemon refuses more than 10 minutes)
+
+
+def grant_mac(token, approval_id, device, command, cwd, nonce, exp):
+    """HMAC-SHA256 over the grant fields, keyed by the device's daemon token; biseo_daemon.grant_mac is the twin."""
+    msg = "azel-grant-v1\n" + json.dumps([approval_id, device, command, cwd, nonce, int(exp)],
+                                         ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def needs_approval(text):
+    """The daemon's `needs_approval` answer (it could not reach us) as a dict, or None."""
+    if '"needs_approval"' not in text.replace('\\"', '"'):
+        return None
+    try:
+        out = json.loads(text[text.index("{"):text.rindex("}") + 1])
+    except ValueError:
+        return None
+    ok = isinstance(out, dict) and out.get("status") == "needs_approval" \
+        and all(isinstance(out.get(k), str) and out[k] for k in ("command", "cwd", "device", "nonce"))
+    return out if ok else None
+
+
 READ_TOOLS = {"list_dir", "read_file", "search", "browse", "job_status", "list_jobs"}
 
 CALL_USER = {
@@ -107,7 +132,8 @@ OWN_TOOLS = None  # set below: the assistant's own tools, in the order models se
 CREATE_TASK = {
     "name": "create_task",
     "description": ("여러 단계가 필요한 일을 백그라운드 작업으로 맡긴다(정리, 조사, 기기에서 하는 작업). 끝나거나 실패하거나 승인이 "
-                    "필요하면 notify대로 알린다: call(전화), push(알림), none."),
+                    "필요하면 notify대로 알린다: call(전화), push(알림), none. 이미 맡긴 작업에 '그 작업 끝나면 전화해 줘'만 "
+                    "덧붙이는 말이면 새 작업이 아니다: 그 말을 goal로 그대로 보내면 방금 맡긴 작업의 알림만 바뀐다."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["goal"], "properties": { "confirmed": CONFIRMED,
         "goal": {"type": "string", "maxLength": 2000}, "device": {"type": "string", "maxLength": 32},
         "notify": {"type": "string", "enum": ["call", "push", "none"]},
@@ -123,8 +149,19 @@ CREATE_TASK = {
 # in the same run (ask or task), a side-effect action from a model needs a read-back the user confirmed.
 TAINT_TOOLS = {"web_search", "web_fetch", "memory_recall", "people_lookup"}
 SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "schedule_update": "예약 변경",
-                "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기"}
+                "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기", "home_scene": "집 장면 실행"}
 TAINT_S = 600
+
+
+TASK_NEVER = {"create_task", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send"}
+SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
+STORING = {"remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task"}
+
+
+def stores(name, args):
+    """Would this action leave something behind? call_user only with a time or a rule (ringing now stores nothing)."""
+    return name in STORING or (name == "call_user" and any(args.get(k) for k in
+                                                           ("when", "when_text", "repeat_cron", "repeat_text")))
 
 
 class Bridge:
@@ -142,13 +179,17 @@ class Bridge:
     async def tools(self, caller="api"):
         """Messages-API definitions of everything this caller may use, and where device tools run."""
         dev_defs, where = await self.d["device_tools"](await self.d["fresh_devices"]())
+        dev_defs = [t for t in dev_defs if where[t["name"]][1] not in MAC_TOOL_NAMES]  # reached as music_* / home_scene
         if caller in ("qwen", "voice"):  # a voice turn of any model never delegates; tasks do
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
         cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
-        own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if await self.mode() == "local" else OWN_TOOLS
+        # local mode: web_search only through the user's own SearXNG, and only while it answers
+        local_no_web = await self.mode() == "local" and not await self.web_ok()
+        own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if local_no_web else OWN_TOOLS
         g_defs, _ = self.d.get("google", lambda: ([], None))()
-        return [*dev_defs, *own, *cyg_defs, *g_defs], where
+        s_defs, _ = self.d.get("spotify", lambda: ([], None))()
+        return [*dev_defs, *own, *cyg_defs, *g_defs, *s_defs], where
 
     # ---------- one call ----------
     async def call(self, name, args, persona_id=None, caller="api", on_progress=None, where=None):
@@ -166,6 +207,10 @@ class Bridge:
             if name in OWN_SCHEMAS:
                 check_args(OWN_SCHEMAS[name], args)
             who = self.d.get("who", lambda: "")()
+            if who.startswith("task:") and name in TASK_NEVER:  # notifying is the runner's job, per the task's notify
+                raise Fail("invalid", "작업 중에는 전화·알림·예약을 하지 않아요. 끝나면 정해진 방법으로 알려 드려요.")
+            if caller != "app" and self.d.get("secret", lambda: False)() and stores(name, args):
+                raise Fail("invalid", SECRET_LINE)  # a secret call reads, it never writes
             if name in SIDE_EFFECTS and caller != "app" and who and args.get("confirmed") is not True \
                     and time.monotonic() - self.tainted.get(who, -1e9) < TAINT_S:
                 what = str(args.get("when_text") or args.get("goal") or args.get("text") or args.get("description")
@@ -248,9 +293,11 @@ class Bridge:
             return await self.approval_status(args)
         if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
             return await getattr(self, name)(args, persona_id)
+        if name in MAC_ACTIONS:
+            return await self.mac(name, args, where, caller)
         if name == "web_search":
-            if await self.mode() == "local":  # Haiku-backed: not in local mode (web_fetch stays)
-                raise Fail("unavailable", "로컬 모드에서는 웹 검색을 못 해요.")
+            if await self.mode() == "local" and not await self.web_ok():  # SearXNG down: no paid search in local
+                raise Fail("unavailable", "로컬 모드에서는 지금 웹 검색을 못 해요.")
             q = str(args["query"]).strip()
             if not q:
                 raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
@@ -260,14 +307,15 @@ class Bridge:
             first = re.split(r"(?<=[.!?。])\s+|\n", r["text"].strip())[0] if r["text"] else "찾은 결과가 없어요."
             lead = f"[{site} 기준] " if site else ""  # the citation in front, where a model copies it from
             return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
-                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마.)"
+                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마. 같은 걸 다시 검색하지 " \
+                "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
             except ValueError as e:
                 raise Fail("invalid", str(e))
             return r["text"][:200], r, f"{r['text']}\n(출처: {r['url']}; 말할 때는 사이트 이름만.)"
-        for source in ("cygnus", "google"):  # read-only sources with their own allowlist and checks
+        for source in ("cygnus", "google", "spotify"):  # sources with their own allowlist and checks
             defs, run = self.d.get(source, lambda: ([], None))()
             if run and name in {t["name"] for t in defs}:
                 return await run(name, args)
@@ -276,6 +324,37 @@ class Bridge:
         if name not in where:
             raise Fail("not_found", f"없는 도구예요: {str(name)[:40]}")
         return await self.device(name, args, where, caller, on_progress)
+
+    async def mac(self, name, args, where, caller):
+        """music_play / music_control / home_scene: the Mac daemon's narrow `music` / `home` tool (its own checks apply)."""
+        tool = MAC_ACTIONS[name]
+        if name == "home_scene" and RISKY_SCENE.search(str(args.get("name") or "")) and args.get("confirmed") is not True \
+                and caller != "app":
+            q = f"'{str(args['name'])[:40]}' 장면은 문이나 보안과 관계될 수 있어서 확인할게요. 실행할까요?"
+            raise Need("confirm", q, f"아직 아무것도 하지 않았어요. 사용자에게 '{q}'라고 묻고, 맞다고 하면 같은 내용에 "
+                       "confirmed=true를 더해 다시 불러.", resend={**args, "confirmed": True})
+        if where is None:
+            _, where = await self.tools(caller)
+        macs = sorted(n for n, (_, t) in where.items() if t == tool)
+        if not macs:
+            raise Fail("unavailable", "지금은 음악과 집 제어를 할 수 있는 맥이 연결돼 있지 않아요.")
+        call = {"music_play": lambda: {"action": "play", "query": str(args.get("query") or ""),
+                                       **({"app": args["app"]} if args.get("app") else {})},
+                "music_control": lambda: {k: args[k] for k in ("action", "volume", "app") if args.get(k) is not None},
+                "home_scene": lambda: {"scene": str(args["name"])}}[name]()
+        res = await self.d["run_tool"]({"id": "bridge", "name": macs[0], "input": call}, where)
+        text = str(res.get("content", ""))
+        try:
+            out = json.loads(text)
+        except ValueError:
+            out = {"status": "error" if res.get("is_error") else "ok", "result": text}
+        status = out.get("status", "ok") if isinstance(out, dict) else "ok"
+        if status == "not_found":
+            raise Fail("not_found", "라이브러리에서 못 찾았어요.")
+        if status != "ok":
+            why = str(out.get("reason") or out.get("error") or text)[:200]
+            raise Fail("failed", f"실행하지 못했어요: {why}")
+        return str(out.get("result") or "했어요.")[:200], out
 
     async def device(self, name, args, where, caller, on_progress):
         url, tool = where[name]
@@ -291,6 +370,8 @@ class Bridge:
         text = str(res.get("content", ""))
         if m := PENDING_RE.search(text.replace('\\"', '"')):
             return await self.after_approval(name, args, m.group(1), where, on_progress)
+        if na := needs_approval(text):
+            return await self.grant_flow(name, args, na, where, on_progress)
         return {"content": text, "is_error": bool(res.get("is_error")), "waited_s": 0}
 
     async def after_approval(self, name, args, aid, where, on_progress):
@@ -303,7 +384,10 @@ class Bridge:
             if a.get("status") == "approved":
                 res = await self.d["run_tool"]({"id": "bridge", "name": name, "input": {**args, "approval_id": aid}},
                                                where)
-                return {"content": str(res.get("content", "")), "is_error": bool(res.get("is_error")),
+                text = str(res.get("content", ""))
+                if na := needs_approval(text):  # a grant device cannot spend an approval id: file one it can
+                    return await self.grant_flow(name, args, na, where, on_progress)
+                return {"content": text, "is_error": bool(res.get("is_error")),
                         "waited_s": time.monotonic() - t0, "approval": "approved"}
             if a.get("status") == "rejected":
                 return {"content": "사용자가 그 실행을 거절했어요.", "is_error": True,
@@ -311,6 +395,47 @@ class Bridge:
             await asyncio.sleep(APPROVAL_POLL_S)
         return {"content": "5분 안에 허용되지 않아서 실행하지 않았어요.", "is_error": True,
                 "waited_s": time.monotonic() - t0, "approval": "expired"}
+
+    async def grant_flow(self, name, args, na, where, on_progress):
+        """A daemon that cannot reach us answered needs_approval: file the approval here (push, expiry, rules, audit),
+        wait for the tap as always, spend it, then re-call with a grant the daemon can check with its own token."""
+        aid = (await self.d["approval_create"]({"device": na["device"], "tool": "run_command", "command": na["command"],
+                                                "cwd": na["cwd"], "requester": self.d.get("who", lambda: "")()}))["approval_id"]
+        if on_progress:
+            await on_progress(ASK_APPROVAL)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < APPROVAL_WAIT_S:
+            a = await self.d["state"]("GET", f"/v1/state/approvals/{aid}") or {}
+            if a.get("status") == "approved":
+                return await self.run_granted(name, args, na, aid, where, time.monotonic() - t0)
+            if a.get("status") == "rejected":
+                return {"content": "사용자가 그 실행을 거절했어요.", "is_error": True,
+                        "waited_s": time.monotonic() - t0, "approval": "denied"}
+            await asyncio.sleep(APPROVAL_POLL_S)
+        return {"content": "5분 안에 허용되지 않아서 실행하지 않았어요.", "is_error": True,
+                "waited_s": time.monotonic() - t0, "approval": "expired"}
+
+    async def run_granted(self, name, args, na, aid, where, waited):
+        url, _ = where[name]
+        try:  # spend it centrally: atomic, once, for this device/command/cwd, within the run window
+            await self.d["state"]("POST", f"/v1/state/approvals/{aid}/use",
+                                  {"device": na["device"], "command": na["command"], "cwd": na["cwd"], "window_s": 600})
+        except Exception:  # noqa: BLE001
+            return {"content": "허용이 이미 쓰였거나 오래돼서 실행하지 않았어요.", "is_error": True, "waited_s": waited}
+        exp = int(time.time()) + GRANT_S
+        grant = {"approval_id": aid, "device": na["device"], "command": na["command"], "cwd": na["cwd"],
+                 "nonce": na["nonce"], "exp": exp,
+                 "mac": grant_mac(self.d["device_token"](url), aid, na["device"], na["command"], na["cwd"], na["nonce"], exp)}
+        res = await self.d["run_tool"]({"id": "bridge", "name": name,
+                                        "input": {**{k: v for k, v in args.items() if k != "approval_id"},
+                                                  "command": na["command"], "cwd": na["cwd"], "grant": grant}}, where)
+        text = str(res.get("content", ""))
+        try:  # the daemon cannot call us back: the audit row is ours
+            out = json.loads(text)
+            await self.d["approval_ran"](aid, {"exit_code": out.get("exit_code"), "status": out.get("status")})
+        except Exception:  # noqa: BLE001  the audit never fails the run
+            pass
+        return {"content": text, "is_error": bool(res.get("is_error")), "waited_s": waited, "approval": "approved"}
 
     # ---------- the assistant's own tools ----------
     async def call_user(self, args, persona_id, caller="api"):
@@ -359,6 +484,9 @@ class Bridge:
         await self.d["place_call"]("user_request", f"말씀하신 대로 전화드렸어요. {reason}", pid)
         await self.log_call(reason, None, pid)
         return "지금 전화를 걸게요."
+
+    async def web_ok(self):
+        return await self.d["web_ok"]() if "web_ok" in self.d else False
 
     async def mode(self):
         return await self.d["mode"]() if "mode" in self.d else "auto"
@@ -645,8 +773,11 @@ class Bridge:
                 **{k: args[k] for k in ("budget_usd", "max_minutes") if k in args},
                 **({"persona": args.get("persona") or persona_id} if args.get("persona") or persona_id else {})}
         t = await self.d["task_create"](body, "app" if caller == "app" else "tool")
-        how = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림으로 알려 드릴게요.", "none": ""}[notify]
-        return f"작업으로 맡겼어요. {how}".strip() + f" (작업 {t['id']})", \
+        how = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림으로 알려 드릴게요.", "none": ""}[t.get("notify", notify)]
+        if t.get("notify_updated"):  # a follow-up about the task already running: its notify changed, nothing new
+            return f"네, 맡기신 작업이 {how}".strip() + f" (작업 {t['id']})", \
+                self.d.get("task_view", lambda t, full=False: t)(t, True)
+        return " ".join(x for x in (t.get("note"), f"작업으로 맡겼어요. {how}".strip()) if x) + f" (작업 {t['id']})", \
             self.d.get("task_view", lambda t, full=False: t)(t, True)
 
 
@@ -820,13 +951,40 @@ WEB_FETCH = {
     "description": "웹 페이지 하나를 읽어 글만 돌려준다(http/https 주소만, 내부 주소는 안 됨). 출처는 사이트 이름만 말해.",
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["url"], "properties": {
         "url": {"type": "string", "maxLength": 2000}}}}
+MUSIC_PLAY = {
+    "name": "music_play",
+    "description": ("맥의 Apple Music으로 노래를 튼다. query는 사용자가 말한 노래·가수·앨범·플레이리스트 이름 그대로(라이브러리에서 "
+                    "찾는다). query 없이 부르면 멈춘 곡을 이어서 튼다. 못 찾으면 못 찾았다고 말해."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "query": {"type": "string", "maxLength": 100},
+        "app": {"type": "string", "enum": ["apple", "spotify"],
+                "description": "apple(기본) 또는 spotify. spotify는 검색 화면을 열 뿐이라 사용자가 재생을 눌러야 한다고 알려 줘"}}}}
+MUSIC_CONTROL = {
+    "name": "music_control",
+    "description": "Apple Music 조작: pause(일시정지), resume(이어서), next(다음 곡), previous(이전 곡), volume(0~100), now_playing(지금 나오는 곡).",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["action"], "properties": {
+        "action": {"type": "string", "enum": ["pause", "resume", "next", "previous", "volume", "now_playing"]},
+        "volume": {"type": "integer", "description": "action이 volume일 때 0~100(벗어나면 맞춰 줌; spotify는 시스템 볼륨)"},
+        "app": {"type": "string", "enum": ["apple", "spotify"]}}}}
+HOME_SCENE = {
+    "name": "home_scene",
+    "description": "사용자가 미리 허용해 둔 집 장면(조명 끄기, 영화 모드 등)을 실행한다. name은 허용된 장면 이름 그대로; 모르면 도구가 목록을 알려 준다.",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["name"], "properties": {
+        "name": {"type": "string", "maxLength": 60}, "confirmed": CONFIRMED}}}
+# These run on the user's Mac through its daemon's `music` and `home` tools (fixed templates / an allowlist there),
+# so they are hidden as `<device>__music` and every model path gets the same two names.
+MAC_ACTIONS = {"music_play": "music", "music_control": "music", "home_scene": "home"}
+MAC_TOOL_NAMES = set(MAC_ACTIONS.values())
+# A scene that sounds like a lock, a door, the garage or security always needs the user's spoken yes, read or no read.
+RISKY_SCENE = re.compile(r"lock|unlock|door|garage|alarm|security|잠금|잠궈|도어락|문|현관|차고|경보|보안|방범", re.I)
 WEB_NAMES = {"web_search", "web_fetch"}  # the Claude API path has native server tools by these names
 # schedule_create: call_user that must have a time (the app's "new schedule" form); same handler, same checks.
 SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH)
+             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
+             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
@@ -879,6 +1037,15 @@ for _n, _m in {
     "web_fetch": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                   "no_rest": "앱에는 페이지 읽기 화면이 없어요(모델 경로 전용).",
                   "examples": ({"url": "https://example.com"}, {"url": "file:///etc/passwd"})},
+    "music_play": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                   "no_rest": "앱에는 음악 화면이 없어요(모델 경로에서 맥 데몬으로).",
+                   "examples": ({"query": "아이유"}, {"query": 1})},
+    "music_control": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                      "no_rest": "앱에는 음악 화면이 없어요(모델 경로에서 맥 데몬으로).",
+                      "examples": ({"action": "pause"}, {"action": "explode"})},
+    "home_scene": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                   "no_rest": "앱에는 집 제어 화면이 없어요(모델 경로에서 맥 데몬으로).",
+                   "examples": ({"name": "azel-movie"}, {})},
 }.items():
     ACTIONS[_n] = _m
 APP_ACTIONS = {n for n, m in ACTIONS.items() if "app" in m["scopes"]}
@@ -886,6 +1053,7 @@ NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); t
     "device": "기기 작업은 앱에서 create_task로 맡겨요(명령 실행은 승인과 함께 모델 경로에서만).",
     "cygnus": "앱에 아직 화면이 없는 개인 조회예요.",
     "google": "앱에 아직 화면이 없는 개인 조회예요.",
+    "spotify": "음악은 말로 틀어요(모델 경로 전용); 앱에는 연결 화면만 있어요.",
 }
 
 
@@ -896,12 +1064,15 @@ async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
     mid, method = msg.get("id"), msg.get("method")
     if mid is None:
         return None
+    # claude -p has no Spotify connector of its own: the gateway's grant serves it here (never to external)
+    extra = bridge.d.get("spotify", lambda: ([], None))()[0] if scope == "full" else []
+    allowed = allowed | {t["name"] for t in extra}
     if method == "initialize":
         result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
                   "capabilities": {"tools": {}}, "serverInfo": {"name": "azel", "version": "1"}}
     elif method == "tools/list":
         result = {"tools": [{"name": t["name"], "description": t["description"], "inputSchema": t["input_schema"]}
-                            for t in MCP_TOOLS if t["name"] in allowed]}
+                            for t in (*MCP_TOOLS, *extra) if t["name"] in allowed]}
     elif method == "tools/call":
         p = msg.get("params") or {}
         if p.get("name") not in allowed:

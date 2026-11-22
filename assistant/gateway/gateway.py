@@ -41,6 +41,8 @@ import connectors
 import google_tools
 import tools_bridge
 import nim
+import oauth
+import spotify
 import wake_enroll
 import claude_api
 from claude_warm import Pool, base_cmd
@@ -76,6 +78,18 @@ WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no")
 COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
 warm_pool = Pool()
 call_warm_keys: dict[str, str] = {}  # call_log id -> its warm process key, closed when the call ends
+call_started: dict[str, float] = {}  # call_log id -> when it started (a call whose end never came expires)
+CALL_TTL_S = 2 * 3600
+
+
+def live_calls():
+    """The calls in progress, as "<persona>:<session>" keys. A call whose end never arrived (the voice link dropped,
+    the voice server restarted) stops counting after CALL_TTL_S, so it can't hold finish calls back forever."""
+    now = time.time()
+    for lid in [lid for lid, at in call_started.items() if now - at > CALL_TTL_S]:
+        call_started.pop(lid, None)
+        call_warm_keys.pop(lid, None)
+    return set(call_warm_keys.values())
 assert MODE in ("full", "limited"), "BISEO_MODE must be full or limited"
 
 MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"}
@@ -96,7 +110,9 @@ DEFAULTS = {
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
-    "brain_mode": "auto",  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
+    "brain_mode": "auto",
+    "search_backend": "searxng",  # searxng (the user's own, free; local Qwen may use it) | haiku (paid Claude search)
+    "searxng_url": os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
@@ -613,6 +629,9 @@ def external_token():
         return ""
 
 
+OAUTH_CALLBACK_PATH = "/v1/oauth/callback"
+
+
 def auth(request: Request):
     got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     if hmac.compare_digest(got.encode(), TOKEN.encode()):
@@ -622,6 +641,9 @@ def auth(request: Request):
     if ext and len(ext) >= 32 and hmac.compare_digest(got.encode(), ext.encode()) \
             and request.method == "POST" and request.url.path == "/v1/mcp":
         request.state.scope = "external"
+        return
+    if request.method == "GET" and request.url.path == OAUTH_CALLBACK_PATH:
+        request.state.scope = "oauth_callback"  # a browser redirect carries no token: its single-use state is the check
         return
     raise HTTPException(401, "bad token")
 
@@ -726,9 +748,10 @@ async def ask_claude_code(text, model, session):
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
     servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
-    resume = await resume_id(session, settings)
+    secret = is_secret(session)
+    resume = None if secret else await resume_id(session, settings)  # a secret call never continues a stored session
     cfg, proc = None, None
-    if WARM and not session.startswith(COLD_SESSIONS):
+    if WARM and not session.startswith(COLD_SESSIONS) and not secret:
         source = (await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, resume, run_settings,
                                       run_env)).turn(text, MODELS[model])
     else:
@@ -738,6 +761,8 @@ async def ask_claude_code(text, model, session):
                 json.dump({"mcpServers": servers}, f)
         env = os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"} | run_env  # wait for the (few) servers
         cmd = base_cmd(MODELS[model], style, allowed, cfg, resume, run_settings)
+        if secret:
+            cmd.append("--no-session-persistence")  # the CLI writes no transcript of this run to disk
         proc = await asyncio.create_subprocess_exec(cmd[0], "-p", text, *cmd[1:],
                                                     cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.DEVNULL, limit=2**24)
@@ -772,7 +797,7 @@ async def ask_claude_code(text, model, session):
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
                              output_tokens=u.get("output_tokens", 0), error=e.get("is_error", False),
                              result=str(e.get("result") or "")[:300])
-                if e.get("session_id"):
+                if e.get("session_id") and not secret:
                     try:
                         await state.call("PUT", f"/v1/state/sessions/{quote(session_key(session, settings), safe='')}",
                                          {"claude_session": e["session_id"], "device": DEVICE})
@@ -796,12 +821,15 @@ def run_args(settings, devices, requester=""):
     custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
-                                                              {"X-Azel-Requester": requester} if requester else None)
-    deny = []
+                                                              {"X-Azel-Requester": requester} if requester else None,
+                                                              own_only=is_secret(requester))  # secret: no connectors
+    # music and home scenes only through azel's music_*/home_scene, which carry the confirm and taint guards
+    deny = [f"mcp__{d['id']}__{t}" for d in devices for t in ("music", "home")]
     if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
-        deny = [f"mcp__{d['id']}__delegate" for d in devices]
+        deny += [f"mcp__{d['id']}__delegate" for d in devices]
     elif requester.startswith("task:"):  # a task never starts another task (no task chains)
-        deny = ["mcp__azel__create_task"]
+        deny += ["mcp__azel__create_task", "mcp__azel__call_user", "mcp__azel__schedule_create",
+                 "mcp__azel__schedule_update", "mcp__azel__schedule_cancel", "mcp__claude_ai_Cygnus_MCP__notify_send"]
     if deny:
         rs = json.loads(run_settings)
         rs.setdefault("permissions", {}).setdefault("deny", [])
@@ -843,7 +871,7 @@ async def prewarm(session, persona_id=None):
     prompt (the call's persona) and devices as ask_claude_code would use for a chat turn, so that turn reuses it.
     `session` is the key the voice server's asks use: "<persona>:<call session>"."""
     if not (WARM and CLAUDE_OK and MODE == "full") or not isinstance(session, str) or not session \
-            or session.startswith(COLD_SESSIONS):
+            or session.startswith(COLD_SESSIONS) or is_secret(session):
         return
     current_persona.set(persona_id if isinstance(persona_id, str) else None)  # this task only
     try:
@@ -1043,7 +1071,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     token = requester_ctx.set(requester_id("ask", session))  # this ask's daemon calls carry it; reset below
     # the API and NIM paths call create_task/call_user in this context: their tasks and calls continue this call,
     # as claude -p's do through X-Azel-Origin (the same rule: the ask's session is the origin)
-    otoken = origin_ctx.set(session if ORIGIN_RE.fullmatch(session or "") else "")
+    otoken = origin_ctx.set(session if ORIGIN_RE.fullmatch(session or "") and not is_secret(session) else "")
     try:
         gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
         said = False
@@ -1145,6 +1173,16 @@ ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
 origin_ctx: contextvars.ContextVar = contextvars.ContextVar("origin_session", default="")
 
 
+SECRET_ALWAYS = "시크릿 통화에서 온 요청이라 이번 한 번만 허용했어요."
+SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
+
+
+def is_secret(key):
+    """A secret call's work: the voice server keys it "<persona>:secret-<id>" (asks, origins, requesters alike).
+    Nothing of it is stored: no Claude session, no schedules, tasks or memories, no standing approval."""
+    return isinstance(key, str) and key.split(":")[-1].startswith("secret-")
+
+
 def origin_of(m):
     v = m.get("origin_session")
     return v if isinstance(v, str) and ORIGIN_RE.fullmatch(v) else ""
@@ -1168,7 +1206,7 @@ async def brain_mode(settings=None):
 def served(coro, m):
     """A link request served in its own context carrying the conversation it came from."""
     ctx = contextvars.copy_context()
-    ctx.run(origin_ctx.set, origin_of(m))
+    ctx.run(origin_ctx.set, "" if is_secret(origin_of(m)) else origin_of(m))  # a secret call links nothing
     ctx.run(mode_ctx.set, mode_of(m))
     if origin_of(m):
         ctx.run(requester_ctx.set, requester_id("ask", origin_of(m)))  # Qwen's tool calls belong to that ask
@@ -1182,7 +1220,23 @@ def with_title(opening, title):
     return f"{title}, {opening}"
 
 
-async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None):
+CALL_LABELS = {"morning_briefing": "아침 브리핑", "deadline": "마감 알림", "server_down": "서버 알림", "wake": "깨우기",
+               "task_approval": "승인 필요"}
+LABEL_PREFIX = {"task": "작업 완료: ", "reminder": "알림: "}
+LABEL_MAX = 14
+
+
+def call_label(reason, hint=""):
+    """The CallKit caller line's label ("<persona> · <label>"): fixed for briefings, deadlines, alerts, wake-ups and
+    approvals; "작업 완료: …" / "알림: …" from the purpose; otherwise the reason. At most LABEL_MAX characters."""
+    if reason in CALL_LABELS:
+        return CALL_LABELS[reason]
+    text = LABEL_PREFIX.get(reason, "") + re.sub(r"\s+", " ", strip_marks(str(hint or reason or ""))).strip()
+    return text if len(text) <= LABEL_MAX else text[:LABEL_MAX - 1].rstrip() + "…"
+
+
+async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None,
+                     detail=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
@@ -1204,10 +1258,26 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
     # The opening must reach the voice server before the phone can answer and connect.
     await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
                      "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {}),
-                     **({"context": context} if context else {})})
-    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
-                                 "persona": persona["id"], **({"context": context} if context else {})})
+                     **({"context": context} if context else {}),
+                     **({"detail": detail[:4000]} if detail else {})})  # what follow-up questions are answered from
+    kind = (context or {}).get("kind") or ("task" if reason.startswith("task") else
+                                           "schedule" if reason in ("wake", "reminder") else reason)
+    caller_ctx = {**(context or {}), "kind": kind, "label": call_label(reason, (context or {}).get("label"))}
+    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],  # every call is labeled
+                                 "persona": persona["id"], "context": caller_ctx})
     return {"call_id": call_id, **push}
+
+
+async def place_held_call(kw):
+    await asyncio.sleep(3)  # the phone needs a moment after hanging up before it rings again
+    try:
+        r = await place_call(**kw)
+        tid = (kw.get("context") or {}).get("id")
+        print("task notify: called after the other call:", tid, r.get("call_id"), flush=True)
+        if tid:
+            await mark_notified({"id": tid})
+    except Exception as e:
+        print("task notify: held call failed:", (kw.get("context") or {}).get("id"), type(e).__name__, flush=True)
 
 
 DEADLINE_PROMPT = (
@@ -1237,6 +1307,10 @@ async def scheduler_tick(now, fired):
         except StateDown:
             pass  # tomorrow, then
     p = s["proactive"]
+    try:
+        await expire_approvals(now.timestamp())
+    except StateDown:
+        pass
     try:  # scheduled calls: only the scheduler lease holder fires (renewed every tick, lowest priority wins)
         if await take_lease("scheduler", 150, SCHED_PRIORITY):
             await fire_scheduled(now.timestamp())
@@ -1281,13 +1355,22 @@ DECIDE_PROMPT = (
     "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
     "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
-    '"opening": "전화 첫마디, 이유를 한두 문장으로, 비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
+    '"opening": "전화를 받자마자 할 말. 전해야 할 내용을 다 말해: 무엇이, 언제까지인지, 지금 무엇을 하면 되는지까지 '
+    '필요한 만큼 길어도 돼. 왜 전화했는지만 짧게 말하고 끝내지 마. 말로 듣기 좋은 문장으로, 목록이나 마크다운 없이, '
+    '비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
 )
+
+
+def checkpoint_prompt(now=None):
+    """The checkpoint's prompt with the date: without it Claude wrote "현재 날짜를 모르니…" into the situation."""
+    now = now or datetime.now(KST)
+    return (CHECKPOINT_PROMPT + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}"
+            "(한국 시간)이야. 날짜는 이 기준으로 '오늘', '내일', '11월 24일'처럼 써." + late_night.prompt_rule(now))
 
 
 async def run_checkpoint():
     """One `claude -p` that reads GISTRA/Planit/Calendar/Gmail and leaves a compact situation note in memory."""
-    text = await ask_text(CHECKPOINT_PROMPT, session=f"checkpoint-{uuid.uuid4().hex[:8]}", model="sonnet",
+    text = await ask_text(checkpoint_prompt(), session=f"checkpoint-{uuid.uuid4().hex[:8]}", model="sonnet",
                           task="schedule")
     if text:
         await state.call("PUT", f"/v1/context/{CHECKPOINT}", {"summary": text[:4000], "open_questions": []})
@@ -1326,9 +1409,13 @@ async def gather_signals(now):
         return [f"{r['names']} ({round((now - r['at']) / 60)}분 전)" for r in rows if now - r["at"] < 86400]
 
     async def approvals():
-        rows = await state.call("GET", "/v1/state/approvals") or []
-        return [f"{r['device']}: {r['command'][:60]} ({round((now - r['created']) / 60)}분째 승인 대기)"
-                for r in rows if now - r["created"] > 1800]
+        await expire_approvals(now)  # an expired request is not "waiting": it can never run any more
+        out = []
+        for r in await state.call("GET", "/v1/state/approvals") or []:
+            v = approval_view(r, await approval_meta(r["id"]), now)
+            if v["status"] == "pending" and now - r["created"] > 120:
+                out.append(f"{r['device']}: {r['command'][:60]} ({round((v['expires_at'] - now) / 60)}분 안에 만료)")
+        return out
 
     async def missed():
         rows = await state.call("GET", "/v1/state/schedule", status="missed") or []
@@ -1337,7 +1424,8 @@ async def gather_signals(now):
 
     async def contexts():
         rows = await state.call("GET", "/v1/context", recent=20) or []
-        return [f"{r['task_id']}: {r['summary'][:80]} / 열린 질문: {'; '.join(r['open_questions'])[:120]}"
+        return [f"{r['task_id']}: {relabel_day(r['summary'], r.get('updated'), now)[:80]} / 열린 질문: "
+                f"{'; '.join(r['open_questions'])[:120]}"
                 for r in rows if r["open_questions"] and r["task_id"] not in (SITUATION, CHECKPOINT)]
 
     for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
@@ -1346,6 +1434,39 @@ async def gather_signals(now):
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
     return sig
+
+
+DAY_WORD = re.compile(r"(오늘|어제|그저께) (\d{1,2}:\d{2})")
+
+
+def relabel_day(text, updated, now):
+    """'오늘 19:48 통화', written when that note was saved, said again relative to `now` ('어제 19:48 통화')."""
+    try:
+        saved = datetime.fromisoformat(str(updated)).astimezone(KST).date()
+    except (TypeError, ValueError):
+        return text
+    today = datetime.fromtimestamp(now, KST).date()
+
+    def again(m):
+        day = saved - timedelta(days={"오늘": 0, "어제": 1, "그저께": 2}[m.group(1)])
+        label = {0: "오늘", 1: "어제", 2: "그저께"}.get((today - day).days) or f"{day.month}월 {day.day}일"
+        return f"{label} {m.group(2)}"
+    return DAY_WORD.sub(again, text)
+
+
+async def expire_approvals(now=None):
+    """Pending requests past their expiry become "expired" in state (approval_view only computed it, so the row
+    stayed "pending" and the judge saw "338분째 승인 대기")."""
+    now = now or time.time()
+    if MODE != "full":
+        return
+    for r in await state.call("GET", "/v1/state/approvals") or []:
+        if approval_view(r, await approval_meta(r["id"]), now)["status"] == "expired" and r["status"] == "pending":
+            try:
+                await state.call("POST", f"/v1/state/approvals/{quote(r['id'], safe='')}",
+                                 {"approve": False, "expire": True})
+            except HTTPException:
+                pass  # decided meanwhile, or another gateway got there first
 
 
 async def situation_note(now):
@@ -1392,10 +1513,10 @@ def fresh_note(note, now, max_age_s=6 * 3600):
         return True
 
 
-async def llm_json(system, user):
+async def llm_json(system, user, max_tokens=300):
     """One request to the local Qwen; the first {...} in its answer, or None."""
     async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(LLM_URL, json={"model": LLM_MODEL, "max_tokens": 300, "temperature": 0.2,
+        r = await c.post(LLM_URL, json={"model": LLM_MODEL, "max_tokens": max_tokens, "temperature": 0.2,
                                         "messages": [{"role": "system", "content": system},
                                                      {"role": "user", "content": user}]})
     r.raise_for_status()
@@ -1414,7 +1535,8 @@ async def qwen_decide(signals, now):
     try:
         persona = persona_block(await load_settings())  # the opening is said in Azel's voice
         d = await llm_json(DECIDE_PROMPT + f" opening은 이 비서의 말투로 써: {persona}",
-                           f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False))
+                           f"지금: {when} KST\n" + json.dumps(signals, ensure_ascii=False),
+                           max_tokens=1500)  # room for an opening as long as it needs to be
     except Exception as e:
         print("autonomous decision failed:", type(e).__name__, flush=True)
         d = None
@@ -1424,7 +1546,7 @@ async def qwen_decide(signals, now):
     urgency = u if isinstance(u, int) and not isinstance(u, bool) and 0 <= u <= 5 else 0  # strict: no 4.9, no "5"
     reason = str(d.get("reason") or "")[:200]
     return {"call": d.get("call") is True, "urgency": urgency, "reason": reason,
-            "opening": str(d.get("opening") or reason)[:200]}
+            "opening": str(d.get("opening") or reason)[:4000]}  # said in full; 4000 only guards a runaway
 
 
 def reason_hash(reason):
@@ -1459,13 +1581,15 @@ async def autonomous_tick(now_dt, a):
     if not isinstance(recent, list):  # unreadable history = unknown cap and gap: fail closed, no call
         raise StateDown("proactive_log unreadable")
     blocked = guard(decision, now, recent, a)
-    entry = {**decision, "persona_id": primary_persona(await load_settings())["id"],
+    entry = {**decision, "opening": decision["opening"][:500],  # the log's copy only; the call says all of it
+             "persona_id": primary_persona(await load_settings())["id"],
              "reason_hash": reason_hash(decision["reason"]), "called": blocked is None,
              "blocked_by": blocked, "signals": {k: v[:10] for k, v in signals.items()}}
     if blocked is None:  # write the row first: if it cannot be recorded, the cap cannot count it, so no call
         entry["call_id"] = uuid.uuid4().hex
         await state.call("POST", "/v1/state/proactive_log", entry)
-        await place_call("autonomous", decision["opening"] or decision["reason"], call_id=entry["call_id"])
+        await place_call("autonomous", decision["opening"] or decision["reason"], call_id=entry["call_id"],
+                         context={"kind": "autonomous", "label": decision["reason"]})
         return entry
     await state.call("POST", "/v1/state/proactive_log", entry)
     return entry
@@ -1756,7 +1880,9 @@ async def serve_schedule(m):
         action = m.get("action")
         if MODE != "full":
             raise HTTPException(403, "limited")
-        if action == "create":
+        if action in ("create", "cancel") and is_secret(origin_of(m)):
+            reply.update(ok=False, say=SECRET_LINE)
+        elif action == "create":
             item, say = await schedule_create(m, "voice")
             reply.update(item=item, say=say)
         elif action == "list":
@@ -1913,10 +2039,14 @@ async def handle_link(ws):
                 warm_key = f"{pid}:{m['session']}"  # what the voice server's asks use as the session
                 if isinstance(m.get("log_id"), str):
                     call_warm_keys[m["log_id"]] = warm_key
+                    call_started[m["log_id"]] = time.time()
                 asyncio.create_task(prewarm(warm_key, pid))
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
+                call_started.pop(m.get("log_id"), None)
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
                 asyncio.create_task(post_call_facts(m["log_id"], warm_key.split(":", 1)[0]))
+                if not live_calls():  # the line is free: the finish calls that waited for it ring now
+                    line_free.set()
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = served(serve_schedule(m), m)
@@ -1926,6 +2056,10 @@ async def handle_link(ws):
             tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
+        elif m.get("type") == "announce_result" and (f := announce_waits.get(m.get("id"))) and not f.done():
+            f.set_result(m)
+        elif m.get("type") == "announced" and (f := announced_waits.get(m.get("id"))) and not f.done():
+            f.set_result(m)
         elif m.get("type") == "call_answered":
             try:
                 await call_answered(m.get("call_id"))
@@ -1956,6 +2090,9 @@ async def voice_link():
             print("voice link down:", type(e).__name__, e, flush=True)
         finally:
             link["ws"] = None
+            call_warm_keys.clear()  # no voice server, no calls: their ends will never arrive
+            call_started.clear()
+            line_free.set()
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
@@ -2006,6 +2143,12 @@ async def reap_warm():
             await warm_pool.reap()
         except Exception as e:
             print("warm reap failed:", type(e).__name__, flush=True)
+        if MODE == "full":  # OAuth grants expiring soon: refreshed here so a run's --mcp-config finds a live token
+            try:
+                async with httpx.AsyncClient(timeout=15) as c:
+                    await oauth.refresh_due(HOME, c)
+            except Exception as e:
+                print("oauth refresh failed:", type(e).__name__, flush=True)
 
 
 app = FastAPI(title="biseo-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
@@ -2074,6 +2217,11 @@ async def put_settings(body: dict):
             body["connectors"] = connectors.check(body["connectors"])
         except ValueError as e:
             raise HTTPException(400, str(e))
+        # an OAuth grant belongs to the server it was made for: a custom server moved or removed loses it
+        new = {c["name"]: c["url"] for c in body["connectors"]["custom"]}
+        for c in ((await load_settings()).get("connectors") or {}).get("custom", []):
+            if c.get("oauth") and new.get(c["name"]) != c["url"]:
+                oauth.forget(HOME, c["name"])
     if "default_model" in body and body["default_model"] not in CHOOSABLE:
         raise HTTPException(400, f"default_model: one of {list(CHOOSABLE)}")
     if "task_defaults" in body:
@@ -2098,6 +2246,11 @@ async def put_settings(body: dict):
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
             raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
+    if "search_backend" in body and body["search_backend"] not in ("searxng", "haiku"):
+        raise HTTPException(400, "search_backend: searxng or haiku")
+    if "searxng_url" in body and not (isinstance(body["searxng_url"], str)
+                                      and re.fullmatch(r"https?://[^\s]{3,300}", body["searxng_url"])):
+        raise HTTPException(400, "searxng_url: an http(s) URL")
     if "brain_mode" in body and body["brain_mode"] not in BRAIN_MODES:
         raise HTTPException(400, f"brain_mode: one of {list(BRAIN_MODES)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
@@ -2426,11 +2579,16 @@ def connectors_out(conn):
     return {"claude_ai": [{"name": c["name"], "enabled": c["enabled"],
                            "status": "connected" if c["status"] == "connected" else "needs_auth"} for c in v["claude_ai"]],
             "custom": [{"name": c["name"], "url": c["url"], "transport": c.get("transport", "http"),
-                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"]} for c in v["custom"]]}
+                        "enabled": c.get("enabled", True), "has_secret": c["has_secret"],
+                        "allowed_tools": c.get("allowed_tools", []),
+                        **({"oauth": True} if c.get("oauth") else {})} for c in v["custom"]],
+            "oauth": oauth_names(conn)}  # needs_consent | connected | expired, per OAuth connector
 
 
-def connectors_in(body):
-    """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name."""
+def connectors_in(body, old=None):
+    """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name.
+    A server sent without `allowed_tools` (an app that predates it) keeps the one already stored under its name."""
+    kept = {c["name"]: c["allowed_tools"] for c in (old or {}).get("custom", []) if c.get("allowed_tools")}
     ai, custom = body.get("claude_ai", []), body.get("custom", [])
     if not isinstance(ai, list) or not all(isinstance(c, dict) and set(c) <= {"name", "enabled", "status"} for c in ai) \
             or not isinstance(custom, list) or set(body) - {"claude_ai", "custom"}:
@@ -2438,7 +2596,10 @@ def connectors_in(body):
     try:
         return connectors.check({"claude_ai": {c.get("name"): c.get("enabled") for c in ai},
                                  "custom": [{**{k: v for k, v in c.items() if k != "has_secret"},
-                                             "auth_ref": c.get("name")} if isinstance(c, dict) else c for c in custom]})
+                                             "auth_ref": c.get("name"),
+                                             **({"allowed_tools": kept[c["name"]]}
+                                                if "allowed_tools" not in c and c.get("name") in kept else {})}
+                                            if isinstance(c, dict) else c for c in custom]})
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -2457,8 +2618,100 @@ async def connectors_get(refresh: bool = False):
 async def connectors_put(body: dict):
     """Replace the switches and the custom list (the GET shape without status / has_secret)."""
     full_only()
-    await put_settings({"connectors": connectors_in(body)})
+    await put_settings({"connectors": connectors_in(body, (await load_settings())["connectors"])})
     return connectors_out((await load_settings())["connectors"])
+
+
+def oauth_names(conn):
+    """Built-in OAuth providers and the custom servers marked oauth, with each one's status."""
+    names = [*oauth.PROVIDERS, *(c["name"] for c in conn.get("custom", []) if c.get("oauth"))]
+    return {n: oauth.status(HOME, n) for n in names}
+
+
+PUBLIC_URL = os.environ.get("BISEO_PUBLIC_URL", "").rstrip("/")  # e.g. https://azel.scian.xyz (the proxy)
+
+
+def gateway_callback():
+    """This gateway's redirect URIs: the tailnet one, plus the public HTTPS one when the proxy passes the callback."""
+    tailnet = f"http://{HOST}:{PORT}{OAUTH_CALLBACK_PATH}"
+    return (tailnet, f"{PUBLIC_URL}{OAUTH_CALLBACK_PATH}") if PUBLIC_URL.startswith("https://") else (tailnet,)
+
+
+@app.post("/v1/connectors/{name}/authorize")
+async def connectors_authorize(name: str, body: dict | None = None):
+    """Start consent: {"client_id"?, "redirect_uri"?} -> {"url", "state", "redirect_uri", "expires_in"}. The app
+    opens `url`; the code comes back to finish (app scheme or loopback) or to GET /v1/oauth/callback."""
+    full_only()
+    body = body or {}
+    conn = (await load_settings()).get("connectors") or {}
+    custom = next((c for c in conn.get("custom", []) if c["name"] == name and c.get("oauth")), None)
+    if name not in oauth.PROVIDERS and not custom:
+        raise HTTPException(404, f"no OAuth connector named {name[:40]}")
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            return await oauth.authorize(HOME, name, c, gateway_callback(), server_url=custom["url"] if custom else None,
+                                         client_id=body.get("client_id"), redirect_uri=body.get("redirect_uri"))
+    except (ValueError, LookupError) as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"the provider did not answer ({type(e).__name__})")
+
+
+async def oauth_finish(name, code, state):
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            st = await oauth.finish(HOME, name, code, state, c)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"the provider did not answer ({type(e).__name__})")
+    await warm_pool.close_all()  # warm processes hold the old --mcp-config
+    return {"name": name, "status": st}
+
+
+@app.post("/v1/connectors/{name}/authorize/finish")
+async def connectors_authorize_finish(name: str, body: dict):
+    """{"code", "state"} from the redirect -> {"name", "status"}. Tokens are stored here and never returned."""
+    full_only()
+    return await oauth_finish(name, body.get("code"), body.get("state"))
+
+
+@app.get(OAUTH_CALLBACK_PATH)
+async def oauth_callback(code: str = "", state: str = "", error: str = ""):
+    """The provider's redirect, for providers that accept this gateway's tailnet address. No token: the pending,
+    single-use state is the check. Never echoes the code."""
+    full_only()
+    name = oauth.pending_name(state)
+    ok = False
+    if name and code and not error:
+        try:
+            ok = (await oauth_finish(name, code, state))["status"] == "connected"
+        except HTTPException:
+            ok = False
+    text = "Azel: 연결을 마쳤어요. 이 창은 닫아도 돼요." if ok else "Azel: 연결하지 못했어요. 앱에서 다시 시도해 주세요."
+    return Response(f"<!doctype html><meta charset=utf-8><p>{text}</p>", media_type="text/html",
+                    status_code=200 if ok else 400)
+
+
+@app.get("/v1/connectors/{name}/oauth")
+async def connectors_oauth_status(name: str):
+    full_only()
+    try:
+        return {"name": name, "status": oauth.status(HOME, name)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/v1/connectors/{name}/oauth")
+async def connectors_oauth_forget(name: str):
+    """Disconnect: delete the stored grant (revoke it at the provider's account page too)."""
+    full_only()
+    try:
+        oauth.forget(HOME, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    await warm_pool.close_all()
+    return Response(status_code=204)
 
 
 @app.put("/v1/connectors/secret/{name}")
@@ -2845,9 +3098,10 @@ async def decide(aid: str, body: dict):
     view = approval_view(row, meta)
     if view["status"] != "pending":
         raise HTTPException(409, f"approval is {view['status']}")
-    forced = decision == "always" and not always_ok(row["command"])
+    secret = decision == "always" and is_secret((meta.get("requester") or {}).get("session"))
+    forced = decision == "always" and (secret or not always_ok(row["command"]))
     if forced:
-        decision = "once"  # only read-only commands become standing rules
+        decision = "once"  # only read-only commands become standing rules, and never from a secret call
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
     if decision == "always":
         rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
@@ -2858,7 +3112,7 @@ async def decide(aid: str, body: dict):
     meta["decision"] = decision
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
-            **({"forced_once": True, "forced_reason": ALWAYS_NO} if forced else {})}
+            **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
 
 
 @app.post("/v1/approvals/{aid}/use")
@@ -2898,7 +3152,7 @@ TASK_MAX_ROUNDS = 4  # one approval wait per round
 TASK_STATUSES = ("queued", "running", "waiting_approval", "done", "failed", "cancelled")
 TASK_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로"
               " 요약해. 도구가 pending_approval을 돌려주면 그 명령을 다시 시도하지 말고 'APPROVAL_PENDING <approval_id>'"
-              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
 PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
 task_slots = asyncio.Semaphore(TASK_SLOTS)
 task_runs: dict[str, asyncio.Task] = {}  # tasks this gateway is running
@@ -2950,9 +3204,39 @@ def check_task(body):
             "device": device, "persona": persona, "backend": backend}
 
 
+NOTIFY_ASK = re.compile(r"(끝나면|끝나고|다\s*되면|완료되면|마치면|끝나는\s*대로)\s*(나한테|저한테|제게|내게)?\s*(전화|연락|알림|알려|푸시)")
+NOTIFY_FILLER = re.compile(r"그\s*(작업|거|것|일)|작업|그거|나한테|저한테|제게|내게|좀|이제|그럼|해\s*줄래요?|해\s*줘요?|"
+                           r"해\s*주세요|해\s*줄\s*수\s*있어|줄래요?|줘요?|주세요|주라|걸어|드려|해요?|[\s\W\d_]")
+WRITES = re.compile(r"저장|파일|작성|만들|써\s*줘|기록|수정|설치|커밋|문서|조사|리서치|정리")
+
+
+def notify_request(goal):
+    """'call' | 'push' when the goal only asks to be told about work already handed over ("그 작업 끝나면 전화해줄래?"),
+    else None (a goal with real work in it, even one that also says "끝나면 전화해 줘")."""
+    m = NOTIFY_ASK.search(goal or "")
+    if not m or NOTIFY_FILLER.sub("", NOTIFY_ASK.sub("", goal)):
+        return None
+    return "push" if m.group(3) in ("알림", "푸시") else "call"
+
+
+async def recent_open_task(origin, persona):
+    """The task a follow-up means: the newest unfinished one from this same call (never another call's)."""
+    seen = {}
+    for t in [*(await bridge_recent_tasks(10)), *task_live.values()]:  # the runners' own dicts win
+        seen[t["id"]] = t
+    open_ = sorted((t for t in seen.values() if t["status"] in ("queued", "running", "waiting_approval")),
+                   key=lambda t: t.get("created") or 0, reverse=True)
+    return next((t for t in open_ if origin and t.get("origin_session") == origin), None)  # this call's own only
+
+
 async def task_create(body, source="api"):
     full_only()
     spec = check_task(body)
+    if want := notify_request(spec["goal"]):  # "그 작업 끝나면 전화해 줘": the running task, not a new one
+        t = await recent_open_task(origin_ctx.get(), spec["persona"])
+        if not t:
+            raise HTTPException(409, "어떤 작업 말씀이세요? 이 통화에서 맡기신 진행 중인 작업이 없어요.")
+        return {**t, **await task_set_notify(t["id"], want), "notify_updated": True}
     settings = await load_settings()
     spec["backend"], spec["fallback_reason"] = await task_backend_for(spec, settings)
     if spec["backend"] == "claude_code" and not CLAUDE_OK:
@@ -2962,6 +3246,10 @@ async def task_create(body, source="api"):
     t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
          "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
          "cost_usd": 0.0, "cancel_requested": False, "origin_session": origin_ctx.get() or None}
+    dev = next((d for d in await fresh_devices() if d["id"] == spec["device"]), None) if spec["device"] else None
+    if dev and dev.get("limited") and WRITES.search(spec["goal"]):  # the user's pick stands; say how it works there
+        word = DEVICE_WORD.get(dev["id"], dev["id"])
+        t["note"] = f"{word}에서 할게요. 바꾸는 명령은 앱에서 승인해 주시면 진행돼요."
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
         await task_save(t)
@@ -2994,9 +3282,13 @@ async def task_backend_for(spec, settings):
 
 
 def task_prompt(t, devices):
-    where = f"작업 기기: {t['device']}." if t["device"] else "작업 기기는 기본 순서대로 골라."
+    where = (f"작업 기기: {t['device']}." if t["device"] else
+             "작업 기기는 기본 순서대로 고르되, 파일 저장·수정·설치처럼 쓰는 일은 전체 권한 기기(맥북)를 우선해.")
     limited = [d["id"] for d in devices if d.get("limited")]
-    note = f" 한도 기기(읽기·진단만): {', '.join(limited)}." if limited else ""
+    note = f" 한도 기기(팀 기기: 바꾸는 명령은 승인을 받아야 하고 delegate는 안 됨): {', '.join(limited)}." if limited else ""
+    if t["device"] and t["device"] in limited:
+        note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
+    note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
     return f"{where}{note}\n\n목표: {t['goal']}"
 
 
@@ -3203,23 +3495,142 @@ def task_summary(t, title=""):
     return f"{hi}맡기신 {what}이 끝나지 못했어요. {spoken_text(t['error'])}".strip()[:600]
 
 
+BRIEFING_PROMPT = (
+    "맡긴 작업의 결과를 전화로 짧게 알려 주는 말을 써. JSON {\"say\": \"...\"} 하나만 답해. 한국어 구어체 존댓말, 제목·목록·"
+    "마크다운·이모지·URL 없이 문장으로만, 5~9문장(말로 20~40초). '맡기신 {goal} 끝났어요.'로 시작하고, 핵심 결과를 요약하고, "
+    "빠지거나 실패한 게 있으면 한 문장으로만 말하고, '더 궁금한 거 있으면 물어보세요.' 같은 한 문장으로 끝내. 호칭은 넣지 마. "
+    "결과에 없는 건 지어내지 마. 전화를 걸었는지, 확인을 받았는지 같은 진행 과정 이야기는 빼.")
+
+
+def short_summary(t, title):
+    """Without a model: the purpose line and the result's first sentences, about 20 seconds."""
+    first = openings.template("task", title, 0, 0, goal=openings.purpose_rule(t["goal"]) or "작업")
+    body, out = re.split(r"(?<=[.!?。])\s+", spoken_text(t.get("result") or "")), ""
+    for sent in body:
+        if len(out) + len(sent) > 220:
+            break
+        out += sent + " "
+    return f"{first} {out.strip() or '결과는 앱에서 확인해 주세요.'} 더 궁금한 거 있으면 물어보세요."
+
+
+async def task_briefing(t, title):
+    """A finished task's call opening: title once, '맡기신 ○○ 끝났어요', the key findings in a few spoken sentences,
+    one line on what is missing, a closing. Failures and approvals keep task_summary's short form."""
+    if t["status"] != "done" or not t.get("result"):
+        return task_summary(t, title)
+    goal = openings.purpose_rule(t["goal"]) or "작업"
+    try:
+        d = await llm_json(BRIEFING_PROMPT.replace("{goal}", goal), f"작업: {goal}\n결과:\n{t['result'][:6000]}",
+                           max_tokens=1500)
+        say = strip_marks(str((d or {}).get("say") or "")).strip()
+    except Exception as e:
+        print("task briefing failed:", t["id"], type(e).__name__, flush=True)
+        say = ""
+    if len(say) < 20:
+        return short_summary(t, title)
+    say = re.sub(rf"{re.escape(title)}\s*,?\s*", "", say) if title else say  # the title once, at the start
+    return (f"{title}, {say}" if title else say)[:900]
+
+
+announce_waits: dict[str, asyncio.Future] = {}  # announce id -> the voice server's answer (taken)
+announced_waits: dict[str, asyncio.Future] = {}  # announce id -> whether it was actually spoken
+pending_finish: list[dict] = []  # finish calls held while the user is on another call
+line_free = asyncio.Event()  # set when the last call ends (or the voice link drops)
+HOLD_MAX_S = 180  # a held finish call rings after this even if the line still looks busy
+STAGGER_S = 20  # after ringing one held call, give it time to connect before the next
+ANNOUNCE_SPOKEN_S = 600  # an announcement not spoken by then (call stayed busy, ended): ring instead
+
+
+async def announce_in_call(session, opening, detail, context):
+    """Say a task's result inside the call the user is on now (the voice server speaks it as a turn). True only once
+    the voice server reports it actually spoken; taken-but-never-spoken (the call ended first) is False: ring."""
+    rid = uuid.uuid4().hex
+    loop = asyncio.get_running_loop()
+    announce_waits[rid], announced_waits[rid] = loop.create_future(), loop.create_future()
+    try:
+        await link_send({"type": "announce", "id": rid, "session": session, "opening": opening, "detail": detail,
+                         "context": context})
+        if (await asyncio.wait_for(announce_waits[rid], 5)).get("ok") is not True:
+            return False
+        return (await asyncio.wait_for(announced_waits[rid], ANNOUNCE_SPOKEN_S)).get("ok") is True
+    except (asyncio.TimeoutError, OSError, RuntimeError):
+        return False
+    finally:
+        announce_waits.pop(rid, None)
+        announced_waits.pop(rid, None)
+
+
+def hold_finish(kw):
+    pending_finish.append({**kw, "_held_at": time.time()})
+    if not any(not t.done() for t in finish_worker):
+        finish_worker[:] = [asyncio.get_running_loop().create_task(ring_held_calls())]
+
+
+finish_worker: list[asyncio.Task] = []
+
+
+async def ring_held_calls():
+    """Ring the held finish calls one at a time: when the line is free, or when the oldest has waited HOLD_MAX_S
+    (a call that looks busy may be a stale one), then give the call it placed STAGGER_S to connect."""
+    while pending_finish:
+        wait = max(0.0, HOLD_MAX_S - (time.time() - pending_finish[0]["_held_at"]))
+        if live_calls() and wait > 0:
+            line_free.clear()
+            try:
+                await asyncio.wait_for(line_free.wait(), min(wait, 30))
+            except asyncio.TimeoutError:
+                pass
+            continue
+        kw = {k: v for k, v in pending_finish.pop(0).items() if k != "_held_at"}
+        await place_held_call(kw)
+        if pending_finish:
+            await asyncio.sleep(STAGGER_S)
+
+
+async def mark_notified(t):
+    """The user was told (in a call, by a call, or by a push): a gateway restart won't tell them again."""
+    try:
+        cur = task_live.get(t["id"]) or await state.call("GET", task_key(t["id"])) or t
+        cur["notified_at"] = time.time()
+        await task_save(cur)
+    except Exception as e:
+        print("task notify: notified_at not saved:", t["id"], type(e).__name__, flush=True)
+
+
 async def task_notify(t, approval=False):
-    """When a task finishes, fails or needs an approval: a call as its persona, or an alert push the app opens
-    as azel://task/<id>."""
+    """When a task finishes, fails or needs an approval: told inside the call the user is on (its origin), a call as
+    its persona (held until hangup when the user is on another call), or an alert push the app opens as
+    azel://task/<id>. Every outcome is logged; nothing is dropped silently."""
     try:
         if t["notify"] == "call":
             settings = await load_settings()
             persona = persona_by_id(settings, t["persona"] or "") or primary_persona(settings)
-            await place_call("task_approval" if approval else "task",
-                             opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"],
-                             **({"origin_session": t["origin_session"]} if t.get("origin_session") else {}),
-                             context={"kind": "task", "id": t["id"],
-                                      "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]})
+            title = user_title(settings, persona)
+            opening = task_summary(t, title) if approval else await task_briefing(t, title)
+            origin = t.get("origin_session")
+            context = {"kind": "task", "id": t["id"], "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]}
+            detail = f"목표: {t['goal'][:300]}\n결과: {(t.get('result') or t.get('error') or '')[:3000]}"
+            if origin and origin in live_calls():
+                if await announce_in_call(origin, opening, detail, context):
+                    print("task notify: told in the current call:", t["id"], flush=True)
+                    await mark_notified(t) if not approval else None  # an approval call isn't the finish
+                    return
+                print("task notify: the current call did not take it, calling:", t["id"], flush=True)
+            kw = {"reason": "task_approval" if approval else "task", "opening": opening, "persona_id": t["persona"],
+                  "context": context, "detail": detail, **({"origin_session": origin} if origin else {})}
+            if live_calls() and not (origin and origin in live_calls()):
+                hold_finish(kw)  # the line is busy with another call: ring once it ends (or after HOLD_MAX_S)
+                print("task notify: on another call, calling after it ends:", t["id"], flush=True)
+                return
+            r = await place_call(**kw)
+            print("task notify: called:", t["id"], r.get("call_id"), "push sent:", r.get("sent"), flush=True)
+            await mark_notified(t) if not approval else None  # an approval call isn't the finish
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
             goal = t["goal"] if len(t["goal"]) <= 40 else t["goal"][:39] + "…"
             await send_alert_push(title, spoken_text(f"{what}: {goal}"), type="task", task_id=t["id"])  # no model output
+            await mark_notified(t) if not approval else None  # an approval call isn't the finish
     except Exception as e:
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 
@@ -3236,14 +3647,25 @@ async def fail_orphan_tasks(startup=True):
         if t["status"] == "queued" and not t.get("cancel_requested"):
             print("picking up queued task:", tid, flush=True)
             start_task(t)
+        elif startup and t["status"] in ("done", "failed") and t.get("notify") in ("call", "push") \
+                and not t.get("notified_at") and time.time() - (t.get("finished") or 0) < NOTIFY_RETRY_S \
+                and tid not in notify_retried:
+            notify_retried.add(tid)  # once per process, however often the watcher looks
+            print("task notify: telling again after a restart:", tid, flush=True)  # its finish was never delivered
+            asyncio.create_task(task_notify(t))
         elif startup and t["status"] in ("running", "waiting_approval"):
             t.update(status="failed", finished=time.time(), error="게이트웨이가 다시 시작돼서 멈췄어요.")
             await task_save(t)
 
 
+NOTIFY_RETRY_S = 6 * 3600  # finishes this recent that were never delivered are told again at startup
+notify_retried: set[str] = set()
+
+
 def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
-            "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note")
+            "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
+            "origin_session", "notified_at")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
@@ -3305,12 +3727,16 @@ async def task_cancel(tid):
     return task_view(await state.call("GET", task_key(tid)) or t, steps=False), "작업을 멈췄어요."
 
 
-DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크"}
+DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크",
+               "core": "코어"}
 
 
 async def serve_task(m):
     """A task request from the voice server ("…해 줘, 끝나면 알려 줘"): start it, answer what to say."""
     reply = {"id": m["id"], "type": "task_result", "ok": True}
+    if is_secret(origin_of(m)):
+        await link_send({**reply, "ok": False, "say": SECRET_LINE})
+        return
     try:
         current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
         t = await task_create({k: m[k] for k in ("goal", "device", "persona", "notify") if m.get(k) is not None},
@@ -3318,10 +3744,15 @@ async def serve_task(m):
         settings = await load_settings()
         dev = t["device"] or settings["default_device"]
         then = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림 드릴게요.", "none": "앱에서 진행 상황을 볼 수 있어요."}
-        reply.update(task_id=t["id"], say=f"{DEVICE_WORD.get(dev, dev)}에서 시작할게요. {then[t['notify']]}")
+        if t.get("notify_updated"):
+            reply.update(task_id=t["id"], say=f"네, {openings.purpose_rule(t['goal']) or '그 작업'} {then[t['notify']]}")
+        else:
+            reply.update(task_id=t["id"], say=" ".join(x for x in (
+                t.get("note") or f"{DEVICE_WORD.get(dev, dev)}에서 시작할게요.", then[t["notify"]]) if x))
     except (HTTPException, StateDown) as e:
         print("voice task refused:", getattr(e, "detail", e), flush=True)
-        reply.update(ok=False, say="지금은 작업을 맡을 수 없어요.")
+        reply.update(ok=False, say=e.detail if isinstance(e, HTTPException) and e.status_code == 409
+                     else "지금은 작업을 맡을 수 없어요.")
     await link_send(reply)
 
 
@@ -3369,14 +3800,14 @@ GOOGLE_STYLE = ("메일과 캘린더는 calendar_events, gmail_search, gmail_rea
                 "말하지 마.")
 TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로 요약해. "
                   "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
-                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
 bridge = tools_bridge.Bridge(
     who=lambda: requester_ctx.get(),  # the run (ask:<session> | task:<id>): the prompt-injection guard's key
     fresh_devices=lambda: fresh_devices(), device_tools=lambda d: device_tools(d), run_tool=lambda b, w: run_tool(b, w),
     place_call=lambda reason, opening, pid: place_call(reason, opening=opening, persona_id=pid),
     schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
     state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
-    in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME),
+    in_call=lambda: bool(live_calls()), cygnus=lambda: claude_api.cygnus_bridge(HOME),
     schedule_list_text=lambda: bridge_schedule_text(), schedule_items=lambda **kw: bridge_schedule_items(**kw),
     schedule_cancel=lambda sid, at, occurrence=None: schedule_cancel(sid=sid, at=at, occurrence=occurrence),
     schedule_update=lambda sid, changes, occ: schedule_update(sid, changes, occ),
@@ -3384,24 +3815,61 @@ bridge = tools_bridge.Bridge(
     task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t) if full else {**task_view(t, steps=False), "steps": t["steps"][-30:]},
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
+    approval_create=lambda body: create_approval(body), approval_ran=lambda aid, body: approval_ran(aid, body),
+    device_token=lambda url: device_tokens.get(url, TOKEN),
     llm=lambda system, user: llm_json(system, user),
     memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
-    mode=lambda: brain_mode(),
+    web_ok=lambda: searxng_ok(),
+    mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
-    google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
+    google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
+    spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
 
 async def none():
     return None
 
 
-async def web_search(query, n):
-    """Haiku with the server-side search (path api, held to the paid budget); a spent budget or no key: the
-    daemon's browse on a search page instead."""
+searxng_health = {"ok": None, "at": 0.0}  # the last time SearXNG answered (or didn't), for local mode's tool list
+
+
+async def searxng_ok():
+    """Is the user's SearXNG reachable? Cached 5 min; local mode offers web_search only while it is."""
     settings = await load_settings()
+    if settings.get("search_backend", "searxng") != "searxng":
+        return False
+    if time.time() - searxng_health["at"] < 300 and searxng_health["ok"] is not None:
+        return searxng_health["ok"]
+    try:
+        async with httpx.AsyncClient(timeout=4) as c:
+            r = await c.get(settings.get("searxng_url") or web.SEARXNG_URL, params={"q": "test", "format": "json"})
+        ok = r.status_code == 200 and isinstance(r.json().get("results"), list)
+    except Exception:  # noqa: BLE001
+        ok = False
+    searxng_health.update(ok=ok, at=time.time())
+    return ok
+
+
+async def web_search(query, n):
+    """The user's SearXNG first (free; the only search local mode may use). When it fails or finds nothing:
+    Haiku with the server-side search (path api, held to the paid budget), never in local mode; with a spent
+    budget or no key, the daemon's browse on a search page instead."""
+    settings = await load_settings()
+    local = await brain_mode(settings) == "local"
+    if settings.get("search_backend", "searxng") == "searxng":
+        try:
+            r = await web.searxng(query, n, settings.get("searxng_url") or web.SEARXNG_URL)
+            searxng_health.update(ok=True, at=time.time())
+            if r:
+                return r
+        except Exception as e:  # noqa: BLE001  unreachable, slow or broken: say so in the log, then fall back
+            searxng_health.update(ok=False, at=time.time())
+            print("searxng failed:", type(e).__name__, flush=True)
+        if local:
+            raise HTTPException(503, "지금은 웹 검색 결과를 찾지 못했어요.")
     spent = "api" in settings["budget_paths"] and await month_cost(settings) >= settings["monthly_budget_usd"]
     if API_KEY and not spent:
         r = await web.search(API_KEY, query, n)

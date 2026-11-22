@@ -40,13 +40,16 @@ answering a call the assistant placed; the server then speaks that call's openin
   runs VAD, so the client never decides when a turn ends.
 - Server → client **binary**: mono PCM16 little-endian, **24 kHz**, play in order.
 - Server → client **text** (JSON, one object per message):
+  - `{"type":"hello","caps":["text","played","mode","secret"]}` — always the very first message: the client messages this
+    server understands beyond audio, `hangup` and `interrupt`. The app shows the keyboard button only when `text` is
+    listed (older servers send no `hello`).
   - `{"type":"state","value":"listening"|"thinking"|"speaking"}` — `speaking` lasts until the client has
     played every byte sent (the server tracks that from the audio length, pauses included) plus 300 ms
     (`PLAY_TAIL_MS`), not just until generation ends; only then come `turn_done` and `listening`. Speech in
     that window is a barge-in (`pause`/check), never a new turn.
   - `{"type":"context","context":{"kind":"task"|"schedule","label":"<short purpose>","id":"<task or schedule id>"}}` —
-    the first message of a call the assistant placed for a task (its finish or approval) or a reminder; nothing else
-    comes before it. The same object rides in that call's VoIP push as `context`. For the call screen's
+    the first message after `hello` of a call the assistant placed for a task (its finish or approval) or a reminder;
+    nothing else comes between them. The same object rides in that call's VoIP push as `context`. For the call screen's
     "맡긴 작업: …" / "예약: …" chip. Absent on other calls.
   - `{"type":"transcript","text":"…"}` — what the user said
   - `{"type":"reply_start","reply_id":N}` — sent right before the first audio frame of each reply (an answer, a
@@ -108,6 +111,37 @@ answering a call the assistant placed; the server then speaks that call's openin
   with exactly that pair; a cancelled reply's own `listening` is dropped, and an interrupt overtaken by a newer one or
   by a new reply sends nothing). During a placed call's
   opening the first sentence still finishes first.
+- Client → server `{"type":"text","text":"…","speak":true|false}` — the user typed during the call. It is a user
+  turn exactly like a transcribed utterance (same routing, tools, persona, history and call log, the log's turn
+  marked `"input":"text"`), without STT or VAD, and the server sends no `transcript` for it (the app shows the
+  typed line itself). Trimmed; empty is ignored; longer than 1000 characters, or within 1 s of the previous typed
+  message, is answered `{"type":"text_rejected","reason":"too_long"|"too_fast"}` and nothing else happens. While
+  the assistant speaks or thinks it interrupts first, like a tap (`interrupt`, then the new reply). `speak:false`
+  (default true): the reply comes as `reply` captions and `turn_done` with no audio and no filler lines. The mic
+  stays live: speech during a typed turn is handled as usual.
+- **Secret calls**: `/v1/call?secret=1`, or `{"type":"secret","value":true}` during a call (the server answers
+  `{"type":"secret","value":true}`; turning it off is refused with the same frame: a secret call stays secret). Every
+  `state` frame carries `"secret": true|false`. In a secret call:
+  - nothing is stored: no call log (`/v1/history`), turns, transcript or memory records, no post-call facts, no brain
+    call events; the call's turns live under a throwaway session key and are dropped at hangup, never joining the
+    persona+session history, and no task or call links back to it (no `origin_session`);
+  - Claude on the `claude -p` path runs cold with `--no-session-persistence`, no `--resume`, and no stored
+    `claude_session`; the API and NIM paths keep no state anyway;
+  - reading is allowed (memory_recall, people_lookup, web, device reads, Cygnus/Google reads, music); anything that
+    stores is refused with "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?": remember, forget,
+    schedule_*, create_task, call_user with a time or rule, the voice fast paths for scheduling and tasks. A device
+    command's approval still works once; "always" becomes once (`forced_reason`). Limit: the approval row itself
+    (device, command, cwd) is stored like any other, because the user must see the command to approve it;
+  - on the `claude -p` path a secret run loads no claude.ai or custom connectors (only the device daemons and azel),
+    so nothing can write through Cygnus, Gmail or Calendar;
+  - usage rows record cost only (model, path, tokens, cost; never text), as they always do;
+  - a call made secret midway keeps what was already logged; from then on nothing more, except the call log's end
+    time and the brain's end event, under the original session.
+  Limit: text sent to Anthropic (Claude) or NVIDIA (NIM) is processed under their own retention policies; the local
+  Qwen and Whisper keep nothing.
+- Client → server `{"type":"played","reply_id":N}` — the phone finished playing reply N's last buffer (none for an
+  interrupted reply). For the reply whose audio went out last, playback counts as ended now; once a client has sent
+  one, the server waits for it after each reply, up to 2 s past its own estimate.
 
 ## 1b. Gateway link — `WS /v1/gateway-link` on the voice server
 
@@ -137,6 +171,27 @@ JSON text frames:
   call connects, its history starts with that conversation's last 8 turns, then the opening (which holds the task
   result), so Qwen and Claude both answer with that context. (In memory on the voice server: a reminder that fires
   after a voice-server restart starts without it.)
+  `detail` (task finish/approval calls, ≤ 4000 chars): the task's goal and whole result. The opening is only a short
+  spoken briefing (title once, "맡기신 ○○ 끝났어요", the key findings, one line on what is missing, a closing; made by
+  the local Qwen, else the result's first sentences), so the call's history also gets the whole result, marked as
+  such, and follow-up questions are answered from it. A placed call whose opening never arrived still speaks a
+  fallback line, never silence. During a placed call's opening (from connect until it has played), "여보세요", "네",
+  "어 왜", "누구세요", the assistant's name and the like are never a turn and never cut it; only a stop word or a real
+  question interrupts, anything else is answered after the opening.
+  `{"type":"announce","id","session","opening","detail"?,"context"?}` (full links only): a task finished while its
+  user is on the call `session` (`persona:session`). The voice server speaks `opening` there as its own turn once the
+  call is quiet (captions route `task`, the context chip first) and answers `{"type":"announce_result","id","ok"}`;
+  `ok:false` (no such live call) and the gateway rings instead. `ok:true` only means taken: once the announcement has
+  actually played the voice server sends `{"type":"announced","id","ok":true}`; cut off, hung up first, or still
+  queued at hangup → `ok:false`, and the gateway rings (it waits up to 10 minutes for the ack). While the user is on
+  another call, the gateway holds the finish call until the line is free, rings held calls one at a time (20 s
+  apart), and rings anyway after 3 minutes. A call counts as in progress from its call_log start to its end, at most
+  2 hours, and none do while the voice link is down. A task records `notified_at` once its user was told (in the call,
+  by a call or by a push); at startup a gateway tells again its own finished notify=call/push tasks from the last 6
+  hours that have none. Every finish outcome is logged on the gateway (`task notify: …`).
+  A follow-up "그 작업 끝나면 전화해 줘" changes the notify of the newest unfinished task from the same call only;
+  otherwise 409 "어떤 작업 말씀이세요?". `task_set_notify` for a task running on another gateway updates its state row
+  only (its runner keeps the old choice); fine while only the Mac runs tasks.
 - Requests the voice server sends over the link to create something (`tool_call`, `schedule`, `task`) carry
   `origin_session` = the conversation being answered; the gateway keeps it on the task (`origin_session`) or on the
   reminder (kv `origin-<schedule id>`).
@@ -307,17 +362,19 @@ device that created them.
   (also writable as part of `PUT /v1/settings`):
   ```json
   {"claude_ai": {"Gmail": true, "Notion": false},
-   "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "transport": "http", "enabled": true, "auth_ref": "wiki"}]}
+   "custom": [{"name": "wiki", "url": "https://wiki.example/mcp", "transport": "http", "enabled": true, "auth_ref": "wiki", "allowed_tools": ["get_*"]}]}
   ```
   `claude_ai` keys are claude.ai connector display names without the `claude.ai ` prefix; a name not listed takes its
   default (Cygnus MCP, Google Calendar, Gmail on; everything else off). `custom`: ≤ 20 servers, `name` a unique ASCII
   slug (`[A-Za-z0-9_-]{1,40}`, also the tool prefix `mcp__<name>`), `url` https (plain http only to a tailnet
   address, 100.64.0.0/10), `transport` `http`|`sse` (default http), `enabled` (default true), optional `auth_ref`,
-  which must equal the server's own `name` (a server never uses another's secret). Secrets never go into settings. Each
+  which must equal the server's own `name` (a server never uses another's secret), and optional `allowed_tools` (≤ 50
+  tool names or globs over `[A-Za-z0-9_.*?-]`; empty or missing = every tool): a run is allowed only those tools of the
+  server (`mcp__<name>__<pattern>`), the rest are refused. A `PUT` entry without `allowed_tools` keeps the list already stored for that name (`[]` clears it). Secrets never go into settings. Each
   run also loads the device daemons, no plugin MCP servers, and every tool up front (no ToolSearch). A custom server
   whose secret file is missing or not 0600 is skipped. Full gateways only; limited → 403 on every route below.
   - `GET /v1/connectors[?refresh=true]` → `{"claude_ai":[{"name","enabled","status":"connected"|"needs_auth"}],
-    "custom":[{"name","url","transport","enabled","has_secret"}]}` (the app's pinned shape). The claude.ai list is
+    "custom":[{"name","url","transport","enabled","has_secret","allowed_tools"}]}` (the app's pinned shape plus `allowed_tools`). The claude.ai list is
     this gateway's login as `claude mcp list` sees it (cached from startup; `refresh=true` re-reads, ~15 s); anything
     not connected is `needs_auth`.
   - `PUT /v1/connectors` with the same shape without `status` / `has_secret` → the GET shape (400 with a reason on a
@@ -326,6 +383,23 @@ device that created them.
     or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
     `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
     Claude processes. Each full gateway that should use the server needs its own copy.
+  - **OAuth connectors** (`gateway/oauth.py`, PKCE S256): built-in providers (`spotify`) and custom servers marked
+    `"oauth": true` in `custom[]` (endpoints discovered from the server's 401: RFC 9728 protected-resource metadata,
+    then RFC 8414/OIDC metadata; client id pre-registered, else RFC 7591 dynamic registration). The GET shape adds
+    `"oauth": {"<name>": "needs_consent"|"connected"|"expired"}` and `"oauth": true` on such custom servers.
+    - `POST /v1/connectors/{name}/authorize` `{"client_id"?, "redirect_uri"?}` → `{"url", "state", "redirect_uri",
+      "expires_in": 600}`; the app opens `url`. `redirect_uri`: `azel://oauth/callback` (default), a loopback
+      `http://127.0.0.1:<port>/…`, or this gateway's `GET /v1/oauth/callback` (tailnet, or `BISEO_PUBLIC_URL`'s HTTPS
+      address through the proxy). A client id, once given, is stored with the grant. 404 unknown name, 400 bad input
+      (e.g. no client id for a provider without registration).
+    - `POST /v1/connectors/{name}/authorize/finish` `{"code", "state"}` → `{"name", "status"}`: what the app sends
+      after its scheme or loopback redirect. The state is single-use, 10 minutes.
+    - `GET /v1/oauth/callback?code&state` (no token: the pending state is the check) → a short HTML page.
+    - `GET /v1/connectors/{name}/oauth` → `{"name", "status"}`; `DELETE /v1/connectors/{name}/oauth` → 204
+      (forgets the grant).
+    Tokens live in `~/.config/biseo/oauth/<name>.json` (0600) on this gateway, are refreshed each minute when close to
+    expiry (under a lock), and are never returned, logged or sent anywhere but the provider. A custom OAuth server
+    with no live token is skipped like one with a missing secret. Spotify setup: `SPOTIFY.md`.
 - NVIDIA NIM provider (full gateways only; `gateway/nim.py`). The hosted, OpenAI-compatible API, never a local
   container. Setting `"providers":{"nim":{"enabled":false,"base_url":"https://integrate.api.nvidia.com/v1",
   "model":"nvidia/nemotron-3-ultra-550b-a55b","prices":{}}}`; GET adds the read-only `"has_key"`. A partial
@@ -556,6 +630,17 @@ then checks `GET /v1/approvals/{id}` → `{"status":"approved","device","command
 and an exact command/cwd match, spends it with `POST /v1/approvals/{id}/use` (central, atomic, once, within 10 min of
 the tap; also kept in the local used-ids file), runs it, and reports `POST /v1/approvals/{id}/ran`
 `{"exit_code","status"}` (no output).
+Grant flow (`approval_via = "gateway-grant"`, vd-spark and vd-core, whose daemons cannot reach the gateway): the daemon
+contacts nobody and answers `{"status":"needs_approval","command","cwd","device","nonce"}` (the nonce is remembered in
+memory for 15 min). The gateway's device-tool path files the approval itself (`create_approval`: push, expiry, rules,
+requester), waits for the tap, spends it (`/use`), and calls `run_command` again with
+`grant = {approval_id, device, command, cwd, nonce, exp, mac}`: `mac` is HMAC-SHA256 (hex) of
+`"azel-grant-v1\n" + json([approval_id, device, command, cwd, nonce, exp])` (compact, UTF-8) keyed by the daemon's
+bearer token; `exp` is at most 10 minutes away (the gateway uses 5). The daemon runs `hard_deny` first, then checks the
+signature, exact device/command/cwd, expiry, and that the nonce is one it issued and has not used (persisted in
+`used_nonces.txt`, 0600), and runs. A grant never bypasses `hard_deny`; an approval id is refused in this mode. The
+gateway records the audit row (`/ran`). `claude -p` runs reach daemons directly, not through the gateway's device-tool
+path, so they receive the `needs_approval` answer and cannot continue it.
 Approved runs may use any existing directory under `$HOME` as cwd, except one that is, is inside, or contains a
 protected path (so never `~` itself); allowlisted runs without approval stay inside `allowed_roots` with `check_args`.
 `approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,

@@ -24,6 +24,7 @@ def start(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("BISEO_LLM_URL", "http://127.0.0.1:9/v1/chat/completions")  # never the real Qwen in tests
+    monkeypatch.setenv("BISEO_SEARXNG_URL", "http://127.0.0.1:9/search")  # nor the real SearXNG
     monkeypatch.setenv("BISEO_WARM_CLAUDE", "0")  # the one-shot fake; test_warm_claude covers the warm path
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -36,6 +37,10 @@ def start(tmp_path, monkeypatch, **env):
     async def no_link():  # tests drive the link by hand
         return None
     g.voice_link = no_link
+
+    async def no_scheduler():  # tests drive scheduler_tick / fire_scheduled by hand, at fixed times; a background
+        return None             # loop on the real clock would mark those items late ("missed") behind their back
+    g.scheduler = no_scheduler
 
     async def discovered():  # what `claude mcp list` / `claude plugin list` would report
         g.discovery.connectors = [{"name": "Cygnus MCP", "url": "https://mcp.example/cygnus", "status": "connected"},
@@ -411,13 +416,14 @@ def test_connectors_app_shape(gw, monkeypatch):
     g.discovery.at = time.time()
     got = c.get("/v1/connectors").json()
     assert got == {"claude_ai": [{"name": "Gmail", "enabled": True, "status": "connected"},
-                                 {"name": "Notion", "enabled": False, "status": "needs_auth"}], "custom": []}
+                                 {"name": "Notion", "enabled": False, "status": "needs_auth"}], "custom": [],
+                   "oauth": {"spotify": "needs_consent"}}
     put = {"claude_ai": [{"name": "Gmail", "enabled": False}, {"name": "Notion", "enabled": True}],
            "custom": [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True}]}
     got = c.put("/v1/connectors", json=put).json()
     assert [x["enabled"] for x in got["claude_ai"]] == [False, True]
     assert got["custom"] == [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True,
-                              "has_secret": False}]
+                              "has_secret": False, "allowed_tools": []}]
     r = c.put("/v1/connectors/secret/linear", json={"value": "lin_secret"})
     assert r.status_code == 204 and r.content == b""
     assert c.get("/v1/connectors").json()["custom"][0]["has_secret"] is True
@@ -964,7 +970,7 @@ def auto_setup(g, monkeypatch, verdict):
         placed.append((reason, opening))
         return {"call_id": f"call{len(placed)}"}
 
-    async def fake_llm(system, user):
+    async def fake_llm(system, user, max_tokens=300):
         asked.append(user)
         return verdict
     monkeypatch.setattr(g, "place_call", fake_place)
@@ -990,6 +996,19 @@ def test_autonomous_tick_calls_logs_and_dedupes(gw, monkeypatch):
     log = c.get("/v1/proactive/log").json()
     assert [r["called"] for r in log] == [False, True] and log[0]["blocked_by"] == "duplicate"
     assert log[1]["signals"]["alerts"][0].startswith("NodeDown")
+
+
+def test_a_long_opening_is_said_in_full(gw, monkeypatch):
+    g, c, _ = gw
+    opening = ("대표님, 역사학특강 토론지 제출이 오늘 밤 11시 59분까지예요. 아직 제출 기록이 없어서 전화드렸어요. "
+               "주제는 동아시아 근대화 비교였고, 분량은 A4 두 장 이상이에요. ") * 8  # well over the old 200 cut
+    placed, _ = auto_setup(g, monkeypatch, {"call": True, "urgency": 5, "reason": "토론지 마감", "opening": opening})
+    now = datetime.now(g.KST).replace(hour=10, minute=0)
+    g.fake.now = lambda: now.timestamp()
+    entry = asyncio.run(g.autonomous_tick(now, A))
+    assert entry["called"] and placed == [("autonomous", opening)]  # nothing cut from what is said
+    assert len(g.fake.db["plog"][-1]["opening"]) <= 500  # the log keeps a short copy (the deployed limit)
+    assert "길어도 돼" in g.DECIDE_PROMPT and "짧은 한 구절" not in g.DECIDE_PROMPT
 
 
 def test_autonomous_never_calls_outside_the_window(gw, monkeypatch):
@@ -1075,7 +1094,8 @@ def test_signals_and_checkpoint(gw, monkeypatch):
     monkeypatch.setattr(g, "ask_text", fake_ask)
     asyncio.run(g.run_checkpoint())
     sig = asyncio.run(g.gather_signals(now))
-    assert sig["approvals"] == ["macbook: git push (60분째 승인 대기)"]
+    assert sig["approvals"] == []  # an hour past its 5-minute expiry: expired, not "waiting"
+    assert g.fake.db["approvals"]["a1"]["status"] == "expired"
     assert len(sig["missed_calls"]) == 1 and sig["missed_calls"][0].endswith("기상 전화 못 받음")
     assert sig["tasks"] == ["t1: 치과 예약 / 열린 질문: 몇 시?"]
     assert sig["device_jobs"] == ["macbook: 빌드 → failed"]
@@ -1470,6 +1490,18 @@ def test_runs_load_only_enabled_connectors(gw):
     assert "mcp__claude_ai_Notion" in args and "mcp__wiki" not in args  # no secret yet: the server is skipped
 
 
+def test_connector_allowed_tools_round_trip(gw):
+    g, c, tmp = gw
+    r = c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp", "allowed_tools": ["Get*"]}]})
+    assert r.json()["custom"][0]["allowed_tools"] == ["Get*"]
+    assert c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp",
+                                                     "allowed_tools": ["a b"]}]}).status_code == 400
+    c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp"}]})  # an older app
+    assert c.get("/v1/connectors").json()["custom"][0]["allowed_tools"] == ["Get*"]  # kept, not wiped
+    c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp", "allowed_tools": []}]})
+    assert c.get("/v1/connectors").json()["custom"][0]["allowed_tools"] == []
+
+
 def test_connector_secret_is_write_only(gw):
     g, c, tmp = gw
     c.put("/v1/connectors", json={"custom": [{"name": "wiki", "url": "https://wiki.example/mcp"}]})
@@ -1551,7 +1583,7 @@ def test_full_api_path_uses_caching_bridge_and_device_tools(tmp_path, monkeypatc
     monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))  # no PAT in tests
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         evs = events(c.post("/v1/ask", json={"text": "홈 폴더 봐 줘", "session": "s", "path": "api", "model": "haiku"}))
-    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "web_search", "web_fetch"]
+    assert seen["key"] == "sk-test" and seen["model"] == "haiku" and seen["tools"] == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "web_search", "web_fetch", "music_play", "music_control", "home_scene"]
     assert "Cygnus 도구" in seen["system"] and g.PERSONAL_REFUSAL not in seen["system"] and seen["result"] == "a b c"
     assert [e["phase"] for e in evs if e["type"] == "activity"] == ["thinking", "tool_start"]
     done = evs[-1]
@@ -1677,3 +1709,62 @@ def test_main_block_is_last():
     tree = ast.parse(pathlib.Path(__file__).resolve().parents[1].joinpath("gateway.py").read_text())
     last = tree.body[-1]
     assert isinstance(last, ast.If) and "__main__" in ast.unparse(last.test)
+
+
+def test_oauth_routes_consent_through_the_gateway_callback(gw, monkeypatch):
+    """authorize -> the browser's redirect to GET /v1/oauth/callback (no token) -> connected; tokens never leave."""
+    import base64 as b64
+    import hashlib
+    from urllib.parse import parse_qs, urlsplit
+    g, c, tmp = gw
+    seen = {}
+
+    def provider(req):
+        f = parse_qs(req.content.decode())
+        want = b64.urlsafe_b64encode(hashlib.sha256(f["code_verifier"][0].encode()).digest()).rstrip(b"=").decode()
+        if f["code"] != ["abc"] or want != seen["challenge"]:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        return httpx.Response(200, json={"access_token": "SECRET-AT", "refresh_token": "SECRET-RT", "expires_in": 3600})
+    real = httpx.AsyncClient
+    monkeypatch.setattr(g.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(provider)))
+    assert c.post("/v1/connectors/nope/authorize", json={}).status_code == 404
+    assert c.post("/v1/connectors/spotify/authorize", json={}).status_code == 400  # no client id yet
+    a = c.post("/v1/connectors/spotify/authorize", json={"client_id": "cid", "redirect_uri": g.gateway_callback()[0]}).json()
+    seen["challenge"] = parse_qs(urlsplit(a["url"]).query)["code_challenge"][0]
+    r = c.get(f"/v1/oauth/callback?code=abc&state={a['state']}", headers={"Authorization": ""})
+    assert r.status_code == 200 and "연결을 마쳤어요" in r.text and "abc" not in r.text
+    assert c.get(f"/v1/oauth/callback?code=abc&state={a['state']}", headers={"Authorization": ""}).status_code == 400  # replay
+    got = c.get("/v1/connectors").json()
+    assert got["oauth"] == {"spotify": "connected"} and c.get("/v1/connectors/spotify/oauth").json()["status"] == "connected"
+    assert not any(s in json.dumps(got) + json.dumps(a) for s in ("SECRET-AT", "SECRET-RT"))
+    assert c.get("/v1/settings", headers={"Authorization": ""}).status_code == 401  # the exemption is the callback only
+    b = c.post("/v1/connectors/spotify/authorize", json={}).json()  # the stored client id is reused
+    assert parse_qs(urlsplit(b["url"]).query)["client_id"] == ["cid"]
+    assert c.post("/v1/connectors/spotify/authorize/finish", json={"code": "x", "state": "bogus"}).status_code == 400
+    assert c.delete("/v1/connectors/spotify/oauth").status_code == 204
+    assert c.get("/v1/connectors/spotify/oauth").json()["status"] == "needs_consent"
+
+
+
+def test_claude_runs_deny_daemon_music_and_home_and_secret_runs_have_no_connectors(gw):
+    g, c, tmp = gw
+    devs = [{"id": "macbook", "url": "http://100.64.0.8:8765/mcp"}]
+    st = {"connectors": {"claude_ai": {"Gmail": True}, "custom": []}}
+    for req in ("ask:azel:call-1", "task:abcabcabcabc", ""):
+        _, _, rs, _ = g.run_args(st, devs, req)
+        deny = json.loads(rs)["permissions"]["deny"]
+        assert "mcp__macbook__music" in deny and "mcp__macbook__home" in deny, req
+    servers, allowed, rs, _ = g.run_args(st, devs, "ask:azel:secret-0123456789ab")
+    assert not any(a.startswith("mcp__claude_ai_") for a in allowed) and set(servers) <= {"macbook", "azel"}
+    assert all("claude_ai" not in json.dumps(x) for x in json.loads(rs).get("allowedMcpServers", []))
+
+
+def test_moving_an_oauth_connector_forgets_its_grant(gw):
+    g, c, tmp = gw
+    g.oauth.save(tmp, "notes", {"access_token": "SECRET-AT", "expires_at": time.time() + 600, "client_id": "c",
+                                "token_endpoint": "https://auth.example.com/token", "server_origin": "https://mcp.example.com"})
+    body = {"claude_ai": [], "custom": [{"name": "notes", "url": "https://mcp.example.com/mcp", "oauth": True}]}
+    assert c.put("/v1/connectors", json=body).status_code == 200 and g.oauth.load(tmp, "notes")  # unchanged: kept
+    body["custom"][0]["url"] = "https://other.example.com/mcp"
+    assert c.put("/v1/connectors", json=body).status_code == 200 and g.oauth.load(tmp, "notes") is None
+    assert c.put("/v1/connectors", json={"claude_ai": [], "custom": [{"name": "spotify", "url": "https://x.example/mcp"}]}).status_code == 400
