@@ -55,8 +55,18 @@ sub init()
     end for
     m.xl = []
     for i = 0 to 3
-        m.xl.Push(mkLabel(m.top, 0, 146, 80, 30, 24, "r", pal("text3")))
+        m.xl.Push(mkLabel(m.top, 0, 164, 80, 30, 24, "r", pal("text3")))
     end for
+    ' over each bar: its value, and on the temperature chart the hour's weather icon
+    m.bv = []
+    m.bi = []
+    for i = 0 to 11
+        l = mkLabel(m.top, 0, 82, 42, 26, 24, "r", pal("text2"))
+        l.horizAlign = "center"
+        m.bv.Push(l)
+        m.bi.Push(mkPoster(m.top, "pkg:/images/wx_clear.png", 0, 54, 24, 24, pal("text2")))
+    end for
+    m.wxIcon = mkPoster(m.top, "pkg:/images/wx_clear.png", 28, 24, 48, 48, pal("text"))
     m.seg = []
     for i = 0 to 3
         r = mkRect(m.top, 0, 0, 10, 3, pal("text2"))
@@ -70,6 +80,9 @@ sub init()
     m.all.Append(m.bars)
     m.all.Append(m.xl)
     m.all.Append(m.seg)
+    m.all.Append(m.bv)
+    m.all.Append(m.bi)
+    m.all.Push(m.wxIcon)
     m.fillBase = pal("card")
 end sub
 
@@ -233,12 +246,18 @@ sub onContent()
         end if
         show(m.meta, 28, 146)
     else if t = "wx"
-        ' now in big figures, the sky word after it; high, low and rain on the second line
+        ' the sky as an icon, now in big figures, the sky word after it; high, low and rain on the second line
+        x = 28
+        if c.d_icon <> ""
+            m.wxIcon.uri = "pkg:/images/wx_" + c.d_icon + ".png"
+            show(m.wxIcon, 28, 24)
+            x = 28 + 48 + 14
+        end if
         m.big.text = c.d_when
         m.big.color = pal("text")
-        show(m.big, 28, 24)
+        show(m.big, x, 24)
         m.tail.text = c.d_tail
-        show(m.tail, 28 + m.big.boundingRect().width + 14, 38)
+        show(m.tail, x + m.big.boundingRect().width + 14, 38)
         m.sent.text = c.d_sent
         if c.d_soon then m.sent.color = pal("amber") else m.sent.color = pal("text")
         m.sent.height = 40
@@ -252,7 +271,7 @@ sub onContent()
         m.stat.color = pal("text3")
         m.stat.width = inner
         show(m.stat, 28, 24)
-        drawBars(c.d_series, c.d_labels, c.d_unit, inner)
+        drawBars(c.d_series, c.d_labels, c.d_unit, inner, c.d_icons)
     else if t = "stock"
         m.name.text = c.d_name
         m.name.width = inner
@@ -323,14 +342,14 @@ sub onContent()
 end sub
 
 ' 12 bars across the card: temperature scaled between its own low and high (never flat), percentages from 0 to 100
-sub drawBars(series as Object, labels as Object, unit as String, inner as Integer)
+sub drawBars(series as Object, labels as Object, unit as String, inner as Integer, icons as Object)
     n = series.Count()
     if n = 0 then return
     if n > 12 then n = 12
     stp = Int(inner / n)
     bw = stp - 12
-    top = 66
-    h = 74
+    top = 110
+    h = 50
     lo = 1000.0
     hi = -1000.0
     for i = 0 to n - 1
@@ -359,15 +378,35 @@ sub drawBars(series as Object, labels as Object, unit as String, inner as Intege
         if unit = "%" and v >= 60 then b.color = pal("amber")
         if unit <> "%" and i = 0 then b.color = pal("text2")
         b.visible = true
+        ' the value over the bar ("15°", "60"), centred on it
+        vl = m.bv[i]
+        if unit = "%" then vl.text = Int(v).ToStr() else vl.text = degShort(v)
+        vl.width = stp
+        vl.translation = [28 + i * stp - 6, 82]
+        vl.color = pal("text2")
+        if unit = "%" and v >= 60 then vl.color = pal("amber")
+        vl.visible = true
+        if i < icons.Count() and icons[i] <> ""
+            ic = m.bi[i]
+            ic.uri = "pkg:/images/wx_" + icons[i] + ".png"
+            ic.translation = [28 + i * stp + Int((bw - 24) / 2), 54]
+            ic.visible = true
+        end if
         if i mod 3 = 0 and li < 4 and i < labels.Count()
             l = m.xl[li]
             l.text = labels[i] + "시"
-            l.translation = [28 + i * stp, 146]
+            l.translation = [28 + i * stp, 164]
             l.visible = true
             li = li + 1
         end if
     end for
 end sub
+
+function degShort(v as Float) as String
+    n = Int(v + 0.5)
+    if v < 0 then n = -Int(-v + 0.5)
+    return n.ToStr() + "°"
+end function
 
 ' a five-point line in the box (x, y, w, h): each step a thin rectangle rotated to meet the next point
 sub drawSpark(series as Object, x as Integer, y as Integer, w as Integer, h as Integer, color as String)

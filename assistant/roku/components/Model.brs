@@ -6,7 +6,7 @@ function newCard(t as String, w as Integer) as Object
         t: t, w: w, head: "", hl: "", sent: "", meta: "", when: "", tail: "", soon: false, now: false, name: ""
         title: "", v: [-1, -1, -1, -1], down: "", n1: "", l1: "", m1: "", n2: "", l2: "", m2: ""
         status: "", load: "", upt: "", note: "", ts: 0, dtitle: "", dsub: "", dsoon: false, facts: []
-        series: [], labels: [], unit: ""
+        series: [], labels: [], unit: "", icons: [], icon: ""
     }
 end function
 
@@ -760,6 +760,7 @@ function weatherSection(w as Object) as Object
     c = newCard("wx", 560)
     c.when = deg(w["now"])
     c.tail = sv(w.sky)
+    c.icon = sv(w.icon)
     parts = []
     if w.high <> invalid then parts.Push("최고 " + deg(w.high))
     if w.low <> invalid then parts.Push("최저 " + deg(w.low))
@@ -777,8 +778,8 @@ function weatherSection(w as Object) as Object
     if hrs.Count() >= 3
         t = newCard("chart", 560)
         p = newCard("chart", 560)
-        t.title = "기온"
-        p.title = "비 올 확률"
+        t.title = "기온 °C"
+        p.title = "비 올 확률 %"
         for each h in hrs
             t.series.Push(h.t)
             pv = h.pop
@@ -786,6 +787,7 @@ function weatherSection(w as Object) as Object
             p.series.Push(pv)
             t.labels.Push(sv(h.h))
             p.labels.Push(sv(h.h))
+            t.icons.Push(sv(h.icon))
         end for
         lo = 1000.0
         hi = -1000.0
@@ -795,8 +797,8 @@ function weatherSection(w as Object) as Object
                 if v > hi then hi = v
             end if
         end for
-        t.tail = deg(lo) + " ~ " + deg(hi)
-        p.tail = "12시간"
+        t.tail = "최저 " + deg(lo) + " · 최고 " + deg(hi)
+        p.tail = "0 ~ 100"
         t.meta = "앞으로 12시간"
         p.meta = "60% 넘으면 호박색"
         t.dtitle = "앞으로 12시간 기온 " + t.tail
@@ -897,7 +899,7 @@ function makeContent(sections as Object) as Object
                 d_tail: c.tail, d_soon: c.soon, d_now: c.now, d_name: c.name, d_v1: c.v[0], d_v2: c.v[1]
                 d_v3: c.v[2], d_v4: c.v[3], d_down: c.down, d_n1: c.n1, d_l1: c.l1, d_m1: c.m1, d_n2: c.n2
                 d_l2: c.l2, d_m2: c.m2, d_status: c.status, d_load: c.load, d_upt: c.upt, d_title: c.title
-                d_series: c.series, d_labels: c.labels, d_unit: c.unit
+                d_series: c.series, d_labels: c.labels, d_unit: c.unit, d_icons: c.icons, d_icon: c.icon
             })
         end for
     end for
