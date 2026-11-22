@@ -27,6 +27,12 @@ sub init()
         v.horizAlign = "right"
         m.rowV.Push(v)
     end for
+    m.barT = []
+    m.barF = []
+    for i = 0 to 3
+        m.barT.Push(mkRect(m.top, 28, 0, 170, 6, pal("rule")))
+        m.barF.Push(mkRect(m.top, 28, 0, 10, 6, pal("text2")))
+    end for
     m.dot = mkLabel(m.top, 28, 25, 0, 30, 24, "sb", pal("text2"))
     m.dot.width = 0
     m.stat = mkLabel(m.top, 28, 28, 358, 30, 24, "r", pal("text3"))
@@ -54,6 +60,10 @@ sub hideAll()
         m.rowL[i].visible = false
         m.rowV[i].visible = false
     end for
+    for i = 0 to 3
+        m.barT[i].visible = false
+        m.barF[i].visible = false
+    end for
     for i = 0 to 1
         m.bn[i].visible = false
         m.bl[i].visible = false
@@ -67,9 +77,10 @@ sub show(n as Object, x as Integer, y as Integer)
 end sub
 
 ' figure i of a host card: two columns of three, label on the left, value on the right
-sub setFig(i as Integer, label as String, text as String, amber as Boolean)
-    x = 28 + Int(i / 3) * 186
-    y = 76 + (i mod 3) * 32
+sub setFig(i as Integer, label as String, text as String, amber as Boolean, pct as Integer)
+    ' meter i of a host card: a 2x2 grid; label left, value right, and a thin bar under them
+    x = 28 + (i mod 2) * 188
+    y = 68 + Int(i / 2) * 40
     m.rowL[i].translation = [x, y]
     m.rowL[i].text = label
     m.rowL[i].visible = true
@@ -77,6 +88,16 @@ sub setFig(i as Integer, label as String, text as String, amber as Boolean)
     m.rowV[i].text = text
     if amber then m.rowV[i].color = pal("amber") else m.rowV[i].color = pal("text")
     m.rowV[i].visible = true
+    m.barT[i].translation = [x, y + 30]
+    m.barT[i].visible = true
+    if pct >= 0
+        w = pct
+        if w > 100 then w = 100
+        m.barF[i].width = Int(w * 1.7) + 1
+        m.barF[i].translation = [x, y + 30]
+        if amber then m.barF[i].color = pal("amber") else m.barF[i].color = pal("text2")
+        m.barF[i].visible = true
+    end if
 end sub
 
 function pctText(v as Integer, suffix as String) as String
@@ -127,8 +148,8 @@ sub onContent()
         if c.d_now then show(m.nowL, x, 38)
         m.sent.text = c.d_sent
         m.sent.height = 80
-        show(m.sent, 28, 84)
-        show(m.meta, 28, 146)
+        show(m.sent, 28, 74)
+        show(m.meta, 28, 150)
     else if t = "due"
         m.big.text = c.d_when
         if c.d_soon then m.big.color = pal("amber") else m.big.color = pal("text")
@@ -137,8 +158,8 @@ sub onContent()
         show(m.tail, 28 + m.big.boundingRect().width + 10, 38)
         m.sent.text = c.d_sent
         m.sent.height = 80
-        show(m.sent, 28, 84)
-        show(m.meta, 28, 146)
+        show(m.sent, 28, 74)
+        show(m.meta, 28, 150)
     else if t = "host"
         st = c.d_status
         m.name.text = c.d_name
@@ -171,16 +192,20 @@ sub onContent()
         if st = "off"
             show(m.meta, 28, 146)
         else
-            setFig(0, "CPU", pctText(c.d_v1, "%"), c.d_v1 >= 85)
-            setFig(1, "메모리", pctText(c.d_v2, "%"), c.d_v2 >= 90)
-            setFig(2, "디스크", pctText(c.d_v3, "%"), c.d_v3 >= 85)
-            setFig(3, "온도", pctText(c.d_v4, "°"), c.d_v4 >= 80)
-            lt = c.d_load
-            if lt = "" then lt = "—"
-            setFig(4, "부하", lt, loadHot(c.d_load))
-            ut = c.d_upt
-            if ut = "" then ut = "—"
-            setFig(5, "가동", ut, false)
+            setFig(0, "CPU", pctText(c.d_v1, "%"), c.d_v1 >= 85, c.d_v1)
+            setFig(1, "메모리", pctText(c.d_v2, "%"), c.d_v2 >= 90, c.d_v2)
+            setFig(2, "디스크", pctText(c.d_v3, "%"), c.d_v3 >= 85, c.d_v3)
+            setFig(3, "온도", pctText(c.d_v4, "°"), c.d_v4 >= 80, c.d_v4)
+            ' load and uptime are not percentages: one quiet line at the bottom
+            ln = ""
+            if c.d_load <> "" then ln = "부하 " + c.d_load
+            if c.d_upt <> ""
+                if ln <> "" then ln = ln + " · "
+                ln = ln + "가동 " + c.d_upt
+            end if
+            m.meta.text = ln
+            if loadHot(c.d_load) then m.meta.color = pal("amber") else m.meta.color = pal("text3")
+            show(m.meta, 28, 148)
         end if
     else if t = "item"
         m.kind.text = c.d_title
