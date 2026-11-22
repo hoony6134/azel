@@ -50,6 +50,8 @@ struct CallLog: Equatable {
             replyOpen = false
             if let p = pendingTyped, p == t { pendingTyped = nil; return }   // the server echoed the typed line
             pendingTyped = nil
+            // The server joined a half-said request to what came next ("…주식" + "오늘 알려줘"): one line, not two.
+            if let i = lines.indices.last, lines[i].mine, t.hasPrefix(lines[i].text) { lines[i].text = t; return }
             lines.append(CallLine(mine: true, text: t))
         case "reply":
             guard let t = LegacyText.clean(event.text) else {

@@ -29,8 +29,10 @@ enum Earcon {
         // Provisional (designer to confirm): a soft single-note "들었어요" and a barely-there pulse.
         case .ack:
             return ([Note(freq: 783.99, start: 0, attack: 0.004, hold: 0, decay: 0.060)], .sine, (2, -20), nil, -30, 0.080)
-        case .pulse:
-            return ([Note(freq: 587.33, start: 0, attack: 0.040, hold: 0, decay: 0.200)], .sine, nil, nil, -38, 0.260)
+        case .pulse: // a heartbeat: a soft "lub", then a lighter "dub" (small: the whole thing peaks at −34 dB)
+            return ([Note(freq: 110, start: 0, attack: 0.012, hold: 0.010, decay: 0.110),
+                     Note(freq: 98, start: 0.19, attack: 0.012, hold: 0.004, decay: 0.090)],
+                    .sine, (2, -9), nil, -34, 0.400)
         }
     }
 
@@ -92,9 +94,9 @@ struct EarconGate {
     static let tickInterval = 0.35, maxWait = 0.3, micHold = 0.25
 
     private var lastTick = -Double.infinity
-    /// Last time a cue other than the pulse played; a pulse within 1.5 s of one is skipped.
+    /// Last time a cue other than the pulse played; a pulse within 0.7 s of one is skipped.
     private var lastOther = -Double.infinity
-    static let pulseQuiet = 1.5
+    static let pulseQuiet = 0.7
 
     /// - userLoudAt: last time the mic was above 0.25 while listening.
     /// - waited: how long this cue has already been held back.

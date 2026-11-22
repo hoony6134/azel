@@ -78,6 +78,16 @@ final class CallLogTests: XCTestCase {
         XCTAssertEqual(log.lines.count, 4)
         XCTAssertEqual(log.lastRoute, "qwen")
     }
+
+    func testAJoinedRequestReplacesItsHalfLine() {
+        var log = CallLog()
+        log.apply(ev("transcript", "내가 보유한 주식"))
+        log.apply(ev("transcript", "내가 보유한 주식 오늘 알려줘"))
+        XCTAssertEqual(log.lines.map(\.text), ["내가 보유한 주식 오늘 알려줘"])
+        log.apply(ev("reply", "네.", "qwen"))
+        log.apply(ev("transcript", "내가 보유한 주식 오늘 알려줘 또"))   // after a reply it is a new turn
+        XCTAssertEqual(log.lines.count, 3)
+    }
 }
 
 final class GreetingTests: XCTestCase {

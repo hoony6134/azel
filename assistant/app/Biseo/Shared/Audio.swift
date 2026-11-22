@@ -235,11 +235,15 @@ final class AudioIO {
 
     /// `interrupt`: stop() drops every scheduled buffer; play() makes the node ready for the next reply.
     func flush() {
+        player.volume = 1.0   // a ducked reply that was cut: the next one is at full volume
         player.stop()
         cuePlayer.stop() // interrupt silences cues too
         speechLock.lock(); speechEnd = 0; scheduledSamples = 0; if pausedAt != nil { pausedAt = ProcessInfo.processInfo.systemUptime }; speechLock.unlock()
         if engine.isRunning { player.play() }
     }
+
+    /// A tentative barge-in: the reply plays on, quieter, until the server confirms (interrupt) or clears it (unduck).
+    func duck(_ on: Bool) { player.volume = on ? 0.2 : 1.0 }
 
     /// Hold: playback pauses where it is (queued replies wait); resume() continues them.
     func pause() {

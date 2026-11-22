@@ -499,7 +499,21 @@ class Bridge:
                 res = await self.d["run_tool"]({"id": "bridge", "name": name, "input": {**args, "approval_id": aid}},
                                                where)
                 text = str(res.get("content", ""))
-                if na := needs_approval(text):  # a grant device cannot spend an approval id: file one it can
+                if "signed grant" in text:  # a grant device (spark) refuses an approval id: ask it for a nonce, and
+                    # turn the tap we already have into a grant, instead of failing and letting the model re-ask
+                    res = await self.d["run_tool"]({"id": "bridge", "name": name,
+                                                    "input": {k: v for k, v in args.items() if k != "approval_id"}}, where)
+                    text = str(res.get("content", ""))
+                    if na := needs_approval(text):
+                        if na["command"] == str(args.get("command", "")) and not str(args.get("cwd") or ""):
+                            # the tap was for exactly this command in the daemon's own default directory, but the row
+                            # holds no cwd and /use matches it exactly: the same consent as a row the daemon can spend
+                            row = await self.d["state"]("POST", "/v1/state/approvals", {
+                                "device": na["device"], "tool": "run_command", "command": na["command"][:500], "cwd": na["cwd"]})
+                            await self.d["state"]("POST", f"/v1/state/approvals/{row['approval_id']}", {"approve": True})
+                            return await self.run_granted(name, args, na, row["approval_id"], where, time.monotonic() - t0)
+                        return await self.grant_flow(name, args, na, where, on_progress)  # another directory: ask again
+                elif na := needs_approval(text):  # a grant device cannot spend an approval id: file one it can
                     return await self.grant_flow(name, args, na, where, on_progress)
                 return {"content": text, "is_error": bool(res.get("is_error")),
                         "waited_s": time.monotonic() - t0, "approval": "approved"}
@@ -532,11 +546,19 @@ class Bridge:
 
     async def run_granted(self, name, args, na, aid, where, waited):
         url, _ = where[name]
-        try:  # spend it centrally: atomic, once, for this device/command/cwd, within the run window
-            await self.d["state"]("POST", f"/v1/state/approvals/{aid}/use",
-                                  {"device": na["device"], "command": na["command"], "cwd": na["cwd"], "window_s": 600})
-        except Exception:  # noqa: BLE001
-            return {"content": "허용이 이미 쓰였거나 오래돼서 실행하지 않았어요.", "is_error": True, "waited_s": waited}
+        for attempt in (0, 1):
+            try:  # spend it centrally: atomic, once, for this device/command/cwd, within the run window
+                await self.d["state"]("POST", f"/v1/state/approvals/{aid}/use",
+                                      {"device": na["device"], "command": na["command"], "cwd": na["cwd"], "window_s": 600})
+                break
+            except Exception as e:  # noqa: BLE001
+                if "409" in str(e) or getattr(e, "status_code", None) == 409 or \
+                        getattr(getattr(e, "response", None), "status_code", None) == 409:
+                    return {"content": "허용이 이미 쓰였거나 오래돼서 실행하지 않았어요.", "is_error": True, "waited_s": waited}
+                if attempt:  # the state service did not answer twice: say so, not "already used" (nothing ran)
+                    return {"content": "허용은 받았지만 승인 서버에 연결하지 못해 실행하지 못했어요. 다시 말씀해 주세요.",
+                            "is_error": True, "waited_s": waited}
+                await asyncio.sleep(0.5)
         exp = int(time.time()) + GRANT_S
         grant = {"approval_id": aid, "device": na["device"], "command": na["command"], "cwd": na["cwd"],
                  "nonce": na["nonce"], "exp": exp,

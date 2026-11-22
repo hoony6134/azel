@@ -618,6 +618,67 @@ def test_needs_approval_becomes_an_approval_row_then_a_signed_grant(monkeypatch)
     assert r["approval"] == "approved"
 
 
+class QwenSpark(GrantWorld):
+    """A grant device (spark) refuses an approval id; the Qwen path files its row with no cwd."""
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+
+    async def run_tool(self, block, where):
+        if block["input"].get("approval_id"):  # what biseo_daemon.run_command raises on a gateway-grant device
+            self.run.append((block["name"], dict(block["input"])))
+            return {"content": "refused: this device takes a signed grant, not an approval id", "is_error": True}
+        return await super().run_tool(block, where)
+
+    async def state(self, method, path, body=None, **params):
+        if path == "/v1/state/approvals" and method == "POST":
+            self.rows.append(body)
+            return {"approval_id": f"q{len(self.rows)}"}
+        if method == "POST" and path.startswith("/v1/state/approvals/") and not path.endswith("/use"):
+            return {}  # the approve call
+        return await super().state(method, path, body, **params)
+
+
+def test_qwen_approval_on_a_grant_device_becomes_a_grant_not_a_refusal(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = QwenSpark()
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, caller="qwen",
+                            where={"spark__run_command": ("http://spark", "run_command")}))
+    assert not r["is_error"] and json.loads(r["content"])["stdout"] == "done" and r["approval"] == "approved"
+    assert w.verdicts == [True] and w.audit == [("q2", {"exit_code": 0, "status": "ok"})]
+    # the row the daemon's own cwd can be spent against: /use matches device, command and cwd exactly
+    assert w.rows[1] == {"device": "vd-spark", "tool": "run_command", "command": "pwd", "cwd": "/home/u/proj"}
+    assert len(w.used) == 1 and w.used[0][1]["cwd"] == "/home/u/proj" and w.created == []  # one tap, no second ask
+
+
+def test_a_qwen_grant_for_another_directory_asks_again(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = QwenSpark()
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd", "cwd": "/tmp"}, caller="qwen",
+                            where={"spark__run_command": ("http://spark", "run_command")}))
+    assert not r["is_error"] and len(w.created) == 1 and w.created[0]["cwd"] == "/home/u/proj"  # a fresh ask, exact cwd
+
+
+def test_a_state_hiccup_while_spending_is_retried_and_not_called_used(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+
+    class W(GrantWorld):
+        fails = 1
+
+        async def state(self, method, path, body=None, **params):
+            if path.endswith("/use") and self.fails:
+                self.fails -= 1
+                raise RuntimeError("StateDown")
+            return await super().state(method, path, body, **params)
+    w = W()
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert not r["is_error"] and json.loads(r["content"])["stdout"] == "done"  # the second try went through
+    w = W()
+    w.fails = 5
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert r["is_error"] and "연결하지 못해" in r["content"] and len(w.run) == 1  # nothing ran, and it says why
+
+
 def test_a_denied_grant_request_runs_nothing(monkeypatch):
     monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
     w = GrantWorld()

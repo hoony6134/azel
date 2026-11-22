@@ -50,7 +50,7 @@ final class PersonaTests: XCTestCase {
 
     func testCallHistoryAndScheduleCarryThePersona() throws {
         let req = try CallClient.request(voiceURL: "wss://azel.scian.xyz", token: "t", session: "iphone-x", callID: nil, persona: "p3")
-        XCTAssertEqual(req.url?.query, "session=iphone-x&persona=p3")
+        XCTAssertEqual(req.url?.query, "session=iphone-x&persona=p3&duck=1")
         let items = try JSONDecoder().decode([HistoryItem].self, from: Data(#"[{"id":"a","started_at":1,"persona_id":"p1"},{"id":"b","started_at":2,"persona_id":3},{"id":"c","started_at":3}]"#.utf8))
         XCTAssertEqual(items[1].persona_id, "3")
         XCTAssertEqual(HistoryCache.filter(items, persona: "p1").map(\.id), ["a"])

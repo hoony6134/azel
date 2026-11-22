@@ -96,6 +96,7 @@ final class CallClient {
         if locked { url.queryItems?.append(URLQueryItem(name: "locked", value: "1")) }
         // "이어서 통화" from the call list: the server seeds this call with that call's turns
         if let resume, !secret { url.queryItems?.append(URLQueryItem(name: "resume", value: resume)) }
+        url.queryItems?.append(URLQueryItem(name: "duck", value: "1"))   // a possible barge-in lowers the reply, not pauses it
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -234,6 +235,8 @@ final class CallClient {
             case "pause", "resume":
                 playback.apply(event.type)   // tentative barge-in: stop playback, keep the queue
                 applyGate()
+            case "duck", "unduck":
+                audio.duck(event.type == "duck")   // the same, but quieter instead of silent (`?duck=1`)
             default: break
             }
             karaokeLock.lock(); karaoke.apply(type: event.type, text: event.text); karaokeLock.unlock()
