@@ -199,7 +199,8 @@ For the phone without Tailscale. Exposed paths only; everything else is blocked 
   `GET /v1/proactive/log`, `GET|POST /v1/personas`, `GET|PUT|DELETE /v1/personas/{id}`,
   `POST /v1/personas/{id}/primary`, `POST /v1/personas/voice-sample`, `GET /v1/voices`,
   `GET|POST|DELETE /v1/wake/enroll`, `GET /v1/providers/nim/models`, `PUT /v1/providers/nim/key`,
-  `GET|POST /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` (bearer header).
+  `GET|POST /v1/tasks`, `GET /v1/tasks/{id}`, `POST /v1/tasks/{id}/cancel` (bearer header);
+  `GET /v1/tv` (the TV token; needs adding to the proxy's list).
 
 Never exposed: `/v1/gateway-link` (also refused by the voice server, section 1b), `/v1/ask`,
 `/v1/devices/*`, `/v1/calls*`, `/v1/alerts`, the daemons, the memory service.
@@ -542,6 +543,22 @@ device that created them.
   - In a call, Claude says "앱에서 허용해 주세요", then calls `run_command` again with the `approval_id`, which waits for
     the decision (below); rejected or expired → it tells the user it was not allowed. Tasks wait as described under
     Tasks.
+- TV dashboard (`gateway/tv.py`, the Roku channel in `roku/`): `GET /v1/tv` → one compact, read-only JSON, cached 30 s
+  (full gateways only):
+  ```json
+  {"at": "2026-11-22T20:15:00+09:00",
+   "infra": {"health": ["…"], "problems": ["…"], "alerts": ["…"]} | null,
+   "tasks": {"running": [{"goal","status"}], "queued": 1, "recent": [{"goal","status"}], "approvals": 0} | null,
+   "todo": {"today": ["…"], "assignments": ["…"]} | null,
+   "calls": [{"at": "21:00", "what": "약 먹기"}] | null,
+   "calendar": ["…"] | null,
+   "assistant": {"name": "아젤", "state": "idle"|"call"} | null}
+  ```
+  Each part is `null` when its source is missing or fails (the rest still answers). Lists are short display lines
+  (≤ 10 lines of ≤ 90 characters). No command, approval detail, task result or message body is ever included.
+  **Auth**: the gateway token, or the TV token in `~/.config/biseo/tv_token` (0600, ≥ 32 characters; read on every
+  request, so deleting or rotating it revokes at once; ignored unless 0600). The TV token opens **only** `GET /v1/tv`
+  (anything else → 401).
 
 ## 4. Agent daemon (MCP, streamable HTTP at `/mcp`)
 
