@@ -137,9 +137,11 @@ final class CallClient {
         pulseTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
             let playing = audio.speechPlaying
-            if playing != wasPlaying { wasPlaying = playing; onPlayback?(playing) }
+            let now = ProcessInfo.processInfo.systemUptime
+            if playing != wasPlaying { wasPlaying = playing; onPlayback?(playing); thinking.playback(playing, now: now) }
             reportPlayed()
-            if let cue = thinking.tick(now: ProcessInfo.processInfo.systemUptime) { self.cue(cue, listening: false) }
+            // listening: true, so the mic-loud check applies: never a heartbeat over the user's voice.
+            if let cue = thinking.tick(now: now) { self.cue(cue, listening: true) }
         }
         // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
         let check = DispatchWorkItem { [weak self] in
@@ -242,7 +244,7 @@ final class CallClient {
             karaokeLock.lock(); karaoke.apply(type: event.type, text: event.text); karaokeLock.unlock()
             recorder?.note(event)
             DispatchQueue.main.async {
-                if let cue = self.thinking.event(event.type, value: event.value, now: ProcessInfo.processInfo.systemUptime) {
+                if let cue = self.thinking.event(event.type, value: event.value, now: ProcessInfo.processInfo.systemUptime, phase: event.phase) {
                     self.cue(cue, listening: false)
                 }
                 self.onEvent?(event)

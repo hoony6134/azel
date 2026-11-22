@@ -157,3 +157,78 @@ final class PulseScheduleTests: XCTestCase {
         XCTAssertEqual(gate.decide(.pulse, now: 12, listening: false, userLoudAt: 0), .play, "a pulse doesn't silence the next pulse")
     }
 }
+
+/// User, 2026-11-23: the heartbeat also fills the silences mid-reply.
+final class MidReplyHeartbeatTests: XCTestCase {
+    /// thinking → first audio → the queue runs dry while the next sentence is generated.
+    private func replying() -> ThinkingCues {
+        var t = ThinkingCues()
+        _ = t.event("state", value: "thinking", now: 0)
+        _ = t.event("state", value: "speaking", now: 2)
+        t.audioArrived()
+        t.playback(true, now: 2)
+        return t
+    }
+
+    func testGapAfterAudioBeats() {
+        var t = replying()
+        XCTAssertNil(t.tick(now: 5), "silent while the reply plays")
+        t.playback(false, now: 6)                         // queue ran dry, turn not done
+        XCTAssertNil(t.tick(now: 6.9), "not in the first second of silence")
+        XCTAssertEqual(t.tick(now: 7.0), .pulse)
+        XCTAssertNil(t.tick(now: 7.5))
+        XCTAssertEqual(t.tick(now: 8.2), .pulse, "every 1.2 s")
+    }
+
+    func testAudioResumingStopsIt() {
+        var t = replying()
+        t.playback(false, now: 6)
+        XCTAssertEqual(t.tick(now: 7), .pulse)
+        t.audioArrived(); t.playback(true, now: 7.3)       // the next sentence
+        XCTAssertNil(t.tick(now: 9))
+        XCTAssertFalse(t.active)
+        t.playback(false, now: 10)                         // dry again: a new wait, its own first second
+        XCTAssertNil(t.tick(now: 10.9))
+        XCTAssertEqual(t.tick(now: 11), .pulse)
+    }
+
+    func testAToolRunningMidReplyIsAWait() {
+        var t = replying()
+        XCTAssertNil(t.event("activity", value: nil, now: 4, phase: "tool_start"))
+        XCTAssertEqual(t.tools, 1)
+        XCTAssertNil(t.tick(now: 5), "still playing: no beat over the reply")
+        t.playback(false, now: 5)
+        XCTAssertEqual(t.tick(now: 6), .pulse, "the tool runs after the audio drained")
+        _ = t.event("activity", value: nil, now: 7, phase: "tool_end")
+        XCTAssertEqual(t.tools, 0)
+        // A tool before any thinking state still opens a wait.
+        var u = ThinkingCues()
+        _ = u.event("activity", value: nil, now: 0, phase: "tool_start")
+        XCTAssertEqual(u.tick(now: 1), .pulse)
+    }
+
+    func testTurnEndsAndPausesStopIt() {
+        for end in ["turn_done", "interrupt", "error", "transcript", "hangup"] {
+            var t = replying()
+            t.playback(false, now: 6)
+            _ = t.event(end, value: nil, now: 6.5)
+            XCTAssertNil(t.tick(now: 9), end)
+            t.playback(false, now: 10)                     // a later drain doesn't restart a closed turn
+            XCTAssertNil(t.tick(now: 12), end)
+        }
+        var l = replying()
+        l.playback(false, now: 6)
+        _ = l.event("state", value: "listening", now: 6.2)
+        XCTAssertNil(l.tick(now: 9), "listening")
+        var p = replying()
+        p.playback(false, now: 6)
+        _ = p.event("pause", value: nil, now: 6.5)          // the user may be talking
+        XCTAssertNil(p.tick(now: 9))
+        _ = p.event("resume", value: nil, now: 9)
+        XCTAssertEqual(p.tick(now: 10), .pulse, "back after resume, its own first second")
+        var d = replying()
+        d.playback(false, now: 6)
+        _ = d.event("duck", value: nil, now: 6.5)
+        XCTAssertNil(d.tick(now: 9), "duck counts as a pause")
+    }
+}
