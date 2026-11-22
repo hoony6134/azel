@@ -725,7 +725,8 @@ def device_prompt(settings, devices):
     order = list(dict.fromkeys(alias[n] for n in [settings["default_device"], *settings["device_fallback"]]
                                if n in alias))
     order += [d["id"] for d in devices if d["id"] not in order]
-    names = ", ".join(f"{i}(mcp__{i})" for i in order)
+    team = {d["id"] for d in devices if d.get("static")}  # their tools come through azel (approvals filed there)
+    names = ", ".join(f"{i}(mcp__azel__{i}__*)" if i in team else f"{i}(mcp__{i})" for i in order)
     first = settings["default_device"]
     note = "" if order[0] == alias.get(first) else f" 기본 기기 {first}는 꺼져 있어. {order[0]}에서 했다고 꼭 말해."
     return (f" 켜져 있는 기기, 우선순위 순: {names}. 사용자가 기기를 말하지 않으면 맨 앞 기기를 써.{note}")
@@ -758,6 +759,8 @@ def tool_info(name):
     """(Korean label, kind) for a tool, from its name alone (never its arguments or result)."""
     if name.startswith("mcp__"):
         server, _, tool = name.removeprefix("mcp__").partition("__")
+        if server == "azel" and "__" in tool:  # a team device served through azel: mcp__azel__spark__run_command
+            server, _, tool = tool.partition("__")
     elif "__" in name:  # the API, NIM and Qwen loops name device tools "<device>__<tool>"
         server, _, tool = name.partition("__")
     else:
@@ -864,6 +867,8 @@ discovery = connectors.Discovery(CLAUDE)
 def run_args(settings, devices, requester=""):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
     custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
+    team = [d for d in devices if d.get("static")]  # served through azel's /v1/mcp: their approvals are filed there
+    devices = [d for d in devices if not d.get("static")]
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
                                                               {"X-Azel-Requester": requester} if requester else None,
@@ -871,7 +876,7 @@ def run_args(settings, devices, requester=""):
     # music and home scenes only through azel's music_*/home_scene, which carry the confirm and taint guards
     deny = [f"mcp__{d['id']}__{t}" for d in devices for t in ("music", "home")]
     if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
-        deny += [f"mcp__{d['id']}__delegate" for d in devices]
+        deny += [f"mcp__{d['id']}__delegate" for d in devices] + [f"mcp__azel__{d['id']}__delegate" for d in team]
     elif requester.startswith("task:"):  # a task never starts another task (no task chains)
         deny += ["mcp__azel__create_task", "mcp__azel__call_user", "mcp__azel__schedule_create",
                  "mcp__azel__schedule_update", "mcp__azel__schedule_cancel", "mcp__claude_ai_Cygnus_MCP__notify_send"]
@@ -968,6 +973,11 @@ async def device_tools(devices):
             tools.append({"name": name, "description": f"[{d['name']}] {t.get('description') or ''}"[:1024],
                           "input_schema": t.get("inputSchema") or {"type": "object"}})
     return tools, where
+
+
+async def team_tools():
+    """The reachable team devices' tools (static entries), for claude -p through /v1/mcp."""
+    return await device_tools([d for d in await fresh_devices() if d.get("static")])
 
 
 async def run_tool(block, where):
@@ -4605,6 +4615,7 @@ bridge = tools_bridge.Bridge(
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
     approval_create=lambda body: create_approval(body), approval_ran=lambda aid, body: approval_ran(aid, body),
+    team_tools=lambda: team_tools(),
     device_token=lambda url: device_tokens.get(url, TOKEN),
     llm=lambda system, user: llm_json(system, user),
     memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),

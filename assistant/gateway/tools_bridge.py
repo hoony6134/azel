@@ -1275,6 +1275,10 @@ NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); t
 }
 
 
+async def none_async():
+    return [], {}
+
+
 async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
     """One JSON-RPC message; None for notifications. A tool outside the caller's scope is invisible in tools/list
     and refused in tools/call exactly like a tool that doesn't exist."""
@@ -1284,6 +1288,10 @@ async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
         return None
     # claude -p has no Spotify connector of its own: the gateway's grant serves it here (never to external)
     extra = bridge.d.get("spotify", lambda: ([], None))()[0] if scope == "full" else []
+    if scope == "full" and method in ("tools/list", "tools/call"):
+        # team devices cannot reach us, so their needs_approval must be filed here (grant_flow): claude -p reaches
+        # their tools through this server, never directly
+        extra = [*extra, *(await bridge.d.get("team_tools", none_async)())[0]]
     allowed = allowed | {t["name"] for t in extra}
     if method == "initialize":
         result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
