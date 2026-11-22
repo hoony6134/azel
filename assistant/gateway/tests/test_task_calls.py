@@ -322,6 +322,39 @@ def test_a_delegated_job_keeps_the_task_running_until_it_ends(tgw, monkeypatch):
     assert any(s["kind"] == "job" for s in t["steps"]) and any(s["kind"] == "job_done" for s in t["steps"])
 
 
+def test_a_delegated_job_blocked_by_permissions_fails_the_task_with_what_is_missing(tgw, monkeypatch):
+    """Live 2026-11-23, task d77336c7ed5f: the job was refused WebSearch, WebFetch and python3, and the task read done."""
+    g, c, notes = tgw
+    replies = [{"job_status": "failed", "needs_input": True, "blocked": ["Bash", "WebFetch", "WebSearch"],
+                "result": "Allow WebSearch/WebFetch/python3 so I can finish the research."},
+               {"job_status": "done", "result": "I couldn't search: permission to use WebSearch was denied."}]  # old daemon
+
+    async def round_(t, prompt, resume, deadline):
+        g.note_job(t, "macbook", '{"status": "ok", "job_id": "60ac064254d1"}')
+        return None, None
+
+    async def devices():
+        return [{"id": "macbook", "url": "http://100.64.0.8:8765/mcp"}]
+
+    async def tools(devs):
+        return [], {"macbook__job_status": ("http://100.64.0.8:8765/mcp", "job_status")}
+
+    async def run_tool(block, where):
+        return {"content": __import__("json").dumps({"status": "ok", "job_id": "60ac064254d1", **replies[0]}), "is_error": False}
+    monkeypatch.setattr(g, "task_round", round_)
+    monkeypatch.setattr(g, "fresh_devices", devices)
+    monkeypatch.setattr(g, "device_tools", tools)
+    monkeypatch.setattr(g, "run_tool", run_tool)
+    monkeypatch.setattr(g, "JOB_POLL_S", 0.05)
+    tid = c.post("/v1/tasks", json={"goal": "실버텔러 시장 조사해서 PDF로 맥북에 저장하고 전화해 줘", "notify": "call"}).json()["id"]
+    t = wait_for(c, tid, ("done", "failed"))
+    assert t["status"] == "failed" and "권한 때문에 막혀서 끝내지 못했어요(명령 실행, 웹 페이지 읽기, 웹 검색)" in t["error"], t
+    assert any(s["kind"] == "job_blocked" for s in t["steps"])
+    replies.pop(0)
+    t = wait_for(c, c.post("/v1/tasks", json={"goal": "다시 조사해 줘", "notify": "none"}).json()["id"], ("done", "failed"))
+    assert t["status"] == "failed" and "권한 때문에 막혀서" in t["error"]  # a daemon that still says done
+
+
 def test_meta_lines_and_tool_labels(tgw):
     g, c, notes = tgw
     assert g.strip_meta("정리했어요. 저는 전화를 직접 걸 수 없어요. 끝나면 시스템이 알려 드릴 거예요.") == "정리했어요."

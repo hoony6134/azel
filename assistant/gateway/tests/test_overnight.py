@@ -80,11 +80,11 @@ def test_models_send_only_now_or_overnight(tgw):
     r = c.portal.call(g.bridge.run, "create_task", {"goal": "정리", "when": "2030-01-01T09:00:00+09:00"}, None, "api")
     assert r["error"]["code"] == "invalid"
     r = c.portal.call(g.bridge.run, "create_task", {"goal": "정리", "auto_approve": True, "when": "overnight"}, None, "api")
-    assert r["error"]["code"] == "invalid"
+    assert r["ok"] and r["data"]["auto_approve"] is False  # a model's true nobody asked for: no auto-approve
     r = c.portal.call(g.bridge.run, "create_task", {"goal": "밤새 조사해 놔", "when": "overnight"}, None, "api")
     assert r["ok"] and r["spoken"].startswith("밤사이에 해 둘게요.") and r["data"]["status"] == "scheduled"
     r = c.portal.call(g.bridge.run, "overnight_list", {}, None, "api")
-    assert r["ok"] and r["spoken"].startswith("밤사이 작업 1개")
+    assert r["ok"] and r["spoken"].startswith("밤사이 작업 2개")  # the "정리" above is queued too
 
 
 def put_task(c, g, **t):

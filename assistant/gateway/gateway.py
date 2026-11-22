@@ -119,6 +119,8 @@ DEFAULTS = {
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
     "overnight": {"window": ["01:00", "06:00"], "report_push": True, "report_call": False, "budget_usd": 5.0},
+    # a voice-made task that works on a device: ask (one question first) | auto | ask_each. The app's sheet has its own toggle
+    "task_auto_approve_default": "ask",
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "brain_mode": "auto",
@@ -2437,6 +2439,8 @@ async def put_settings(body: dict):
             raise HTTPException(400, "overnight: {window: [HH:MM, HH:MM], report_push: bool, report_call: bool, "
                                      "budget_usd: 0-100}")
         body["overnight"] = {k: o[k] for k in DEFAULTS["overnight"]}
+    if "task_auto_approve_default" in body and body["task_auto_approve_default"] not in tools_bridge.TASK_APPROVE_DEFAULTS:
+        raise HTTPException(400, f"task_auto_approve_default: one of {list(tools_bridge.TASK_APPROVE_DEFAULTS)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
         raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
     if body.get("task_backend") == "nim":  # the shared default must be able to run
@@ -3924,6 +3928,13 @@ def strip_meta(text):
     return (META_LINES.sub("", text or "").strip() or None) if text else text
 
 
+# the daemon's BLOCKED_TEXT, for daemons from before it marked a refused run (needs_input)
+JOB_BLOCKED = re.compile(r"(permission|권한)[^.\n]{0,40}(denied|refused|blocked|not granted|required|needed|거부|없|필요)"
+                         r"|\ballow (WebSearch|WebFetch|Bash)|grant (me )?(the )?permission|wasn't (allowed|permitted)", re.I)
+TOOL_KO = {"WebSearch": "웹 검색", "WebFetch": "웹 페이지 읽기", "Bash": "명령 실행", "Write": "파일 쓰기", "Edit": "파일 고치기",
+           "Read": "파일 읽기"}
+
+
 async def await_jobs(t, deadline):
     """Keep the task running while a job it delegated runs on the device: poll <device>__job_status until done or
     failed, within the task's time cap (and its cancel). The task's result becomes the job's result."""
@@ -3953,6 +3964,12 @@ async def await_jobs(t, deadline):
                 j.update({k: got[k] for k in ("session_id", "cwd", "output_file") if isinstance(got.get(k), str)})
                 open_jobs.remove(j)
                 out = str(got.get("result") or got.get("summary") or "").strip()
+                if got.get("needs_input") or state_ == "done" and JOB_BLOCKED.search(out):  # an older daemon says done
+                    names = [TOOL_KO.get(n.split("(")[0], n) for n in got.get("blocked") or []]
+                    task_step(t, "job_blocked", label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업이 권한에 막힘",
+                              job_id=j["job_id"])
+                    raise TaskLimit("blocked", f"기기 작업이 권한 때문에 막혀서 끝내지 못했어요"
+                                    + (f"({', '.join(dict.fromkeys(names))})" if names else "") + f". {out[:300]}".rstrip())
                 task_step(t, "job_" + state_, label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업 "
                           f"{'끝남' if state_ == 'done' else '실패'}", job_id=j["job_id"])
                 if state_ == "failed":
@@ -4648,6 +4665,8 @@ bridge = tools_bridge.Bridge(
     auto_end=lambda scope: end_grants(scope),
     end_call=lambda session, reason: link_send({"type": "end_call", "session": session, "reason": reason}),
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
+    task_approve_default=lambda: task_approve_default(),
+    set_task_approve_default=lambda v: put_settings({"task_auto_approve_default": v}),
     agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
@@ -4709,6 +4728,10 @@ async def web_search(query, n):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
     res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
     return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def task_approve_default():
+    return (await load_settings()).get("task_auto_approve_default") or "ask"
 
 
 async def agenda_text(f, t):

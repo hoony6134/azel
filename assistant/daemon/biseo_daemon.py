@@ -57,6 +57,12 @@ DEFAULTS = {
     "command_timeout": 120,
     "delegate_timeout": 3600,
     "claude_bin": "claude",
+    # What a delegated `claude -p` may do without asking (headless, it cannot prompt): research and build basics.
+    # Edits stay inside its cwd (acceptEdits); git push, rm and sudo stay refused whatever this says.
+    "delegate_allowed_tools": ["WebSearch", "WebFetch", "Bash(python3:*)", "Bash(python:*)", "Bash(pip3 install:*)",
+                               "Bash(uv:*)", "Bash(mkdir:*)", "Bash(ls:*)", "Bash(cat:*)",
+                               "Bash(typst:*)", "Bash(pandoc:*)",  # reports as PDF (a research job needed both)
+                               "Read(./**)", "Write(./**)", "Edit(./**)"],
     # `claude setup-token` output, 0600. Only the delegate subprocess gets it (as CLAUDE_CODE_OAUTH_TOKEN), never run_command.
     "claude_token_file": "~/.config/biseo/claude_oauth_token",
     "browse_enabled": True,
@@ -89,6 +95,9 @@ def load_config(path: str | os.PathLike) -> dict:
         cfg.update(tomllib.loads(p.read_text()))
     cfg["roots"] = [Path(r).expanduser().resolve() for r in cfg["allowed_roots"]]
     cfg["log_path"] = Path(cfg["log_path"]).expanduser()
+    tools = cfg["delegate_allowed_tools"]
+    if not (isinstance(tools, list) and all(isinstance(t, str) and t.strip() and not t.startswith("-") for t in tools)):
+        raise SystemExit("delegate_allowed_tools must be a list of tool rules (strings)")
     cfg["token"] = Path(cfg["token_file"]).expanduser().read_text().strip()
     if not cfg["token"]:
         raise SystemExit("token file is empty")
@@ -631,6 +640,22 @@ def _claude_env() -> dict:
     return env
 
 
+# A job that could not do the work because a tool was refused is not "done" (live 2026-11-23: a research job was
+# refused WebSearch and python3 on every try, said "Allow WebSearch/WebFetch/python3", and the task read as done).
+# claude's own permission_denials comes first; the text only backs it up for a refusal it did not list.
+BLOCKED_TEXT = re.compile(r"(permission|권한)[^.\n]{0,40}(denied|refused|blocked|not granted|required|needed|거부|없|필요)"
+                          r"|\ballow (WebSearch|WebFetch|Bash)|grant (me )?(the )?permission|wasn't (allowed|permitted)", re.I)
+
+
+def _blocked(data: dict, text: str) -> list[str] | None:
+    """The tools a finished run was refused (names), [] when only its text says so, None when it was not blocked."""
+    denials = data.get("permission_denials") if isinstance(data.get("permission_denials"), list) else []
+    names = sorted({str(x.get("tool_name") or "?")[:40] for x in denials if isinstance(x, dict)})
+    if names:
+        return names
+    return [] if BLOCKED_TEXT.search(text or "") else None
+
+
 def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
     status = "failed"  # set to the real outcome last: a client treats anything but running as finished
     try:
@@ -645,6 +670,9 @@ def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
                 job["session_id"] = sid
                 _remember_session(sid, cwd, job["job_id"])
             status = "failed" if data.get("is_error") or out.returncode else "done"
+            blocked = _blocked(data, job["result"])
+            if blocked is not None:  # refused something it needed: not done, and the user is told what
+                status, job["needs_input"], job["blocked"] = "failed", True, blocked
         except ValueError:
             job["result"] = _cap(out.stdout)
             status = "failed"
@@ -684,7 +712,9 @@ def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | Non
             raise Refused("a job on that session is still running")
         resume_args = ["--resume", resume]
     env = _claude_env()
+    allowed = CFG.get("delegate_allowed_tools", DEFAULTS["delegate_allowed_tools"])
     argv = [CFG["claude_bin"], "-p", task, *resume_args, "--permission-mode", "acceptEdits",
+            *(["--allowedTools", *allowed] if allowed else []),
             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
             "--output-format", "json", "--append-system-prompt", NO_ATTRIBUTION]
     if model:
@@ -709,7 +739,7 @@ def job_status(job_id: str) -> dict:
 def list_jobs() -> dict:
     """All delegated jobs (without full results)."""
     return {"status": "ok", "jobs": [{k: j.get(k) for k in ("job_id", "status", "task", "cwd", "started", "finished",
-                                                            "summary", "session_id", "output_file")}
+                                                            "summary", "session_id", "output_file", "blocked")}
                                      for j in JOBS.values()]}
 
 
