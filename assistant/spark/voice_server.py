@@ -688,18 +688,43 @@ async def _refresh_gateway_tools():
         gw_tools["refreshing"] = 0
 
 
+DEVICE_TOOL_KO = {"list_dir": "폴더 보기", "read_file": "파일 읽기", "search": "파일 내용 찾기",
+                  "run_command": "명령 실행(df -h 같은 조회도, 위험하면 앱 승인)", "job_status": "맡긴 작업 상태",
+                  "list_jobs": "맡긴 작업 목록", "browse": "웹 페이지 열기", "delegate": "여러 단계 작업 맡기기"}
+
+
 def gateway_tools_text(defs):
+    """Every tool Qwen may call, in its prompt. Device tools are one line per kind (13 devices × 7 tools listed one by
+    one used up the old 40-line cap, so call_user, memory, web and the Cygnus tools never reached Qwen)."""
     if not defs:
         return ""
-    lines = "\n".join(f"- {t['name']}: {str(t.get('description', ''))[:120]}" for t in defs[:40])
-    return ("\n\n[기기·전화·작업 도구, 같은 형식으로 불러]\n" + lines + "\n사용자에게 전화를 걸거나 예약하려면 call_user, 여러 단계 "
+    devices: dict[str, list] = {}
+    own = []
+    for t in defs:
+        if "__" in t["name"]:
+            dev, tool = t["name"].split("__", 1)
+            devices.setdefault(tool, []).append(dev)
+        else:
+            own.append(t)
+    lines = [f"- {t['name']}: {str(t.get('description', ''))[:160]}" for t in own]
+    if devices:
+        lines.append("- 기기 도구, 이름은 '기기__도구'(예: spark__run_command, macbook__list_dir): " + "; ".join(
+            f"{tool}={DEVICE_TOOL_KO.get(tool, tool)} [{', '.join(ds)}]" for tool, ds in devices.items()))
+    names = {t["name"] for t in own}
+    return ("\n\n[도구] 쓰려면 다른 말 없이 한 줄로 정확히 " + TOOL_TAG + ' {"name": "도구 이름", "args": {…}} 만 출력해. '
+            "결과를 받기 전에는 확인했다거나 결과를 말하지 마. 목록:\n" + "\n".join(lines) + "\n사용자에게 전화를 걸거나 예약하려면 call_user, 여러 단계 "
             "일은 create_task로 맡겨(끝나고 전화를 원하면 notify call). 기기에서 무언가 실행하는 도구는 사용자가 앱에서 "
             "허용해야 실행돼. 전화를 걸 수 없다고 말하지 마."
+            + ("\n서버, 인프라, 노드, 홈서버, 내부 시스템 상태(켜짐, CPU, 메모리, 디스크, 온도, 컨테이너)는 infra_health로, 문제 "
+               "있는 서비스만은 infra_status, 울리는 경보는 infra_alerts로 확인해. 특정 기기의 디스크나 파일은 그 기기의 "
+               "run_command(예: df -h)나 list_dir로." if "infra_health" in names else "")
+            + "\n'도구가 없다'고 말하기 전에 위 목록을 다시 봐. 딱 맞는 게 없으면 가장 가까운 읽기 도구를 먼저 불러. 음성 인식이 "
+            "틀린 말('대내부 상태'처럼)도 뜻으로 알아들어."
             + ("\n사용자, 주변 사람, 지난 일, 취향, 계획을 물으면 '모르겠어요' 하기 전에 memory_recall이나 people_lookup을 먼저 "
                "불러. 결과에 없는 사실은 지어내지 마. '기억해', '잊지 마'라고 하면 remember로 저장하고 결과 문장을 그대로 말해."
-               if any(t["name"] == "memory_recall" for t in defs) else "")
+               if "memory_recall" in names else "")
             + ("\n날씨, 뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '기상청 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
-               if any(t["name"] == "web_search" for t in defs) else ""))
+               if "web_search" in names else ""))
 
 
 async def gateway_tool(name, args, on_say=None):
@@ -4457,4 +4482,12 @@ if __name__ == "__main__":
         assert said == ["앱에서 허용해 주세요.", "크롬을 열었어요."], said
         assert sent[0]["name"] == "macbook__run_command" and sent[0]["args"] == {"command": "open -a Chrome"}
         assert "call_user" in prompts[0][0]["content"] and "전화를 걸 수 없다고 말하지 마" in prompts[0][0]["content"]
+        devs = ["albireo", "deneb", "gienah", "macbook", "ruchba", "sadr", "spark", "vd-core", "a", "b", "c", "d", "e"]
+        many = [{"name": f"{d}__{t}", "description": t} for d in devs for t in DEVICE_TOOL_KO if t != "delegate"] + \
+            [{"name": n, "description": n} for n in ("call_user", "memory_recall", "web_search", "infra_health",
+                                                       "infra_status", "calendar_events")]
+        text = gateway_tools_text(many)  # 97 tools, as live: nothing may fall off the end any more
+        assert all(n in text for n in ("call_user", "memory_recall", "web_search", "infra_health", "calendar_events",
+                                       "spark__run_command", "run_command=명령 실행", "vd-core")), text
+        assert "도구가 없다" in text and "서버, 인프라, 노드" in text and len(text) < 4000, len(text)
         print("voice_server checks ok")

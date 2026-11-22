@@ -61,9 +61,10 @@ TOOLS = {
     "memory_recall": ("사용자의 장기 기억 검색(취향, 사람, 프로젝트, 결정)", {"query": _text(120), "kind": _memkind},
                       ("query",), {"limit": 5}),
     "gistra_people": ("교수·조교 목록과 맡은 과목, 연락처·사무실·면담 시간(query로 이름·과목 필터)", {"query": _text(60)}, (), {}),
-    "infra_health": ("서버별 상태: 켜짐, CPU, 메모리, 디스크, 온도", {}, (), {}),
-    "infra_status": ("서비스 모니터 중 문제 있는 것", {}, (), {"problems_only": True}),
-    "infra_alerts": ("지금 울리고 있는 서버 경보", {}, (), {}),
+    "infra_health": ("서버·인프라·노드·홈서버·내부 시스템 상태: 서버별 켜짐, CPU, 메모리(RAM), 디스크, 온도, 컨테이너",
+                     {}, (), {}),
+    "infra_status": ("서비스·컨테이너 모니터 중 지금 문제 있는 것(내부 시스템이 괜찮은지)", {}, (), {"problems_only": True}),
+    "infra_alerts": ("지금 울리고 있는 서버·인프라 경보", {}, (), {}),
 }
 SHARED_ONLY = {"memory_recall"}
 # JSON schemas of the arguments, for models that call these tools natively (the Claude API path); check_args still
