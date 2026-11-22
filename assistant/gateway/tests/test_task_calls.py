@@ -21,17 +21,22 @@ def test_notify_request_tells_follow_ups_from_real_work(tgw):
 def test_follow_up_changes_the_running_task_instead_of_creating_one(tgw):
     g, c, notes = tgw
     g.fake.db["approvals"]["ap1"] = {"id": "ap1", "device": "macbook", "status": "pending"}
-    first = c.post("/v1/tasks", json={"goal": "TASK-APPROVAL 임시 폴더 지워 줘", "notify": "push", "persona": "azel"}).json()
+    async def in_call(body, origin="azel:s1"):  # as the voice server's task frame would, from that call
+        g.origin_ctx.set(origin)
+        return await g.task_create(body, "voice")
+    first = c.portal.call(in_call, {"goal": "TASK-APPROVAL 임시 폴더 지워 줘", "notify": "push", "persona": "azel"})
     wait_for(c, first["id"], ("waiting_approval",))
-    r = c.post("/v1/tasks", json={"goal": "그 작업 끝나면 나한테 전화해줄래?", "persona": "azel"})
-    assert r.status_code in (200, 201) and r.json()["id"] == first["id"] and r.json()["notify"] == "call", r.text
-    assert [t["id"] for t in c.get("/v1/tasks").json()] == [first["id"]]  # nothing new
+    with pytest.raises(g.HTTPException):  # another call's follow-up never touches this call's task
+        c.portal.call(in_call, {"goal": "그 작업 끝나면 전화해줘", "persona": "azel"}, "azel:s2")
+    t = c.portal.call(in_call, {"goal": "그 작업 끝나면 나한테 전화해줄래?", "persona": "azel"})
+    assert t["id"] == first["id"] and t["notify"] == "call" and t["notify_updated"]
+    assert [x["id"] for x in c.get("/v1/tasks").json()] == [first["id"]]  # nothing new
 
 
 def test_follow_up_without_a_running_task_is_refused(tgw):
     g, c, notes = tgw
     r = c.post("/v1/tasks", json={"goal": "그 작업 끝나면 전화해 줘", "persona": "azel"})
-    assert r.status_code == 409 and "진행 중인 작업이 없어요" in r.text and c.get("/v1/tasks").json() == []
+    assert r.status_code == 409 and "어떤 작업 말씀이세요?" in r.text and c.get("/v1/tasks").json() == []
 
 
 def finished(**kw):
@@ -48,8 +53,10 @@ def test_a_result_is_told_in_the_call_the_user_is_on(tgw, monkeypatch):
         sent.append(m)
         if m["type"] == "announce":
             g.announce_waits[m["id"]].set_result({"ok": True})
+            g.announced_waits[m["id"]].set_result({"ok": True})  # and the voice server reports it spoken
     monkeypatch.setattr(g, "link_send", link_send)
     monkeypatch.setitem(g.call_warm_keys, "log1", "azel:s1")
+    monkeypatch.setitem(g.call_started, "log1", time.time())
     asyncio.run(g.task_notify(finished()))
     ann = [m for m in sent if m["type"] == "announce"]
     assert ann and ann[0]["session"] == "azel:s1" and "한화생명" in ann[0]["detail"] and not notes  # no new call
@@ -63,19 +70,90 @@ def test_a_call_that_does_not_take_it_falls_back_to_ringing(tgw, monkeypatch):
             g.announce_waits[m["id"]].set_result({"ok": False})
     monkeypatch.setattr(g, "link_send", link_send)
     monkeypatch.setitem(g.call_warm_keys, "log1", "azel:s1")
+    monkeypatch.setitem(g.call_started, "log1", time.time())
     asyncio.run(g.task_notify(finished()))
     assert [n[:2] for n in notes] == [("call", "task")]
 
 
-def test_busy_with_another_call_rings_after_it(tgw, monkeypatch):
+def test_busy_with_another_call_rings_after_it_one_at_a_time(tgw, monkeypatch):
     g, c, notes = tgw
-    monkeypatch.setitem(g.call_warm_keys, "log2", "azel:other")
-    g.pending_finish.clear()
-    asyncio.run(g.task_notify(finished()))
-    assert not notes and len(g.pending_finish) == 1 and g.pending_finish[0]["origin_session"] == "azel:s1"
-    kw = g.pending_finish.pop()
-    asyncio.run(g.place_call(**kw))
+    monkeypatch.setattr(g, "STAGGER_S", 0.05)
+
+    async def no_wait(*a):
+        pass
+    monkeypatch.setattr(g, "place_held_call", lambda kw: g.place_call(**kw))
+
+    async def go():
+        g.call_warm_keys["log2"], g.call_started["log2"] = "azel:other", time.time()
+        g.pending_finish.clear()
+        await g.task_notify(finished())
+        await g.task_notify(finished(id="defdefdefdef"))
+        await asyncio.sleep(0.05)
+        assert not notes and len(g.pending_finish) == 2  # held while the other call goes on
+        g.call_warm_keys.pop("log2"), g.call_started.pop("log2")
+        g.line_free.set()  # that call ended
+        await asyncio.sleep(0.02)
+        assert len(notes) == 1  # one rings first, the next after the stagger
+        await asyncio.wait_for(g.finish_worker[0], 2)
+    asyncio.run(go())
+    assert [n[:2] for n in notes] == [("call", "task"), ("call", "task")] and not g.pending_finish
+
+
+def test_a_held_call_rings_after_three_minutes_even_if_the_line_looks_busy(tgw, monkeypatch):
+    g, c, notes = tgw
+    monkeypatch.setattr(g, "HOLD_MAX_S", 0.1)
+    monkeypatch.setattr(g, "place_held_call", lambda kw: g.place_call(**kw))
+
+    async def go():
+        g.call_warm_keys["stale"], g.call_started["stale"] = "azel:other", time.time()  # its end never came
+        g.pending_finish.clear()
+        await g.task_notify(finished())
+        await asyncio.wait_for(g.finish_worker[0], 2)
+    asyncio.run(go())
     assert [n[:2] for n in notes] == [("call", "task")]
+    g.call_warm_keys.clear(), g.call_started.clear()
+
+
+def test_stale_calls_expire_and_a_dropped_voice_link_clears_them(tgw, monkeypatch):
+    g, c, notes = tgw
+    g.call_warm_keys["old"], g.call_started["old"] = "azel:x", time.time() - g.CALL_TTL_S - 1
+    g.call_warm_keys["new"], g.call_started["new"] = "azel:y", time.time()
+    assert g.live_calls() == {"azel:y"} and "old" not in g.call_warm_keys
+    g.call_warm_keys.clear(), g.call_started.clear()
+
+
+def test_an_announcement_taken_but_never_spoken_rings_instead(tgw, monkeypatch):
+    g, c, notes = tgw
+
+    async def link_send(m):
+        if m["type"] == "announce":
+            g.announce_waits[m["id"]].set_result({"ok": True})
+            g.announced_waits[m["id"]].set_result({"ok": False})  # the call ended before it was said
+    monkeypatch.setattr(g, "link_send", link_send)
+    monkeypatch.setitem(g.call_warm_keys, "log1", "azel:s1")
+    monkeypatch.setitem(g.call_started, "log1", time.time())
+    asyncio.run(g.task_notify(finished()))
+    assert [n[:2] for n in notes] == [("call", "task")]
+
+
+def test_an_undelivered_finish_is_told_again_after_a_restart(tgw, monkeypatch):
+    g, c, notes = tgw
+    told = []
+
+    async def notify(t, approval=False):
+        told.append(t["id"])
+    monkeypatch.setattr(g, "task_notify", notify)
+    base = {"goal": "조사", "notify": "call", "owner": g.DEVICE, "finished": time.time() - 60, "result": "끝"}
+    g.fake.db["kv"]["task-aaaaaaaaaaaa"] = {**base, "id": "aaaaaaaaaaaa", "status": "done"}
+    g.fake.db["kv"]["task-bbbbbbbbbbbb"] = {**base, "id": "bbbbbbbbbbbb", "status": "done", "notified_at": time.time()}
+    g.fake.db["kv"]["task-cccccccccccc"] = {**base, "id": "cccccccccccc", "status": "done", "finished": time.time() - 99999}
+    g.fake.db["kv"]["tasks-index"] = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
+
+    async def go():
+        await g.fail_orphan_tasks(startup=True)
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert told == ["aaaaaaaaaaaa"]  # never told, recent: again; told, or too old: no
 
 
 def test_finish_opening_is_a_short_briefing_with_the_title_once(tgw, monkeypatch):

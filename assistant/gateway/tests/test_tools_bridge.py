@@ -552,3 +552,83 @@ def test_risky_home_scene_names_always_need_a_confirmed_yes():
     assert w.run == []
     assert not run(b.call("home_scene", {"name": "garage-open", "confirmed": True}))["is_error"] and len(w.run) == 1
     assert not run(b.call("home_scene", {"name": "azel-lights-off"}))["is_error"]  # an ordinary scene: no extra step
+
+
+def test_grant_mac_matches_the_daemons_golden_value():
+    assert TB.grant_mac("tok", "ap-1", "vd-spark", "ls -la", "/home/u/x", "n0nce", 1700000000) == "78a6c4f27e365ff9965f2d61eb1bfeec26de56c0587bd4ab0a6013c5eea7f0f7"
+
+
+class GrantWorld(World):
+    """vd-spark: a daemon that cannot reach us. needs_approval first, a verified grant second."""
+    verdicts: list
+
+    def __init__(self):
+        super().__init__()
+        self.verdicts, self.created, self.used, self.audit, self.decision = [], [], [], [], "approved"
+
+    async def device_tools(self, devices):
+        return ([{"name": "spark__run_command", "description": "x", "input_schema": {"type": "object"}}],
+                {"spark__run_command": ("http://spark", "run_command")})
+
+    async def run_tool(self, block, where):
+        inp = block["input"]
+        self.run.append((block["name"], dict(inp)))
+        g = inp.get("grant")
+        if not g:
+            return {"content": json.dumps({"status": "needs_approval", "command": inp["command"], "cwd": "/home/u/proj",
+                                           "device": "vd-spark", "nonce": "nonce1"}), "is_error": False}
+        want = TB.grant_mac("spark-token", g["approval_id"], g["device"], g["command"], g["cwd"], g["nonce"], g["exp"])
+        self.verdicts.append(want == g["mac"] and g["exp"] - time.time() <= 600)
+        return {"content": json.dumps({"status": "ok", "exit_code": 0, "stdout": "done"}), "is_error": False}
+
+    async def state(self, method, path, body=None, **params):
+        if path.startswith("/v1/state/approvals/") and path.endswith("/use"):
+            self.used.append((path, body))
+            return {"status": "used"}
+        if path.startswith("/v1/state/approvals/") and method == "GET":
+            return {"status": self.decision}
+        return await super().state(method, path, body, **params)
+
+    def bridge(self):
+        b = super().bridge()
+
+        async def create(body):
+            self.created.append(body)
+            return {"approval_id": "ap-9", "status": "pending"}
+
+        async def ran(aid, body):
+            self.audit.append((aid, body))
+        b.d.update(approval_create=create, approval_ran=ran, device_token=lambda url: "spark-token",
+                   who=lambda: "ask:s1")
+        return b
+
+
+def test_needs_approval_becomes_an_approval_row_then_a_signed_grant(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = GrantWorld()
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert r["content"] and json.loads(r["content"])["stdout"] == "done" and not r["is_error"]
+    assert w.created == [{"device": "vd-spark", "tool": "run_command", "command": "pwd", "cwd": "/home/u/proj",
+                          "requester": "ask:s1"}]
+    assert w.used[0][1] == {"device": "vd-spark", "command": "pwd", "cwd": "/home/u/proj", "window_s": 600}
+    assert w.verdicts == [True]  # the daemon would accept this signature
+    sent = w.run[1][1]
+    assert sent["cwd"] == "/home/u/proj" and sent["grant"]["approval_id"] == "ap-9" and "approval_id" not in sent
+    assert w.audit == [("ap-9", {"exit_code": 0, "status": "ok"})]
+    assert r["approval"] == "approved"
+
+
+def test_a_denied_grant_request_runs_nothing(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = GrantWorld()
+    w.decision = "rejected"
+    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert r["is_error"] and r["approval"] == "denied" and len(w.run) == 1 and w.used == []
+
+
+def test_needs_approval_parser_ignores_look_alikes():
+    assert TB.needs_approval("ran ls") is None
+    assert TB.needs_approval(json.dumps({"status": "needs_approval", "command": "x"})) is None  # missing fields
+    ok = {"status": "needs_approval", "command": "x", "cwd": "/c", "device": "d", "nonce": "n"}
+    assert TB.needs_approval(json.dumps(ok)) == ok
+    assert TB.needs_approval("stdout: needs_approval") is None

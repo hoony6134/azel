@@ -202,8 +202,17 @@ JSON text frames:
   `{"type":"announce","id","session","opening","detail"?,"context"?}` (full links only): a task finished while its
   user is on the call `session` (`persona:session`). The voice server speaks `opening` there as its own turn once the
   call is quiet (captions route `task`, the context chip first) and answers `{"type":"announce_result","id","ok"}`;
-  `ok:false` (no such live call) and the gateway rings instead. While the user is on another call, the gateway holds
-  the finish call until that call ends. Every finish outcome is logged on the gateway.
+  `ok:false` (no such live call) and the gateway rings instead. `ok:true` only means taken: once the announcement has
+  actually played the voice server sends `{"type":"announced","id","ok":true}`; cut off, hung up first, or still
+  queued at hangup → `ok:false`, and the gateway rings (it waits up to 10 minutes for the ack). While the user is on
+  another call, the gateway holds the finish call until the line is free, rings held calls one at a time (20 s
+  apart), and rings anyway after 3 minutes. A call counts as in progress from its call_log start to its end, at most
+  2 hours, and none do while the voice link is down. A task records `notified_at` once its user was told (in the call,
+  by a call or by a push); at startup a gateway tells again its own finished notify=call/push tasks from the last 6
+  hours that have none. Every finish outcome is logged on the gateway (`task notify: …`).
+  A follow-up "그 작업 끝나면 전화해 줘" changes the notify of the newest unfinished task from the same call only;
+  otherwise 409 "어떤 작업 말씀이세요?". `task_set_notify` for a task running on another gateway updates its state row
+  only (its runner keeps the old choice); fine while only the Mac runs tasks.
 - Requests the voice server sends over the link to create something (`tool_call`, `schedule`, `task`) carry
   `origin_session` = the conversation being answered; the gateway keeps it on the task (`origin_session`) or on the
   reminder (kv `origin-<schedule id>`).
@@ -642,6 +651,17 @@ then checks `GET /v1/approvals/{id}` → `{"status":"approved","device","command
 and an exact command/cwd match, spends it with `POST /v1/approvals/{id}/use` (central, atomic, once, within 10 min of
 the tap; also kept in the local used-ids file), runs it, and reports `POST /v1/approvals/{id}/ran`
 `{"exit_code","status"}` (no output).
+Grant flow (`approval_via = "gateway-grant"`, vd-spark and vd-core, whose daemons cannot reach the gateway): the daemon
+contacts nobody and answers `{"status":"needs_approval","command","cwd","device","nonce"}` (the nonce is remembered in
+memory for 15 min). The gateway's device-tool path files the approval itself (`create_approval`: push, expiry, rules,
+requester), waits for the tap, spends it (`/use`), and calls `run_command` again with
+`grant = {approval_id, device, command, cwd, nonce, exp, mac}`: `mac` is HMAC-SHA256 (hex) of
+`"azel-grant-v1\n" + json([approval_id, device, command, cwd, nonce, exp])` (compact, UTF-8) keyed by the daemon's
+bearer token; `exp` is at most 10 minutes away (the gateway uses 5). The daemon runs `hard_deny` first, then checks the
+signature, exact device/command/cwd, expiry, and that the nonce is one it issued and has not used (persisted in
+`used_nonces.txt`, 0600), and runs. A grant never bypasses `hard_deny`; an approval id is refused in this mode. The
+gateway records the audit row (`/ran`). `claude -p` runs reach daemons directly, not through the gateway's device-tool
+path, so they receive the `needs_approval` answer and cannot continue it.
 Approved runs may use any existing directory under `$HOME` as cwd, except one that is, is inside, or contains a
 protected path (so never `~` itself); allowlisted runs without approval stay inside `allowed_roots` with `check_args`.
 `approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,

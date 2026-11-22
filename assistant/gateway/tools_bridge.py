@@ -14,6 +14,8 @@ Tools:
 The gateway wires it with its own functions (Bridge(...)), so this module holds the rules, not the plumbing.
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import re
 import time
@@ -28,6 +30,29 @@ APPROVAL_POLL_S = 2
 CALL_CAP = 20  # user-requested calls a day, apart from the autonomous-call limits
 ASK_APPROVAL = "앱에서 허용해 주세요."
 PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
+GRANT_S = 300  # a signed grant is valid this long (the daemon refuses more than 10 minutes)
+
+
+def grant_mac(token, approval_id, device, command, cwd, nonce, exp):
+    """HMAC-SHA256 over the grant fields, keyed by the device's daemon token; biseo_daemon.grant_mac is the twin."""
+    msg = "azel-grant-v1\n" + json.dumps([approval_id, device, command, cwd, nonce, int(exp)],
+                                         ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def needs_approval(text):
+    """The daemon's `needs_approval` answer (it could not reach us) as a dict, or None."""
+    if '"needs_approval"' not in text.replace('\\"', '"'):
+        return None
+    try:
+        out = json.loads(text[text.index("{"):text.rindex("}") + 1])
+    except ValueError:
+        return None
+    ok = isinstance(out, dict) and out.get("status") == "needs_approval" \
+        and all(isinstance(out.get(k), str) and out[k] for k in ("command", "cwd", "device", "nonce"))
+    return out if ok else None
+
+
 READ_TOOLS = {"list_dir", "read_file", "search", "browse", "job_status", "list_jobs"}
 
 CALL_USER = {
@@ -359,6 +384,8 @@ class Bridge:
         text = str(res.get("content", ""))
         if m := PENDING_RE.search(text.replace('\\"', '"')):
             return await self.after_approval(name, args, m.group(1), where, on_progress)
+        if na := needs_approval(text):
+            return await self.grant_flow(name, args, na, where, on_progress)
         return {"content": text, "is_error": bool(res.get("is_error")), "waited_s": 0}
 
     async def after_approval(self, name, args, aid, where, on_progress):
@@ -371,7 +398,10 @@ class Bridge:
             if a.get("status") == "approved":
                 res = await self.d["run_tool"]({"id": "bridge", "name": name, "input": {**args, "approval_id": aid}},
                                                where)
-                return {"content": str(res.get("content", "")), "is_error": bool(res.get("is_error")),
+                text = str(res.get("content", ""))
+                if na := needs_approval(text):  # a grant device cannot spend an approval id: file one it can
+                    return await self.grant_flow(name, args, na, where, on_progress)
+                return {"content": text, "is_error": bool(res.get("is_error")),
                         "waited_s": time.monotonic() - t0, "approval": "approved"}
             if a.get("status") == "rejected":
                 return {"content": "사용자가 그 실행을 거절했어요.", "is_error": True,
@@ -379,6 +409,47 @@ class Bridge:
             await asyncio.sleep(APPROVAL_POLL_S)
         return {"content": "5분 안에 허용되지 않아서 실행하지 않았어요.", "is_error": True,
                 "waited_s": time.monotonic() - t0, "approval": "expired"}
+
+    async def grant_flow(self, name, args, na, where, on_progress):
+        """A daemon that cannot reach us answered needs_approval: file the approval here (push, expiry, rules, audit),
+        wait for the tap as always, spend it, then re-call with a grant the daemon can check with its own token."""
+        aid = (await self.d["approval_create"]({"device": na["device"], "tool": "run_command", "command": na["command"],
+                                                "cwd": na["cwd"], "requester": self.d.get("who", lambda: "")()}))["approval_id"]
+        if on_progress:
+            await on_progress(ASK_APPROVAL)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < APPROVAL_WAIT_S:
+            a = await self.d["state"]("GET", f"/v1/state/approvals/{aid}") or {}
+            if a.get("status") == "approved":
+                return await self.run_granted(name, args, na, aid, where, time.monotonic() - t0)
+            if a.get("status") == "rejected":
+                return {"content": "사용자가 그 실행을 거절했어요.", "is_error": True,
+                        "waited_s": time.monotonic() - t0, "approval": "denied"}
+            await asyncio.sleep(APPROVAL_POLL_S)
+        return {"content": "5분 안에 허용되지 않아서 실행하지 않았어요.", "is_error": True,
+                "waited_s": time.monotonic() - t0, "approval": "expired"}
+
+    async def run_granted(self, name, args, na, aid, where, waited):
+        url, _ = where[name]
+        try:  # spend it centrally: atomic, once, for this device/command/cwd, within the run window
+            await self.d["state"]("POST", f"/v1/state/approvals/{aid}/use",
+                                  {"device": na["device"], "command": na["command"], "cwd": na["cwd"], "window_s": 600})
+        except Exception:  # noqa: BLE001
+            return {"content": "허용이 이미 쓰였거나 오래돼서 실행하지 않았어요.", "is_error": True, "waited_s": waited}
+        exp = int(time.time()) + GRANT_S
+        grant = {"approval_id": aid, "device": na["device"], "command": na["command"], "cwd": na["cwd"],
+                 "nonce": na["nonce"], "exp": exp,
+                 "mac": grant_mac(self.d["device_token"](url), aid, na["device"], na["command"], na["cwd"], na["nonce"], exp)}
+        res = await self.d["run_tool"]({"id": "bridge", "name": name,
+                                        "input": {**{k: v for k, v in args.items() if k != "approval_id"},
+                                                  "command": na["command"], "cwd": na["cwd"], "grant": grant}}, where)
+        text = str(res.get("content", ""))
+        try:  # the daemon cannot call us back: the audit row is ours
+            out = json.loads(text)
+            await self.d["approval_ran"](aid, {"exit_code": out.get("exit_code"), "status": out.get("status")})
+        except Exception:  # noqa: BLE001  the audit never fails the run
+            pass
+        return {"content": text, "is_error": bool(res.get("is_error")), "waited_s": waited, "approval": "approved"}
 
     # ---------- the assistant's own tools ----------
     async def call_user(self, args, persona_id, caller="api"):

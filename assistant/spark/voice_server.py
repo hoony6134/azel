@@ -2534,7 +2534,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         ctx = m.get("context")
         if isinstance(ctx, dict) and ctx.get("kind") == "task":
             await send({"type": "context", "context": {k: str(ctx.get(k) or "")[:60] for k in ("kind", "label", "id")}})
-        gen, said = new_reply(), []
+        gen, said, spoken = new_reply(), [], False
         try:
             await send({"type": "state", "value": "speaking"})
             await send({"type": "reply_start", "reply_id": gen}, gen=gen)
@@ -2543,9 +2543,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 await send(audio=pcm, gen=gen)
                 said.append(s)
             await until_played()
+            spoken = True
         finally:
             if said:
                 history[hkey].append({"role": "assistant", "content": " ".join(said)})
+            # the gateway counts it delivered only now; cut off or hung up first: it rings instead
+            await links.notify({"type": "announced", "id": m.get("id"), "ok": spoken})
             await send({"type": "state", "value": "listening"}, gen=gen)
 
     async def opening_heard(audio):
@@ -2743,7 +2746,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         await brain({"type": "call_event", "event": "end", "session": session})
         links.session_ctx.pop(session, None)
         for k in [k for k, q in active_calls.items() if k.endswith(f":{session}")]:
-            active_calls.pop(k, None)
+            q = active_calls.pop(k, None)
+            while q is not None and not q.empty():  # taken but never spoken before the hangup: the gateway rings
+                await links.notify({"type": "announced", "id": q.get_nowait().get("id"), "ok": False})
             call_hooks.pop(k, None)
             if current.get("auto"):  # its grant ends with the call (a secret call has no call log to end it)
                 await links.notify({"type": "auto_grant", "session": k, "value": False})
@@ -3667,6 +3672,7 @@ if __name__ == "__main__":
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.1)
             results = {m["id"]: m["ok"] for m in full.ws.sent if m.get("type") == "announce_result"}
+            results.update({f"{m['id']}:spoken": m["ok"] for m in full.ws.sent if m.get("type") == "announced"})
             grant_end = [m for m in full.ws.sent if m.get("type") == "auto_grant"][len(grant_req):]
             links.remove(full)
             return opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end
@@ -4074,7 +4080,7 @@ if __name__ == "__main__":
         assert opening_said[0].startswith("정훈님, 맡기신") and len(asked) == 1  # one turn: the follow-up, no greeting reply
         assert "스타트업 B" in asked[0] and DETAIL_NOTE in asked[0]  # answered from the task's whole result
         assert fallback.startswith("전화드렸어요")  # an opening that never arrived: never silent
-        assert announced == ["맡기신 정리 끝났어요.", "파일 세 개를 옮겼어요."] and results == {"an1": True, "an2": False}
+        assert announced == ["맡기신 정리 끝났어요.", "파일 세 개를 옮겼어요."] and results == {"an1": True, "an2": False, "an1:spoken": True}
         spoken, rejected, quiet, over, turns, asked = typed_check()
         kinds = lambda fs: [f if f == "audio" else f["type"] for f in fs]  # noqa: E731
         assert "transcript" not in kinds(spoken) and "audio" in kinds(spoken), kinds(spoken)
