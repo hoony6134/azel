@@ -1,6 +1,6 @@
-' Azel TV dashboard (SPEC.md): header, four summary tiles, one RowList of sections with 402x220 cards, a side detail
-' panel (OK), ambient mode (Play/Pause or 5 idle minutes), error/stale/partial/empty states, settings.
-' View-only: no key sends anything to the gateway except the poll itself.
+' Azel TV dashboard (SPEC.md): header with the living logo, a four-figure strip, one RowList of sections whose card
+' width follows the content, a compact detail panel (OK), ambient mode (Play/Pause or 5 idle minutes), error/stale/
+' partial/empty states and settings. View-only: nothing here sends anything to the gateway except the poll itself.
 
 sub init()
     m.reg = CreateObject("roRegistrySection", "azel")
@@ -24,18 +24,19 @@ sub init()
     m.errIdx = 0
     m.setIdx = 0
     m.glaze = pal("celadon")
+    m.inCall = false
     m.header = m.top.findNode("header")
     m.strip = m.top.findNode("strip")
     m.rows = m.top.findNode("rows")
+    m.rowsClip = m.top.findNode("rowsClip")
     m.detail = m.top.findNode("detail")
     m.ambientG = m.top.findNode("ambientG")
-    m.orbG = m.top.findNode("orbG")
+    m.ambBase = m.top.findNode("ambBase")
     m.errorG = m.top.findNode("errorG")
     m.settings = m.top.findNode("settings")
     m.poll = m.top.findNode("poll")
     m.idle = m.top.findNode("idle")
     m.tick = m.top.findNode("tick")
-    m.breath = m.top.findNode("breath")
     buildHeader()
     buildStrip()
     buildRows()
@@ -62,29 +63,38 @@ end sub
 ' ---------- build ----------
 
 sub buildHeader()
-    m.hGlow = mkPoster(m.header, "pkg:/images/orb_glow_72.png", -14, -14, 100, 100, m.glaze)
-    m.hBody = mkPoster(m.header, "pkg:/images/orb_body_72.png", 0, 0, 72, 72, "0xFFFFFFFF")
-    n = mkLabel(m.header, 92, 0, 600, 44, 36, "sb", pal("text"))
-    n.text = "Azel"
-    m.hState = mkLabel(m.header, 92, 46, 700, 34, 26, "r", pal("text2"))
-    m.hClock = mkLabel(m.header, 1128, 0, 600, 52, 48, "sb", pal("text"))
-    m.hClock.horizAlign = "right"
-    m.hDate = mkLabel(m.header, 828, 54, 900, 32, 26, "r", pal("text2"))
+    m.hLogo = CreateObject("roSGNode", "Logo")
+    m.header.appendChild(m.hLogo)
+    m.hName = mkLabel(m.header, 84, 9, 0, 46, 34, "sb", pal("text"))
+    m.hName.width = 0
+    m.hName.text = "Azel"
+    m.hState = mkLabel(m.header, 0, 17, 0, 30, 24, "r", pal("text"))
+    m.hState.width = 0
+    m.hClock = mkLabel(m.header, 1432, 8, 300, 48, 44, "sb", pal("text"))
+    m.hClock.width = 0
+    m.hDate = mkLabel(m.header, 0, 20, 760, 30, 24, "r", pal("text2"))
     m.hDate.horizAlign = "right"
 end sub
 
 sub buildStrip()
+    mkPoster(m.strip, "pkg:/images/rule.png", 0, 0, 1728, 2, pal("rule"))
+    for each x in [426, 864, 1302]
+        mkPoster(m.strip, "pkg:/images/rule.png", x, 2, 2, 120, pal("rule"))
+    end for
     m.tiles = []
+    xs = [0, 438, 876, 1314]
+    ws = [426, 438, 438, 426]
     for i = 0 to 3
         t = CreateObject("roSGNode", "StatTile")
-        t.translation = [i * 438, 0]
+        t.translation = [xs[i], 0]
+        t.colW = ws[i]
         m.strip.appendChild(t)
         m.tiles.Push(t)
     end for
-    setTiles([{k: "경고", v: "—", s2: "", hot: false, acc: ""}, {k: "진행 중 작업", v: "—", s2: "", hot: false, acc: ""}, {k: "다음 마감", v: "—", s2: "", hot: false, acc: ""}, {k: "다음 통화", v: "—", s2: "", hot: false, acc: ""}])
+    setFigs([{k: "경고", v: "—", t: "", acc: ""}, {k: "진행 중 작업", v: "—", t: "", acc: ""}, {k: "다음 마감", v: "—", t: "", acc: ""}, {k: "다음 통화", v: "—", t: "", acc: ""}])
 end sub
 
-sub setTiles(list as Object)
+sub setFigs(list as Object)
     for i = 0 to 3
         m.tiles[i].data = list[i]
     end for
@@ -93,64 +103,91 @@ end sub
 sub buildRows()
     m.rows.rowLabelFont = mkFont("sb", 34)
     m.rows.rowLabelColor = pal("text")
+    m.counter = mkLabel(m.rowsClip, 1224, 6, 600, 30, 24, "r", pal("text3"))
+    m.counter.horizAlign = "right"
+    m.counterOn = []
+end sub
+
+sub updateCounter()
+    f = m.rows.rowItemFocused
+    m.counter.visible = false
+    if f = invalid or f.Count() <> 2 or m.model = invalid then return
+    if f[0] >= m.model.sections.Count() then return
+    sec = m.model.sections[f[0]]
+    if sec.cards.Count() <= sec.cap then return
+    m.counter.text = (f[1] + 1).ToStr() + " / " + sec.cards.Count().ToStr()
+    m.counter.visible = true
 end sub
 
 sub buildDetail()
-    mkRect(m.detail, 0, 0, 760, 1080, pal("raised"))
-    mkRect(m.detail, 0, 0, 2, 1080, pal("stroke"))
-    m.dKind = mkLabel(m.detail, 56, 54, 650, 32, 24, "sb", pal("text2"))
-    m.dTitle = mkLabel(m.detail, 56, 100, 650, 156, 40, "sb", pal("text"))
+    m.dBg = mkPoster(m.detail, "pkg:/images/card.9.png", 0, 0, 852, 400, pal("raised"))
+    m.dTitle = mkLabel(m.detail, 40, 36, 772, 0, 34, "sb", pal("text"))
     m.dTitle.wrap = true
     m.dTitle.maxLines = 3
-    m.dTitle.height = 0 ' auto-height: the sub line follows its bottom
-    m.dSub = mkLabel(m.detail, 56, 200, 650, 40, 28, "r", pal("text2"))
-    m.dSubHot = mkLabel(m.detail, 56, 200, 650, 40, 28, "sb", pal("amber"))
+    m.dTitle.height = 0
+    m.dSub = mkLabel(m.detail, 40, 0, 772, 30, 24, "r", pal("text2"))
+    m.dSubHot = mkLabel(m.detail, 40, 0, 772, 30, 24, "sb", pal("amber"))
     m.dLine = []
     m.dFl = []
     m.dFv = []
-    for i = 0 to 4
-        m.dLine.Push(mkRect(m.detail, 56, 0, 648, 2, pal("stroke")))
-        m.dFl.Push(mkLabel(m.detail, 56, 0, 648, 30, 24, "r", pal("text3")))
-        v = mkLabel(m.detail, 56, 0, 648, 80, 30, "r", pal("text"))
-        v.wrap = true
-        v.maxLines = 2
-        m.dFv.Push(v)
+    for i = 0 to 5
+        m.dLine.Push(mkPoster(m.detail, "pkg:/images/rule.png", 40, 0, 772, 2, pal("rule")))
+        m.dFl.Push(mkLabel(m.detail, 40, 0, 120, 30, 24, "r", pal("text2")))
+        m.dFv.Push(mkLabel(m.detail, 200, 0, 612, 40, 30, "r", pal("text")))
     end for
-    h = mkLabel(m.detail, 56, 1000, 650, 36, 26, "r", pal("text2"))
-    h.text = "뒤로 닫기      ← → 옆 카드"
+    m.dHint = CreateObject("roSGNode", "MultiStyleLabel")
+    m.dHint.width = 772
+    m.dHint.height = 30
+    m.dHint.drawingStyles = {
+        default: {fontUri: "pkg:/fonts/PretendardKR-Regular.otf", fontSize: 24, color: "#8A9692FF"}
+        k: {fontUri: "pkg:/fonts/PretendardKR-SemiBold.otf", fontSize: 24, color: "#A9B4B0FF"}
+    }
+    m.dHint.text = "<k>뒤로</k> 닫기  ·  <k>좌우 키</k> 옆 카드"
+    m.detail.appendChild(m.dHint)
 end sub
 
 sub buildAmbient()
-    m.aClock = mkLabel(m.orbG, 432, 10, 700, 190, 180, "sb", "0xECF0ECD1")
-    m.aDate = mkLabel(m.orbG, 432, 222, 900, 50, 40, "r", "0xA9B4B0D1")
-    m.aSum = mkLabel(m.orbG, 432, 282, 1100, 44, 34, "r", "0xA9B4B0D1")
-    m.aUrgent = mkLabel(m.orbG, 432, 336, 1100, 44, 34, "sb", "0xE9BC6EE6")
-    m.orbG.translation = [240, 250]
+    m.aLogo = CreateObject("roSGNode", "Logo")
+    m.aLogo.scale = [2.34375, 2.34375]
+    m.aLogo.opacity = 0.85
+    m.ambBase.appendChild(m.aLogo)
+    m.aClock = mkLabel(m.ambBase, 198, -25, 0, 200, 200, "sb", "0xECF0ECCC")
+    m.aClock.width = 0
+    m.aL1 = mkLabel(m.ambBase, 198, 215, 1300, 52, 34, "r", "0xA9B4B0CC")
+    m.aL2 = mkLabel(m.ambBase, 198, 267, 1300, 52, 34, "r", "0xFF7A6EE6")
+    m.aL3 = mkLabel(m.ambBase, 198, 319, 1300, 52, 34, "r", "0xE9BC6EE6")
 end sub
 
 sub buildError()
-    m.eOrb = mkPoster(m.errorG, "pkg:/images/orb_body_360.png", 860, 300, 200, 200, pal("grey"))
-    m.eOrb.opacity = 0.55
-    m.eTitle = mkLabel(m.errorG, 0, 516, 1920, 64, 52, "sb", pal("text"))
-    m.eTitle.horizAlign = "center"
-    m.eBody = mkLabel(m.errorG, 360, 600, 1200, 90, 30, "r", pal("text2"))
-    m.eBody.horizAlign = "center"
+    m.eTitle = mkLabel(m.errorG, 96, 360, 1500, 68, 56, "sb", pal("text"))
+    m.eBody = mkLabel(m.errorG, 96, 448, 1100, 88, 30, "r", pal("text2"))
     m.eBody.wrap = true
     m.eBody.maxLines = 2
-    m.eBorder = []
+    m.eBody.lineSpacing = 4
     m.eFill = []
+    m.eRing = []
     m.eText = []
+    m.eBtnW = []
     names = ["다시 시도", "설정"]
+    x = 96
     for i = 0 to 1
-        x = 700 + i * 280
-        m.eBorder.Push(mkPoster(m.errorG, "pkg:/images/pill.9.png", x - 2, 732, 244, 76, pal("stroke")))
-        m.eFill.Push(mkPoster(m.errorG, "pkg:/images/pill.9.png", x, 734, 240, 72, pal("bg")))
-        l = mkLabel(m.errorG, x, 734, 240, 72, 30, "sb", pal("text"))
-        l.horizAlign = "center"
+        l = mkLabel(m.errorG, 0, 592, 0, 72, 30, "sb", pal("text"))
+        l.width = 0
         l.vertAlign = "center"
         l.text = names[i]
+        bw = l.boundingRect().width + 64
+        fill = mkPoster(m.errorG, "pkg:/images/card.9.png", x, 592, bw, 72, pal("card"))
+        ring = mkPoster(m.errorG, "pkg:/images/focus.9.png", x, 592, bw, 72, pal("text"))
+        ring.visible = false
+        m.errorG.removeChild(l)
+        m.errorG.appendChild(l)
+        l.translation = [x + 32, 592]
+        m.eFill.Push(fill)
+        m.eRing.Push(ring)
         m.eText.Push(l)
+        x = x + bw + 24
     end for
+    m.eHost = mkLabel(m.errorG, 96, 712, 1300, 30, 24, "r", pal("text3"))
 end sub
 
 sub buildSettings()
@@ -183,18 +220,18 @@ end sub
 sub hideAllModes()
     m.header.visible = false
     m.strip.visible = false
-    m.rows.visible = false
+    m.rowsClip.visible = false
     m.detail.visible = false
     m.ambientG.visible = false
     m.errorG.visible = false
     m.settings.visible = false
-    m.breath.control = "stop"
+    m.hLogo.active = false
+    m.aLogo.active = false
 end sub
 
 sub setDim(on as Boolean)
     o = 1.0
-    if on then o = 0.45
-    m.header.opacity = o
+    if on then o = 0.35
     m.strip.opacity = o
     if on
         m.rows.opacity = o
@@ -208,7 +245,9 @@ sub showDash()
     m.mode = "dash"
     m.header.visible = true
     m.strip.visible = true
-    m.rows.visible = true
+    m.rowsClip.visible = true
+    m.hLogo.opacity = 1
+    m.hLogo.active = true
     setDim(false)
     m.rows.setFocus(true)
     restartIdle()
@@ -236,37 +275,45 @@ sub showAmbient()
     m.mode = "ambient"
     m.ambientG.visible = true
     m.top.setFocus(true)
-    m.breath.control = "start"
+    m.aLogo.tint = m.glaze
+    m.aLogo.inCall = m.inCall
+    m.aLogo.active = true
     updateAmbient()
 end sub
 
 sub showError()
     hideAllModes()
     m.mode = "error"
+    m.header.visible = true
     m.errorG.visible = true
     m.top.setFocus(true)
     m.idle.control = "stop"
+    m.hLogo.tint = pal("text3")
+    m.hLogo.opacity = 0.4
+    m.hLogo.active = false
     if m.errCode = 401
         m.eTitle.text = "토큰이 맞지 않아요"
         m.eBody.text = "설정에서 TV 토큰을 다시 넣어 주세요."
         m.errIdx = 1
     else
         m.eTitle.text = "서버에 연결할 수 없어요"
-        m.eBody.text = "인터넷 연결과 서버 주소를 확인해 주세요." + Chr(10) + "30초마다 저절로 다시 시도해요."
+        m.eBody.text = "인터넷 연결과 서버 주소를 확인해 주세요. 30초마다 저절로 다시 시도해요."
         m.errIdx = 0
     end if
+    h = m.url
+    p = Instr(1, h, "://")
+    if p > 0 then h = Mid(h, p + 3)
+    p = Instr(1, h, "/")
+    if p > 0 then h = Left(h, p - 1)
+    m.eHost.text = "서버 주소 " + h
     refreshError()
+    updateHeader()
 end sub
 
 sub refreshError()
     for i = 0 to 1
-        if i = m.errIdx
-            m.eFill[i].blendColor = pal("celadon")
-            m.eText[i].color = pal("bg")
-        else
-            m.eFill[i].blendColor = pal("bg")
-            m.eText[i].color = pal("text")
-        end if
+        m.eRing[i].visible = i = m.errIdx
+        if i = m.errIdx then m.eFill[i].blendColor = pal("cardFocus") else m.eFill[i].blendColor = pal("card")
     end for
 end sub
 
@@ -367,14 +414,22 @@ sub applyData()
     now = nowEpoch()
     model = buildModel(m.data, m.v, now)
     m.model = model
-    setTiles(model.tiles)
+    setFigs(model.figs)
+    m.glaze = pal("celadon")
+    m.inCall = false
     a = m.data.assistant
     if a <> invalid
-        if a.persona <> invalid then m.glaze = glazeOf(sv(a.persona.tint)) else m.glaze = pal("celadon")
+        if sv(a.state) = "call" then m.inCall = true
+        if a.persona <> invalid and m.inCall then m.glaze = glazeOf(sv(a.persona.tint))
     end if
-    m.hGlow.blendColor = m.glaze
+    m.hLogo.tint = m.glaze
+    m.hLogo.inCall = m.inCall
     setRows(model)
-    if m.mode = "ambient" then updateAmbient()
+    if m.mode = "ambient"
+        m.aLogo.tint = m.glaze
+        m.aLogo.inCall = m.inCall
+        updateAmbient()
+    end if
     if m.mode = "detail" then updateDetail(m.detailRow, m.detailCol)
 end sub
 
@@ -390,14 +445,21 @@ sub setRows(model as Object)
         prevC = f[1]
     end if
     titles = []
+    sizes = []
+    gaps = []
     for each s in model.sections
         titles.Push(s.title)
+        sizes.Push([s.w, 200])
+        gaps.Push([24, 0])
     end for
     m.sectionTitles = titles
+    m.rows.rowItemSize = sizes
+    m.rows.rowItemSpacing = gaps
     m.rows.content = makeContent(model.sections)
-    r = 0
-    c = 0
+    updateCounter()
     if prevTitle <> ""
+        r = 0
+        c = 0
         for i = 0 to titles.Count() - 1
             if titles[i] = prevTitle
                 r = i
@@ -420,18 +482,23 @@ end function
 
 sub updateHeader()
     now = nowEpoch()
-    m.hClock.text = fmtHM(now)
-    st = "대기 중"
-    st2 = pal("text2")
-    if m.data <> invalid and m.data.assistant <> invalid and sv(m.data.assistant.state) = "call"
+    inErr = m.mode = "error"
+    m.hClock.visible = not inErr
+    m.hDate.visible = not inErr
+    st = ""
+    if m.inCall
         st = "통화 중"
-        st2 = pal("celadon")
-        if m.data.assistant.persona <> invalid
+        if m.data <> invalid and m.data.assistant <> invalid and m.data.assistant.persona <> invalid
             if sv(m.data.assistant.persona.name) <> "" then st = st + " · " + sv(m.data.assistant.persona.name)
         end if
     end if
     m.hState.text = st
-    m.hState.color = st2
+    m.hState.visible = st <> "" and not inErr
+    m.hState.translation = [84 + m.hName.boundingRect().width + 24, 17]
+    m.hClock.text = fmtHM(now)
+    cw = m.hClock.boundingRect().width
+    m.hClock.translation = [1732 - cw, 8]
+    m.hDate.translation = [1732 - cw - 20 - 760, 20]
     m.hDate.color = pal("text2")
     if not m.hasData
         if m.err <> "" then m.hDate.text = "" else m.hDate.text = "불러오는 중이에요"
@@ -441,29 +508,34 @@ sub updateHeader()
     else if m.fetching
         m.hDate.text = "갱신 중…"
     else
-        m.hDate.text = dateKo(now) + " · " + fmtHM(m.lastOk) + " 갱신"
+        m.hDate.text = dateKo(now)
+        age = now - m.lastOk
+        if age > 120
+            m.hDate.text = m.hDate.text + " · " + Int(age / 60).ToStr() + "분 전 갱신"
+            m.hDate.color = pal("text3")
+        end if
     end if
 end sub
 
 sub updateAmbient()
     now = nowEpoch()
     m.aClock.text = fmtHM(now)
-    m.aDate.text = dateKo(now)
-    s = ""
-    u = ""
+    l1 = dateKo(now)
+    l2 = ""
+    l3 = ""
     if m.model <> invalid
-        s = "경고 " + m.model.alerts.ToStr() + " · 진행 중 작업 " + m.model.running.ToStr()
-        if m.model.nextCall <> "—" then s = s + " · 다음 통화 " + m.model.nextCall
-        u = m.model.urgentLine
+        if m.model.nextCall <> "" then l1 = l1 + " · 다음 통화 " + m.model.nextCall
+        l2 = m.model.brokenLine
+        l3 = m.model.soonLine
     end if
-    m.aSum.text = s
-    m.aUrgent.text = u
-    m.aUrgent.visible = u <> ""
-    m.aGlow = m.top.findNode("aGlow")
-    m.aGlow.blendColor = m.glaze
-    offs = [[0, 0], [120, 60], [240, 0], [240, 120], [120, 180], [0, 120]]
+    m.aL1.text = l1
+    m.aL2.text = l2
+    m.aL3.text = l3
+    m.aL2.visible = l2 <> ""
+    m.aL3.visible = l3 <> ""
+    offs = [[0, 0], [160, 60], [320, 0], [320, 140], [160, 200], [0, 140]]
     o = offs[m.offsetIdx mod 6]
-    m.orbG.translation = [240 + o[0], 250 + o[1]]
+    m.ambBase.translation = [240 + o[0], 320 + o[1]]
 end sub
 
 sub updateDetail(r as Integer, c as Integer)
@@ -472,35 +544,42 @@ sub updateDetail(r as Integer, c as Integer)
     cards = m.model.sections[r].cards
     if c >= cards.Count() then return
     k = cards[c]
-    m.dKind.text = k.dkind
-    m.dKind.color = accentColor(k.acc, "text2")
     m.dTitle.text = k.dtitle
-    y = 100 + m.dTitle.boundingRect().height + 14
+    y = 36 + m.dTitle.boundingRect().height
     m.dSub.visible = false
     m.dSubHot.visible = false
     if k.dsub <> ""
         s = m.dSub
-        if k.dhot then s = m.dSubHot
+        if k.dsoon then s = m.dSubHot
         s.text = k.dsub
-        s.translation = [56, y]
+        s.translation = [40, y + 12]
         s.visible = true
-        y = y + 54
+        y = y + 12 + 30
     end if
-    y = y + 34
-    for i = 0 to 4
+    for i = 0 to 5
         show = i < k.facts.Count()
         m.dLine[i].visible = show
         m.dFl[i].visible = show
         m.dFv[i].visible = show
-        if show
-            m.dLine[i].translation = [56, y]
-            m.dFl[i].translation = [56, y + 14]
-            m.dFv[i].translation = [56, y + 46]
+    end for
+    if k.facts.Count() > 0
+        y = y + 28
+        for i = 0 to k.facts.Count() - 1
+            if i > 5 then exit for
+            m.dLine[i].translation = [40, y]
+            m.dFl[i].translation = [40, y + 20]
+            m.dFv[i].translation = [200, y + 14]
             m.dFl[i].text = k.facts[i].l
             m.dFv[i].text = k.facts[i].v
-            y = y + 106
-        end if
-    end for
+            y = y + 64
+        end for
+        m.dLine[k.facts.Count() - 1].visible = true
+        y = y + 2
+    end if
+    y = y + 28
+    m.dHint.translation = [40, y]
+    y = y + 30 + 32
+    m.dBg.height = y
 end sub
 
 ' ---------- input ----------
@@ -517,6 +596,7 @@ end sub
 
 sub onFocused()
     restartIdle()
+    updateCounter()
     if m.mode <> "detail" then return
     f = m.rows.rowItemFocused
     if f = invalid or f.Count() <> 2 then return
@@ -636,6 +716,7 @@ sub saveSettings()
     m.err = ""
     m.sig = ""
     m.model = invalid
+    m.hLogo.tint = pal("celadon")
     showDash()
     startFetch()
 end sub

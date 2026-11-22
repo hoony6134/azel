@@ -116,12 +116,22 @@ def parse_down(text):
     return out[:LINES]
 
 
+HEADS = ((re.compile(r"disk|디스크", re.I), "디스크 부족"), (re.compile(r"mem|메모리", re.I), "메모리 부족"),
+         (re.compile(r"cpu|load|부하", re.I), "CPU 높음"), (re.compile(r"temp|온도", re.I), "온도 높음"),
+         (re.compile(r"down|멈춤|꺼짐|unreachable", re.I), "응답 없음"))
+
+
+def alert_head(text):
+    """A short run-in head for the TV card (SPEC 2.2), from the alert's own words; `경고` when nothing matches."""
+    return next((h for pat, h in HEADS if pat.search(text)), "경고")
+
+
 def parse_alerts(text):
     out = []
     for line in lines(text, 20):
         if re.match(r"(no firing alerts|지금 울리는 경보 없음)", line, re.I):
             continue
-        out.append({"text": line.lstrip("-*• ")[:WIDTH], "level": "crit" if CRIT.search(line) else "warn", "at": None})
+        out.append({"text": line.lstrip("-*• ")[:WIDTH], "head": alert_head(line), "level": "crit" if CRIT.search(line) else "warn", "at": None})
     return out[:LINES]
 
 

@@ -2,6 +2,7 @@
 <component name="StatTile" extends="Group">
     <interface>
         <field id="data" type="assocarray" onChange="onData" />
+        <field id="colW" type="integer" value="426" />
     </interface>
     <script type="text/brightscript" uri="pkg:/components/Common.brs" />
     <script type="text/brightscript" uri="pkg:/components/StatTile.brs" />

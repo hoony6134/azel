@@ -122,7 +122,7 @@ def test_v2_parsers_on_real_cygnus_text():
     assert tv.parse_down(STATUS) == [{"service": "Vuja De claw (NemoClaw)", "node": "vd-spark", "since": None}]
     assert tv.parse_alerts("No firing alerts.") == []
     a = tv.parse_alerts("deneb disk 91% (warning)\nCRITICAL: gienah down")
-    assert [x["level"] for x in a] == ["warn", "crit"]
+    assert [x["level"] for x in a] == ["warn", "crit"] and [x["head"] for x in a] == ["디스크 부족", "응답 없음"]
     assign, todos = tv.parse_assignments(ASSIGN, NOW)
     assert assign == [{"title": "12주차 토론지 제출", "course": "역사학특강", "due": assign[0]["due"]}]
     assert assign[0]["due"].endswith("-11-22T23:00:00+09:00")

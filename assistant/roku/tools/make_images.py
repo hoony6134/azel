@@ -51,42 +51,65 @@ def nine(path, inner, stretch, pad=None):
     Image.fromarray(img, "RGBA").save(OUT / path, optimize=True)
 
 
-def orb(size, glow=False):
-    """The jar-outlined orb. body: white to #F3EBDC radial; glow: soft white halo (alpha only), 1.4x the body."""
-    n = round(size * (1.4 if glow else 1))
+def jar_field(n, size):
+    """Per-pixel (signed distance to the jar edge in px, outward unit vector) on an n x n canvas, supersampled x2."""
     r = size / 2 * 0.86
     dx, dy = optical_offset()
     cx, cy = n / 2 - dx * r, n / 2 - dy * r
-    W = n * (2 if n > 200 else 3)
+    W = n * 2
     y, x = np.mgrid[0:W, 0:W]
     px, py = (x + 0.5) / W * n - cx, (y + 0.5) / W * n - cy
     t = np.arctan2(py, px)
     edge = r * (1 - 0.06 * np.sin(t) - 0.035 * np.cos(2 * t) + 0.015 * np.sin(3 * t + 0.6))
-    dist = np.hypot(px, py) - edge  # < 0 inside
-    s = n / W
-    if glow:
-        a = np.clip(1 - np.maximum(dist, 0) / (0.34 * r), 0, 1) ** 2 * 0.7
-        rgb = np.full((W, W, 3), 255.0)
-    else:
-        a = np.clip(0.5 - dist / s, 0, 1)
-        k = np.clip(np.hypot(px + 0.25 * r, py + 0.3 * r) / (1.15 * r), 0, 1)
-        top, bot = np.array([255, 255, 255.0]), np.array([0xF3, 0xEB, 0xDC])
-        rgb = top * (1 - k[..., None]) + bot * k[..., None]
-    img = np.dstack([rgb, a * 255])
-    img = img.reshape(n, W // n, n, W // n, 4).mean(axis=(1, 3)) if W % n == 0 else \
-        np.asarray(Image.fromarray(img.astype(np.uint8), "RGBA").resize((n, n), Image.LANCZOS)).astype(float)
-    Image.fromarray(np.round(img).astype(np.uint8), "RGBA").save(OUT / f"orb_{'glow' if glow else 'body'}_{size}.png", optimize=True)
+    dist = np.hypot(px, py)
+    return W, edge, dist - edge, px / np.maximum(dist, 1e-6), py / np.maximum(dist, 1e-6), r
+
+
+def down(a, n):
+    return a.reshape(n, a.shape[0] // n, n, a.shape[1] // n, -1).mean(axis=(1, 3))
+
+
+def save_rgba(rgb, alpha, name):
+    img = np.dstack([rgb, alpha * 255])
+    Image.fromarray(np.round(down(img, rgb.shape[0] // 2)).astype(np.uint8), "RGBA").save(OUT / name, optimize=True)
+
+
+def orb_images(n=150):
+    """orb_body: neutral porcelain jar, white to #F3EBDC radial. orb_rim: the same outline, white with alpha only
+    toward the lower-right rim (blended with the persona glaze). Header uses them scaled to 64."""
+    W, edge, d, ux, uy, r = jar_field(n, n)
+    inside = np.clip(0.5 - d / 2, 0, 1)
+    yy, xx = np.mgrid[0:W, 0:W]
+    pxn, pyn = (xx + 0.5) / W * n, (yy + 0.5) / W * n
+    c = n / 2
+    kk = np.clip(np.hypot(pxn - (c - 0.18 * r), pyn - (c - 0.22 * r)) / (1.2 * r), 0, 1)
+    top, bot = np.array([255, 255, 255.0]), np.array([0xF3, 0xEB, 0xDC])
+    rgb = top * (1 - kk[..., None]) + bot * kk[..., None]
+    save_rgba(rgb, inside, "orb_body.png")
+    depth = np.clip(-d / (0.22 * r), 0, 1)  # 0 at the edge, 1 deep inside
+    lower_right = np.clip(0.5 + 0.5 * (ux * 0.72 + uy * 0.72), 0, 1) ** 1.4
+    rim = (1 - depth) ** 1.6 * lower_right * 0.9 * inside
+    save_rgba(np.full((W, W, 3), 255.0), rim, "orb_rim.png")
+
+
+def light_image(w=64, h=54):
+    y, x = np.mgrid[0:h * 2, 0:w * 2]
+    d = np.hypot((x + 0.5) / (w * 2) - 0.5, ((y + 0.5) / (h * 2) - 0.5) * (w / h)) / 0.5
+    a = np.clip(1 - d, 0, 1) ** 2 * 0.75
+    img = np.dstack([np.full((h * 2, w * 2, 3), 255.0), a * 255])
+    Image.fromarray(np.round(img.reshape(h, 2, w, 2, 4).mean(axis=(1, 3))).astype(np.uint8), "RGBA").save(OUT / "orb_light.png", optimize=True)
 
 
 def main():
     OUT.mkdir(exist_ok=True)
-    nine("card.9.png", rrect_mask(40, 40, 16), (16, 24, 16, 24))
-    ring = rrect_mask(52, 52, 22, ring=6)
-    nine("focus.9.png", ring, (22, 30, 22, 30), pad=(6, 6, 6, 6))
-    nine("pill.9.png", rrect_mask(72, 72, 36), (36, 36 + 1, 36, 36 + 1))
-    for size in (360, 72):
-        orb(size)
-        orb(size, glow=True)
+    nine("card.9.png", rrect_mask(24, 24, 8), (8, 16, 8, 16))
+    nine("focus.9.png", rrect_mask(24, 24, 8, ring=4), (8, 16, 8, 16))
+    Image.fromarray(np.full((2, 2, 4), 255, dtype=np.uint8), "RGBA").save(OUT / "rule.png")
+    wrap = np.zeros((2, 1920, 4), dtype=np.uint8)  # the RowList wrap seam: the safe width, in the rule colour
+    wrap[:, 96:1824] = (0x26, 0x31, 0x3A, 255)
+    Image.fromarray(wrap, "RGBA").save(OUT / "rule_wrap.png", optimize=True)
+    orb_images()
+    light_image()
 
 
 if __name__ == "__main__":

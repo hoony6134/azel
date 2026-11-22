@@ -5,27 +5,23 @@
     <script type="text/brightscript" uri="pkg:/components/MainScene.brs" />
     <children>
         <Rectangle id="bg" width="1920" height="1080" color="0x0D1113FF" />
-        <Group id="header" translation="[96,54]" />
-        <Group id="strip" translation="[96,162]" />
-        <RowList id="rows" translation="[0,330]" itemComponentName="DashCard" itemSize="[1920,324]" numRows="3"
-            rowHeights="[324]" rowItemSize="[[402,220]]" rowItemSpacing="[[24,0]]" focusXOffset="[96]"
-            rowLabelOffset="[[96,0]]" showRowLabel="[true]" showRowCounter="[true]" rowCounterRightOffset="96"
-            rowFocusAnimationStyle="floatingFocus" vertFocusAnimationStyle="fixedFocus" drawFocusFeedback="true"
-            focusBitmapUri="pkg:/images/focus.9.png" focusBitmapBlendColor="0x82CBB4FF" />
-        <Group id="detail" visible="false" translation="[1160,0]" />
+        <Group id="header" translation="[92,54]" />
+        <Group id="strip" translation="[96,150]" />
+        <Group id="rowsClip" translation="[0,318]" clippingRect="[0,0,1920,682]">
+            <RowList id="rows" itemComponentName="DashCard" itemSize="[1920,264]" itemSpacing="[0,48]" numRows="3"
+                rowItemSize="[[414,200]]" rowItemSpacing="[[24,0]]" focusXOffset="[96]" rowLabelOffset="[[96,16]]"
+                showRowLabel="[true]" showRowCounter="[false]"
+                rowFocusAnimationStyle="floatingFocus" vertFocusAnimationStyle="fixedFocusWrap"
+                wrapDividerBitmapUri="pkg:/images/rule_wrap.png" wrapDividerHeight="2" wrapDividerWidth="1920"
+                drawFocusFeedback="true" focusBitmapUri="pkg:/images/focus.9.png" focusBitmapBlendColor="0xECF0ECFF" />
+        </Group>
+        <Group id="detail" visible="false" translation="[972,318]" />
         <Group id="ambientG" visible="false">
             <Rectangle id="ambientBg" width="1920" height="1080" color="0x080B0CFF" />
-            <Group id="orbG">
-                <Poster id="aGlow" uri="pkg:/images/orb_glow_360.png" translation="[-72,-72]" width="504" height="504" />
-                <Poster id="aBody" uri="pkg:/images/orb_body_360.png" width="360" height="360" />
-            </Group>
+            <Group id="ambBase" translation="[240,320]" />
         </Group>
         <Group id="errorG" visible="false" />
         <Group id="settings" visible="false" />
-        <Animation id="breath" duration="8" repeat="true" easeFunction="inOutQuad">
-            <FloatFieldInterpolator id="breathA" fieldToInterp="aBody.opacity" key="[0.0, 0.5, 1.0]" keyValue="[0.9, 0.6, 0.9]" />
-            <FloatFieldInterpolator id="breathB" fieldToInterp="aGlow.opacity" key="[0.0, 0.5, 1.0]" keyValue="[0.9, 0.6, 0.9]" />
-        </Animation>
         <Timer id="poll" duration="60" repeat="true" />
         <Timer id="idle" duration="300" repeat="false" />
         <Timer id="tick" duration="60" repeat="true" />

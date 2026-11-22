@@ -671,7 +671,7 @@ device that created them.
   ```json
   {"at": "…", "assistant": {"state": "idle"|"call", "persona": {"name": "세레나", "tint": "plum"}},
    "infra": {"nodes": [{"name","up","cpu","ram","disk","temp"|null,"seen"|null}],
-             "alerts": [{"text","level": "warn"|"crit","at"|null}], "down": [{"service","node","since"|null}]},
+             "alerts": [{"text","head","level": "warn"|"crit","at"|null}], "down": [{"service","node","since"|null}]},
    "tasks": {"running": [{"goal","since"}], "queued": {"count","next"|null},
              "approvals": {"count","oldest"|null}, "overnight": {"count","starts": "01:00"},
              "recent": [{"goal","status": "done"|"failed","at"}]},

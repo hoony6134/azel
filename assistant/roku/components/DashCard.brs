@@ -1,42 +1,55 @@
-' One 402x220 card (SPEC.md 5.4). Static children are built once; onContent only sets text, colours and visibility.
+' One card (SPEC.md 5.4): a plain fill, no border, no tint. Colour lives only in the words (run-in head, a deadline's
+' figure, a value over its threshold). Padding 24 top, 28 sides; the meta line's bottom sits at y 176.
 
 sub init()
-    m.border = mkPoster(m.top, "pkg:/images/card.9.png", -2, -2, 406, 224, pal("stroke"))
-    m.fill = mkPoster(m.top, "pkg:/images/card.9.png", 0, 0, 402, 220, pal("card"))
-    m.kind = mkLabel(m.top, 26, 22, 350, 32, 24, "sb", pal("text2"))
-    m.kindR = mkLabel(m.top, 26, 22, 350, 32, 24, "r", pal("text2"))
-    m.title = mkLabel(m.top, 26, 22, 260, 40, 32, "sb", pal("text"))
-    m.title.width = 0 ' auto-size: its bounding rect places the chip
-    m.chipB = mkPoster(m.top, "pkg:/images/pill.9.png", 0, 0, 10, 38, pal("celadon"))
-    m.chipF = mkPoster(m.top, "pkg:/images/pill.9.png", 0, 0, 10, 34, pal("celadon"))
-    m.chipL = mkLabel(m.top, 0, 0, 200, 34, 24, "sb", pal("celadon"))
-    m.chipL.vertAlign = "center"
-    m.body = mkLabel(m.top, 26, 62, 350, 100, 30, "r", pal("text"))
-    m.body.wrap = true
-    m.body.maxLines = 2
-    m.body.ellipsisText = "…"
-    m.bodyS = mkLabel(m.top, 26, 70, 350, 96, 28, "r", pal("text2"))
-    m.bodyS.wrap = true
-    m.bodyS.maxLines = 2
-    m.bodyS.ellipsisText = "…"
-    m.big = mkLabel(m.top, 26, 64, 350, 72, 64, "sb", pal("text"))
-    m.meta = mkLabel(m.top, 26, 166, 350, 30, 24, "r", pal("text3"))
-    m.mLab = []
-    m.mVal = []
-    m.mTrack = []
-    m.mFill = []
+    m.fill = mkPoster(m.top, "pkg:/images/card.9.png", 0, 0, 414, 200, pal("card"))
+    m.head = CreateObject("roSGNode", "MultiStyleLabel")
+    m.head.translation = [28, 24]
+    m.head.wrap = true
+    m.head.maxLines = 2
+    m.head.lineSpacing = 6
+    m.head.drawingStyles = {
+        default: {fontUri: "pkg:/fonts/PretendardKR-Regular.otf", fontSize: 30, color: "#ECF0ECFF"}
+        crit: {fontUri: "pkg:/fonts/PretendardKR-SemiBold.otf", fontSize: 30, color: "#FF7A6EFF"}
+        soon: {fontUri: "pkg:/fonts/PretendardKR-SemiBold.otf", fontSize: 30, color: "#E9BC6EFF"}
+    }
+    m.top.appendChild(m.head)
+    m.big = mkLabel(m.top, 28, 24, 0, 48, 44, "sb", pal("text"))
+    m.big.width = 0
+    m.tail = mkLabel(m.top, 0, 38, 0, 30, 24, "r", pal("text2"))
+    m.tail.width = 0
+    m.nowL = mkLabel(m.top, 0, 38, 0, 30, 24, "sb", pal("celadon"))
+    m.nowL.width = 0
+    m.nowL.text = "지금"
+    m.sent = mkLabel(m.top, 28, 24, 358, 80, 30, "r", pal("text"))
+    m.sent.wrap = true
+    m.sent.maxLines = 2
+    m.sent.lineSpacing = 0
+    m.sent.ellipsisText = "…"
+    m.meta = mkLabel(m.top, 28, 146, 358, 30, 24, "r", pal("text3"))
+    m.name = mkLabel(m.top, 28, 24, 212, 40, 30, "sb", pal("text"))
+    m.down = mkLabel(m.top, 28, 68, 212, 30, 24, "sb", pal("danger"))
+    m.rowL = []
+    m.rowV = []
     for i = 0 to 3
-        x = 26 + (i mod 2) * 190
-        y = 72 + Int(i / 2) * 50
-        m.mLab.Push(mkLabel(m.top, x, y, 100, 30, 24, "r", pal("text2")))
-        v = mkLabel(m.top, x, y, 160, 30, 24, "sb", pal("text"))
+        m.rowL.Push(mkLabel(m.top, 28, 68 + i * 27, 120, 30, 24, "r", pal("text2")))
+        v = mkLabel(m.top, 28, 68 + i * 27, 212, 30, 24, "sb", pal("text"))
         v.horizAlign = "right"
-        m.mVal.Push(v)
-        m.mTrack.Push(mkRect(m.top, x, y + 34, 160, 6, pal("stroke")))
-        m.mFill.Push(mkRect(m.top, x, y + 34, 10, 6, pal("celadon")))
+        m.rowV.Push(v)
     end for
+    m.bn = []
+    m.bl = []
+    m.bm = []
+    for i = 0 to 1
+        x = 28 + i * 268
+        m.bn.Push(mkLabel(m.top, x, 24, 0, 64, 56, "sb", pal("text")))
+        m.bn[i].width = 0
+        m.bl.Push(mkLabel(m.top, x, 42, 0, 40, 30, "r", pal("text2")))
+        m.bl[i].width = 0
+        m.bm.Push(mkLabel(m.top, x, 146, 216, 30, 24, "r", pal("text3")))
+    end for
+    m.all = [m.head, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down]
     m.fillBase = pal("card")
-    m.all = [m.kind, m.kindR, m.title, m.chipB, m.chipF, m.chipL, m.body, m.bodyS, m.big, m.meta]
 end sub
 
 sub hideAll()
@@ -44,148 +57,134 @@ sub hideAll()
         n.visible = false
     end for
     for i = 0 to 3
-        m.mLab[i].visible = false
-        m.mVal[i].visible = false
-        m.mTrack[i].visible = false
-        m.mFill[i].visible = false
+        m.rowL[i].visible = false
+        m.rowV[i].visible = false
+    end for
+    for i = 0 to 1
+        m.bn[i].visible = false
+        m.bl[i].visible = false
+        m.bm[i].visible = false
     end for
 end sub
 
-sub place(n as Object, y as Integer)
-    n.translation = [26, y]
+sub show(n as Object, x as Integer, y as Integer)
+    n.translation = [x, y]
     n.visible = true
 end sub
 
-sub showChip(text as String, color as String, x as Integer, y as Integer)
-    m.chipL.width = 0
-    m.chipL.text = text
-    m.chipL.visible = true
-    w = m.chipL.boundingRect().width + 28
-    m.chipL.width = w
-    m.chipL.horizAlign = "center"
-    m.chipL.translation = [x, y]
-    m.chipL.color = color
-    m.chipF.width = w
-    m.chipF.translation = [x, y]
-    m.chipF.blendColor = withAlpha(color, "1F")
-    m.chipB.width = w + 4
-    m.chipB.translation = [x - 2, y - 2]
-    m.chipB.blendColor = withAlpha(color, "99")
-    m.chipF.visible = true
-    m.chipB.visible = true
-end sub
-
-sub setMeter(i as Integer, label as String, v as Integer, warnAt as Integer, suffix as String)
-    m.mLab[i].text = label
-    m.mLab[i].visible = true
-    m.mVal[i].visible = true
-    m.mTrack[i].visible = true
+sub setRow(i as Integer, label as String, v as Integer, warnAt as Integer, suffix as String)
+    m.rowL[i].text = label
+    m.rowL[i].visible = true
+    m.rowV[i].visible = true
     if v < 0
-        m.mVal[i].text = "—"
-        m.mFill[i].visible = false
+        m.rowV[i].text = "—"
+        m.rowV[i].color = pal("text2")
         return
     end if
-    m.mVal[i].text = v.ToStr() + suffix
-    m.mVal[i].color = pal("text")
-    w = v
-    if w > 100 then w = 100
-    m.mFill[i].width = Int(w * 1.6) + 1
-    if v >= warnAt
-        m.mFill[i].color = pal("amber")
-        m.mVal[i].color = pal("amber")
-    else
-        m.mFill[i].color = pal("celadon")
-    end if
-    m.mFill[i].visible = true
+    m.rowV[i].text = v.ToStr() + suffix
+    if v >= warnAt then m.rowV[i].color = pal("amber") else m.rowV[i].color = pal("text")
 end sub
 
 sub onContent()
     c = m.top.itemContent
     if c = invalid then return
     hideAll()
+    w = c.d_w
+    if w < 100 then w = 414
+    m.fill.width = w
+    inner = w - 56
     t = c.d_t
-    acc = c.d_acc
-    fill = pal("card")
-    border = pal("stroke")
-    if c.d_hot
-        if acc = "danger"
-            fill = pal("hotDanger")
-            border = pal("borderDanger")
-        else
-            fill = pal("hotAmber")
-            border = pal("borderAmber")
-        end if
-    end if
-    m.fillBase = fill
-    m.fill.blendColor = fill
-    m.border.blendColor = border
-    m.border.visible = true
+    m.meta.width = inner
     m.meta.text = c.d_meta
-    m.meta.color = pal("text3")
-    if t = "node"
-        m.title.text = c.d_title
-        m.title.color = pal("text")
-        place(m.title, 22)
-        setMeter(0, "CPU", c.d_m1, 85, "%")
-        setMeter(1, "메모리", c.d_m2, 90, "%")
-        setMeter(2, "디스크", c.d_m3, 85, "%")
-        setMeter(3, "온도", c.d_m4, 80, "°")
+    m.sent.width = inner
+    m.head.width = inner
+    m.head.height = 90
+    if t = "urgent"
+        s = "<" + c.d_hl + ">" + c.d_head + "</" + c.d_hl + "> " + c.d_sent
+        m.head.text = s
+        m.head.visible = true
+        show(m.meta, 28, 146)
+    else if t = "slot"
+        m.big.text = c.d_when
+        m.big.color = pal("text")
+        show(m.big, 28, 24)
+        x = 28 + m.big.boundingRect().width + 2
+        if c.d_tail <> ""
+            m.tail.text = c.d_tail
+            show(m.tail, x, 38)
+            x = x + m.tail.boundingRect().width + 12
+        end if
+        if c.d_now then show(m.nowL, x, 38)
+        m.sent.text = c.d_sent
+        m.sent.height = 80
+        show(m.sent, 28, 84)
+        show(m.meta, 28, 146)
+    else if t = "due"
+        m.big.text = c.d_when
+        if c.d_soon then m.big.color = pal("amber") else m.big.color = pal("text")
+        show(m.big, 28, 24)
+        m.tail.text = c.d_tail
+        show(m.tail, 28 + m.big.boundingRect().width + 10, 38)
+        m.sent.text = c.d_sent
+        m.sent.height = 80
+        show(m.sent, 28, 84)
+        show(m.meta, 28, 146)
+    else if t = "node"
+        m.name.text = c.d_name
+        m.name.color = pal("text")
+        show(m.name, 28, 24)
+        setRow(0, "CPU", c.d_v1, 85, "%")
+        setRow(1, "메모리", c.d_v2, 90, "%")
+        setRow(2, "디스크", c.d_v3, 85, "%")
+        setRow(3, "온도", c.d_v4, 80, "°")
     else if t = "nodedown"
-        m.title.text = c.d_title
-        m.title.color = pal("text2")
-        place(m.title, 22)
-        showChip(c.d_chip, pal(c.d_chipc), 26 + m.title.boundingRect().width + 16, 24)
-        m.bodyS.text = c.d_body
-        place(m.bodyS, 70)
-        place(m.meta, 166)
-    else if t = "task"
-        showChip(c.d_chip, pal(c.d_chipc), 26, 22)
-        m.body.text = c.d_body
-        place(m.body, 70)
-        place(m.meta, 166)
+        m.name.text = c.d_name
+        m.name.color = pal("text2")
+        show(m.name, 28, 24)
+        m.down.text = c.d_down
+        show(m.down, 28, 68)
+        show(m.meta, 28, 146)
     else if t = "count"
-        m.kindR.text = c.d_kind
-        place(m.kindR, 22)
-        m.big.text = c.d_num
-        place(m.big, 64)
-        place(m.meta, 166)
-    else if t = "class" or t = "event" or t = "call"
-        m.title.text = c.d_title
-        m.title.color = pal("text")
-        place(m.title, 22)
-        if c.d_chip <> ""
-            showChip(c.d_chip, pal(c.d_chipc), 26 + m.title.boundingRect().width + 16, 24)
-        end if
-        m.body.text = c.d_body
-        place(m.body, 70)
-        place(m.meta, 166)
+        for i = 0 to 1
+            n = c.d_n1
+            l = c.d_l1
+            mt = c.d_m1
+            if i = 1
+                n = c.d_n2
+                l = c.d_l2
+                mt = c.d_m2
+            end if
+            if n <> ""
+                x = 28 + i * 268
+                m.bn[i].text = n
+                show(m.bn[i], x, 24)
+                m.bl[i].text = l
+                show(m.bl[i], x + m.bn[i].boundingRect().width + 12, 42)
+                m.bm[i].text = mt
+                show(m.bm[i], x, 146)
+            end if
+        end for
+        m.meta.visible = false
     else if t = "fail" or t = "empty"
-        m.kind.text = c.d_kind
-        m.kind.color = pal("text2")
-        place(m.kind, 22)
-        m.bodyS.text = c.d_body
-        place(m.bodyS, 62)
-        place(m.meta, 166)
+        m.sent.text = c.d_sent
+        m.sent.color = pal("text2")
+        m.sent.height = 80
+        show(m.sent, 28, 24)
+        if t = "fail" then show(m.meta, 28, 146)
     else
-        ' alert, due, todo: kind line (in its accent), body, meta
-        m.kind.text = c.d_kind
-        m.kind.color = accentColor(acc, "text2")
-        place(m.kind, 22)
-        m.body.text = c.d_body
-        place(m.body, 62)
-        if acc <> ""
-            m.meta.color = pal(acc)
-        end if
-        place(m.meta, 166)
+        ' task, todo: the sentence on the top line, the meta line at the bottom
+        m.sent.text = c.d_sent
+        m.sent.height = 80
+        show(m.sent, 28, 24)
+        show(m.meta, 28, 146)
     end if
+    if t <> "fail" and t <> "empty" then m.sent.color = pal("text")
 end sub
 
 sub onFocus()
     if m.top.focusPercent > 0.5
         m.fill.blendColor = pal("cardFocus")
-        m.border.visible = false
     else
-        m.fill.blendColor = m.fillBase
-        m.border.visible = true
+        m.fill.blendColor = pal("card")
     end if
 end sub

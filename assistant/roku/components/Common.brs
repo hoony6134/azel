@@ -3,11 +3,9 @@
 
 function pal(name as String) as String
     c = {
-        bg: "0x0D1113FF", ambient: "0x080B0CFF", raised: "0x131A1DFF", card: "0x182025FF", cardFocus: "0x202B31FF"
-        stroke: "0x26313AFF", text: "0xECF0ECFF", text2: "0xA9B4B0FF", text3: "0x8A9692FF"
-        celadon: "0x82CBB4FF", indigo: "0x9AAAF0FF", amber: "0xE9BC6EFF", danger: "0xFF7A6EFF"
-        hotAmber: "0x2A2D2AFF", hotDanger: "0x2C2527FF", borderAmber: "0x9A8656FF", borderDanger: "0xA35752FF"
-        grey: "0x9AA3A0FF"
+        bg: "0x0D1113FF", ambient: "0x080B0CFF", raised: "0x131A1DFF", card: "0x182025FF", cardFocus: "0x222C32FF"
+        rule: "0x26313AFF", text: "0xECF0ECFF", text2: "0xA9B4B0FF", text3: "0x8A9692FF"
+        danger: "0xFF7A6EFF", amber: "0xE9BC6EFF", celadon: "0x82CBB4FF"
     }
     if c[name] <> invalid then return c[name]
     return c.text
@@ -130,6 +128,15 @@ function relAgo(epoch as Integer, now as Integer) as String
     if d < 86400 then return Int(d / 3600).ToStr() + "시간 전"
     dt = localDt(epoch)
     return dt.GetMonth().ToStr() + "월 " + dt.GetDayOfMonth().ToStr() + "일"
+end function
+
+' "3시간" / "12분" / "2일" (the big figure on a deadline card; "남음" is its tail)
+function remainBig(epoch as Integer, now as Integer) as String
+    d = epoch - now
+    if d < 60 then return "곧"
+    if d < 3600 then return Int(d / 60).ToStr() + "분"
+    if d < 86400 then return Int(d / 3600).ToStr() + "시간"
+    return Int(d / 86400).ToStr() + "일"
 end function
 
 ' N분 남음 / N시간 남음 / 내일 HH:MM / M월 D일

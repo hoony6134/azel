@@ -9,8 +9,8 @@ sub run()
     while Right(base, 1) = "/"
         base = Left(base, Len(base) - 1)
     end while
-    if base = "demo"
-        m.top.result = {ok: true, v: 2, data: demoData()}
+    if base = "demo" or base = "demo-call"
+        m.top.result = {ok: true, v: 2, data: demoData(base = "demo-call")}
         return
     end if
     r = doGet(base + "/v1/tv?v=2")
@@ -56,7 +56,7 @@ function doGet(url as String) as Object
 end function
 
 ' Preview mode: set the server address to "demo" in the settings. Made-up data, times relative to now.
-function demoData() as Object
+function demoData(inCall as Boolean) as Object
     now = CreateObject("roDateTime").AsSeconds()
     hm = function(t as Integer) as String
         dt = CreateObject("roDateTime")
@@ -71,7 +71,7 @@ function demoData() as Object
     end function
     return {
         at: iso(now)
-        assistant: {state: "idle", persona: {name: "세레나", tint: "plum"}}
+        assistant: {state: demoState(inCall), persona: {name: "세레나", tint: "plum"}}
         infra: {
             nodes: [
                 {name: "albireo", up: true, cpu: 34, ram: 61, disk: 48, temp: 58, seen: iso(now - 30)}
@@ -80,7 +80,7 @@ function demoData() as Object
                 {name: "ruchba", up: true, cpu: 6, ram: 56, disk: 22, temp: invalid, seen: iso(now - 30)}
                 {name: "sadr", up: false, cpu: invalid, ram: invalid, disk: invalid, temp: invalid, seen: iso(now - 1320)}
             ]
-            alerts: [{text: "deneb 디스크 사용량 91%", level: "warn", at: iso(now - 720)}]
+            alerts: [{text: "deneb 디스크가 91% 찼어요", head: "디스크 부족", level: "warn", at: iso(now - 720)}]
             down: [{service: "searxng", node: "gienah", since: invalid}]
         }
         tasks: {
@@ -98,4 +98,9 @@ function demoData() as Object
         calendar: [{start: hm(now + 7200), end: hm(now + 10800), what: "연구실 회의"}]
         calls: [{at: hm(now + 5400), what: "약 먹기"}]
     }
+end function
+
+function demoState(inCall as Boolean) as String
+    if inCall then return "call"
+    return "idle"
 end function
