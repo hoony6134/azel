@@ -133,4 +133,14 @@ struct KaraokeText: View {
         return max(0, min(Double(texts[index].count), spoken - Double(before)))
     }
 }
+
+extension KaraokeText {
+    /// Scroll anchor that keeps the sentence being heard in view: the point that far through the paragraph lines up
+    /// with the same point of the viewport (a long reply no longer jumps to its unheard end).
+    static func follow(_ texts: [String], current: Int) -> UnitPoint {
+        let total = texts.reduce(0) { $0 + $1.count + 1 }
+        let before = texts.prefix(current).reduce(0) { $0 + $1.count + 1 }
+        return UnitPoint(x: 0.5, y: total > 0 ? Double(before) / Double(total) : 0)
+    }
+}
 #endif

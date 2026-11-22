@@ -1312,6 +1312,7 @@ RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일�
                       "이어서 자연스럽게 다시 말해. 이미 한 말은 반복하지 마.",
            "personal": "방금 '{s}'라고 했는데, 사용자의 일정이나 개인 정보는 확인된 게 없어. 지어내지 말고 그 말은 빼고 이어서 "
                         "자연스럽게 다시 말해. 이미 한 말은 반복하지 마."}
+PROMISE_NOTE = "방금은 하겠다는 말만 하고 내용이 없었어. 같은 말은 반복하지 말고, 지금 바로 그 내용을 말로 이어서 해."
 STUB_NOTE = "방금 답이 너무 짧아서 아무 내용이 없었어. 이미 한 말은 반복하지 말고, 질문에 네 성격대로 내용을 담아 이어서 답해."
 INTERJECTION = re.compile(r"아+|어+|오+|음+|응+|네+|예|그거|그게|뭐+|헐|와+|우와|아이고|진짜|정말|그러니까|있잖아|맞다|글쎄")
 
@@ -1976,7 +1977,7 @@ AUDIO_S_PER_SYL = 0.24  # Qwen3-TTS Korean speech, measured 2026-11-22; tracked 
 audio_rate = [AUDIO_S_PER_SYL]
 SYNTH_MARGIN = 1.4  # synthesis estimates are padded this much (the TTS box is shared: rates swing ~0.7-1.0x real time)
 FUTURE_SYL = 25  # an LLM still writing: assume one more sentence of about this size will follow
-HOLD_MAX_S = 6.0  # never hold ready audio back longer than this, whatever the estimates say
+HOLD_MAX_S = 3.0  # never hold ready audio back longer than this: a short pause mid-reply beats a long silence first
 FIRST_MIN_SYL = 12  # an opening's second chunk is at least this long
 MAX_CHUNK_SYL = 60  # merged chunks stay a few sentences long (prosody, and a cut-in loses less)
 
@@ -2348,6 +2349,12 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         pending_lookup[hkey] = (time.time(), request_text)
                         await sentences.put(LOOKUP_FAILED)
                         break
+                    if requested and not stubbed and not confirmed["ok"] and said_round and all(map(future, said_round)):
+                        stubbed = True  # "정리해 드릴게요." and nothing after it (live 2026-11-22): the content, now
+                        timings["promise_only"] = " ".join(said_round)[:40]
+                        messages += [{"role": "assistant", "content": " ".join(said_round)},
+                                     {"role": "user", "content": PROMISE_NOTE}]
+                        continue
                     if asked and not stubbed and stub(" ".join(said_round), user_title(settings, persona)):
                         stubbed = True  # "아, 그거!" to a question: ask for the rest, once (live 2026-11-22, 서아)
                         timings["stub"] = " ".join(said_round)[:40]
@@ -2454,6 +2461,11 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 break
             if not speak and s in (FILLER, FILLER_LONG):
                 continue  # a muted (typed) turn: captions only, and "잠시만요" is not a caption
+            if held and not opened[0] and s not in (FILLER, FILLER_LONG) and \
+                    time.monotonic() - held_since[0] + synth_est(syllables(s)) > HOLD_MAX_S:
+                back.append(s)  # synthesizing this first would hold the ready audio too long (live: 13 s of silence)
+                held_since[0] = -1e9
+                continue
             pcm, sr = await tts(s) if speak else (b"", 24000)
             if opened[0] or s in (FILLER, FILLER_LONG):
                 timings.setdefault("first_audio_ms", ms(t0))
@@ -3580,6 +3592,9 @@ if __name__ == "__main__":
             replies.append([a(x) for x in said])
             a.done()
         assert replies == [["대표님, 네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["그럼요."], ["오늘은 쉬세요."]], replies
+        # live 2026-11-22: a promise and nothing after it is re-asked; a reply with content is not
+        assert all(map(future, ["네, 그 서비스의 핵심과 구체적인 작동 방식을 정리해 드릴게요."]))
+        assert not all(map(future, ["정리해 드릴게요.", "핵심은 회의 피로를 줄이는 거예요."]))
         assert stub("아, 그거!") and stub("오빠, 아, 그거!", "오빠") and stub("네.") and not stub("오, 좋아! 카레 먹자.")
         assert not stub("세 개야.") and not stub("아, 카페 로고 의뢰야.")
         for ask in ("오늘 광주 날씨 어때?", "비트코인 시세 알려줘"):  # with the gateway's web_search: Qwen answers
