@@ -3209,7 +3209,8 @@ async def create_approval(body: dict):
     rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
     rule = None if requester and requester.get("task_id") else next(  # a task's commands always need a tap
         (r for r in rules if (r["device"], r["command"], r.get("cwd")) == (row["device"], row["command"], row["cwd"])), None)
-    meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None}
+    meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None,
+            **({"in_roots": body["in_roots"]} if isinstance(body.get("in_roots"), bool) else {})}  # daemon's say (resolved paths)
     if rule:  # an "always" rule: approved on the spot, still audited when it runs
         await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
         meta.update(decision="rule", rule_id=rule["id"])

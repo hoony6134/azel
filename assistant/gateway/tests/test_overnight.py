@@ -155,6 +155,7 @@ def test_night_approvals_wait_for_the_morning(tgw, monkeypatch):
     r = c.portal.call(g.create_approval, {"device": "macbook", "command": "ls -la", "requester": f"task:{auto['id']}",
                                           "cwd": "/Users/jh/dev/proj", "in_roots": True})  # as the daemon files it
     assert r["status"] == "approved" and r["auto"]  # the grant comes first, the classifier decides
+    assert c.portal.call(g.state.call, "GET", f"/v1/state/kv/approval-{r['approval_id']}")["in_roots"] is True
     r = c.portal.call(g.create_approval, {"device": "macbook", "command": "rm -rf /", "requester": f"task:{auto['id']}"})
     assert r["status"] == "pending" and r["expires_at"] > time.time() + 3 * 3600  # risky: still waits for the morning
     assert [n for n in notes if n[0] == "push" and n[1] == "승인 요청"] == []
