@@ -883,9 +883,26 @@ function money(v as Float, cur as String) as String
         if cur = "JPY" then unit = "엔"
         return s + out + unit
     end if
-    if cur = "USD" then return "$" + fmt2(v)
-    if cur = "index" then return fmt2(v)
+    if cur = "USD" then return "$" + grouped(fmt2(v))
+    if cur = "index" then return grouped(fmt2(v))
     return fmt2(v) + " " + cur
+end function
+
+' "6910.39" -> "6,910.39"
+function grouped(s as String) as String
+    p = Instr(1, s, ".")
+    whole = s
+    frac = ""
+    if p > 0
+        whole = Left(s, p - 1)
+        frac = Mid(s, p)
+    end if
+    out = ""
+    while Len(whole) > 3
+        out = "," + Right(whole, 3) + out
+        whole = Left(whole, Len(whole) - 3)
+    end while
+    return whole + out + frac
 end function
 
 function sparkText(series as Object, cur as String) as String

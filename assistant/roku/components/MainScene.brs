@@ -76,8 +76,181 @@ sub buildHeader()
     m.hState.width = 0
     m.hClock = mkLabel(m.header, 1432, 8, 300, 48, 44, "sb", pal("text"))
     m.hClock.width = 0
-    m.hDate = mkLabel(m.header, 0, 20, 760, 30, 24, "r", pal("text2"))
-    m.hDate.horizAlign = "right"
+    m.hDate = mkLabel(m.header, 0, 20, 0, 30, 24, "r", pal("text2"))
+    m.hDate.width = 0
+    buildTicker()
+end sub
+
+' ---------- the header ticker: weather, then holdings, then indices; one item at a time, every 5 s ----------
+' Two slots trade places with a short fade and a 10 px rise, never a scrolling tape. Its right edge is worked out from
+' the date's left edge (which follows the clock), so the clock never moves.
+
+sub buildTicker()
+    m.tick2 = []
+    for i = 0 to 1
+        g = CreateObject("roSGNode", "Group")
+        g.id = "tk" + i.ToStr()  ' the crossfade's interpolators find the slots by id
+        g.opacity = 0
+        m.header.appendChild(g)
+        ic = mkPoster(g, "pkg:/images/wx_clear.png", 0, 2, 30, 30, pal("text2"))
+        tri = mkPoster(g, "pkg:/images/tri.png", 0, 11, 16, 14, pal("text2"))
+        tri.scaleRotateCenter = [8, 7]
+        a = mkLabel(g, 0, 0, 0, 34, 26, "r", pal("text"))
+        a.width = 0
+        b = mkLabel(g, 0, 0, 0, 34, 26, "sb", pal("text2"))
+        b.width = 0
+        m.tick2.Push({g: g, ic: ic, tri: tri, a: a, b: b, w: 0})
+    end for
+    m.tickFront = 0
+    m.tickIdx = -1
+    m.tickItems = []
+    m.dateW = 0
+    m.tickAnim = CreateObject("roSGNode", "ParallelAnimation")
+    m.tickInterp = []
+    for i = 0 to 1
+        an = CreateObject("roSGNode", "Animation")
+        an.duration = 0.6
+        an.easeFunction = "outCubic"
+        fo = CreateObject("roSGNode", "FloatFieldInterpolator")
+        fo.key = [0.0, 1.0]
+        tr = CreateObject("roSGNode", "Vector2DFieldInterpolator")
+        tr.key = [0.0, 1.0]
+        an.appendChild(fo)
+        an.appendChild(tr)
+        m.tickAnim.appendChild(an)
+        m.tickInterp.Push({fo: fo, tr: tr})
+    end for
+    m.header.appendChild(m.tickAnim)
+    m.tickTimer = CreateObject("roSGNode", "Timer")
+    m.tickTimer.duration = 5
+    m.tickTimer.repeat = true
+    m.tickTimer.observeField("fire", "onTicker")
+    m.header.appendChild(m.tickTimer)
+end sub
+
+' the items from the v2 data: weather first, then listed holdings with a price, then indices; unlisted or failed skip
+function tickerItems() as Object
+    out = []
+    if m.data = invalid or m.v <> 2 then return out
+    w = m.data.weather
+    if w <> invalid and w["now"] <> invalid
+        t = deg(w["now"])
+        if w.pop <> invalid then t = t + "  비 " + Int(w.pop).ToStr() + "%"
+        out.Push({icon: sv(w.icon), a: t, b: "", hl: ""})
+    end if
+    idx = []
+    for each h in arr(m.data.holdings)
+        if h.price <> invalid and h.listed <> invalid
+            if h.listed
+                it = {icon: "", a: sv(h.name) + "  " + money(h.price, sv(h.currency)), b: "", hl: ""}
+                if h.pct <> invalid
+                    if h.pct > 0 then it.hl = "up"
+                    if h.pct < 0 then it.hl = "down"
+                    p = h.pct
+                    if p < 0 then p = -p
+                    it.b = fmt2(p) + "%"
+                end if
+                if sv(h.currency) = "index" then idx.Push(it) else out.Push(it)
+            end if
+        end if
+    end for
+    for each it in idx
+        out.Push(it)
+    end for
+    return out
+end function
+
+' fill slot k with item it; returns its width
+function fillTick(k as Integer, it as Object) as Integer
+    s = m.tick2[k]
+    x = 0
+    s.ic.visible = false
+    s.tri.visible = false
+    if it.icon <> ""
+        s.ic.uri = "pkg:/images/wx_" + it.icon + ".png"
+        s.ic.visible = true
+        x = 40
+    end if
+    s.a.text = it.a
+    s.a.translation = [x, 0]
+    x = x + s.a.boundingRect().width
+    s.b.text = ""
+    if it.b <> ""
+        col = pal("text2")
+        if it.hl = "up" then col = "0xFF7A6EFF"
+        if it.hl = "down" then col = "0x8FB1F0FF"
+        x = x + 16
+        if it.hl <> ""
+            s.tri.blendColor = col
+            s.tri.rotation = 0
+            if it.hl = "down" then s.tri.rotation = 3.14159
+            s.tri.translation = [x, 11]
+            s.tri.visible = true
+            x = x + 22
+        end if
+        s.b.color = col
+        s.b.text = it.b
+        s.b.translation = [x, 0]
+        x = x + s.b.boundingRect().width
+    end if
+    s.w = x
+    return x
+end function
+
+' x where a ticker item of width w ends 40 px left of the date
+function tickX(w as Integer) as Integer
+    return 1732 - m.hClock.boundingRect().width - 20 - m.dateW - 40 - w
+end function
+
+sub refreshTicker()
+    m.tickItems = tickerItems()
+    show = m.tickItems.Count() > 0 and m.mode <> "error" and m.err = ""  ' stale: the long amber date line needs the room
+    if not show
+        m.tickTimer.control = "stop"
+        for each s in m.tick2
+            s.g.opacity = 0
+        end for
+        return
+    end if
+    if m.tickIdx < 0 or m.tickIdx >= m.tickItems.Count()
+        m.tickIdx = 0
+        k = m.tickFront
+        w = fillTick(k, m.tickItems[0])
+        m.tick2[k].g.translation = [tickX(w), 18]
+        m.tick2[k].g.opacity = 1
+        m.tick2[1 - k].g.opacity = 0
+    else
+        ' the same item, new numbers: refresh in place without an animation
+        k = m.tickFront
+        w = fillTick(k, m.tickItems[m.tickIdx])
+        m.tick2[k].g.translation = [tickX(w), 18]
+    end if
+    if m.tickItems.Count() > 1 then m.tickTimer.control = "start" else m.tickTimer.control = "stop"
+end sub
+
+sub onTicker()
+    n = m.tickItems.Count()
+    if n < 2 then return
+    m.tickIdx = (m.tickIdx + 1) mod n
+    old = m.tickFront
+    nw = 1 - old
+    w = fillTick(nw, m.tickItems[m.tickIdx])
+    ox = m.tick2[old].g.translation[0]
+    x = tickX(w)
+    m.tickAnim.control = "stop"
+    a = m.tickInterp[0]
+    b = m.tickInterp[1]
+    ' interpolators address nodes by id
+    a.fo.fieldToInterp = "tk" + old.ToStr() + ".opacity"
+    a.tr.fieldToInterp = "tk" + old.ToStr() + ".translation"
+    a.fo.keyValue = [1.0, 0.0]
+    a.tr.keyValue = [[ox, 18], [ox, 8]]
+    b.fo.fieldToInterp = "tk" + nw.ToStr() + ".opacity"
+    b.tr.fieldToInterp = "tk" + nw.ToStr() + ".translation"
+    b.fo.keyValue = [0.0, 1.0]
+    b.tr.keyValue = [[x, 28], [x, 18]]
+    m.tickAnim.control = "start"
+    m.tickFront = nw
 end sub
 
 sub buildStrip()
@@ -318,6 +491,7 @@ sub showError()
     m.hLogo.tint = pal("text3")
     m.hLogo.opacity = 0.4
     m.hLogo.active = false
+    refreshTicker()
     if m.errCode = 401
         m.eTitle.text = "토큰이 맞지 않아요"
         m.eBody.text = "설정에서 TV 토큰을 다시 넣어 주세요."
@@ -452,6 +626,7 @@ sub applyData()
     m.hLogo.tint = m.glaze
     m.hLogo.inCall = m.inCall
     setRows(model)
+    refreshTicker()
     if m.mode = "ambient"
         m.aLogo.tint = m.glaze
         m.aLogo.inCall = m.inCall
@@ -530,7 +705,6 @@ sub updateHeader()
     m.hClock.text = fmtHM(now)
     cw = m.hClock.boundingRect().width
     m.hClock.translation = [1732 - cw, 8]
-    m.hDate.translation = [1732 - cw - 20 - 760, 20]
     m.hDate.color = pal("text2")
     if not m.hasData
         if m.err <> "" then m.hDate.text = "" else m.hDate.text = "불러오는 중이에요"
@@ -546,6 +720,13 @@ sub updateHeader()
             m.hDate.text = m.hDate.text + " · " + Int(age / 60).ToStr() + "분 전 갱신"
             m.hDate.color = pal("text3")
         end if
+    end if
+    ' the date ends 20 px left of the clock; the ticker keys off the date's usual width ("갱신 중…" is brief)
+    dw = m.hDate.boundingRect().width
+    m.hDate.translation = [1732 - cw - 20 - dw, 20]
+    if not m.fetching and m.err = "" and m.hasData and dw <> m.dateW
+        m.dateW = dw
+        if m.tickItems.Count() > 0 then refreshTicker()
     end if
 end sub
 
