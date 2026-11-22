@@ -1006,7 +1006,9 @@ def test_delegate_allowed_tools_come_from_the_config(cfg, monkeypatch, tmp_path)
 
 
 def test_a_refused_run_is_not_done(cfg, monkeypatch):
-    """Live 2026-11-23 (job 60ac064254d1): every WebSearch, WebFetch and python3 refused, yet the task read as done."""
+    """Live 2026-11-23 (job 60ac064254d1): every WebSearch, WebFetch and python3 refused, yet the task read as done.
+    A device without the prompt tool (gateway-grant) still judges refusals itself."""
+    monkeypatch.setitem(d.CFG, "approval_via", "gateway-grant")
     st, _ = run_delegate(monkeypatch, {"result": "조사를 못 했어요.", "is_error": False, "permission_denials": [
         {"tool_name": "WebSearch", "tool_use_id": "a"}, {"tool_name": "WebFetch", "tool_use_id": "b"},
         {"tool_name": "Bash", "tool_use_id": "c", "tool_input": {"command": "python3 make_pdf.py"}},
@@ -1021,6 +1023,17 @@ def test_a_refused_run_is_not_done(cfg, monkeypatch):
                                        "is_error": False, "permission_denials": [
         {"tool_name": "Bash", "tool_use_id": "e", "tool_input": {"command": "rm preview/p1.png"}}]})
     assert st["job_status"] == "done" and st["needs_input"] is False
+    st, _ = run_delegate(monkeypatch, {"result": "다 했어요.", "permission_denials": [
+        {"tool_name": "Bash", "tool_use_id": "f", "tool_input": {"command": "cd build && rm -rf out"}}]})
+    assert st["job_status"] == "done"  # an rm after && is still an rm
+
+
+def test_a_run_that_could_ask_is_judged_by_its_outcome(cfg, monkeypatch):
+    """Live 2026-11-22 (job 2bcbd8fae21e): five tool uses were asked and approved in the app, the report was saved,
+    and one leftover Bash refusal still marked the run blocked."""
+    st, argv = run_delegate(monkeypatch, {"result": "보고서를 저장했어요.", "is_error": False, "permission_denials": [
+        {"tool_name": "Bash", "tool_use_id": "g", "tool_input": {"command": "open report.pdf"}}]})
+    assert "--permission-prompt-tool" in argv and st["job_status"] == "done" and st["needs_input"] is False
 
 
 def test_delegated_runs_ask_through_the_prompt_tool(cfg, monkeypatch):

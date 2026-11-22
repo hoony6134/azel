@@ -656,8 +656,9 @@ def _wanted(denial: dict) -> bool:
     blocked and its finish call said it had failed (live 2026-11-22)."""
     if denial.get("tool_name") != "Bash":
         return True
-    cmd = str((denial.get("tool_input") or {}).get("command") or "").strip()
-    return not any(cmd == p or cmd.startswith(p + " ") for p in NEVER_ALLOWED)
+    cmd = str((denial.get("tool_input") or {}).get("command") or "")
+    parts = [x.strip() for x in re.split(r"&&|\|\||;|\||\n", cmd)]  # "cd build && rm -rf out" is an rm too
+    return not any(x == p or x.startswith(p + " ") for x in parts for p in NEVER_ALLOWED)
 
 
 def _blocked(data: dict, text: str) -> list[str] | None:
@@ -684,7 +685,9 @@ def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
                 job["session_id"] = sid
                 _remember_session(sid, cwd, job["job_id"])
             status = "failed" if data.get("is_error") or out.returncode else "done"
-            blocked = _blocked(data, job["result"])
+            # with the prompt tool every refusal the user could lift was asked in the app; what is left was refused on
+            # purpose or by the user, and the result says what could not be done (a finished report was marked blocked)
+            blocked = None if job.get("asks") else _blocked(data, job["result"])
             job["needs_input"] = blocked is not None  # always present: the gateway's text check is for older daemons
             if blocked is not None:  # refused something it needed: not done, and the user is told what
                 status, job["needs_input"], job["blocked"] = "failed", True, blocked
@@ -739,7 +742,7 @@ def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | Non
         argv += ["--model", model]
     env["MCP_TOOL_TIMEOUT"] = str((PROMPT_WAIT_S + 30) * 1000)  # the prompt tool waits for the user's tap
     # shortcut: jobs live in memory and are lost on restart (their sessions are remembered on disk)
-    job = {"job_id": job_id, "status": "running", "task": task, "cwd": str(wd),
+    job = {"job_id": job_id, "status": "running", "task": task, "cwd": str(wd), "asks": "--permission-prompt-tool" in argv,
            "model": model, "started": time.time(), **({"resumes": resume} if resume else {})}
     JOBS[job["job_id"]] = job
     threading.Thread(target=_run_job, args=(job, argv, wd, env), daemon=True).start()
