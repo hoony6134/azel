@@ -726,9 +726,10 @@ async def ask_claude_code(text, model, session):
     settings = await load_settings()
     style = name_prompt(settings) + VOICE_STYLE + device_prompt(settings, devices)
     servers, allowed, run_settings, run_env = run_args(settings, devices, requester_id("ask", session))
-    resume = await resume_id(session, settings)
+    secret = is_secret(session)
+    resume = None if secret else await resume_id(session, settings)  # a secret call never continues a stored session
     cfg, proc = None, None
-    if WARM and not session.startswith(COLD_SESSIONS):
+    if WARM and not session.startswith(COLD_SESSIONS) and not secret:
         source = (await warm_pool.get(session, MODELS[model], style, allowed, WORKDIR, servers, resume, run_settings,
                                       run_env)).turn(text, MODELS[model])
     else:
@@ -738,6 +739,8 @@ async def ask_claude_code(text, model, session):
                 json.dump({"mcpServers": servers}, f)
         env = os.environ | {"MCP_CONNECTION_NONBLOCKING": "false"} | run_env  # wait for the (few) servers
         cmd = base_cmd(MODELS[model], style, allowed, cfg, resume, run_settings)
+        if secret:
+            cmd.append("--no-session-persistence")  # the CLI writes no transcript of this run to disk
         proc = await asyncio.create_subprocess_exec(cmd[0], "-p", text, *cmd[1:],
                                                     cwd=WORKDIR, env=env, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.DEVNULL, limit=2**24)
@@ -772,7 +775,7 @@ async def ask_claude_code(text, model, session):
                 final.update(cost_usd=e.get("total_cost_usd") or 0, input_tokens=u.get("input_tokens", 0),
                              output_tokens=u.get("output_tokens", 0), error=e.get("is_error", False),
                              result=str(e.get("result") or "")[:300])
-                if e.get("session_id"):
+                if e.get("session_id") and not secret:
                     try:
                         await state.call("PUT", f"/v1/state/sessions/{quote(session_key(session, settings), safe='')}",
                                          {"claude_session": e["session_id"], "device": DEVICE})
@@ -1043,7 +1046,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     token = requester_ctx.set(requester_id("ask", session))  # this ask's daemon calls carry it; reset below
     # the API and NIM paths call create_task/call_user in this context: their tasks and calls continue this call,
     # as claude -p's do through X-Azel-Origin (the same rule: the ask's session is the origin)
-    otoken = origin_ctx.set(session if ORIGIN_RE.fullmatch(session or "") else "")
+    otoken = origin_ctx.set(session if ORIGIN_RE.fullmatch(session or "") and not is_secret(session) else "")
     try:
         gen = {"claude_code": ask_claude_code, "nim": ask_nim}.get(path, ask_api)
         said = False
@@ -1145,6 +1148,16 @@ ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
 origin_ctx: contextvars.ContextVar = contextvars.ContextVar("origin_session", default="")
 
 
+SECRET_ALWAYS = "시크릿 통화에서 온 요청이라 이번 한 번만 허용했어요."
+SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
+
+
+def is_secret(key):
+    """A secret call's work: the voice server keys it "<persona>:secret-<id>" (asks, origins, requesters alike).
+    Nothing of it is stored: no Claude session, no schedules, tasks or memories, no standing approval."""
+    return isinstance(key, str) and key.split(":")[-1].startswith("secret-")
+
+
 def origin_of(m):
     v = m.get("origin_session")
     return v if isinstance(v, str) and ORIGIN_RE.fullmatch(v) else ""
@@ -1168,7 +1181,7 @@ async def brain_mode(settings=None):
 def served(coro, m):
     """A link request served in its own context carrying the conversation it came from."""
     ctx = contextvars.copy_context()
-    ctx.run(origin_ctx.set, origin_of(m))
+    ctx.run(origin_ctx.set, "" if is_secret(origin_of(m)) else origin_of(m))  # a secret call links nothing
     ctx.run(mode_ctx.set, mode_of(m))
     if origin_of(m):
         ctx.run(requester_ctx.set, requester_id("ask", origin_of(m)))  # Qwen's tool calls belong to that ask
@@ -1756,7 +1769,9 @@ async def serve_schedule(m):
         action = m.get("action")
         if MODE != "full":
             raise HTTPException(403, "limited")
-        if action == "create":
+        if action in ("create", "cancel") and is_secret(origin_of(m)):
+            reply.update(ok=False, say=SECRET_LINE)
+        elif action == "create":
             item, say = await schedule_create(m, "voice")
             reply.update(item=item, say=say)
         elif action == "list":
@@ -2845,9 +2860,10 @@ async def decide(aid: str, body: dict):
     view = approval_view(row, meta)
     if view["status"] != "pending":
         raise HTTPException(409, f"approval is {view['status']}")
-    forced = decision == "always" and not always_ok(row["command"])
+    secret = decision == "always" and is_secret((meta.get("requester") or {}).get("session"))
+    forced = decision == "always" and (secret or not always_ok(row["command"]))
     if forced:
-        decision = "once"  # only read-only commands become standing rules
+        decision = "once"  # only read-only commands become standing rules, and never from a secret call
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
     if decision == "always":
         rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
@@ -2858,7 +2874,7 @@ async def decide(aid: str, body: dict):
     meta["decision"] = decision
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
-            **({"forced_once": True, "forced_reason": ALWAYS_NO} if forced else {})}
+            **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
 
 
 @app.post("/v1/approvals/{aid}/use")
@@ -3311,6 +3327,9 @@ DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에
 async def serve_task(m):
     """A task request from the voice server ("…해 줘, 끝나면 알려 줘"): start it, answer what to say."""
     reply = {"id": m["id"], "type": "task_result", "ok": True}
+    if is_secret(origin_of(m)):
+        await link_send({**reply, "ok": False, "say": SECRET_LINE})
+        return
     try:
         current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
         t = await task_create({k: m[k] for k in ("goal", "device", "persona", "notify") if m.get(k) is not None},
@@ -3389,7 +3408,7 @@ bridge = tools_bridge.Bridge(
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
-    mode=lambda: brain_mode(),
+    mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
 

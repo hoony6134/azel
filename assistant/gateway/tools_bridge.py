@@ -127,6 +127,16 @@ SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "sche
 TAINT_S = 600
 
 
+SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
+STORING = {"remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task"}
+
+
+def stores(name, args):
+    """Would this action leave something behind? call_user only with a time or a rule (ringing now stores nothing)."""
+    return name in STORING or (name == "call_user" and any(args.get(k) for k in
+                                                           ("when", "when_text", "repeat_cron", "repeat_text")))
+
+
 class Bridge:
     """`deps` (all async unless noted): fresh_devices(), device_tools(devices) -> (defs, where),
     run_tool(block, where) -> tool_result dict, place_call(reason, opening, persona_id) -> dict,
@@ -166,6 +176,8 @@ class Bridge:
             if name in OWN_SCHEMAS:
                 check_args(OWN_SCHEMAS[name], args)
             who = self.d.get("who", lambda: "")()
+            if caller != "app" and self.d.get("secret", lambda: False)() and stores(name, args):
+                raise Fail("invalid", SECRET_LINE)  # a secret call reads, it never writes
             if name in SIDE_EFFECTS and caller != "app" and who and args.get("confirmed") is not True \
                     and time.monotonic() - self.tainted.get(who, -1e9) < TAINT_S:
                 what = str(args.get("when_text") or args.get("goal") or args.get("text") or args.get("description")

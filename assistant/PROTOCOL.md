@@ -40,13 +40,16 @@ answering a call the assistant placed; the server then speaks that call's openin
   runs VAD, so the client never decides when a turn ends.
 - Server → client **binary**: mono PCM16 little-endian, **24 kHz**, play in order.
 - Server → client **text** (JSON, one object per message):
+  - `{"type":"hello","caps":["text","played","mode","secret"]}` — always the very first message: the client messages this
+    server understands beyond audio, `hangup` and `interrupt`. The app shows the keyboard button only when `text` is
+    listed (older servers send no `hello`).
   - `{"type":"state","value":"listening"|"thinking"|"speaking"}` — `speaking` lasts until the client has
     played every byte sent (the server tracks that from the audio length, pauses included) plus 300 ms
     (`PLAY_TAIL_MS`), not just until generation ends; only then come `turn_done` and `listening`. Speech in
     that window is a barge-in (`pause`/check), never a new turn.
   - `{"type":"context","context":{"kind":"task"|"schedule","label":"<short purpose>","id":"<task or schedule id>"}}` —
-    the first message of a call the assistant placed for a task (its finish or approval) or a reminder; nothing else
-    comes before it. The same object rides in that call's VoIP push as `context`. For the call screen's
+    the first message after `hello` of a call the assistant placed for a task (its finish or approval) or a reminder;
+    nothing else comes between them. The same object rides in that call's VoIP push as `context`. For the call screen's
     "맡긴 작업: …" / "예약: …" chip. Absent on other calls.
   - `{"type":"transcript","text":"…"}` — what the user said
   - `{"type":"reply_start","reply_id":N}` — sent right before the first audio frame of each reply (an answer, a
@@ -108,6 +111,34 @@ answering a call the assistant placed; the server then speaks that call's openin
   with exactly that pair; a cancelled reply's own `listening` is dropped, and an interrupt overtaken by a newer one or
   by a new reply sends nothing). During a placed call's
   opening the first sentence still finishes first.
+- Client → server `{"type":"text","text":"…","speak":true|false}` — the user typed during the call. It is a user
+  turn exactly like a transcribed utterance (same routing, tools, persona, history and call log, the log's turn
+  marked `"input":"text"`), without STT or VAD, and the server sends no `transcript` for it (the app shows the
+  typed line itself). Trimmed; empty is ignored; longer than 1000 characters, or within 1 s of the previous typed
+  message, is answered `{"type":"text_rejected","reason":"too_long"|"too_fast"}` and nothing else happens. While
+  the assistant speaks or thinks it interrupts first, like a tap (`interrupt`, then the new reply). `speak:false`
+  (default true): the reply comes as `reply` captions and `turn_done` with no audio and no filler lines. The mic
+  stays live: speech during a typed turn is handled as usual.
+- **Secret calls**: `/v1/call?secret=1`, or `{"type":"secret","value":true}` during a call (the server answers
+  `{"type":"secret","value":true}`; turning it off is refused with the same frame: a secret call stays secret). Every
+  `state` frame carries `"secret": true|false`. In a secret call:
+  - nothing is stored: no call log (`/v1/history`), turns, transcript or memory records, no post-call facts, no brain
+    call events; the call's turns live under a throwaway session key and are dropped at hangup, never joining the
+    persona+session history, and no task or call links back to it (no `origin_session`);
+  - Claude on the `claude -p` path runs cold with `--no-session-persistence`, no `--resume`, and no stored
+    `claude_session`; the API and NIM paths keep no state anyway;
+  - reading is allowed (memory_recall, people_lookup, web, device reads, Cygnus/Google reads, music); anything that
+    stores is refused with "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?": remember, forget,
+    schedule_*, create_task, call_user with a time or rule, the voice fast paths for scheduling and tasks. A device
+    command's approval still works once; "always" becomes once (`forced_reason`);
+  - usage rows record cost only (model, path, tokens, cost; never text), as they always do;
+  - a call made secret midway keeps what was already logged; from then on nothing more, except the call log's end
+    time and the brain's end event, under the original session.
+  Limit: text sent to Anthropic (Claude) or NVIDIA (NIM) is processed under their own retention policies; the local
+  Qwen and Whisper keep nothing.
+- Client → server `{"type":"played","reply_id":N}` — the phone finished playing reply N's last buffer (none for an
+  interrupted reply). For the reply whose audio went out last, playback counts as ended now; once a client has sent
+  one, the server waits for it after each reply, up to 2 s past its own estimate.
 
 ## 1b. Gateway link — `WS /v1/gateway-link` on the voice server
 
