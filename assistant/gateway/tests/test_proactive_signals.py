@@ -72,3 +72,29 @@ def test_recent_calls_show_what_the_user_said_and_unanswered_rings(gw, monkeypat
     assert any("역사학특강" in x for x in sig["calendar_today"])
     # context alone is no reason to ask the judge
     assert asyncio.run(g.qwen_decide({"recent_calls": ["x"], "calendar_today": ["y"], "alerts": []}, now))["reason"] == "신호 없음"
+
+
+def test_the_judge_reads_open_gistra_assignments(gw, monkeypatch):  # noqa: F811
+    """A submitted 토론지 stayed "제출 여부 모름" in the checkpoint note; GISTRA's open list is the truth."""
+    import cygnus
+    g, _, _ = gw
+    seen = []
+
+    async def fake_call(name, args, raw=False):
+        seen.append((name, args))
+        return "스냅샷: 11월 22일 (일) 19:30\n\n- 11/23 23:59 컴파일러 프로젝트 [과제]"
+    monkeypatch.setattr(cygnus, "available", lambda: True)
+    monkeypatch.setattr(cygnus, "call", fake_call)
+
+    async def no_agenda(f, t):
+        return ""
+    monkeypatch.setattr(g, "agenda_text", no_agenda)
+    sig = asyncio.run(g.gather_signals(ts(22, 19, 30)))
+    assert ("gistra_assignments", {"scope": "upcoming", "limit": 15}) in seen
+    assert any("컴파일러" in x for x in sig["gistra_due"]) and not any("토론지" in x for x in sig["gistra_due"])
+    assert "gistra_due" in g.DECIDE_PROMPT and "gistra_assignments" in g.CHECKPOINT_PROMPT
+
+    async def down(name, args, raw=False):
+        return "지금은 Cygnus에 연결할 수 없어요."
+    monkeypatch.setattr(cygnus, "call", down)
+    assert asyncio.run(g.gather_signals(ts(22, 19, 30)))["gistra_due"] == []  # a failure is no list
