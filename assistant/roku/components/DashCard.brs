@@ -23,14 +23,14 @@ sub init()
     m.rowV = []
     for i = 0 to 5
         m.rowL.Push(mkLabel(m.top, 28, 68 + i * 27, 100, 30, 24, "r", pal("text2")))
-        v = mkLabel(m.top, 28, 68 + i * 27, 172, 30, 24, "sb", pal("text"))
+        v = mkLabel(m.top, 28, 68 + i * 27, 150, 30, 24, "sb", pal("text"))
         v.horizAlign = "right"
         m.rowV.Push(v)
     end for
     m.barT = []
     m.barF = []
     for i = 0 to 3
-        m.barT.Push(mkRect(m.top, 28, 0, 170, 6, pal("rule")))
+        m.barT.Push(mkRect(m.top, 28, 0, 150, 6, pal("rule")))
         m.barF.Push(mkRect(m.top, 28, 0, 10, 6, pal("text2")))
     end for
     m.dot = mkLabel(m.top, 28, 25, 0, 30, 24, "sb", pal("text2"))
@@ -79,8 +79,8 @@ end sub
 ' figure i of a host card: two columns of three, label on the left, value on the right
 sub setFig(i as Integer, label as String, text as String, amber as Boolean, pct as Integer)
     ' meter i of a host card: a 2x2 grid; label left, value right, and a thin bar under them
-    x = 28 + (i mod 2) * 188
-    y = 68 + Int(i / 2) * 40
+    x = 28 + (i mod 2) * 208
+    y = 78 + Int(i / 2) * 52
     m.rowL[i].translation = [x, y]
     m.rowL[i].text = label
     m.rowL[i].visible = true
@@ -88,13 +88,13 @@ sub setFig(i as Integer, label as String, text as String, amber as Boolean, pct 
     m.rowV[i].text = text
     if amber then m.rowV[i].color = pal("amber") else m.rowV[i].color = pal("text")
     m.rowV[i].visible = true
-    m.barT[i].translation = [x, y + 30]
+    m.barT[i].translation = [x, y + 34]
     m.barT[i].visible = true
     if pct >= 0
         w = pct
         if w > 100 then w = 100
-        m.barF[i].width = Int(w * 1.7) + 1
-        m.barF[i].translation = [x, y + 30]
+        m.barF[i].width = Int(w * 1.5) + 1
+        m.barF[i].translation = [x, y + 34]
         if amber then m.barF[i].color = pal("amber") else m.barF[i].color = pal("text2")
         m.barF[i].visible = true
     end if
@@ -196,16 +196,6 @@ sub onContent()
             setFig(1, "메모리", pctText(c.d_v2, "%"), c.d_v2 >= 90, c.d_v2)
             setFig(2, "디스크", pctText(c.d_v3, "%"), c.d_v3 >= 85, c.d_v3)
             setFig(3, "온도", pctText(c.d_v4, "°"), c.d_v4 >= 80, c.d_v4)
-            ' load and uptime are not percentages: one quiet line at the bottom
-            ln = ""
-            if c.d_load <> "" then ln = "부하 " + c.d_load
-            if c.d_upt <> ""
-                if ln <> "" then ln = ln + " · "
-                ln = ln + "가동 " + c.d_upt
-            end if
-            m.meta.text = ln
-            if loadHot(c.d_load) then m.meta.color = pal("amber") else m.meta.color = pal("text3")
-            show(m.meta, 28, 148)
         end if
     else if t = "item"
         m.kind.text = c.d_title
