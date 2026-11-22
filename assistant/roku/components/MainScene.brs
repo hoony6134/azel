@@ -627,7 +627,7 @@ sub onSelected()
         if Left(title, 3) = "인프라"
             name = ""
             k = m.model.sections[f[0]].cards[f[1]]
-            if k.t = "node" then name = k.name
+            if k.t = "host" then name = k.name  ' the page opens with this host at the top
             openPage("infra", name)
         else if title = "Azel 작업"
             openPage("tasks", "")
