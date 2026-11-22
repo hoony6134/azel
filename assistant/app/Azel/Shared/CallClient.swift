@@ -120,6 +120,7 @@ final class CallClient {
         audio.onConfigurationChange = { [weak self] in self?.routeChanged() }
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
+            if holdFrame(data) { return }   // the wake handoff: waits until the listener's recording is sent
             let action = sending ? Self.micAction(muted: muted, held: held) : .drop
             if action == .send {
                 task?.send(.data(data)) { error in if let error { Log.call.error("mic send failed: \(error.localizedDescription, privacy: .public)") } }
@@ -411,6 +412,7 @@ final class CallClient {
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
         logTiming()   // a call that never got reply audio still reports how far it got
+        micHoldLock.lock(); micHold = nil; micHoldLock.unlock()
         _ = beginCall()            // the old socket's late frames are dropped from here on
         silenceCheck?.cancel()
         pulseTimer?.invalidate()
@@ -435,6 +437,38 @@ final class CallClient {
         held = false
         playback = PlaybackGate()
         sending = true
+    }
+
+    /// The wake handoff (user bug, 2026-11-23: "아젤, 내일 날씨…" in one breath lost its middle): live
+    /// mic frames wait here with their arrival time instead of being dropped while the listener's
+    /// recording is read, then go out right after it.
+    private var micHold: [(at: Double, pcm: Data)]?
+    private let micHoldLock = NSLock()
+    static let micHoldLimit = 600   // ~12 s of tap buffers; a stuck handoff never grows without bound
+
+    func holdMic() { micHoldLock.lock(); micHold = []; micHoldLock.unlock() }
+
+    private func holdFrame(_ data: Data) -> Bool {
+        micHoldLock.lock(); defer { micHoldLock.unlock() }
+        guard micHold != nil else { return false }
+        if micHold!.count < Self.micHoldLimit { micHold!.append((ProcessInfo.processInfo.systemUptime, data)) }
+        return true
+    }
+
+    /// Held frames the listener's recording doesn't already cover: those that arrived at or after
+    /// `cutoff` (when its finished file appeared, i.e. when it stopped capturing).
+    static func seam(_ held: [(at: Double, pcm: Data)], cutoff: Double?) -> [Data] {
+        held.filter { cutoff == nil || $0.at >= cutoff! }.map(\.pcm)
+    }
+
+    /// Sends the listener's recording, then the held frames after its end, then lets the live mic
+    /// through, in that order (live frames wait on the lock meanwhile).
+    func releaseMic(first: Data?, cutoff: Double?) {
+        micHoldLock.lock(); defer { micHoldLock.unlock() }
+        if let first { sendUserAudio(first) }
+        let rest = Self.seam(micHold ?? [], cutoff: first == nil ? nil : cutoff)
+        if Self.micAction(muted: muted, held: held) == .send { rest.forEach { sendUserAudio($0) } }
+        micHold = nil
     }
 
     /// Audio the user already said (the wake listener's recording) sent as mic frames, 100 ms each,

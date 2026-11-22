@@ -192,13 +192,12 @@ final class MacCall: ObservableObject {
 
     /// Sends the waiting utterance, then opens the live mic.
     private func sendUtterance(_ id: String) {
-        client.sending = false
         Task { [weak self] in
-            let data = await AzelFiles.takeUtterance(id)
+            let got = await AzelFiles.takeUtterance(id)
             guard let self, self.inCall else { return }
-            if let data { self.client.sendUserAudio(data) }
-            self.client.markTiming(data == nil ? "utterance_none" : "utterance_sent")
-            self.client.sending = true
+            self.client.releaseMic(first: got.data, cutoff: got.at)
+            self.client.markTiming(got.data == nil ? "utterance_none" : "utterance_sent")
+            if let d = got.data { Log.call.notice("wake utterance \(d.count / 32) ms") }
         }
     }
 
@@ -344,7 +343,7 @@ final class MacCall: ObservableObject {
         do {
             let mode = BrainModeChoice.shared.takeForCall()
             brainMode = mode
-            if pendingUtterance != nil { client.sending = false }   // nothing live goes ahead of the utterance
+            if pendingUtterance != nil { client.holdMic() }   // live frames wait (not dropped) behind the utterance
             let wantSecret = BrainModeChoice.shared.takeSecretForCall()
             secret = wantSecret
             try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
@@ -467,9 +466,14 @@ final class MacCall: ObservableObject {
             let f = screen.visibleFrame
             p.setFrameOrigin(NSPoint(x: f.midX - p.frame.width / 2, y: f.minY + 80))
         }
-        panel?.alphaValue = 0
+        // On screen now, not after a fade: the fade ran on the main thread, which the audio engine's
+        // start (voice processing, synchronous) blocks right after, so the panel stayed invisible
+        // through it (user report, 2026-11-23: a long gap between "네?" and the panel).
+        panel?.alphaValue = 1
         panel?.makeKeyAndOrderFront(nil) // non-activating: takes Esc without pulling focus from the current app
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.25; panel?.animator().alphaValue = 1 }
+        panel?.contentView?.layoutSubtreeIfNeeded()
+        panel?.displayIfNeeded()
+        CATransaction.flush()   // drawn before connect() blocks the main thread
     }
 }
 

@@ -13,6 +13,8 @@ struct AzelMacApp: App {
 
     init() {
         AzelFiles.clearMarkers()   // left over from a crash or a force quit
+        MacApp.noNap = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                                                             reason: "the wake listener hands calls to Azel at any moment")
         Recordings.cleanup()
         Config.migrateAddresses()
         HotKey.action = { MacCall.shared.hotkey(down: $0) }
@@ -565,6 +567,10 @@ struct MacSettingsCard: View {
         }
     }
 }
+
+/// Held for the app's life: a menu-bar app without windows is an App Nap candidate, and a napping
+/// app answers `azel://wake` late. Idle CPU stays near zero (the activity only stops throttling).
+enum MacApp { static var noNap: NSObjectProtocol? }
 
 /// URLs from `open -g` (the wake listener): handled without activating the app.
 final class MacAppDelegate: NSObject, NSApplicationDelegate {

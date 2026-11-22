@@ -46,13 +46,15 @@ final class WakeURLTests: XCTestCase {
         let pcm = Data((0..<3201).map { UInt8($0 % 251) })      // an odd byte at the end
         try pcm.write(to: AzelFiles.utterance("u1"))
         let got = await AzelFiles.takeUtterance("u1", appear: 0.5)
-        XCTAssertEqual(got?.count, 3200, "whole samples only")
+        XCTAssertEqual(got.data?.count, 3200, "whole samples only")
+        XCTAssertNotNil(got.at, "when it appeared: the seam's cutoff")
         XCTAssertFalse(FileManager.default.fileExists(atPath: AzelFiles.utterance("u1").path))
         let missing = await AzelFiles.takeUtterance("nope", appear: 0.2)
-        XCTAssertNil(missing)
+        XCTAssertNil(missing.data)
+        XCTAssertNil(missing.at, "never appeared: the app sends all of its own held audio")
         try Data().write(to: AzelFiles.utterance("empty"))
         let empty = await AzelFiles.takeUtterance("empty", appear: 0.2)
-        XCTAssertNil(empty, "zero bytes: nobody spoke after the name")
+        XCTAssertNil(empty.data, "zero bytes: nobody spoke after the name")
         XCTAssertFalse(FileManager.default.fileExists(atPath: AzelFiles.utterance("empty").path))
     }
 
@@ -65,7 +67,7 @@ final class WakeURLTests: XCTestCase {
             try? FileManager.default.moveItem(at: url.appendingPathExtension("part"), to: url)   // the listener finishes
         }
         let got = await AzelFiles.takeUtterance("late", appear: 0.3, partLimit: 3)
-        XCTAssertEqual(got?.count, 640)
+        XCTAssertEqual(got.data?.count, 640)
     }
 }
 #endif
@@ -104,3 +106,24 @@ final class WakeIntentTests: XCTestCase {
     }
 }
 #endif
+
+/// User bug, 2026-11-23: "아젤, 내일 날씨 알려줘" in one breath lost words where the listener's
+/// recording ended and the app's own mic began (the app dropped its frames until it read the file).
+final class UtteranceSeamTests: XCTestCase {
+    private func f(_ at: Double, _ byte: UInt8) -> (at: Double, pcm: Data) { (at, Data([byte, byte])) }
+
+    func testOnlyFramesAfterTheListenerStoppedFollowTheRecording() {
+        let held = [f(10.00, 1), f(10.02, 2), f(10.20, 3), f(10.22, 4)]   // the app's mic while waiting
+        // The listener's file appeared at 10.10: it covers up to there, so 3 and 4 go next.
+        XCTAssertEqual(CallClient.seam(held, cutoff: 10.10), [Data([3, 3]), Data([4, 4])])
+        XCTAssertEqual(CallClient.seam(held, cutoff: nil).count, 4, "no recording: all of the app's own audio")
+        XCTAssertEqual(CallClient.seam([], cutoff: 10).count, 0)
+    }
+
+    func testHeldFramesAreSentInOrderAfterTheRecordingAndHoldEnds() {
+        let client = CallClient()
+        client.holdMic()
+        client.releaseMic(first: Data(count: 6400), cutoff: 0)   // no socket here: nothing sent, no crash
+        client.releaseMic(first: nil, cutoff: nil)                // a second release is harmless
+    }
+}
