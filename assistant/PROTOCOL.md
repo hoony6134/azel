@@ -40,7 +40,7 @@ answering a call the assistant placed; the server then speaks that call's openin
   runs VAD, so the client never decides when a turn ends.
 - Server → client **binary**: mono PCM16 little-endian, **24 kHz**, play in order.
 - Server → client **text** (JSON, one object per message):
-  - `{"type":"hello","caps":["text","played","mode"]}` — always the very first message: the client messages this
+  - `{"type":"hello","caps":["text","played","mode","secret"]}` — always the very first message: the client messages this
     server understands beyond audio, `hangup` and `interrupt`. The app shows the keyboard button only when `text` is
     listed (older servers send no `hello`).
   - `{"type":"state","value":"listening"|"thinking"|"speaking"}` — `speaking` lasts until the client has
@@ -119,6 +119,23 @@ answering a call the assistant placed; the server then speaks that call's openin
   the assistant speaks or thinks it interrupts first, like a tap (`interrupt`, then the new reply). `speak:false`
   (default true): the reply comes as `reply` captions and `turn_done` with no audio and no filler lines. The mic
   stays live: speech during a typed turn is handled as usual.
+- **Secret calls**: `/v1/call?secret=1`, or `{"type":"secret","value":true}` during a call (the server answers
+  `{"type":"secret","value":true}`; turning it off is refused with the same frame: a secret call stays secret). Every
+  `state` frame carries `"secret": true|false`. In a secret call:
+  - nothing is stored: no call log (`/v1/history`), turns, transcript or memory records, no post-call facts, no brain
+    call events; the call's turns live under a throwaway session key and are dropped at hangup, never joining the
+    persona+session history, and no task or call links back to it (no `origin_session`);
+  - Claude on the `claude -p` path runs cold with `--no-session-persistence`, no `--resume`, and no stored
+    `claude_session`; the API and NIM paths keep no state anyway;
+  - reading is allowed (memory_recall, people_lookup, web, device reads, Cygnus/Google reads, music); anything that
+    stores is refused with "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?": remember, forget,
+    schedule_*, create_task, call_user with a time or rule, the voice fast paths for scheduling and tasks. A device
+    command's approval still works once; "always" becomes once (`forced_reason`);
+  - usage rows record cost only (model, path, tokens, cost; never text), as they always do;
+  - a call made secret midway keeps what was already logged; from then on nothing more, except the call log's end
+    time and the brain's end event, under the original session.
+  Limit: text sent to Anthropic (Claude) or NVIDIA (NIM) is processed under their own retention policies; the local
+  Qwen and Whisper keep nothing.
 - Client → server `{"type":"played","reply_id":N}` — the phone finished playing reply N's last buffer (none for an
   interrupted reply). For the reply whose audio went out last, playback counts as ended now; once a client has sent
   one, the server waits for it after each reply, up to 2 s past its own estimate.

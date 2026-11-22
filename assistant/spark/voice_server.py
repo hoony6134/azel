@@ -2016,7 +2016,8 @@ def real_content(text):
     return len(re.findall(r"[가-힣]", "".join(words))) >= 2 or bool(re.search(r"[A-Za-z]{3,}", text))
 
 
-CALL_CAPS = ("text", "played", "mode")  # client messages /v1/call understands beyond audio, hangup and interrupt
+CALL_CAPS = ("text", "played", "mode", "secret")
+SECRET_PREFIX = "secret-"  # a secret call's throwaway session key (the gateway keys its own rules off this)  # client messages /v1/call understands beyond audio, hangup and interrupt
 TEXT_MAX, TEXT_GAP_S = 1000, 1.0  # a typed message: at most this long, and one per second
 TAIL_GUARD_S = 1.0  # the phone may still be playing this long after the server's estimate (network, buffering)
 PLAYED_WAIT_S = 2.0  # an app that reports "played": wait this long past the estimate for it, then go on anyway
@@ -2080,7 +2081,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = "", persona: str = "", mode: str = ""):
+               intent: str = "", persona: str = "", mode: str = "", secret: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -2091,6 +2092,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         return
     await ws.accept()
     session = session or f"call-{int(time.time())}"
+    # Secret mode: nothing about this call is stored. Its turns live under a throwaway session key (the gateway sees
+    # "secret-" and keeps no Claude session, refuses storing tools and forces approvals to once), no call log or brain
+    # event is sent, and the key's history is dropped at hangup, never merged into the persona+session history.
+    secret_on = secret in ("1", "true")
+    if secret_on:
+        session = f"{SECRET_PREFIX}{uuid.uuid4().hex[:12]}"
     log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
     start_log = {"event": "start", "log_id": log_id}
     vad_turn = Turn(SileroVoiceActivityDetector(), mode=links.settings.get("noise_mode", "normal"))
@@ -2103,10 +2110,30 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                      "said": deque(maxlen=8),  # (sent at, text) of recent reply sentences, for the echo check
                      # the reply whose audio went out last, and the last one the app reported fully played (an app
                      # that sends {"type":"played"} at all: "reports")
-                     "audio_gen": 0, "played": None, "reports": False, "text_at": -1e9}
+                     "audio_gen": 0, "played": None, "reports": False, "text_at": -1e9,
+                     "secret": secret_on, "logged": False}  # logged: the call's start went to the call log
     # this call's brain mode: ?mode=, else the shared setting; replies spawned later copy the current value
     current["mode"] = mode if mode in BRAIN_MODES else (links.settings.get("brain_mode") or "auto")
     CALL_MODE.set(current["mode"])
+
+    async def log(ev):
+        """The call log, unless secret. A call made secret midway keeps only its (text-free) end."""
+        if current["secret"] and not (ev.get("event") == "end" and current["logged"]):
+            return
+        current["logged"] = current["logged"] or ev.get("event") == "start"
+        await links.log(ev)
+
+    async def brain(ev):
+        """Call events for the brain, unless secret (it may remember what a call was about). A call made secret
+        midway still ends, under the session the brain knows."""
+        end, known = ev.get("event") == "end", current.get("brain_session")
+        if current["secret"] and not (end and known):
+            return
+        if ev.get("event") == "start":
+            current["brain_session"] = ev.get("session")
+        elif end and known:
+            ev = {**ev, "session": known}
+        await links.brain_event(ev)
 
     def spawn(coro):
         """A task that may speak: tracked so an interrupt can cancel all of them, not only the latest."""
@@ -2144,8 +2171,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             else:
                 if obj.get("type") == "reply":
                     current["said"].append((time.monotonic(), str(obj.get("text", ""))))
-                if obj.get("type") == "state":
-                    obj = {**obj, "mode": current["mode"]}  # every state frame says which brain is answering
+                if obj.get("type") == "state":  # every state frame says which brain answers, and whether it's secret
+                    obj = {**obj, "mode": current["mode"], "secret": current["secret"]}
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
     guard = OpeningGuard()
@@ -2287,7 +2314,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if spoken:
                 history[f"{current_persona(await gateway_settings())['id']}:{session}"].append(
                     {"role": "assistant", "content": " ".join(spoken) + (CUT_MARK if cut and short else "")})
-                await links.log({**start_log, "opening": " ".join(spoken)})
+                await log({**start_log, "opening": " ".join(spoken)})
             if not cut:
                 await until_played()
             await send({"type": "state", "value": "listening"}, gen=gen)  # not after it was interrupted
@@ -2377,7 +2404,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             await send({"type": "error", "message": f"{type(e).__name__}: {e}"})
         finally:
             if text:  # turns with an empty transcript are not history
-                await links.log({"event": "turn", "log_id": log_id, "user": text, **turn,
+                await log({"event": "turn", "log_id": log_id, "user": text, **turn,
                                  "timings": timings, "at": time.time()})
             if not turn["interrupted"]:  # a failed turn's partial reply still plays out first
                 await until_played()
@@ -2395,18 +2422,18 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         briefing = intent == "briefing" and not call_id
         if call_id:  # the callee picked up: stops a scheduled call's retries
             await links.notify({"type": "call_answered", "call_id": call_id})
-        await links.brain_event({"type": "call_event", "event": "start", "session": session, "persona": pid,
+        await brain({"type": "call_event", "event": "start", "session": session, "persona": pid,
                                  "reason": (op or {}).get("reason", ""), "opening": (op or {}).get("text", "")})
         start_log.update(session=session, call_id=call_id, client=client[:20], started_at=started, persona_id=pid,
                          # the user's point of view, like a phone's call log: the assistant calling = incoming
                          direction="incoming" if call_id else "outgoing",
                          reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
-        await links.log(start_log)
+        await log(start_log)
         if briefing:  # the app's "오늘 브리핑": speak a briefing first, interruptible like any reply
             current["task"] = spawn(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
             if op and op["parts"]:
-                if op.get("origin") and op["origin"] != f"{pid}:{session}":  # a task's or reminder's call: continue there
+                if op.get("origin") and op["origin"] != f"{pid}:{session}" and not current["secret"]:  # a task's or reminder's call: continue there
                     history[f"{pid}:{session}"].extend(list(history.get(op["origin"], ()))[-ORIGIN_TURNS:])
                 history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
                 guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
@@ -2429,6 +2456,13 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                         current["played"] = current["audio_gen"]
                         if current["paused_at"] is None:
                             current["play_end"] = time.monotonic()
+                if kind == "secret":  # on midway: from here nothing is stored; off is refused (a secret call stays one)
+                    if json.loads(msg["text"]).get("value") is True and not current["secret"]:
+                        old, session = session, f"{SECRET_PREFIX}{uuid.uuid4().hex[:12]}"
+                        for k in [k for k in history if k.endswith(f":{old}")]:  # the context so far, as a copy
+                            history[k.rsplit(":", 1)[0] + f":{session}"] = deque(history[k], maxlen=MAX_TURNS * 2)
+                        current["secret"] = True
+                    await send({"type": "secret", "value": current["secret"]})
                 if kind == "text":  # typed during the call: a user turn like a transcript, no STT, no VAD
                     await typed_turn(json.loads(msg["text"]))
                 if kind == "mode" and (v := json.loads(msg["text"]).get("value")) in BRAIN_MODES:
@@ -2477,18 +2511,23 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             t.cancel()
         await asyncio.gather(*left, return_exceptions=True)  # its turn is logged before the end
         ended = time.time()
-        await links.log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
-        await links.brain_event({"type": "call_event", "event": "end", "session": session})
+        await log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
+        await brain({"type": "call_event", "event": "end", "session": session})
         links.session_ctx.pop(session, None)
         for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
             games.pop(k, None)
+        if current["secret"]:  # forget the secret turns: history, title rhythm, a half-asked schedule
+            for store in (history, history_sig, title_gap):
+                for k in [k for k in store if k.endswith(f":{session}")]:
+                    store.pop(k, None)
+            pending_schedule.pop(session, None)
 
 
 if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
-        def nomode(f):  # state frames carry the call's brain mode; most checks don't care
-            return {k: v for k, v in f.items() if k != "mode"} if isinstance(f, dict) else f
+        def nomode(f):  # state frames carry the call's brain mode and secret flag; most checks don't care
+            return {k: v for k, v in f.items() if k not in ("mode", "secret")} if isinstance(f, dict) else f
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
         for noise in ["MBC 뉴스 김철수입니다.", "MBC 뉴스 이덕영입니다", "시청해 주셔서 감사합니다", "시청해주셔서 감사합니다!",
@@ -3193,6 +3232,68 @@ if __name__ == "__main__":
                 w.send_text(json.dumps({"type": "hangup"}))
             links.remove(full)
             return waits
+        def secret_check():
+            """A secret call: no call log or brain event, state frames say secret, its turns never reach the next call on
+            the same session, and turning secret on midway hides the rest of a normal call."""
+            from fastapi.testclient import TestClient
+            prompts = []
+
+            async def fake_llm(messages, max_tokens=600):
+                prompts.append(json.dumps(messages, ensure_ascii=False))
+                yield "네, 알겠어요."
+
+            async def fake_tts(sentence):
+                return b"\0" * 480, 24000
+
+            async def no_stt(audio):
+                raise AssertionError("typed only")
+            globals().update(transcribe=no_stt, llm_stream=fake_llm, tts=fake_tts,
+                             SileroVoiceActivityDetector=lambda: (lambda f: 0.0))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            br = links.add(FakeWS())
+            links.receive(br, {"type": "hello", "device": "brain", "mode": "full", "role": "brain", "priority": 5})
+            states = []
+
+            def turn(w, text):
+                w.send_text(json.dumps({"type": "text", "text": text}))
+                while True:
+                    m = w.receive()
+                    f = json.loads(m["text"]) if m.get("text") else {}
+                    if f.get("type") == "state":
+                        states.append(f)
+                    if f.get("type") in ("turn_done", "error"):
+                        return
+
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            hdr = {"Authorization": "Bearer app-tok"}
+            with tc.websocket_connect("/v1/call?client=iphone&session=sec&secret=1", headers=hdr) as w:
+                assert "secret" in json.loads(w.receive_text())["caps"]
+                turn(w, "내 비밀번호 힌트는 고양이 이름이야")
+                w.send_text(json.dumps({"type": "secret", "value": False}))  # a secret call stays secret
+                while (f := json.loads(w.receive_text()))["type"] != "secret":
+                    pass
+                stays = f["value"]
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.1)
+            leftover = [k for k in history if k.endswith("secret-") or ":secret-" in k]
+            with tc.websocket_connect("/v1/call?client=iphone&session=sec", headers=hdr) as w:
+                w.receive_text()
+                time.sleep(1.05)
+                turn(w, "아까 뭐라고 했지?")
+                time.sleep(1.05)
+                w.send_text(json.dumps({"type": "secret", "value": True}))  # midway
+                while (f := json.loads(w.receive_text()))["type"] != "secret":
+                    pass
+                midway = f["value"]
+                turn(w, "이건 비밀이야")
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.1)
+            logs = [m for m in full.ws.sent if m.get("type") == "call_log"]
+            brain = [m for m in br.ws.sent if m.get("type") == "call_event"]
+            links.remove(full)
+            links.remove(br)
+            return states, stays, midway, leftover, logs, brain, prompts
         def typed_check():
             """Typing during a call: a user turn without STT (no transcript echo, input "text" in the log), captions only
             with speak=false, rejected when too long or too fast, and typing over a reply interrupts it."""
@@ -3483,9 +3584,9 @@ if __name__ == "__main__":
             asyncio.run(placed())
             assert set(voices) == {"vivian"}
             with tc.websocket_connect("/v1/call?session=pm&mode=local", headers={"Authorization": "Bearer app-tok"}) as w:
-                assert json.loads(w.receive_text()) == {"type": "hello", "caps": ["text", "played", "mode"]}  # first
+                assert json.loads(w.receive_text()) == {"type": "hello", "caps": ["text", "played", "mode", "secret"]}  # first
                 assert json.loads(w.receive_text()) == {"type": "mode", "value": "local"}  # on connect
-                assert json.loads(w.receive_text()) == {"type": "state", "value": "listening", "mode": "local"}
+                assert json.loads(w.receive_text()) == {"type": "state", "value": "listening", "mode": "local", "secret": False}
                 w.send_text(json.dumps({"type": "mode", "value": "bogus"}))  # ignored
                 w.send_text(json.dumps({"type": "mode", "value": "claude_api"}))
                 assert json.loads(w.receive_text()) == {"type": "mode", "value": "claude_api"}  # on each change
@@ -3570,6 +3671,13 @@ if __name__ == "__main__":
         games.clear()
         (k1, early), (k2, held) = played_check()
         assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
+        states, stays, midway, leftover, slogs, brain_evs, prompts = secret_check()
+        assert stays is True and midway is True and leftover == [], leftover
+        assert all(f["secret"] is True for f in states[:3]) and states[3]["secret"] is False and states[-1]["secret"] is True
+        assert "고양이" not in prompts[1]  # the next call on the same session never sees the secret turns
+        assert [m["event"] for m in slogs] == ["start", "turn", "end"], slogs  # only the normal call's part
+        assert "비밀" not in json.dumps(slogs, ensure_ascii=False) and "고양이" not in json.dumps(slogs, ensure_ascii=False)
+        assert [e["event"] for e in brain_evs] == ["start", "end"] and all("secret-" not in json.dumps(e) for e in brain_evs)
         spoken, rejected, quiet, over, turns, asked = typed_check()
         kinds = lambda fs: [f if f == "audio" else f["type"] for f in fs]  # noqa: E731
         assert "transcript" not in kinds(spoken) and "audio" in kinds(spoken), kinds(spoken)
