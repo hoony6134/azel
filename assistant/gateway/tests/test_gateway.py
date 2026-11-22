@@ -37,6 +37,10 @@ def start(tmp_path, monkeypatch, **env):
         return None
     g.voice_link = no_link
 
+    async def no_scheduler():  # tests drive scheduler_tick with their own times; the real-clock loop would mark a
+        return None            # fixed-date test call missed once the wall clock passes it
+    g.scheduler = no_scheduler
+
     async def discovered():  # what `claude mcp list` / `claude plugin list` would report
         g.discovery.connectors = [{"name": "Cygnus MCP", "url": "https://mcp.example/cygnus", "status": "connected"},
                                   {"name": "Gmail", "url": "https://gmail.example/mcp", "status": "connected"},
