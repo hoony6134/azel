@@ -375,11 +375,13 @@ extension CallManager: PKPushRegistryDelegate {
         let p = payload.dictionaryPayload
         let caller = p["caller"] as? String ?? AssistantName.current
         let uuid = UUID()
+        let context = CallContext.from(p["context"])
         incoming[uuid] = (p["call_id"] as? String, p["reason"] as? String, caller,
-                          (p["persona"] as? String) ?? (p["persona"] as? NSNumber).map(\.stringValue), CallContext.from(p["context"]))
+                          (p["persona"] as? String) ?? (p["persona"] as? NSNumber).map(\.stringValue), context)
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: caller)
-        update.localizedCallerName = caller
+        // What it's about, before answering (and in Phone's recents): "아젤 · 작업: 창업 리서치".
+        update.localizedCallerName = CallContext.callerLine(caller, context)
         update.hasVideo = false
         update.supportsHolding = true
         update.supportsGrouping = false

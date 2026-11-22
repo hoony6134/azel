@@ -269,6 +269,30 @@ struct CallContext: Equatable {
         return CallContext(kind: d["kind"] as? String, label: label, id: d["id"].map(describe))
     }
 
+    /// The incoming-call screen's short reason (≤ 14 characters, then …): "작업: 창업 리서치",
+    /// "알림: 역사학특강 과제", "아침 브리핑", "마감 알림", "서버 알림".
+    var reason: String {
+        let r: String
+        switch kind {
+        case "task": r = "작업: " + label
+        case "schedule", "reminder": r = "알림: " + label
+        case "wake": r = "깨우기"
+        case "briefing", "morning_briefing": r = "아침 브리핑"
+        case "deadline", "deadline_check": r = "마감 알림"
+        case "server", "server_alert", "server_alerts": r = "서버 알림"
+        default: r = label
+        }
+        return Self.clip(r, 14)
+    }
+
+    static func clip(_ s: String, _ n: Int) -> String { s.count <= n ? s : String(s.prefix(n - 1)) + "…" }
+
+    /// "아젤 · 작업: 창업 리서치" for CallKit, recents and the Live Activity; the plain name without context.
+    static func callerLine(_ name: String, _ context: CallContext?) -> String {
+        guard let context else { return name }
+        return "\(name) · \(context.reason)"
+    }
+
     /// "맡긴 작업: …" / "예약: …".
     var chip: String {
         switch kind {

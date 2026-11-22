@@ -65,7 +65,8 @@ final class LiveActivities {
                 Task { await call.update(.init(state: s, staleDate: nil)) }
             } else if enabled {
                 let p = c.activePersona ?? PersonaModel.shared.selected
-                let attrs = CallActivityAttributes(name: p?.name ?? AssistantName.current, glaze: Self.glaze(p), startedAt: Date())
+                let name = c.callerName ?? p?.name ?? AssistantName.current
+                let attrs = CallActivityAttributes(name: CallContext.callerLine(name, c.callContext), glaze: Self.glaze(p), startedAt: Date())
                 call = try? ActivityKit.Activity.request(attributes: attrs, content: .init(state: s, staleDate: nil))
                 lastCall = s
             }

@@ -153,3 +153,24 @@ final class CallContextFrameTests: XCTestCase {
         XCTAssertEqual(sent, ["notify": "call"])
     }
 }
+
+final class IncomingReasonTests: XCTestCase {
+    private func ctx(_ kind: String?, _ label: String) -> CallContext { CallContext(kind: kind, label: label, id: nil) }
+
+    func testCallerLines() {
+        XCTAssertEqual(CallContext.callerLine("아젤", ctx("task", "창업 리서치")), "아젤 · 작업: 창업 리서치")
+        XCTAssertEqual(CallContext.callerLine("아젤", ctx("schedule", "역사학특강 과제")), "아젤 · 알림: 역사학특강 과제")
+        XCTAssertEqual(CallContext.callerLine("아젤", ctx("briefing", "x")), "아젤 · 아침 브리핑")
+        XCTAssertEqual(CallContext.callerLine("아젤", ctx("deadline", "x")), "아젤 · 마감 알림")
+        XCTAssertEqual(CallContext.callerLine("아젤", ctx("server_alert", "x")), "아젤 · 서버 알림")
+        XCTAssertEqual(CallContext.callerLine("미아", nil), "미아", "no context: the plain name")
+    }
+
+    func testReasonIsClippedTo14() {
+        let r = ctx("task", "2026년 2학기 창업 아이템 시장 조사 정리").reason
+        XCTAssertEqual(r.count, 14)
+        XCTAssertTrue(r.hasSuffix("…"))
+        XCTAssertEqual(r, "작업: 2026년 2학기…")
+        XCTAssertEqual(ctx("schedule", "약 먹기").reason, "알림: 약 먹기", "short ones stay whole")
+    }
+}
