@@ -1,7 +1,7 @@
 [project]
 name = "biseo-wake"
 version = "0.1.0"
-description = "Biseo always-on wake-word listener for the Mac"
+description = "Azel always-on wake-word listener for the Mac"
 requires-python = ">=3.11,<3.13"
 dependencies = ["httpx", "numpy", "sounddevice", "soundfile", "pysilero-vad", "openwakeword"]
 

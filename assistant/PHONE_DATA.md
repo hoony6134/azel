@@ -97,12 +97,12 @@ model tool call → gateway bridge → link {"type":"phone_query","id","kind","a
 - Raw samples, events, reminders, contacts, location and music never leave the phone except inside one live answer.
 - Summaries: 30 days on the server, delete-all in the app; only on full (jh-only) gateways, never limited ones.
 
-## 5. App structure (`assistant/app/Biseo/iOS/PhoneData/`)
+## 5. App structure (`assistant/app/Azel/iOS/PhoneData/`)
 - `Shared/PhoneDataCore.swift` — categories and toggles, `PhoneAuth` (row states), the `PhoneStores` protocol, pure
   aggregation (samples → day summary) and `PhoneResponder` (query → `phone_result`). Unit tested with fake stores.
 - `iOS/PhoneData/AppleStores.swift` — the real stores (HealthKit, EventKit, Contacts, CoreLocation, CoreMotion, MediaPlayer).
 - `iOS/PhoneData/PhoneDataSettings.swift` — permission requests and status mapping, the settings screen, the first-run sheet.
 - `iOS/PhoneData/PhoneDataSync.swift` — call-socket hooks, HealthKit observers, background delivery, BGTask, upload, delete.
 - Shared edits: `CallClient` gets two static hooks (`phoneHello` sent on start, `phoneQuery` answers `phone_query`
-  frames); `BiseoApp` calls `PhoneDataSync.start()`, uploads on foreground, adds `.phoneDataFirstRun()` and the settings row. Entitlements: `com.apple.developer.healthkit`, `…healthkit.background-delivery`; Info.plist
+  frames); `AzelApp` calls `PhoneDataSync.start()`, uploads on foreground, adds `.phoneDataFirstRun()` and the settings row. Entitlements: `com.apple.developer.healthkit`, `…healthkit.background-delivery`; Info.plist
   usage strings (Korean) and `BGTaskSchedulerPermittedIdentifiers`, background mode `fetch`.

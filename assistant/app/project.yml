@@ -1,4 +1,4 @@
-name: Biseo
+name: Azel
 options:
   bundleIdPrefix: xyz.scian
   developmentLanguage: ko # Siri matches the Korean App Shortcut phrases in Intents.swift against this language
@@ -15,16 +15,16 @@ targets:
   # One multiplatform app: same sources and bundle id for iPhone and Mac. Shared/ builds everywhere;
   # iOS/ (CallKit, PushKit, App Intents, tab UI) and macOS/ (menu bar, hotkey, call panel, wake toggle)
   # build only for their platform.
-  Biseo:
+  Azel:
     type: application
     supportedDestinations: [iOS, macOS]
     sources:
-      - path: Biseo/Shared
-      - path: Biseo/iOS
+      - path: Azel/Shared
+      - path: Azel/iOS
         destinationFilters: [iOS]
-      - path: Biseo/LiveActivity
+      - path: Azel/LiveActivity
         destinationFilters: [iOS]
-      - path: Biseo/macOS
+      - path: Azel/macOS
         destinationFilters: [macOS]
     dependencies:
       - target: AzelWidgets
@@ -37,14 +37,14 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon # Shared/Assets.xcassets, from assistant/design/icon
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS[sdk=iphone*]: Biseo/Biseo-iOS.entitlements # aps-environment
-        CODE_SIGN_ENTITLEMENTS[sdk=macosx*]: Biseo/Biseo-macOS.entitlements # sandbox, network client, audio input
+        CODE_SIGN_ENTITLEMENTS[sdk=iphone*]: Azel/Azel-iOS.entitlements # aps-environment
+        CODE_SIGN_ENTITLEMENTS[sdk=macosx*]: Azel/Azel-macOS.entitlements # sandbox, network client, audio input
         ENABLE_HARDENED_RUNTIME[sdk=macosx*]: YES
     info:
-      path: Biseo/Info.plist
+      path: Azel/Info.plist
       properties:
         CFBundleDisplayName: Azel
-        CFBundleName: Azel # macOS menu/app name; PRODUCT_NAME stays Biseo (module name, test host)
+        CFBundleName: Azel # macOS menu/app name; the module name, the executable and the test host are Azel too
         # Siri needs the app's name in a phrase; these let "아젤 불러줘" and "비서 불러줘" work too.
         INAlternativeAppNames:
           - INAlternativeAppName: 아젤
@@ -90,7 +90,7 @@ targets:
   AzelWidgets:
     type: app-extension
     platform: iOS
-    sources: [Biseo/Widgets, Biseo/LiveActivity, Biseo/CallWidget]
+    sources: [Azel/Widgets, Azel/LiveActivity, Azel/CallWidget]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.widgets
@@ -98,7 +98,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) WIDGET # ApprovalIntent: the app-only perform body
     info:
-      path: Biseo/Widgets/Info.plist
+      path: Azel/Widgets/Info.plist
       properties:
         CFBundleDisplayName: Azel
         CFBundleShortVersionString: "1.0"
@@ -112,20 +112,20 @@ targets:
     type: application
     platform: watchOS
     sources:
-      - path: Biseo/Watch
-      - path: Biseo/Shared/CallClient.swift
-      - path: Biseo/Shared/Audio.swift
-      - path: Biseo/Shared/Config.swift
-      - path: Biseo/Shared/CallLog.swift
-      - path: Biseo/Shared/AssistantName.swift
-      - path: Biseo/Shared/Log.swift
-      - path: Biseo/Shared/CallEvent.swift
-      - path: Biseo/Shared/Activity.swift
-      - path: Biseo/Shared/Earcon.swift
-      - path: Biseo/Shared/Karaoke.swift
-      - path: Biseo/Shared/Recording.swift
-      - path: Biseo/Shared/Theme.swift
-      - path: Biseo/Shared/MoonJar.swift
+      - path: Azel/Watch
+      - path: Azel/Shared/CallClient.swift
+      - path: Azel/Shared/Audio.swift
+      - path: Azel/Shared/Config.swift
+      - path: Azel/Shared/CallLog.swift
+      - path: Azel/Shared/AssistantName.swift
+      - path: Azel/Shared/Log.swift
+      - path: Azel/Shared/CallEvent.swift
+      - path: Azel/Shared/Activity.swift
+      - path: Azel/Shared/Earcon.swift
+      - path: Azel/Shared/Karaoke.swift
+      - path: Azel/Shared/Recording.swift
+      - path: Azel/Shared/Theme.swift
+      - path: Azel/Shared/MoonJar.swift
     dependencies:
       - target: AzelWatchWidgets
     settings:
@@ -134,7 +134,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
     info:
-      path: Biseo/Watch/Info.plist
+      path: Azel/Watch/Info.plist
       properties:
         CFBundleDisplayName: Azel
         CFBundleShortVersionString: "1.0"
@@ -156,34 +156,34 @@ targets:
   AzelWatchWidgets:
     type: app-extension
     platform: watchOS
-    sources: [Biseo/WatchWidgets, Biseo/CallWidget]
+    sources: [Azel/WatchWidgets, Azel/CallWidget]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.watchkitapp.widgets
         GENERATE_INFOPLIST_FILE: NO
     info:
-      path: Biseo/WatchWidgets/Info.plist
+      path: Azel/WatchWidgets/Info.plist
       properties:
         CFBundleDisplayName: Azel
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
-  BiseoTests:
+  AzelTests:
     type: bundle.unit-test
     supportedDestinations: [iOS, macOS]
-    sources: [BiseoTests]
+    sources: [AzelTests]
     dependencies:
-      - target: Biseo
+      - target: Azel
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        TEST_HOST[sdk=macosx*]: $(BUILT_PRODUCTS_DIR)/Biseo.app/Contents/MacOS/Biseo # xcodegen writes the iOS layout
+        TEST_HOST[sdk=macosx*]: $(BUILT_PRODUCTS_DIR)/Azel.app/Contents/MacOS/Azel # xcodegen writes the iOS layout
 schemes:
-  Biseo:
+  Azel:
     build:
       targets:
-        Biseo: all
-        BiseoTests: [test]
+        Azel: all
+        AzelTests: [test]
     test:
-      targets: [BiseoTests]
+      targets: [AzelTests]
