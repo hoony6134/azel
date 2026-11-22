@@ -571,7 +571,47 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     return res
 
 
+SESSION_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _sessions_file() -> Path:
+    return CFG["log_path"].with_name("delegate_sessions.json")
+
+
+def _sessions() -> dict:
+    try:
+        v = json.loads(_sessions_file().read_text())
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember_session(session_id: str, cwd: Path, job_id: str) -> None:
+    """The Claude Code sessions this daemon's own delegate jobs created (id -> cwd): the only ones it will resume."""
+    with _lock:
+        known = _sessions()
+        known[session_id] = {"cwd": str(cwd), "job_id": job_id, "at": time.time()}
+        keep = dict(sorted(known.items(), key=lambda kv: kv[1].get("at", 0))[-200:])
+        f = _sessions_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f.with_name(f.name + ".tmp"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(keep, fh)
+        os.replace(f.with_name(f.name + ".tmp"), f)
+
+
+def _write_output(job: dict) -> None:
+    """The job's final text as a private file next to the log, so a follow-up can point at it."""
+    f = CFG["log_path"].parent / "delegate-output" / f"{job['job_id']}.txt"
+    f.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(job.get("result") or "")
+    job["output_file"] = str(f)
+
+
 def _run_job(job: dict, argv: list[str], cwd: Path) -> None:
+    status = "failed"  # set to the real outcome last: a client treats anything but running as finished
     try:
         out = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=CFG["delegate_timeout"])
         job["exit_code"] = out.returncode
@@ -579,31 +619,57 @@ def _run_job(job: dict, argv: list[str], cwd: Path) -> None:
             data = json.loads(out.stdout)
             job["result"] = data.get("result", "")
             job["cost_usd"] = data.get("total_cost_usd")
-            job["status"] = "failed" if data.get("is_error") or out.returncode else "done"
+            sid = data.get("session_id")
+            if isinstance(sid, str) and SESSION_RE.fullmatch(sid):
+                job["session_id"] = sid
+                _remember_session(sid, cwd, job["job_id"])
+            status = "failed" if data.get("is_error") or out.returncode else "done"
         except ValueError:
             job["result"] = _cap(out.stdout)
-            job["status"] = "failed"
+            status = "failed"
         job["stderr"] = _cap(out.stderr[-4000:])
     except Exception as e:
-        job.update(status="failed", result=f"{type(e).__name__}: {e}")
+        status = "failed"
+        job["result"] = f"{type(e).__name__}: {e}"
     job["summary"] = (job.get("result") or "")[:500]
+    try:
+        _write_output(job)
+    except OSError as e:
+        log.warning("delegate output not saved: %s", e)
     job["finished"] = time.time()
+    job["status"] = status
 
 
 @logged
-def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | None = None) -> dict:
-    """Run a coding task with Claude Code (`claude -p`) in the background; returns a job_id."""
+def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | None = None,
+             resume: str | None = None) -> dict:
+    """Run a coding task with Claude Code (`claude -p`) in the background; returns a job_id. job_status then has the
+    Claude Code `session_id`, the cwd and the `output_file`. `resume` is the session_id of an earlier job of this
+    daemon: the same session continues, in the same cwd, with `task` as the follow-up instruction."""
     if harness != "claude_code":
         raise Refused(f"unsupported harness: {harness}")
     wd = safe_path(cwd)
-    argv = [CFG["claude_bin"], "-p", task, "--permission-mode", "acceptEdits",
+    resume_args: list[str] = []
+    if resume:
+        if not SESSION_RE.fullmatch(resume):
+            raise Refused("resume must be a session_id from job_status")
+        known = _sessions().get(resume)
+        if not known:
+            raise Refused("unknown session: only sessions this device's own delegate jobs created can be resumed")
+        if known["cwd"] != str(wd):
+            raise Refused(f"that session lives in {known['cwd']}: resume it there")
+        if any(j.get("status") == "running" and j.get("session_id") == resume or j.get("resumes") == resume
+               and j.get("status") == "running" for j in JOBS.values()):
+            raise Refused("a job on that session is still running")
+        resume_args = ["--resume", resume]
+    argv = [CFG["claude_bin"], "-p", task, *resume_args, "--permission-mode", "acceptEdits",
             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
             "--output-format", "json", "--append-system-prompt", NO_ATTRIBUTION]
     if model:
         argv += ["--model", model]
-    # shortcut: jobs live in memory and are lost on restart; persist them if long jobs matter
+    # shortcut: jobs live in memory and are lost on restart (their sessions are remembered on disk)
     job = {"job_id": uuid.uuid4().hex[:12], "status": "running", "task": task, "cwd": str(wd),
-           "model": model, "started": time.time()}
+           "model": model, "started": time.time(), **({"resumes": resume} if resume else {})}
     JOBS[job["job_id"]] = job
     threading.Thread(target=_run_job, args=(job, argv, wd), daemon=True).start()
     return {"status": "ok", "job_id": job["job_id"]}
@@ -621,7 +687,8 @@ def job_status(job_id: str) -> dict:
 def list_jobs() -> dict:
     """All delegated jobs (without full results)."""
     return {"status": "ok", "jobs": [{k: j.get(k) for k in ("job_id", "status", "task", "cwd", "started", "finished",
-                                                            "summary")} for j in JOBS.values()]}
+                                                            "summary", "session_id", "output_file")}
+                                     for j in JOBS.values()]}
 
 
 PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
