@@ -114,6 +114,7 @@ final class CallClient {
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
         Log.call.info("call start session=\(session, privacy: .public) intent=\(intent ?? "-", privacy: .public) host=\(task.originalRequest?.url?.host ?? "?", privacy: .public)")
+        markTiming("ws_start")
         task.resume()
         if let hello = Self.phoneHello?() { task.send(.string(hello)) { _ in } }
         audio.onConfigurationChange = { [weak self] in self?.routeChanged() }
@@ -127,6 +128,7 @@ final class CallClient {
             }
             if action != .drop { recorder?.mic(data, silent: action == .silence) }
         }
+        defer { markTiming("audio_up") }   // engine and voice processing running (synchronous, on this thread)
         do { try audio.start() } catch {
             Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
             throw StartError.audio
@@ -159,7 +161,7 @@ final class CallClient {
             guard let self else { return }
             switch result {
             case .success(let message):
-                if !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
+                if !receivedAny { receivedAny = true; markTiming("ws_first_frame"); Log.call.info("call socket open, first message") }
                 deliver(message, call: call)
             case .failure:
                 let status = (task.response as? HTTPURLResponse)?.statusCode
@@ -203,6 +205,8 @@ final class CallClient {
             // After an interrupt, frames of the old reply may still arrive: drop them.
             admissionLock.lock(); let admit = admission.admits; admissionLock.unlock()
             guard admit else { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock(); return }
+            markTiming("first_reply_audio")
+            logTiming()
             audio.play(pcm)
             karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
             playedLock.lock(); played.audio(samples: pcm.count / 2); playedLock.unlock()
@@ -211,6 +215,13 @@ final class CallClient {
             recorder?.assistant(pcm)
         case .string(let text):
             guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { return }
+            switch event.type {
+            case "hello": markTiming("hello")
+            case "state": markTiming("state_" + (event.value ?? ""))   // state_listening, state_thinking, …
+            case "transcript": markTiming("transcript")
+            case "reply": markTiming("reply_text")
+            default: break
+            }
             if event.type == "phone_query" {  // answered off the receive path; never shown or recorded
                 if let answer = Self.phoneQuery {
                     Task { [weak self] in if let r = await answer(Data(text.utf8)) { self?.socket?.send(.string(r)) { _ in } } }
@@ -269,6 +280,23 @@ final class CallClient {
     /// `{"type":"played","reply_id":N}` once reply N's last buffer has actually played, so the server
     /// stops guessing when playback ended (the cut-off investigation, 2026-11-22).
     private var played = PlayedTracker()
+    /// Call-start timing (see CallTiming); the owner calls `beginTiming` when the user asks for the call.
+    private var timing = CallTiming()
+    private let timingLock = NSLock()
+
+    func beginTiming(_ source: String) { timingLock.lock(); timing.begin(source); timingLock.unlock() }
+
+    /// Starts timing unless the wake handoff just began it for this call (begun, nothing marked yet).
+    func beginTimingIfIdle(_ source: String) {
+        timingLock.lock(); if !timing.justBegun { timing.begin(source) }; timingLock.unlock()
+    }
+
+    func markTiming(_ name: String) { timingLock.lock(); timing.mark(name); timingLock.unlock() }
+
+    private func logTiming() {
+        timingLock.lock(); let line = timing.takeLine(); timingLock.unlock()
+        if let line { Log.call.notice("call timing \(line, privacy: .public)") }
+    }
     private let playedLock = NSLock()
 
     private func reportPlayed() {
@@ -382,6 +410,7 @@ final class CallClient {
 
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
+        logTiming()   // a call that never got reply audio still reports how far it got
         _ = beginCall()            // the old socket's late frames are dropped from here on
         silenceCheck?.cancel()
         pulseTimer?.invalidate()
@@ -572,5 +601,35 @@ struct PlayedTracker: Equatable {
             replies.removeFirst()
         }
         return out
+    }
+}
+
+/// Milliseconds from the call's start to each stage, logged once per call at `.notice` (kept by
+/// the unified log, unlike `.info`): `log show --predicate 'subsystem == "xyz.scian.biseo"' | grep timing`.
+struct CallTiming {
+    private(set) var source = ""
+    private var t0: Double?
+    private(set) var marks: [(String, Int)] = []
+    private var logged = false
+
+    mutating func begin(_ source: String, now: Double = ProcessInfo.processInfo.systemUptime) {
+        self = CallTiming(); self.source = source; t0 = now
+    }
+
+    /// The first time `name` happens in this call; later repeats are ignored.
+    mutating func mark(_ name: String, now: Double = ProcessInfo.processInfo.systemUptime) {
+        guard let t0, !marks.contains(where: { $0.0 == name }) else { return }
+        marks.append((name, Int(((now - t0) * 1000).rounded())))
+    }
+
+    var justBegun: Bool { t0 != nil && marks.isEmpty && !logged }
+
+    var line: String { "\(source): " + marks.map { "\($0.0)=\($0.1)" }.joined(separator: " ") }
+
+    /// The line once (at the first reply audio, or at hangup if none came).
+    mutating func takeLine() -> String? {
+        guard t0 != nil, !logged, !marks.isEmpty else { return nil }
+        logged = true
+        return line
     }
 }

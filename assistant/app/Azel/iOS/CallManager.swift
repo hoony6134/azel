@@ -122,6 +122,7 @@ final class CallManager: NSObject, ObservableObject {
     /// refuses the outgoing call, the gateway rings back instead (that works on the lock screen).
     @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil, ringbackOnFailure: Bool = false,
                               resume: HistoryItem? = nil) {
+        client.beginTiming(prefix == "briefing" ? "iphone-briefing" : "iphone")
         guard !inCall else { return }
         sessionPrefix = prefix
         // a secret call kept nothing to continue; any other call goes on in its own session (Claude resumes it too)
@@ -242,6 +243,7 @@ final class CallManager: NSObject, ObservableObject {
     /// Runs from `didActivate`: the audio session is ours now. After a hold the socket is still up,
     /// so only the audio engine comes back.
     private func connect() {
+        client.markTiming("session_active")   // CallKit's didActivate
         guard let uuid = callUUID else { return fail("서버 설정이 없습니다") }
         if client.isConnected {
             do { try client.restartAudio() } catch { fail(error.localizedDescription) }
@@ -351,6 +353,7 @@ extension CallManager: CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        client.beginTiming("iphone-incoming")
         let info = incoming.removeValue(forKey: action.callUUID)
         begin(action.callUUID, callID: info?.callID)
         callerName = info?.caller

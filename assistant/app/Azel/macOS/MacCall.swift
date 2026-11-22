@@ -176,6 +176,7 @@ final class MacCall: ObservableObject {
     /// shows without taking focus and the mic is live at once for the sentence after the name.
     func wake(persona key: String?, utterance: String? = nil) {
         if inCall { showPanel(); return }
+        client.beginTiming(utterance == nil ? "wake" : "wake+utterance")
         let p = key.flatMap { k in PersonaModel.shared.personas.first { $0.id == k || $0.name == k } } ?? PersonaModel.shared.primary
         wakeCall = true
         pendingUtterance = utterance
@@ -196,6 +197,7 @@ final class MacCall: ObservableObject {
             let data = await AzelFiles.takeUtterance(id)
             guard let self, self.inCall else { return }
             if let data { self.client.sendUserAudio(data) }
+            self.client.markTiming(data == nil ? "utterance_none" : "utterance_sent")
             self.client.sending = true
         }
     }
@@ -209,7 +211,8 @@ final class MacCall: ObservableObject {
         activity = ActivityLog()
         state = ""
         error = nil
-        if usePanel { showPanel() }
+        client.beginTimingIfIdle(pttCall || talking ? "hotkey" : "start")
+        if usePanel { showPanel(); client.markTiming("panel") }
         guard AudioIO.hardware else { return }   // the test host never asks for the mic or dials out
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: connect()
@@ -335,6 +338,7 @@ final class MacCall: ObservableObject {
     private static var micDenied: String { "\(AssistantName.josa(AssistantName.current, "이", "가")) 말을 들으려면 마이크를 허용해 주세요. 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 Azel을 켜 주세요." }
 
     private func connect() {
+        client.markTiming("mic_ok")
         inCall = true
         applyDevices()
         do {
