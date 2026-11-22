@@ -28,3 +28,9 @@ browse_enabled = true
 browse_timeout_s = 20     # capped at 20
 browse_max_chars = 20000
 browse_allow_private = []
+# macOS only. music(action, query?, volume?): Apple Music through fixed AppleScript templates (the query goes in as
+# argv). macOS asks once to let the daemon control Music (Automation). run_command still cannot run osascript.
+music_enabled = true
+# home(scene): runs `shortcuts run <name>` for these exact names only (one Shortcut per HomeKit scene, built in
+# the Shortcuts app). Empty = home refuses. Keep locks, garage doors and alarms out of this list.
+home_shortcuts = []   # e.g. ["azel-lights-off", "azel-movie"]

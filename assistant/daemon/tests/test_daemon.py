@@ -213,7 +213,8 @@ def test_e2e_mcp_call(live):
             return names, res
 
     names, res = anyio.run(go)
-    assert names == {"list_dir", "read_file", "search", "run_command", "delegate", "job_status", "list_jobs", "browse"}
+    assert names == {"list_dir", "read_file", "search", "run_command", "delegate", "job_status", "list_jobs", "browse",
+                     *(["music", "home"] if __import__("sys").platform == "darwin" else [])}
     assert not res.is_error
     assert "a.txt" in json.dumps(res.structured_content or [c.model_dump() for c in res.content])
 
@@ -609,3 +610,124 @@ def test_open_apps_and_urls_still_reach_approval(cfg, gw):
             assert d.run_command(command=cmd, cwd="proj")["status"] == "pending_approval", cmd
     finally:
         d.CFG["approve_unlisted"] = False
+
+
+# ---------- music and home: fixed templates, fake osascript / shortcuts ----------
+
+mac_only = pytest.mark.skipif(__import__("sys").platform != "darwin", reason="macOS only")
+
+
+@pytest.fixture
+def fake_bins(tmp_path, monkeypatch):
+    """osascript and shortcuts stand-ins that log stdin and argv as JSON lines and print $FAKE_OUT."""
+    log = tmp_path / "calls.jsonl"
+    for name in ("osascript", "shortcuts"):
+        b = tmp_path / name
+        b.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$(python3 -c 'import json,sys;print(json.dumps({{\"bin\":\"{name}\",\"argv\":sys.argv[1:],"
+                     f"\"stdin\":sys.stdin.read()}}))' \"$@\")\" >> {log}\necho \"${{FAKE_OUT:-ok}}\"\n[ -n \"$FAKE_FAIL\" ] && {{ echo \"$FAKE_FAIL\" >&2; exit 1; }}\nexit 0\n")
+        b.chmod(0o755)
+    monkeypatch.setattr(d, "OSASCRIPT", str(tmp_path / "osascript"))
+    monkeypatch.setattr(d, "SHORTCUTS", str(tmp_path / "shortcuts"))
+    return lambda: [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+
+
+@mac_only
+def test_music_play_passes_the_query_as_argv_never_in_the_script(cfg, fake_bins):
+    evil = 'x" & (do shell script "touch /tmp/pwned") & "'
+    r = d.music(action="play", query=evil)
+    (call,) = fake_bins()
+    assert r["status"] == "ok" and call["bin"] == "osascript"
+    assert call["argv"] == ["-", evil] and "pwned" not in call["stdin"]
+    assert call["stdin"] == d.MUSIC_SCRIPTS["play"]
+
+
+@mac_only
+def test_music_actions_use_fixed_templates_and_volume_is_clamped(cfg, fake_bins):
+    for a in ("pause", "resume", "next", "previous", "now_playing"):
+        assert d.music(action=a)["status"] == "ok"
+    d.music(action="volume", volume=250)
+    d.music(action="volume", volume=-5)
+    d.music(action="play")  # no query: continue
+    calls = fake_bins()
+    assert [c["stdin"] for c in calls[:5]] == [d.MUSIC_SCRIPTS[k] for k in ("pause", "resume", "next", "previous", "now_playing")]
+    assert [c["argv"] for c in calls[5:7]] == [["-", "100"], ["-", "0"]]
+    assert calls[7]["stdin"] == d.MUSIC_SCRIPTS["play_any"] and calls[7]["argv"] == ["-"]
+
+
+@mac_only
+def test_music_refuses_bad_input_and_reports_not_found_and_automation(cfg, fake_bins, monkeypatch):
+    assert d.music(action="rm -rf")["status"] == "refused"
+    assert d.music(action="volume")["status"] == "refused"
+    assert fake_bins() == []
+    monkeypatch.setenv("FAKE_OUT", "not found")
+    assert d.music(action="play", query="없는 노래")["status"] == "not_found"
+    monkeypatch.delenv("FAKE_OUT")
+    monkeypatch.setenv("FAKE_FAIL", "execution error: Not authorized to send Apple events to Music. (-1743)")
+    r = d.music(action="pause")
+    assert r["status"] == "refused" and "Automation" in r["reason"]
+    long = "가" * 500
+    monkeypatch.delenv("FAKE_FAIL")
+    d.music(action="play", query=long)
+    assert len(fake_bins()[-1]["argv"][1]) == d.MUSIC_QUERY_MAX
+
+
+@mac_only
+def test_home_runs_only_allowlisted_scenes(cfg, fake_bins):
+    d.CFG["home_shortcuts"] = ["azel-lights-off", "azel-movie"]
+    r = d.home(scene="azel-movie")
+    (call,) = fake_bins()
+    assert r["status"] == "ok" and call == {"bin": "shortcuts", "argv": ["run", "azel-movie"], "stdin": ""}
+    for bad in ("azel-lights-off; id", "Azel-Movie", "front door lock", "-h", ""):
+        assert d.home(scene=bad)["status"] == "refused"
+    assert len(fake_bins()) == 1
+    d.CFG["home_shortcuts"] = []
+    assert d.home(scene="azel-movie")["status"] == "refused"
+
+
+def test_music_and_home_default_config_is_safe(cfg):
+    assert d.CFG["home_shortcuts"] == [] and cfg["music_enabled"] is True
+    assert "osascript" in d.DENY_PROGRAMS  # run_command still cannot run it
+
+
+@pytest.fixture
+def fake_open(tmp_path, monkeypatch):
+    log = tmp_path / "open.log"
+    b = tmp_path / "open"
+    b.write_text(f"#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log}; done\n")
+    b.chmod(0o755)
+    monkeypatch.setattr(d, "OPEN", str(b))
+    return lambda: log.read_text().splitlines() if log.exists() else []
+
+
+@mac_only
+def test_spotify_play_opens_a_checked_uri_by_argv(cfg, fake_open, fake_bins):
+    r = d.music(action="play", query="아이유 밤편지; rm -rf ~", app="spotify")
+    (arg0, arg1, arg2) = fake_open()
+    assert r["status"] == "ok" and (arg0, arg1) == ("-a", "Spotify")
+    assert arg2.startswith("spotify:search:") and ";" not in arg2 and " " not in arg2 and "%EC%95%84" in arg2
+    assert d.SPOTIFY_URI.fullmatch(arg2) and len(arg2) <= len("spotify:search:") + 200
+    assert fake_bins() == []  # not through osascript
+
+
+@mac_only
+def test_spotify_uri_validation_and_length_cap(cfg, fake_open):
+    ok = "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
+    assert d.music(action="play", uri=ok, app="spotify")["status"] == "ok" and fake_open()[-1] == ok
+    for bad in ("https://evil.example", "spotify:track:short", "spotify:search:a b", "spotify:user:abc1234567890",
+                "spotify:track:4uLU6hMCjMI75M1A2tKUQC --args", "file:///etc/passwd"):
+        assert d.music(action="play", uri=bad, app="spotify")["status"] == "refused", bad
+    d.music(action="play", query="가" * 150, app="spotify")
+    assert len(fake_open()[-1]) <= len("spotify:search:") + 200 and d.SPOTIFY_URI.fullmatch(fake_open()[-1])
+    assert d.music(action="play", query="x", app="tidal")["status"] == "refused"
+
+
+@mac_only
+def test_spotify_transport_and_system_volume(cfg, fake_bins):
+    for a in ("pause", "resume", "next", "previous", "now_playing"):
+        assert d.music(action=a, app="spotify")["status"] == "ok"
+    d.music(action="volume", volume=999, app="spotify")
+    d.music(action="play", app="spotify")  # nothing to search for: continue
+    calls = fake_bins()
+    assert [c["stdin"] for c in calls[:5]] == [d.SPOTIFY_SCRIPTS[k] for k in ("pause", "resume", "next", "previous", "now_playing")]
+    assert calls[5]["stdin"] == d.SYSTEM_VOLUME and calls[5]["argv"] == ["-", "100"]
+    assert calls[6]["stdin"] == d.SPOTIFY_SCRIPTS["resume"]

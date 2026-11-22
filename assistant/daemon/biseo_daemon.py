@@ -18,12 +18,13 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tomllib
 import uuid
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 import uvicorn
@@ -56,6 +57,8 @@ DEFAULTS = {
     "browse_timeout_s": 20,
     "browse_max_chars": 20_000,
     "browse_allow_private": [],
+    "music_enabled": True,  # macOS only: Apple Music through fixed AppleScript templates
+    "home_shortcuts": [],  # macOS only: the only Shortcuts home(scene) may run, by exact name; empty = home refuses
 }
 NO_ATTRIBUTION = "Never add Co-Authored-By or any AI attribution to commits, PRs or files."
 
@@ -651,7 +654,153 @@ def browse(url: str, selector: str | None = None, wait_for: str | None = None, m
     return fut.result(timeout=limit + 30)
 
 
+# ---------- music and home (macOS only) ----------
+# osascript is denied in run_command; these two tools run it themselves from fixed templates. The script comes in on
+# stdin and the only caller-controlled text (the search query) as argv, never inside the script, so it cannot inject.
+
+OSASCRIPT, SHORTCUTS = "/usr/bin/osascript", "/usr/bin/shortcuts"
+MUSIC_ACTIONS = ("play", "pause", "resume", "next", "previous", "volume", "now_playing")
+MUSIC_QUERY_MAX = 100
+_NOT_RUNNING = 'if application "Music" is not running then return "not running"\n'
+MUSIC_SCRIPTS = {
+    # first user playlist whose name contains the query, else a library track by name, artist or album
+    "play": """on run argv
+set q to item 1 of argv
+tell application "Music"
+  set pls to (every user playlist whose name contains q)
+  if (count of pls) > 0 then
+    play item 1 of pls
+    return "playlist: " & (name of item 1 of pls)
+  end if
+  set ts to (every track of library playlist 1 whose name contains q)
+  if (count of ts) = 0 then set ts to (every track of library playlist 1 whose artist contains q)
+  if (count of ts) = 0 then set ts to (every track of library playlist 1 whose album contains q)
+  if (count of ts) = 0 then return "not found"
+  play item 1 of ts
+  return "track: " & (name of item 1 of ts) & " - " & (artist of item 1 of ts)
+end tell
+end run
+""",
+    "play_any": 'tell application "Music" to play\nreturn "playing"\n',
+    "pause": _NOT_RUNNING + 'tell application "Music" to pause\nreturn "paused"\n',
+    "resume": _NOT_RUNNING + 'tell application "Music" to play\nreturn "playing"\n',
+    "next": _NOT_RUNNING + 'tell application "Music" to next track\nreturn "next"\n',
+    "previous": _NOT_RUNNING + 'tell application "Music" to previous track\nreturn "previous"\n',
+    "volume": """on run argv
+if application "Music" is not running then return "not running"
+tell application "Music" to set sound volume to (item 1 of argv as integer)
+return "volume " & (item 1 of argv)
+end run
+""",
+    "now_playing": _NOT_RUNNING + """tell application "Music"
+  if player state is stopped then return "stopped"
+  return (player state as text) & ": " & (name of current track) & " - " & (artist of current track)
+end tell
+""",
+}
+
+
+# Spotify (no Premium, so no Web API): its own AppleScript commands for transport, `open -a Spotify <uri>` for play.
+OPEN = "/usr/bin/open"
+SPOTIFY_URI = re.compile(r"spotify:(?:search:[A-Za-z0-9%._~-]{1,200}|(?:track|album|artist|playlist):[A-Za-z0-9]{10,40})")
+_SP_NOT_RUNNING = 'if application "Spotify" is not running then return "not running"\n'
+SPOTIFY_SCRIPTS = {
+    "pause": _SP_NOT_RUNNING + 'tell application "Spotify" to pause\nreturn "paused"\n',
+    "resume": _SP_NOT_RUNNING + 'tell application "Spotify" to play\nreturn "playing"\n',
+    "next": _SP_NOT_RUNNING + 'tell application "Spotify" to next track\nreturn "next"\n',
+    "previous": _SP_NOT_RUNNING + 'tell application "Spotify" to previous track\nreturn "previous"\n',
+    "now_playing": _SP_NOT_RUNNING + """tell application "Spotify"
+  if player state is stopped then return "stopped"
+  return (player state as text) & ": " & (name of current track) & " - " & (artist of current track)
+end tell
+""",
+}
+SYSTEM_VOLUME = """on run argv
+set volume output volume (item 1 of argv as integer)
+return "volume " & (item 1 of argv)
+end run
+"""
+
+
+def spotify_uri(query: str | None, uri: str | None) -> str:
+    """The one URI Spotify may be opened with: a checked track/album/artist/playlist, or a search for the user's words."""
+    if uri:
+        if not SPOTIFY_URI.fullmatch(uri):
+            raise Refused("uri must be spotify:search:<encoded query> or spotify:track|album|artist|playlist:<id>")
+        return uri
+    q = " ".join((query or "").split())[:MUSIC_QUERY_MAX]
+    while len(quote(q, safe="")) > 200:
+        q = q[:-1]
+    return "spotify:search:" + quote(q, safe="") if q else ""
+
+
+def _spotify_open(uri: str) -> None:
+    r = subprocess.run([OPEN, "-a", "Spotify", uri], capture_output=True, text=True, timeout=15)
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip() or f"open exit {r.returncode}")[:300])
+
+
+def _osascript(script: str, *argv: str) -> str:
+    r = subprocess.run([OSASCRIPT, "-", *argv], input=script, capture_output=True, text=True, timeout=15)
+    if r.returncode:
+        err = r.stderr.strip()
+        if "-1743" in err or "not allowed" in err.lower():
+            raise Refused("macOS has not allowed this daemon to control Music (System Settings > Privacy & Security > Automation)")
+        raise RuntimeError(err[:300] or f"osascript exit {r.returncode}")
+    return r.stdout.strip()
+
+
+@logged
+def music(action: str, query: str | None = None, volume: int | None = None, app: str = "apple",
+          uri: str | None = None) -> dict:
+    """Control music on this Mac. app: apple (Apple Music) or spotify. action: play (apple: `query` names a playlist,
+    track, artist or album in the library; spotify: opens a Spotify search for `query`, or a checked `uri`, which the
+    user then starts; neither: continue), pause, resume, next, previous, volume (0-100, clamped), now_playing."""
+    if sys.platform != "darwin" or not CFG["music_enabled"]:
+        raise Refused("music is only available on a Mac with music_enabled")
+    if action not in MUSIC_ACTIONS:
+        raise Refused(f"action must be one of {', '.join(MUSIC_ACTIONS)}")
+    if app not in ("apple", "spotify"):
+        raise Refused("app must be apple or spotify")
+    if app == "spotify":
+        if action == "volume":
+            if volume is None:
+                raise Refused("volume needs a number from 0 to 100")  # the system output volume
+            return {"status": "ok", "result": _osascript(SYSTEM_VOLUME, str(max(0, min(100, int(volume)))))}
+        if action == "play":
+            target = spotify_uri(query, uri)
+            if not target:
+                return {"status": "ok", "result": _osascript(SPOTIFY_SCRIPTS["resume"])}
+            _spotify_open(target)
+            return {"status": "ok", "result": f"opened {target} in Spotify; press play on the result"}
+        return {"status": "ok", "result": _osascript(SPOTIFY_SCRIPTS[action])}
+    if action == "play":
+        q = " ".join((query or "").split())[:MUSIC_QUERY_MAX]
+        out = _osascript(MUSIC_SCRIPTS["play"], q) if q else _osascript(MUSIC_SCRIPTS["play_any"])
+        return {"status": "not_found" if out == "not found" else "ok", "result": out}
+    if action == "volume":
+        if volume is None:
+            raise Refused("volume needs a number from 0 to 100")
+        return {"status": "ok", "result": _osascript(MUSIC_SCRIPTS["volume"], str(max(0, min(100, int(volume)))))}
+    return {"status": "ok", "result": _osascript(MUSIC_SCRIPTS["now_playing" if action == "now_playing" else action])}
+
+
+@logged
+def home(scene: str) -> dict:
+    """Run one of the user's allowed HomeKit scenes (a Shortcut in the daemon's home_shortcuts list, exact name)."""
+    names = CFG["home_shortcuts"]
+    if sys.platform != "darwin" or not names:
+        raise Refused("home is only available on a Mac with home_shortcuts set")
+    if scene not in names or scene.startswith("-"):
+        raise Refused(f"unknown scene; allowed: {', '.join(names)}")
+    r = subprocess.run([SHORTCUTS, "run", scene], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise RuntimeError((r.stderr.strip() or f"shortcuts exit {r.returncode}")[:300])
+    return {"status": "ok", "scene": scene, "result": r.stdout.strip()[:300]}
+
+
 TOOLS = [list_dir, read_file, search, run_command, delegate, job_status, list_jobs, browse]
+MAC_TOOLS = [music, home]  # registered on macOS only
 
 
 # ---------- HTTP app ----------
@@ -684,7 +833,7 @@ def build_app(cfg: dict):
     CFG.clear()
     CFG.update(cfg)
     server = MCPServer(name=f"biseo-daemon-{cfg['id']}")
-    for t in TOOLS:
+    for t in [*TOOLS, *(MAC_TOOLS if sys.platform == "darwin" else [])]:
         server.tool()(t)
     # Host-header check (DNS rebinding) for our bind address; the bearer token is the real gate.
     sec = TransportSecuritySettings(enable_dns_rebinding_protection=True,
