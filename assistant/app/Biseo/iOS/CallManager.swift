@@ -47,6 +47,7 @@ final class CallManager: NSObject, ObservableObject {
     private var callUUID: UUID?
     private var callID: String?                     // set when answering a call the assistant placed
     private var sessionPrefix = "iphone"            // outgoing calls: "iphone" or "briefing"
+    private var resumeFrom: (session: String, call: String)?  // "이어서 통화": that call's session and history id
     private var incoming: [UUID: (callID: String?, reason: String?, caller: String, persona: String?, context: CallContext?)] = [:]
     /// The task or reminder this call is about (from the push's `context`).
     @Published private(set) var callContext: CallContext?
@@ -119,9 +120,12 @@ final class CallManager: NSObject, ObservableObject {
     /// `persona`: nil = the one chosen in the app (or the primary).
     /// `ringbackOnFailure`: from Siri's INStartCallIntent, possibly in the background. If CallKit
     /// refuses the outgoing call, the gateway rings back instead (that works on the lock screen).
-    @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil, ringbackOnFailure: Bool = false) {
+    @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil, ringbackOnFailure: Bool = false,
+                              resume: HistoryItem? = nil) {
         guard !inCall else { return }
         sessionPrefix = prefix
+        // a secret call kept nothing to continue; any other call goes on in its own session (Claude resumes it too)
+        resumeFrom = resume.flatMap { r in r.session.flatMap { $0.contains("secret-") ? nil : ($0, r.id) } }
         let who = persona ?? PersonaModel.shared.selected
         activePersona = who
         callerName = who?.name
@@ -243,7 +247,7 @@ final class CallManager: NSObject, ObservableObject {
             do { try client.restartAudio() } catch { fail(error.localizedDescription) }
             return
         }
-        activeSession = callID ?? Session.current(sessionPrefix)
+        activeSession = callID ?? resumeFrom?.session ?? Session.current(sessionPrefix)
         // Outgoing briefing calls (오늘 브리핑, Siri) tell the server what to open with.
         let intent = callID == nil && sessionPrefix == "briefing" ? "briefing" : nil
         let mode = MainActor.assumeIsolated { BrainModeChoice.shared.takeForCall() }
@@ -251,7 +255,8 @@ final class CallManager: NSObject, ObservableObject {
         let wantSecret = MainActor.assumeIsolated { BrainModeChoice.shared.takeSecretForCall() }
         secret = wantSecret
         let locked = MainActor.assumeIsolated { !UIApplication.shared.isProtectedDataAvailable }
-        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode, secret: wantSecret, locked: locked) } catch {
+        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode, secret: wantSecret, locked: locked,
+                              resume: callID == nil ? resumeFrom?.call : nil) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
@@ -318,6 +323,7 @@ final class CallManager: NSObject, ObservableObject {
         callUUID = nil
         callID = nil
         sessionPrefix = "iphone"
+        resumeFrom = nil
         muted = false
         held = false
         recording = false

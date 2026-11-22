@@ -1512,7 +1512,7 @@ DECIDE_PROMPT = (
     "calendar_today(오늘 일정)를 봐: 지금 수업·회의·시험·발표 중이면 전화를 받을 수 없어. 그 일정이 끝난 뒤에도 늦지 "
     "않으면 call=false로 두고, 끝나기를 기다릴 수 없을 만큼 급할 때(대규모 서버 장애, 1시간 안 마감인데 미완료)만 걸어.\n"
     "gistra_due(GISTRA에서 지금 조회한, 아직 안 낸 과제·할 일)가 제출 여부의 기준이야: 여기에 없는 과제는 이미 냈거나 "
-    "끝난 거니 상황 메모나 캘린더에 남아 있어도 전화하지 마.\n"
+    "끝난 거니 상황 메모나 캘린더에 남아 있어도 전화하지 마. '이미 제출함' 표시가 붙은 줄은 그 일로 전화하지 마.\n"
     "상황 메모는 몇 시간 늦을 수 있어. 완료 여부가 불확실하면 미완료로 단정하지 말고 긴급도를 낮춰. '제출 여부 모름'인 "
     "마감은 마감 1시간 전부터만 전화해. 사용자가 캘린더에 직접 걸어 둔 미리알림이 있는 일은 그 알림에 맡기고 전화하지 마.\n"
     "urgency: 5 = 지금 안 걸면 확실히 손해, 4 = 오늘 안에 꼭 알아야 하고 다른 알림으로는 안 닿음, 3 이하 = 전화 말고 "
@@ -1637,7 +1637,7 @@ async def gather_signals(now):
         await source(name, fn)
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
-    if gistra_ok:  # the model kept ringing about a submitted 토론지 the note called "제출 여부 모름": cut it in code
+    if gistra_ok:  # the model kept ringing about a submitted 토론지 the note called "제출 여부 모름": mark it in code
         sig["situation"] = [x for x in ("\n".join(still_due(note.splitlines(), gistra_ok[0])),) if x] if note else []
         sig["calendar_today"] = still_due(sig.get("calendar_today") or [], gistra_ok[0])
     return sig
@@ -1648,16 +1648,20 @@ EMPTY_DUE = re.compile(r"없습니다|없어요|없음")
 DUE_STOP = {"오늘", "내일", "종일", "LMS", "GIST", "확인", "마감", "미리알림", "까지", "본인이", "제출해야", "여부", "모름"}
 
 
+SUBMITTED_MARK = " ⟵ [GISTRA 기준 이미 제출함: 이 일로는 절대 전화하지 마]"
+
+
 def still_due(lines, open_text):
-    """Lines about an assignment GISTRA no longer lists as open are dropped (submitted); other lines stay. A line is
-    still due when one of its words (2+ letters, before the dash) appears in GISTRA's open list."""
+    """Lines about an assignment GISTRA no longer lists as open get a strong "submitted, never call" mark; the judge
+    still decides (user rule 2026-11-22: steer hard in code, but don't take the judgement away). A line is still due
+    when one of its words (2+ letters, before the dash) appears in GISTRA's open list."""
     out = []
     for ln in lines:
         if ASSIGNMENT.search(ln):
             words = re.findall(r"[가-힣A-Za-z0-9]{2,}", re.split(r" — | - ", ln)[0])
             words = [w for w in words if not w.isdigit() and not ASSIGNMENT.fullmatch(w) and w not in DUE_STOP]
             if not any(w in open_text for w in words):
-                continue
+                ln += SUBMITTED_MARK
         out.append(ln)
     return out
 
@@ -1705,6 +1709,19 @@ async def situation_note(now):
         if note and note.get("summary") and fresh_note(note, now):
             return note["summary"][:1500]
     return ""
+
+
+async def serve_history_turns(m):
+    """A past call's turns for the voice server ("이어서 통화" in the app's call list). Full gateways only."""
+    turns = []
+    if MODE == "full" and isinstance(m.get("call"), str) and re.fullmatch(r"[0-9a-f]{32}", m["call"]):
+        try:
+            row = await state.call("GET", f"/v1/state/history/{m['call']}") or {}
+        except (StateDown, HTTPException):
+            row = {}
+        turns = [{"user": str(t.get("user") or "")[:1000], "assistant": " ".join(t.get("assistant") or [])[:1500]}
+                 for t in row.get("turns") or []][-12:]
+    await link_send({"id": m["id"], "type": "history_turns", "turns": turns})
 
 
 async def serve_briefing_context(m):
@@ -2309,6 +2326,8 @@ async def handle_link(ws):
             tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "phone_result" and (f := phone_pending.get(m.get("id"))) and not f.done():
             f.set_result(m)
+        elif m.get("type") == "history_turns" and isinstance(m.get("id"), str):
+            tasks[m["id"]] = asyncio.create_task(serve_history_turns(m))
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "auto_grant" and isinstance(m.get("session"), str):  # the call's toggle (the app)

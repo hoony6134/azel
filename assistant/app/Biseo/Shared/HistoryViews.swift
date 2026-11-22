@@ -323,6 +323,13 @@ struct HistoryDetailView: View {
         .navigationTitle("")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                #if os(iOS)
+                if item.session?.contains("secret-") != true {  // a secret call kept nothing to continue
+                    Button {
+                        CallManager.shared.startCall(persona: PersonaModel.shared.persona(id: item.persona_id), resume: item)
+                    } label: { Image(systemName: "phone.arrow.up.right") }.accessibilityLabel("이어서 통화")
+                }
+                #endif
                 if let call = model.call { ShareLink(item: call.plainText) { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("공유") }
                 Button { confirmDelete = true } label: { Image(systemName: "trash") }.accessibilityLabel("삭제").disabled(history.isOffline)
             }

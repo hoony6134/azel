@@ -484,6 +484,25 @@ MODE_TYPES = ("ask", "tool_call", "schedule", "task")
 LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
 ORIGIN_TYPES = ("tool_call", "schedule", "task")
 ORIGIN_TURNS = 8
+RESUME_RE = re.compile(r"[0-9a-f]{32}")
+
+
+async def seed_from_call(key, call):
+    """Continue a past call (the app's call list, "이어서 통화"): its turns from the call history become this call's
+    history, so the model picks up where it left off even after a voice-server restart emptied memory."""
+    if not RESUME_RE.fullmatch(call or ""):
+        return 0
+    try:
+        reply = await links.request({"type": "history_turns", "call": call}, timeout=3)
+    except (RuntimeError, asyncio.TimeoutError):
+        return 0
+    turns = [t for t in reply.get("turns") or [] if isinstance(t, dict)][-ORIGIN_TURNS:]
+    for t in turns:
+        if str(t.get("user") or "").strip():
+            history[key].append({"role": "user", "content": str(t["user"])[:1000]})
+        if str(t.get("assistant") or "").strip():
+            history[key].append({"role": "assistant", "content": str(t["assistant"])[:1500]})
+    return len(turns)
 ORIGIN_RE = re.compile(r"[A-Za-z0-9_:.-]{1,120}")
 # Who each history was built as (persona name, user title). The app reuses one session id all day, so without this a
 # renamed persona or a new title would keep being contradicted by the earlier turns Qwen sees and imitates.
@@ -2662,7 +2681,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = "", persona: str = "", mode: str = "", secret: str = ""):
+               intent: str = "", persona: str = "", mode: str = "", secret: str = "", resume: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -2672,6 +2691,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         await ws.close(code=4401)
         return
     await ws.accept()
+    resume_from = resume  # the handler defines its own resume() (un-pause) below, which rebinds the name
     session = session or f"call-{int(time.time())}"
     # Secret mode: nothing about this call is stored. Its turns live under a throwaway session key (the gateway sees
     # "secret-" and keeps no Claude session, refuses storing tools and forces approvals to once), no call log or brain
@@ -3060,6 +3080,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                          direction="incoming" if call_id else "outgoing",
                          reason="briefing" if briefing else (op or {}).get("reason", ""), opening=(op or {}).get("text", ""))
         await log(start_log)
+        if resume_from and not current["secret"] and not history[f"{pid}:{session}"]:
+            await seed_from_call(f"{pid}:{session}", resume_from)  # "이어서 통화" from the call list
         if briefing:  # the app's "오늘 브리핑": speak a briefing first, interruptible like any reply
             current["task"] = spawn(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
@@ -5420,4 +5442,19 @@ if __name__ == "__main__":
         assert task_intent("빌드 돌려 놓고 끝나면 푸시로 알려줘") == "push"
         assert auto_intent("자동 승인으로 해서 진행해줘", "azel:z") is None and auto_intent("알아서 해", "azel:z") == "on"
         pending_auto.clear()
+        async def resume_check():
+            async def fake_request(msg, timeout=10, need_claude=False):
+                assert msg == {"type": "history_turns", "call": "a" * 32}
+                return {"turns": [{"user": "실버텔러 조사 맡겨줘", "assistant": "맥북에 맡겼어요."}, {"user": "", "assistant": "x"}]}
+            real_req = links.request
+            links.request = fake_request
+            try:
+                n_bad = await seed_from_call("azel:r0", "not-an-id")
+                n = await seed_from_call("azel:r1", "a" * 32)
+            finally:
+                links.request = real_req
+            return n_bad, n, list(history.pop("azel:r1", []))
+        n_bad, n, seeded_turns = asyncio.run(resume_check())
+        assert n_bad == 0 and n == 2 and seeded_turns == [{"role": "user", "content": "실버텔러 조사 맡겨줘"},
+            {"role": "assistant", "content": "맥북에 맡겼어요."}, {"role": "assistant", "content": "x"}]
         print("voice_server checks ok")
