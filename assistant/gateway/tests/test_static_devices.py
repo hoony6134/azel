@@ -80,8 +80,8 @@ def test_team_devices_may_delegate_and_sadr_never(sgw, monkeypatch):
     res = asyncio.run(g.run_tool({"id": "1", "name": "sadr__delegate", "input": {"task": "x"}}, where))
     assert res["is_error"] and not any(m == "tools/call" and u.startswith("http://100.64.0.99") for u, m, _ in calls)
     servers, allowed, run_settings, _ = g.run_args(asyncio.run(g.load_settings()), devs)
-    assert servers["spark"]["headers"]["Authorization"] == "Bearer spark-daemon-tok"
-    assert "mcp__spark__delegate" not in json.loads(run_settings)["permissions"]["deny"]
+    assert "spark" not in servers and "azel" in servers  # claude -p reaches a team device only through azel
+    assert "mcp__azel__spark__delegate" not in json.loads(run_settings).get("permissions", {}).get("deny", [])
     sadr = [{"id": "sadr", "url": "http://100.64.0.99:8765/mcp"}]
     _, _, rs, _ = g.run_args(asyncio.run(g.load_settings()), sadr)
     assert "mcp__sadr__delegate" in json.loads(rs)["permissions"]["deny"]
@@ -91,3 +91,35 @@ def test_static_entry_must_be_limited(tmp_path, monkeypatch):
     token_file(tmp_path, "spark", "x")
     with pytest.raises(ValueError, match="mode limited"):
         start(tmp_path, monkeypatch, BISEO_STATIC_DEVICES=json.dumps([{**SPARK, "mode": "full"}]))
+
+
+def test_claude_reaches_team_devices_through_azel_and_their_approvals_reach_the_app(sgw, monkeypatch):
+    """A team daemon cannot file its own approval (needs_approval): claude -p used to call it directly, so the
+    approval was never filed and the app never asked. Through azel's /v1/mcp the gateway files it and pushes."""
+    g, c = sgw
+    g.static_devices["spark"]["last_seen"] = 9e12
+    na = {"status": "needs_approval", "command": "docker restart nemoclaw", "cwd": "/home/u/biseo-work",
+          "device": "spark", "in_roots": True, "nonce": "n1"}
+
+    async def mcp(url, method, params):
+        if method == "tools/list":
+            return {"tools": [{"name": "run_command", "inputSchema": {"type": "object"}}]}
+        return {"content": [{"type": "text", "text": json.dumps(na)}]}
+    monkeypatch.setattr(g, "mcp", mcp)
+    pushed = []
+
+    async def push(*a, **k):
+        pushed.append(k.get("approval_id"))
+    monkeypatch.setattr(g, "send_alert_push", push)
+    monkeypatch.setattr(g.tools_bridge, "APPROVAL_WAIT_S", 0.3)
+    monkeypatch.setattr(g.tools_bridge, "APPROVAL_POLL_S", 0.05)
+    c = TestClient(g.app, headers={"Authorization": "Bearer t0k"}, client=("100.64.0.8", 5))  # tailnet only
+    listed = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
+    assert "spark__run_command" in [t["name"] for t in listed]
+    r = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "spark__run_command", "arguments": {"command": "docker restart nemoclaw"}}}).json()["result"]
+    assert r["isError"] and "5분" in r["content"][0]["text"]  # nobody tapped within the (shortened) wait
+    rows = list(g.fake.db["approvals"].values())
+    assert [(a["device"], a["command"]) for a in rows] == [("spark", "docker restart nemoclaw")]
+    assert pushed == [rows[0]["id"]]  # the app was asked
+    assert g.tool_label("mcp__azel__spark__run_command") == "spark에서 명령 실행 중"
