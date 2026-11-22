@@ -2,7 +2,8 @@
 and Gistra (Cygnus gistra_schedule: classes, exams, assignments, todos, meetings). One answer for every model path.
 
 Rows are merged by day and time; a calendar event that Gistra also lists (same day, same start, same title) is
-dropped, since Gistra's line says more (its kind: 수업, 과제, 회의 ...). Calendar lines are marked "(구글 캘린더)".
+dropped, since Gistra's line says more (its kind: 수업, 과제, 회의 ...). Calendar lines carry their calendar's name
+("(대회 일정)", the primary as "(기본 캘린더)").
 A source that fails is named in one short line; the other still answers. Nothing is ever made up.
 """
 import asyncio
@@ -61,8 +62,8 @@ def merge(cal, gis):
     def dup(c):
         return any(g["day"] == c["day"] and g["start"] == c["start"] and _norm(c["title"]) and
                    _norm(c["title"]) in _norm(g["text"]) for g in gis)
-    rows = gis + [{**c, "text": c["title"] + (f" @ {c['where']}" if c.get("where") else "") + " (구글 캘린더)",
-                   "src": "calendar"} for c in cal if not dup(c)]
+    rows = gis + [{**c, "text": c["title"] + (f" @ {c['where']}" if c.get("where") else "")
+                   + f" ({c.get('cal') or '기본 캘린더'})", "src": "calendar"} for c in cal if not dup(c)]
     return sorted(rows, key=lambda r: (r["day"], r["start"] or "", r["src"] != "gistra"))
 
 
@@ -101,6 +102,10 @@ async def merged(f, t, calendar, gistra):
     if isinstance(g, str) and g.startswith(GISTRA_FAIL):
         g = RuntimeError(g)
     notes = []
+    if isinstance(c, tuple):  # google_tools.events: (rows, calendars it could not read in time)
+        c, missed = c
+        if missed:
+            notes.append(f"(못 읽은 캘린더: {', '.join(missed)}. 그 캘린더 일정은 위에 없어요.)")
     if isinstance(c, BaseException):
         notes.append(f"(구글 캘린더는 지금 못 읽었어요: {_why(c)}. 위는 Gistra 일정뿐이에요.)")
         c = []

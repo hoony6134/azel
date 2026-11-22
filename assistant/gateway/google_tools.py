@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import date as Date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -230,29 +230,70 @@ async def call(home, name, args, client=None):
         return out[:MAX_RESULT]
     except Expired:
         return "Google 연결이 만료됐어요. 앱에서 'Google 다시 연결'을 눌러 주세요."
-    except (httpx.HTTPError, KeyError, ValueError) as e:
+    except (httpx.HTTPError, KeyError, ValueError, asyncio.TimeoutError) as e:
         return f"지금은 Google을 볼 수 없어요. ({type(e).__name__})"
     finally:
         if client is None:
             await http.aclose()
 
 
+CAL_BUDGET_S = 6  # the whole read, list included: a call never waits on one slow calendar
+CAL_CONCURRENCY = 8
+CAL_PAGES = 10  # pages per list (250 items each): a runaway nextPageToken stops here
+
+
+async def _paged(http, url, h, params):
+    items, token = [], None
+    for _ in range(CAL_PAGES):
+        r = await http.get(url, headers=h, params={**params, **({"pageToken": token} if token else {})})
+        r.raise_for_status()
+        d = r.json()
+        items += d.get("items", [])
+        token = d.get("nextPageToken")
+        if not token:
+            break
+    return items
+
+
+def _cal_name(c):
+    return None if c.get("primary") else str(c.get("summaryOverride") or c.get("summary") or c.get("id", ""))[:30]
+
+
 async def _event_rows(http, h, a):
-    """Events in the selected calendars as rows {day, start, end, title, where, line}, by start (KST)."""
+    """Events in every calendar the user has (hidden ones too: "all of them"), read in parallel within CAL_BUDGET_S, as
+    (rows {day, start, end, title, where, cal, when, key} by start (KST), names of calendars that failed or were slow).
+    `cal` is the calendar's name, None for the primary; an event in two calendars (same start and title) is kept once."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CAL_BUDGET_S
     tmin = datetime.combine(a["from"], datetime.min.time(), KST).isoformat()
     tmax = datetime.combine(a["to"] + timedelta(days=1), datetime.min.time(), KST).isoformat()
-    cals = (await http.get(f"{CAL}/users/me/calendarList", headers=h, params={"minAccessRole": "reader"})).json()
-    rows = []
-    for cal in [c for c in cals.get("items", []) if c.get("selected", c.get("primary"))][:10]:
-        r = await http.get(f"{CAL}/calendars/{cal['id']}/events", headers=h, params={
-            "timeMin": tmin, "timeMax": tmax, "singleEvents": "true", "orderBy": "startTime", "maxResults": 50})
-        if r.status_code != 200:
+    cals = await asyncio.wait_for(_paged(http, f"{CAL}/users/me/calendarList", h, {
+        "minAccessRole": "reader", "showHidden": "true", "maxResults": 250}), CAL_BUDGET_S)
+    cals = sorted((c for c in cals if not c.get("deleted") and c.get("id")), key=lambda c: not c.get("primary"))
+    gate = asyncio.Semaphore(CAL_CONCURRENCY)
+
+    async def one(c):
+        async with gate:
+            return await _paged(http, f"{CAL}/calendars/{quote(c['id'], safe='@.')}/events", h, {
+                "timeMin": tmin, "timeMax": tmax, "singleEvents": "true", "orderBy": "startTime", "maxResults": 250})
+    jobs = [asyncio.ensure_future(one(c)) for c in cals]
+    if jobs:
+        await asyncio.wait(jobs, timeout=max(0.1, deadline - loop.time()))
+    rows, seen, missed = [], set(), []
+    for c, job in zip(cals, jobs):
+        if not job.done() or job.cancelled() or job.exception():
+            job.cancel()
+            missed.append(_cal_name(c) or "기본")
             continue
-        for e in r.json().get("items", []):
+        for e in job.result():
             if e.get("status") == "cancelled":
                 continue
             s, en = e.get("start", {}), e.get("end", {})
             title, loc = e.get("summary", "(제목 없음)")[:80], (e.get("location") or "")[:40]
+            key = s.get("dateTime") or s.get("date") or ""
+            if (key, title) in seen:
+                continue
+            seen.add((key, title))
             if "dateTime" in s:
                 st, et = datetime.fromisoformat(s["dateTime"]).astimezone(KST), datetime.fromisoformat(en["dateTime"]).astimezone(KST)
                 row = {"day": st.date(), "start": f"{st:%H:%M}", "end": f"{et:%H:%M}",
@@ -260,22 +301,25 @@ async def _event_rows(http, h, a):
             else:
                 row = {"day": Date.fromisoformat(s["date"]) if s.get("date") else a["from"], "start": "", "end": "",
                        "when": f"{s.get('date', '')} 종일"}
-            rows.append({**row, "key": s.get("dateTime") or s.get("date") or "", "title": title, "where": loc})
-    return sorted(rows, key=lambda r: r["key"])
+            rows.append({**row, "key": key, "title": title, "where": loc, "cal": _cal_name(c)})
+    return sorted(rows, key=lambda r: r["key"]), missed
 
 
 async def _events(http, h, a):
-    rows = [f"- {r['when']} {r['title']}" + (f" @ {r['where']}" if r["where"] else "") for r in await _event_rows(http, h, a)]
+    found, missed = await _event_rows(http, h, a)
+    rows = [f"- {r['when']} {r['title']}" + (f" @ {r['where']}" if r["where"] else "") + (f" ({r['cal']})" if r["cal"] else "")
+            for r in found]
     head = f"캘린더 {a['from']}~{a['to']} (KST)"
-    return head + ("\n" + "\n".join(rows) if rows else "\n일정 없음")
+    return head + ("\n" + "\n".join(rows) if rows else "\n일정 없음") + (f"\n못 읽은 캘린더: {', '.join(missed)}" if missed else "")
 
 
 async def events(home, f, t, client=None):
-    """calendar_events as rows for agenda.py; raises (Expired, httpx errors, no grant) instead of answering in words."""
+    """calendar_events for agenda.py as (rows, missed calendar names); raises (Expired, httpx errors, no grant)
+    instead of answering in words."""
     if status(home) != "connected":
         raise Expired("Google 연결이 없거나 만료됐어요")
     a = _check("calendar_events", {"from": f, "to": t})
-    http = client or httpx.AsyncClient(timeout=20)
+    http = client or httpx.AsyncClient(timeout=CAL_BUDGET_S)
     try:
         token = await access_token(home, http)
         return await _event_rows(http, {"Authorization": f"Bearer {token}"}, a)
