@@ -47,6 +47,10 @@ LABELS = ("client", "link", "link_limited")
 DEFAULT_NAME = os.environ.get("ASSISTANT_NAME", "아젤")  # until the gateways push settings with assistant_name
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "12"))
 END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
+# Speech under way and no audio at all for this long: the client stopped sending, so the turn is over. The quiet that
+# ends a turn has to arrive as frames; a one-breath command sent as one block, then no live frames, waited ~17 s for
+# them (Mac, live 2026-11-23). Live audio comes every ~100 ms, so this never cuts a healthy stream.
+END_STALL_S = float(os.environ.get("END_STALL_MS", "800")) / 1000
 KST = timezone(timedelta(hours=9))
 MAX_UPLOAD = 16000 * 2 * 60  # one minute of 16 kHz PCM16
 ROUTE_TAG = "[CLAUDE]"
@@ -2956,6 +2960,16 @@ class Turn:
                 self.last_voiced_s = self.voiced * self.FRAME / 16000
                 yield ("end", audio) if self.last_voiced_s >= self.min_voiced_s else ("drop", None)
 
+    def flush(self):
+        """End the speech under way now, as if its closing quiet had come: [("end", audio)] or [("drop", None)], or []
+        with nothing under way. For a client that stopped sending mid-turn."""
+        if not self.speech:
+            return []
+        audio = np.frombuffer(b"".join(self.speech), dtype=np.int16).astype(np.float32) / 32768
+        self.speech, self.ring, self.pending = [], [], b""
+        self.last_voiced_s = self.voiced * self.FRAME / 16000
+        return [("end", audio) if self.last_voiced_s >= self.min_voiced_s else ("drop", None)]
+
 
 class TurnDiag:
     """Per turn, from speech onset to its end: inbound audio seconds, wall seconds, the longest gap between inbound audio
@@ -3531,9 +3545,46 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         end_hooks[call_key] = on_end_call
         side(announcer(announce_q))
         await send({"type": "mode", "value": current["mode"]})  # the app shows which brain answers
+        async def on_vad(kind, audio, by):
+            """One VAD event (start / end / drop) of this call's speech; `by` says what ended it (quiet, stall)."""
+            now = time.monotonic()
+            d = diag_done(by if kind == "end" else "drop", vad_turn.last_voiced_s) if kind in ("end", "drop") else None
+            task = current["task"]
+            busy = task and not task.done()
+            # The tail guard: speech then still gets the barge-in check (echo, noise), never a free new turn
+            # whose reply_start would make the app drop the rest of a reply it is still playing.
+            playing = now < current["play_end"] + TAIL_GUARD_S * (current["play_end"] > 0 and not played_out()) \
+                or current["paused_at"] is not None
+            if kind == "start" and guard.active(now):
+                guard.start(now)  # a placed call's opening: its own rules (first sentence, greetings)
+            elif kind == "start" and playing and current["paused_at"] is None and vad_turn.barge:
+                await pause()
+            elif kind == "drop":
+                guard.end(now, 0.0)
+                await resume()  # a click or cough: the reply plays on
+            elif kind == "end":
+                if guard.speech_at is not None:  # during a placed call's opening: decided on the words
+                    guard.end(now, len(audio) / 16000)
+                    spawn(opening_heard(audio))
+                elif current["paused_at"] is not None:
+                    spawn(barge_check(audio, vad_turn.last_voiced_s))
+                elif playing and not vad_turn.barge:
+                    pass  # noisy mode: speech over the reply is not a turn
+                elif busy:  # thinking: never cancel on raw voice, decide on the transcript
+                    current["task"] = spawn(followup(audio, task))
+                else:
+                    current["task"] = spawn(answer(audio, timings={"turn": d} if d else None))
+
         await send({"type": "state", "value": "listening"})
+        last_audio = time.monotonic()
         while True:
-            msg = await ws.receive()
+            try:  # mid-speech, no audio from the client for END_STALL_S ends the turn (control messages don't count)
+                left = END_STALL_S - (time.monotonic() - last_audio)
+                msg = await (asyncio.wait_for(ws.receive(), max(0.01, left)) if vad_turn.speech else ws.receive())
+            except asyncio.TimeoutError:
+                for kind, audio in vad_turn.flush():
+                    await on_vad(kind, audio, "stall")
+                continue
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("text"):
@@ -3579,39 +3630,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     CALL_MODE.set(v)  # from the next reply on
                     await send({"type": "mode", "value": v})
                 continue
+            last_audio = time.monotonic()
             vad_turn.set_mode("noisy" if time.monotonic() < wake_guard_until else links.settings.get("noise_mode", "normal"))
             diag.frame(time.monotonic(), len(msg.get("bytes") or b""))  # before the VAD: a stall then the closing frames
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
-                now = time.monotonic()
                 if kind == "start":
-                    diag.start(now)
+                    diag.start(time.monotonic())
                     diag.audio_s += len(msg.get("bytes") or b"") / 32000  # the message speech began in (a one-shot send: all of it)
-                d = diag_done("quiet" if kind == "end" else "drop", vad_turn.last_voiced_s) if kind in ("end", "drop") else None
-                task = current["task"]
-                busy = task and not task.done()
-                # The tail guard: speech then still gets the barge-in check (echo, noise), never a free new turn
-                # whose reply_start would make the app drop the rest of a reply it is still playing.
-                playing = now < current["play_end"] + TAIL_GUARD_S * (current["play_end"] > 0 and not played_out()) \
-                    or current["paused_at"] is not None
-                if kind == "start" and guard.active(now):
-                    guard.start(now)  # a placed call's opening: its own rules (first sentence, greetings)
-                elif kind == "start" and playing and current["paused_at"] is None and vad_turn.barge:
-                    await pause()
-                elif kind == "drop":
-                    guard.end(now, 0.0)
-                    await resume()  # a click or cough: the reply plays on
-                elif kind == "end":
-                    if guard.speech_at is not None:  # during a placed call's opening: decided on the words
-                        guard.end(now, len(audio) / 16000)
-                        spawn(opening_heard(audio))
-                    elif current["paused_at"] is not None:
-                        spawn(barge_check(audio, vad_turn.last_voiced_s))
-                    elif playing and not vad_turn.barge:
-                        pass  # noisy mode: speech over the reply is not a turn
-                    elif busy:  # thinking: never cancel on raw voice, decide on the transcript
-                        current["task"] = spawn(followup(audio, task))
-                    else:
-                        current["task"] = spawn(answer(audio, timings={"turn": d} if d else None))
+                await on_vad(kind, audio, "quiet")
     except WebSocketDisconnect:
         pass
     finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
@@ -3744,6 +3770,10 @@ if __name__ == "__main__":
         ev = list(t.feed(quiet + loud[:5000])) + list(t.feed(loud[5000:] + quiet))
         assert [k for k, _ in ev] == ["start", "end"] and 0.9 < len(ev[1][1]) / 16000 < 1.6, ev
         assert list(t.feed(quiet)) == []
+        assert t.flush() == []  # nothing under way
+        assert [k for k, _ in t.feed(quiet + loud)] == ["start"]  # a one-breath block that ends on its last word
+        got = t.flush()  # the client sends nothing more: the turn ends with what came
+        assert [k for k, _ in got] == ["end"] and 0.9 < len(got[0][1]) / 16000 < 1.4 and t.speech == [], got
         short = (np.ones(3000, np.int16) * 3000).tobytes()   # 0.19 s blip: no turn
         assert [k for k, _ in t.feed(short + quiet)] == ["start", "drop"]  # a blip: no turn, and playback resumes
 
@@ -5082,6 +5112,50 @@ if __name__ == "__main__":
         games.clear()
         (k1, early), (k2, held) = played_check()
         assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
+        def stall_check():
+            """Live 2026-11-23 (Mac): a one-breath command sent as one block, then no live frames: the turn waited ~17 s
+            for the quiet that ends it. Now no audio for END_STALL_S ends it."""
+            import threading
+            from fastapi.testclient import TestClient
+            heard, seen = [], {}
+
+            class LoudVad:
+                def __call__(self, frame):
+                    return float(np.abs(np.frombuffer(frame, np.int16)).mean() > 1000)
+
+            async def stt(audio):
+                heard.append(len(audio) / 16000)
+                return "내일 날씨 알려줘"
+
+            async def llm(messages, max_tokens=600):
+                yield "내일은 맑아요."
+
+            async def quiet_tts(sentence, *a, **k):
+                return b"\0" * 480, 24000
+            saved = {k: globals()[k] for k in ("SileroVoiceActivityDetector", "transcribe", "llm_stream", "tts", "check_token")}
+            globals().update(SileroVoiceActivityDetector=lambda: LoudVad(), transcribe=stt, llm_stream=llm, tts=quiet_tts,
+                             check_token=lambda got, labels=("client",): "client")
+
+            def talk():
+                with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
+                        "/v1/call?client=mac&session=stall", headers={"Authorization": "Bearer t"}) as w:
+                    w.receive_text()
+                    w.send_bytes(np.zeros(4800, np.int16).tobytes())  # room tone
+                    t = time.monotonic()
+                    w.send_bytes((np.ones(32000, np.int16) * 3000).tobytes())  # 2 s of speech, nothing after it
+                    while time.monotonic() - t < 5:
+                        f = json.loads(w.receive_text())
+                        if f.get("type") == "state" and f.get("value") == "thinking":  # the turn closed: STT starts
+                            seen["after"] = time.monotonic() - t
+                            break
+                    w.send_text(json.dumps({"type": "hangup"}))
+            th = threading.Thread(target=talk, daemon=True)
+            th.start()
+            th.join(8)
+            globals().update(saved)
+            return seen.get("after"), heard
+        after, heard = stall_check()
+        assert after is not None and after < END_STALL_S + 0.6 and heard and heard[0] > 1.9, (after, heard)
         states, stays, midway, leftover, slogs, brain_evs, prompts = secret_check()
         assert stays is True and midway is True and leftover == [], leftover
         assert all(f["secret"] is True for f in states[:3]) and states[3]["secret"] is False and states[-1]["secret"] is True
