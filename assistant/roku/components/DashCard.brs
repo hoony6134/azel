@@ -48,7 +48,28 @@ sub init()
         m.bl[i].width = 0
         m.bm.Push(mkLabel(m.top, x, 146, 216, 30, 24, "r", pal("text3")))
     end for
-    m.all = [m.kind, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down, m.dot, m.stat]
+    ' charts: 12 bars with every third hour labelled, and a five-point line (rotated thin rectangles) for a stock
+    m.bars = []
+    for i = 0 to 11
+        m.bars.Push(mkRect(m.top, 0, 0, 30, 10, pal("text3")))
+    end for
+    m.xl = []
+    for i = 0 to 3
+        m.xl.Push(mkLabel(m.top, 0, 146, 80, 30, 24, "r", pal("text3")))
+    end for
+    m.seg = []
+    for i = 0 to 3
+        r = mkRect(m.top, 0, 0, 10, 3, pal("text2"))
+        r.scaleRotateCenter = [0, 1.5]
+        m.seg.Push(r)
+    end for
+    m.endDot = mkPoster(m.top, "pkg:/images/card.9.png", 0, 0, 10, 10, pal("text"))
+    m.tri = mkPoster(m.top, "pkg:/images/tri.png", 0, 0, 16, 14, pal("text2"))
+    m.tri.scaleRotateCenter = [8, 7]
+    m.all = [m.kind, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down, m.dot, m.stat, m.endDot, m.tri]
+    m.all.Append(m.bars)
+    m.all.Append(m.xl)
+    m.all.Append(m.seg)
     m.fillBase = pal("card")
 end sub
 
@@ -126,6 +147,8 @@ sub onContent()
     m.meta.text = c.d_meta
     m.sent.width = inner
     m.kind.width = inner
+    m.stat.width = inner
+    m.name.width = 212
     if t = "urgent"
         ' the kind on its own line in its colour, then the sentence
         m.kind.text = c.d_head
@@ -209,6 +232,59 @@ sub onContent()
             show(m.sent, 28, 24)
         end if
         show(m.meta, 28, 146)
+    else if t = "wx"
+        ' now in big figures, the sky word after it; high, low and rain on the second line
+        m.big.text = c.d_when
+        m.big.color = pal("text")
+        show(m.big, 28, 24)
+        m.tail.text = c.d_tail
+        show(m.tail, 28 + m.big.boundingRect().width + 14, 38)
+        m.sent.text = c.d_sent
+        if c.d_soon then m.sent.color = pal("amber") else m.sent.color = pal("text")
+        m.sent.height = 40
+        show(m.sent, 28, 86)
+        show(m.meta, 28, 146)
+    else if t = "chart"
+        m.kind.text = c.d_title
+        m.kind.color = pal("text2")
+        show(m.kind, 28, 24)
+        m.stat.text = c.d_tail
+        m.stat.color = pal("text3")
+        m.stat.width = inner
+        show(m.stat, 28, 24)
+        drawBars(c.d_series, c.d_labels, c.d_unit, inner)
+    else if t = "stock"
+        m.name.text = c.d_name
+        m.name.width = inner
+        m.name.color = pal("text")
+        show(m.name, 28, 24)
+        if c.d_status = "unlisted" or c.d_status = "noprice"
+            m.sent.text = c.d_sent
+            m.sent.color = pal("text3")
+            m.sent.height = 40
+            show(m.sent, 28, 70)
+            return
+        end if
+        m.big.text = c.d_when
+        m.big.color = pal("text")
+        show(m.big, 28, 68)
+        m.tail.text = c.d_tail
+        ' Korean market colours: up red, down blue; the arrow says it too
+        col = pal("text2")
+        if c.d_hl = "up" then col = "0xFF7A6EFF"
+        if c.d_hl = "down" then col = "0x8FB1F0FF"
+        m.tail.color = col
+        tx = 28
+        if c.d_hl = "up" or c.d_hl = "down"  ' the arrow is drawn (the font has no ▲/▼), so the figure never shifts
+            m.tri.blendColor = col
+            m.tri.rotation = 0
+            if c.d_hl = "down" then m.tri.rotation = 3.14159
+            show(m.tri, 28, 128)
+            tx = 52
+        end if
+        show(m.tail, tx, 120)
+        show(m.meta, 28, 150)
+        drawSpark(c.d_series, w - 28 - 120, 78, 120, 56, col)
     else if t = "count"
         for i = 0 to 1
             n = c.d_n1
@@ -244,6 +320,88 @@ sub onContent()
         show(m.meta, 28, 146)
     end if
     if t <> "fail" and t <> "empty" then m.sent.color = pal("text")
+end sub
+
+' 12 bars across the card: temperature scaled between its own low and high (never flat), percentages from 0 to 100
+sub drawBars(series as Object, labels as Object, unit as String, inner as Integer)
+    n = series.Count()
+    if n = 0 then return
+    if n > 12 then n = 12
+    stp = Int(inner / n)
+    bw = stp - 12
+    top = 66
+    h = 74
+    lo = 1000.0
+    hi = -1000.0
+    for i = 0 to n - 1
+        v = series[i]
+        if v <> invalid
+            if v < lo then lo = v
+            if v > hi then hi = v
+        end if
+    end for
+    if unit = "%"
+        lo = 0
+        hi = 100
+    end if
+    span = hi - lo
+    if span <= 0 then span = 1
+    li = 0
+    for i = 0 to n - 1
+        v = series[i]
+        if v = invalid then v = lo
+        bh = Int(8 + (v - lo) / span * (h - 8))
+        b = m.bars[i]
+        b.width = bw
+        b.height = bh
+        b.translation = [28 + i * stp, top + h - bh]
+        b.color = pal("text3")
+        if unit = "%" and v >= 60 then b.color = pal("amber")
+        if unit <> "%" and i = 0 then b.color = pal("text2")
+        b.visible = true
+        if i mod 3 = 0 and li < 4 and i < labels.Count()
+            l = m.xl[li]
+            l.text = labels[i] + "시"
+            l.translation = [28 + i * stp, 146]
+            l.visible = true
+            li = li + 1
+        end if
+    end for
+end sub
+
+' a five-point line in the box (x, y, w, h): each step a thin rectangle rotated to meet the next point
+sub drawSpark(series as Object, x as Integer, y as Integer, w as Integer, h as Integer, color as String)
+    n = series.Count()
+    if n < 2 then return
+    lo = series[0]
+    hi = series[0]
+    for each v in series
+        if v < lo then lo = v
+        if v > hi then hi = v
+    end for
+    span = hi - lo
+    if span <= 0 then span = 1
+    pts = []
+    for i = 0 to n - 1
+        px = x + i * w / (n - 1)
+        py = y + h - (series[i] - lo) / span * h
+        pts.Push([px, py])
+    end for
+    for i = 0 to n - 2
+        if i > 3 then exit for
+        dx = pts[i + 1][0] - pts[i][0]
+        dy = pts[i + 1][1] - pts[i][1]
+        r = m.seg[i]
+        r.width = Sqr(dx * dx + dy * dy) + 1
+        r.translation = [pts[i][0], pts[i][1] - 1.5]
+        r.rotation = -Atn(dy / dx)
+        r.color = color
+        r.visible = true
+    end for
+    last = pts[n - 1]
+    m.endDot.translation = [last[0] - 5, last[1] - 5]
+    m.endDot.blendColor = color
+    m.endDot.visible = true
 end sub
 
 sub onFocus()

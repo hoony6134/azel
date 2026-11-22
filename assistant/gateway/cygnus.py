@@ -244,6 +244,21 @@ async def _one(name, checked, raw=False):
         return f"{FAILED}. ({type(e).__name__})"
 
 
+async def query(promql, limit=200):
+    """infra_query with PromQL written by the gateway's own code (the TV's 24 h CPU/memory history). Not a model tool:
+    it is not in TOOLS, so no model can send it a query. A short string either way, never an exception."""
+    global _shared_client
+    if not available():
+        return ""
+    if _shared_client is None:
+        import os
+        _shared_client = Cygnus(os.environ.get("BRAIN_CYGNUS_URL", "https://mcp.scian.xyz"), _pat_file().read_text().strip())
+    try:
+        return await _shared_client.call("infra_query", {"query": promql, "limit": limit}, raw=True)
+    except (PermissionError, RuntimeError, httpx.HTTPError):
+        return ""
+
+
 # ---------- memory writes: a separate memory-scoped PAT (cygnus_pat_rw), on the Mac gateway only ----------
 # Only these two tools, only these shapes; the read path above never sees this token. Nothing is cached.
 _write_client: "Cygnus | None" = None

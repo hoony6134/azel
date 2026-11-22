@@ -53,6 +53,19 @@ function newSlot(h as Integer) as Object
     s.right.vertAlign = "center"
     s.right.drawingStyles = styles()
     g.appendChild(s.right)
+    ' host rows: CPU and memory over the last 24 h as two rows of 8 small bars; service rows: a 24 h uptime bar
+    s.hl = []
+    s.hb = []
+    for k = 0 to 1
+        l = mkLabel(g, 0, 0, 80, h - 8, 24, "r", pal("text3"))
+        l.vertAlign = "center"
+        s.hl.Push(l)
+        for i = 0 to 7
+            s.hb.Push(mkRect(g, 0, 0, 6, 4, pal("text3")))
+        end for
+    end for
+    s.ut = mkRect(g, 1066, Int((h - 8) / 2) - 4, 56, 8, pal("rule"))
+    s.uf = mkRect(g, 1066, Int((h - 8) / 2) - 4, 10, 8, pal("text2"))
     s.meta = createObject("roSGNode", "MultiStyleLabel")
     s.meta.translation = [112, 50]
     s.meta.width = 1700
@@ -233,6 +246,7 @@ sub drawInfraLine(s as Object, ln as Object)
     s.meta.text = ""
     s.b.text = ""
     s.dot.visible = false
+    hideCharts(s)
     if ln.t = "gap"
         s.a.text = ""
         return
@@ -246,6 +260,10 @@ sub drawInfraLine(s as Object, ln as Object)
         s.b.translation = [96 + s.a.boundingRect().width + 18, 2]
         s.b.text = ln.role
         s.right.text = hostStats(ln.h)
+        if ln.h <> invalid
+            spark(s, 0, 680, "CPU", ln.h.cpu_24h, 85)
+            spark(s, 1, 860, "메모리", ln.h.mem_24h, 90)
+        end if
         return
     end if
     sv_ = ln.s
@@ -266,6 +284,12 @@ sub drawInfraLine(s as Object, ln as Object)
         if up < 99.5 then col = pal("amber")
         if up < 95 then col = pal("danger")
         put(s.c[2], xs[3], fmtPct(up), col, "r", "right")
+        if up < 99.9  ' only a flaky or down service gets its bar: a full one says nothing
+            s.ut.visible = true
+            s.uf.width = Int(56 * up / 100) + 1
+            s.uf.color = col
+            s.uf.visible = true
+        end if
     end if
     if sv_.ms <> invalid
         col = pal("text2")
@@ -282,6 +306,43 @@ sub put(l as Object, x as Object, t as String, col as String, w as String, align
     l.color = col
     l.horizAlign = align
     l.text = t
+end sub
+
+sub hideCharts(s as Object)
+    for each n in s.hb
+        n.visible = false
+    end for
+    for each n in s.hl
+        n.visible = false
+    end for
+    s.ut.visible = false
+    s.uf.visible = false
+end sub
+
+' 8 bars (21 h ago … now) for one metric of a host row, label first; the latest bar brighter, over-threshold amber
+sub spark(s as Object, k as Integer, x as Integer, label as String, series as Dynamic, warn as Integer)
+    if Type(series) <> "roArray" or series.Count() = 0 then return
+    l = s.hl[k]
+    l.translation = [x, 0]
+    l.text = label
+    l.width = 0
+    l.visible = true
+    bx = x + l.boundingRect().width + 10
+    cy = Int((s.h - 8) / 2)
+    for i = 0 to 7
+        b = s.hb[k * 8 + i]
+        v = invalid
+        if i < series.Count() then v = series[i]
+        if v <> invalid
+            bh = Int(3 + v / 100 * 25)
+            b.height = bh
+            b.translation = [bx + i * 9, cy + 13 - bh]
+            b.color = pal("text3")
+            if i = 7 then b.color = pal("text2")
+            if v >= warn then b.color = pal("amber")
+            b.visible = true
+        end if
+    end for
 end sub
 
 function hostStats(h as Dynamic) as String
@@ -387,6 +448,7 @@ sub buildTasks(d as Object)
 end sub
 
 sub drawTaskLine(s as Object, ln as Object)
+    hideCharts(s)
     for each l in s.c
         l.text = ""
     end for

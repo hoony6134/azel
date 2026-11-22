@@ -180,8 +180,14 @@ def test_build2_a_failing_part_is_null():
     assert out["infra"] is None and out["gistra"] is None and out["calendar"] is None and out["tasks"]["queued"]["count"] == 1
 
 
-def test_tv_route_versions(gw):
+def test_tv_route_versions(gw, monkeypatch):
     g, c, tmp = gw
+
+    async def offline():  # never the network in tests: weather and quotes have their own recorded-response tests
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(g, "tv_weather", offline)
+    monkeypatch.setattr(g, "tv_holdings", offline)
     assert "tasks" in c.get("/v1/tv").json() and "gistra" not in c.get("/v1/tv").json()  # v1 is unchanged
     v2 = c.get("/v1/tv?v=2")
     assert v2.status_code == 200 and v2.json().keys() >= {"at", "infra", "tasks", "gistra", "calls", "calendar", "assistant"}
@@ -425,3 +431,111 @@ def test_detail_query_is_open_to_the_tv_token(gw, monkeypatch):
     assert r.status_code == 200 and r.json() == {"ok": "tasks"}
     assert c.get("/v1/tv?detail=secrets", headers=tvh).status_code == 400
     assert c.get("/v1/tasks", headers=tvh).status_code == 401  # still only the TV path
+
+
+# ---------- weather, holdings, history: recorded responses (tests/fixtures/tv_*), never the network ----------
+def test_weather_card_from_recorded_kma():
+    import json
+    from datetime import datetime
+    rec = json.loads((FIX / "tv_kma.json").read_text())
+    now = datetime.fromisoformat(rec["now"]).timestamp()
+    w = tv.weather_card({"source": "기상청", "place": "광주", **rec}, now)
+    t1h = float(next(i["obsrValue"] for i in rec["ncst"] if i["category"] == "T1H"))
+    assert w["source"] == "기상청" and w["now"] == t1h and w["place"] == "광주"
+    assert w["low"] <= t1h <= w["high"] and 0 <= w["pop"] <= 100 and w["sky"]
+    assert len(w["hourly"]) == 12 and w["hourly"][0]["h"] == rec["now"][11:13]  # from this hour on
+    assert all(isinstance(h["t"], float) and 0 <= h["pop"] <= 100 for h in w["hourly"])
+    assert not w["sky"].endswith("요")  # a TV word, not a spoken sentence
+
+
+def test_weather_card_falls_back_to_recorded_open_meteo():
+    import json
+    d = json.loads((FIX / "tv_openmeteo.json").read_text())
+    w = tv.weather_card({"source": "Open-Meteo", "place": "광주", **d}, NOW)
+    assert w["now"] == 1.7 and w["sky"] == "맑음" and w["hourly"] == []
+    assert w["high"] == d["daily"]["temperature_2m_max"][0] and w["low"] == d["daily"]["temperature_2m_min"][0]
+    assert tv.weather_card(None, NOW) is None
+
+
+def test_history_from_recorded_infra_query():
+    cpu = tv.parse_history((FIX / "tv_history_cpu.txt").read_text())
+    mem = tv.parse_history((FIX / "tv_history_mem.txt").read_text())
+    assert set(cpu) == set(mem) and len(cpu) == 8 and "vd-spark" in cpu
+    assert all(len(v) == 8 and None not in v and all(0 <= x <= 100 for x in v) for v in [*cpu.values(), *mem.values()])
+    assert mem["deneb"][0] == 71  # `{ago="21",node="deneb"} 71`: the oldest point comes first
+    q = tv.history_query("mem")
+    assert len(q) <= 2000 and q.count("offset") == 14 and '"ago", "0"' in q  # infra_query's limit; 7 offsets × 2 selectors
+
+
+def test_infra_detail_carries_24h_history():
+    health, status = (FIX / "tv_infra_health.txt").read_text(), (FIX / "tv_infra_status.txt").read_text()
+    cpu, mem = (FIX / "tv_history_cpu.txt").read_text(), (FIX / "tv_history_mem.txt").read_text()
+
+    async def raw(n, extra=None):
+        return {"infra_health": health, "infra_status": status, "infra_alerts": "No firing alerts."}[n]
+
+    async def query(q):
+        return mem if "MemAvailable" in q else cpu
+
+    out = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: True, "infra_raw": raw, "query": query}, NOW))
+    deneb = next(h for h in out["hosts"] if h["name"] == "deneb")
+    assert len(deneb["cpu_24h"]) == 8 and deneb["mem_24h"][0] == 71
+
+
+def quote_transport():
+    """Naver/Yahoo answered from tests/fixtures/tv_quotes.json; Naver's search is unreachable (as it was when recorded)
+    and Yahoo's search answers 400 to a Korean query (recorded)."""
+    import json
+    import httpx
+    rec = json.loads((FIX / "tv_quotes.json").read_text())
+
+    def handle(req):
+        url = str(req.url)
+        if "ac.stock.naver.com" in url:
+            raise httpx.ConnectTimeout("timed out", request=req)
+        if "finance/search" in url:
+            return httpx.Response(400, json={"finance": {"error": {"code": "Bad Request"}}})
+        if "polling.finance.naver.com" in url:
+            return httpx.Response(200, json=rec[f"naver:{url.rsplit('/', 1)[1]}"])
+        sym, rng = url.split("/chart/")[1].split("?")[0], req.url.params["range"]
+        key = f"chart:{sym}:{rng}"
+        return httpx.Response(200, json=rec[key]) if key in rec else httpx.Response(404, json={"chart": {"result": None}})
+    return httpx.MockTransport(handle)
+
+
+def test_holdings_from_recorded_quotes():
+    import httpx
+    import quote
+
+    async def run():
+        async with httpx.AsyncClient(transport=quote_transport()) as c:
+            return [await quote.holding(n, c) for n in ("삼성전자 (005930)", "애플 (AAPL)", "토스", "SK하이닉스 (000660)")]
+
+    sam, apple, toss, hynix = asyncio.run(run())
+    assert sam["name"] == "삼성전자" and sam["price"] == 180900 and sam["pct"] == -8.13 and sam["currency"] == "KRW"
+    assert sam["spark"] == [196800.0, 190300.0, 194700.0, 196900.0, 183100.0] and sam["source"] == "네이버 증권"
+    assert apple["name"] == "애플" and apple["ticker"] == "AAPL" and apple["currency"] == "USD" and len(apple["spark"]) == 5
+    assert toss == {"name": "토스", "listed": False}  # unlisted: quietly 비상장, no guess
+    assert hynix["price"] == 1100000 and hynix["spark"][-1] == 1113000.0
+
+
+def test_build2_adds_weather_and_holdings():
+    async def weather():
+        return {"source": "Open-Meteo", "place": "광주", "current": {"temperature_2m": 3.0, "weather_code": 3},
+                "daily": {"temperature_2m_max": [9.0], "temperature_2m_min": [-1.0], "precipitation_probability_max": [20]}}
+
+    async def holdings():
+        return [{"name": "토스", "listed": False}]
+
+    out = asyncio.run(tv.build2(deps2(weather=weather, holdings=holdings), NOW))
+    assert out["weather"]["now"] == 3.0 and out["weather"]["sky"] == "흐림" and out["holdings"] == [{"name": "토스", "listed": False}]
+    assert asyncio.run(tv.build2(deps2(), NOW))["weather"] is None  # a gateway without them: null parts
+
+
+def test_holdings_setting(gw):
+    g, c, _ = gw
+    assert c.get("/v1/settings").json()["holdings"][3] == "삼성전자 (005930)"
+    r = c.put("/v1/settings", json={"holdings": ["  애플   (AAPL) ", "카카오"]})
+    assert r.status_code == 200 and c.get("/v1/settings").json()["holdings"] == ["애플 (AAPL)", "카카오"]
+    for bad in ("애플", [""], ["x" * 41], ["a\nb"], ["a"] * 13):
+        assert c.put("/v1/settings", json={"holdings": bad}).status_code == 400, bad
