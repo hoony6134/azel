@@ -48,7 +48,17 @@ targets:
         # iOS (ignored on macOS)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        UIBackgroundModes: [audio, voip]
+        UIBackgroundModes: [audio, voip, fetch]
+        # iPhone data (PHONE_DATA.md): asked only when that toggle is turned on in Settings → 아이폰 데이터
+        BGTaskSchedulerPermittedIdentifiers: [xyz.scian.biseo.phone-sync]
+        NSHealthShareUsageDescription: 켜 둔 항목(걸음, 수면, 운동, 심박 등)을 아젤이 읽고 물어보시면 답하기 위해 건강 데이터를 사용합니다.
+        NSHealthUpdateUsageDescription: Azel은 건강 데이터를 쓰지 않습니다.
+        NSCalendarsFullAccessUsageDescription: 아이폰 캘린더 일정을 물어보시면 답하기 위해 사용합니다.
+        NSRemindersFullAccessUsageDescription: 미리 알림에 남은 항목을 물어보시면 답하기 위해 사용합니다.
+        NSContactsUsageDescription: 연락처를 이름으로 찾아 달라고 하시면 답하기 위해 사용합니다.
+        NSLocationWhenInUseUsageDescription: 지금 어디인지 물어보실 때만 한 번 위치를 확인합니다. 위치를 저장하거나 추적하지 않습니다.
+        NSMotionUsageDescription: 위치를 물어보실 때 걷는 중인지, 이동 중인지 함께 알려 드리기 위해 사용합니다.
+        NSAppleMusicUsageDescription: 지금 듣는 음악과 최근 들은 곡을 물어보시면 답하기 위해 사용합니다.
         NSSupportsLiveActivities: true
         NSSupportsLiveActivitiesFrequentUpdates: true
         # macOS (ignored on iOS): menu-bar only, no Dock icon
