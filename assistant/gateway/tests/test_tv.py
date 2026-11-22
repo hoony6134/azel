@@ -86,3 +86,17 @@ def test_tv_token_opens_only_the_tv_route(gw):
     assert c.get("/v1/tv", headers={"Authorization": "Bearer short"}).status_code == 401
     assert c.get("/v1/tv", headers={"Authorization": "Bearer nope"}).status_code == 401
     assert c.get("/v1/tv").json().keys() >= {"at", "infra", "tasks", "calls", "assistant"}  # the full token works too
+
+
+def test_tv_deps_infra_calls_cygnus_with_args(monkeypatch):
+    """tv.py asks d["infra"](name); cygnus.call takes (name, args). A one-arg fake once hid the TypeError (empty infra)."""
+    import cygnus
+    import gateway
+    seen = []
+
+    async def fake_call(name, args):
+        seen.append((name, args))
+        return "ok"
+
+    monkeypatch.setattr(cygnus, "call", fake_call)
+    assert asyncio.run(gateway.tv_deps()["infra"]("infra_health")) == "ok" and seen == [("infra_health", {})]

@@ -2439,7 +2439,7 @@ def tv_deps():
     async def calendar(today):
         return await google_tools.call(HOME, "calendar_events", {"from": today, "to": today})
 
-    return {"infra": cyg.call, "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
+    return {"infra": lambda name: cyg.call(name, {}), "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
             "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
             "google_ok": lambda: google_status() == "connected", "calendar": calendar}
 
