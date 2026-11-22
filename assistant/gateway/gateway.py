@@ -1525,7 +1525,7 @@ async def gather_signals(now):
         """Calls of the last 12 h, oldest first, with what the user said ("내가 할게" at 14:00: no ring at 14:30),
         and the autonomous calls that rang unanswered."""
         out, answered = [], set()
-        for r in reversed(await state.call("GET", "/v1/state/history", limit=10) or []):
+        for r in reversed(await state.call("GET", "/v1/state/history", limit=30) or []):
             at = r.get("started_at") or 0
             if now - at > 12 * 3600:
                 continue
