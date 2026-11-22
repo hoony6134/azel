@@ -62,6 +62,8 @@ QUOTES = {("aapl", "apple", "애플"): "야후 파이낸스 기준 11월 21일 A
           ("nvda", "nvidia", "엔비디아"): "야후 파이낸스 기준 11월 21일 NVIDIA 주가는 125.53달러예요. 전날보다 14.01% 내렸어요.",
           ("005930", "samsung", "삼성"): "네이버 증권 기준 11월 20일 삼성전자 주가는 180,900원이에요. 전날보다 8.13% 내렸어요.",
           ("000660", "sk hynix", "하이닉스", "skhynix"): "네이버 증권 기준 11월 20일 SK하이닉스 주가는 412,000원이에요. 전날보다 5.20% 내렸어요."}
+PORTFOLIO = ("보유 종목 5개 (11월 21일 기준): 애플 342.56달러 -1.90% / 엔비디아 125.53달러 -14.01% / "
+             "삼성전자 180,900원 -8.13% / SK하이닉스 412,000원 -5.20% / 토스 비상장(시세 없음).")
 HOLD_CASES = [("내가 갖고 있는 주식 현황 이용해가지고 어떤 주식이 얼마만큼 올랐는지 떨어졌는지 알려줘.", True),
               ("내가 갖고 있는 주식 보유 현황 알려줘", False)]
 ANNOUNCE_ONLY = re.compile(r"^[^.?!]*(찾아|알아|확인해)\s*볼게요\.?$")
@@ -108,6 +110,8 @@ async def main():
         used.append((name, args))
         if name.startswith("infra_"):
             return INFRA_RESULT[name]
+        if name == "portfolio" and holdings_on:
+            return PORTFOLIO
         if name == "memory_recall" and holdings_on:
             return HOLDINGS
         if name == "stock_quote" and holdings_on:
@@ -184,11 +188,11 @@ async def main():
         out = [s async for s, *_ in V.respond(said, f"hold-{i}", t0, timings)]
         reply = " ".join(out)
         names = ("애플", "토스", "엔비디아", "삼성", "하이닉스")
-        checks = {"memory first": bool(used) and used[0][0] == "memory_recall",
+        checks = {"portfolio (or memory) first": bool(used) and used[0][0] in ("portfolio", "memory_recall"),
                   "all five named": all(n in reply for n in names), "no empty lead-in": not V.LEAD_IN.search(reply.strip()),
                   "no promise said": not any(PROMISE.search(x) for x in out)}
         if figures:
-            checks["quoted four"] = sum(n == "stock_quote" for n, _ in used) >= 4
+            checks["quoted"] = used[0][0] == "portfolio" or sum(n == "stock_quote" for n, _ in used) >= 4
             checks["figures"] = len(re.findall(r"\d[\d,.]*\s*(%|퍼센트|달러|원)", reply)) >= 4
         rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
         if os.environ.get("EVAL_DEBUG"):
