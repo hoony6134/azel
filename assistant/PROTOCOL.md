@@ -124,6 +124,19 @@ answering a call the assistant placed; the server then speaks that call's openin
   the assistant speaks or thinks it interrupts first, like a tap (`interrupt`, then the new reply). `speak:false`
   (default true): the reply comes as `reply` captions and `turn_done` with no audio and no filler lines. The mic
   stays live: speech during a typed turn is handled as usual.
+- **The assistant hangs up**: server → client `{"type":"hangup","reason":"<short text, may be empty>"}`, then the server
+  closes the socket. It comes after the goodbye the assistant just said has finished playing ("네, 끝나면 전화드릴게요."),
+  when the user said "끊어", "이제 됐어 끊어", "끊을게" or "맡겨 놓고 끊어" (the model's `end_call` action; never while a
+  confirm/clarify question waits for an answer, never from a task). The app ends the call as if the user hung up; the
+  reason is for logs, the app need not show it.
+- **Continuing a task from its finish call**: an instruction given in a task's finish call (within 3 h, e.g. "그거 이렇게
+  고쳐서 다시 해 줘") creates a continuation task: `parent_task` = the finished task, the same device, notify inherited, and
+  when the parent delegated, `resume` = that device's Claude Code session (`session_id`, `cwd` from the job), so the
+  device's Claude Code keeps its own context (`<device>__delegate` with `resume`, same `cwd`). Questions in the call are
+  answered from the result, as before. A task that delegates waits for the job (`job_status`) before it counts as done.
+- **Approval pushes** carry `aps.category = "APPROVAL"` (허용 / 거부 / 항상 허용 buttons) with `approval_id`, and
+  `forced_once: true` when "always" can't hold (a command that writes, or a secret call): hide that button.
+- Team devices (vd-spark, vd-core) may be handed a `delegate` (their own Claude Code); only `sadr` never is.
 - **Auto-approve** (like Claude Code's auto mode, only when the user grants it): while a grant is live, a device
   command whose run (this call, or a task started in it, or a task granted directly) asks for approval runs at once
   when it classifies **safe**; **risky** ones still need a tap, and the daemons' hard_deny is unchanged. Browser-tool

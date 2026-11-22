@@ -129,6 +129,7 @@ the tool name only.
 | `task_status` | one task or the recent ones | `GET /v1/tasks`, `GET /v1/tasks/{id}` | ✓ | — | "맡긴 거 어떻게 됐어?" | — |
 | `task_cancel` | stop a running task | `POST /v1/tasks/{id}/cancel` | ✓ (new tool) | — | "그 작업 그만해" | `STOP` on a running-task push |
 | `approval_status` | pending approvals and their state (read only) | `GET /v1/approvals`, `GET /v1/approvals/{id}` | ✓ | — (personal device commands) | "승인 기다리는 거 있어?" | — |
+| `end_call` | hang up the call after a short goodbye, when the user says so (never mid-question, never from a task) | — (in-call only; the app hangs up itself) | ✓ | — | "이제 됐어 끊어" | — |
 | `auto_approve` | the user's own "알아서 해": safe device commands run without a tap for this call (≤ 2 h), risky ones still ask; read back once, refused after a web/mail/memory read and in tasks | the app's toggle is `POST /v1/auto-approve` (and the call's `auto_approve` frame) | ✓ | — | "권한 줄 테니 알아서 해" | — |
 | `music_play`, `music_control` | Apple Music on the user's Mac through the daemon's `music` tool (fixed AppleScript templates; no approval) | not on REST: no app screen | ✓ (no approval for qwen) | — | (models) | — |
 | `home_scene` | run an allowlisted HomeKit scene (a Shortcut named in the daemon's `home_shortcuts`); after a web/mail/memory read it needs `confirmed` | not on REST | ✓ | — | (models) | — |

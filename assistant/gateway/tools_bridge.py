@@ -162,7 +162,7 @@ SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "sche
 TAINT_S = 600
 
 
-TASK_NEVER = {"create_task", "web_task", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send",
+TASK_NEVER = {"create_task", "web_task", "end_call", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send",
               "auto_approve"}
 AUTO_APPROVE = {
     "name": "auto_approve",
@@ -173,6 +173,14 @@ AUTO_APPROVE = {
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {"confirmed": CONFIRMED,
         "off": {"type": "boolean"}, "minutes": {"type": "number", "minimum": 1, "maximum": 120},
         "devices": {"type": "array", "items": {"type": "string", "maxLength": 32}, "maxItems": 10}}},
+}
+END_CALL = {
+    "name": "end_call",
+    "description": ("통화를 끊는다. 사용자가 '끊어', '이제 됐어 끊어', '끊을게'라고 하거나, 작업을 맡긴 뒤 '맡겨 놓고 끊어'처럼 "
+                    "끝내려 할 때만 쓴다. 먼저 짧게 인사한 뒤(예: '네, 끝나면 전화드릴게요.') 부른다. 확인 질문에 아직 답을 "
+                    "못 들었으면 쓰지 마."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "reason": {"type": "string", "maxLength": 40}}},
 }
 AUTO_Q = "이번 통화 동안 위험하지 않은 명령은 묻지 않고 바로 실행할게요. 지우기나 설치 같은 건 여전히 여쭤볼게요. 맞죠?"
 SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
@@ -196,6 +204,7 @@ class Bridge:
         self.recent = {}  # (at, cron) -> (monotonic, say): a model repeating the same call_user creates nothing
         self.tainted = {}  # run id (ask:<session> | task:<id>) -> monotonic of its last web/mail/Cygnus/memory read
         self.auto_asked = {}  # run id -> when auto_approve's read-back was asked (confirmed only counts after it)
+        self.confirming = {}  # run id -> when a confirm/clarify question went out (end_call waits for the answer)
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -223,6 +232,7 @@ class Bridge:
     async def run(self, name, args, persona_id=None, caller="api", surface="tool", on_progress=None, where=None):
         """Every action, every surface: {"ok", "spoken", "data", "needs", "error"} (ACTIONS.md §2), audited once."""
         args = args if isinstance(args, dict) else {}
+        who = ""
         try:
             if caller == "app" and name not in APP_ACTIONS:
                 raise Fail("not_found", f"없는 기능이에요: {str(name)[:40]}")
@@ -258,6 +268,8 @@ class Bridge:
             else:
                 r = result(True, out)
         except Need as e:
+            if who:
+                self.confirming[who] = time.monotonic()  # a question is out: no hanging up before its answer
             r = result(False, e.question, needs={"kind": e.kind, "question": e.question,
                                                  **({"options": e.options} if e.options else {}),
                                                  **({"args": e.resend} if e.resend else {})})
@@ -298,6 +310,8 @@ class Bridge:
             return await self.call_user(args, persona_id, caller)
         if name == "create_task":
             return await self.create_task(args, persona_id, caller)
+        if name == "end_call":
+            return await self.end_call(args)
         if name == "auto_approve":
             return await self.auto_approve(args)
         if name == "schedule_list":
@@ -811,6 +825,16 @@ class Bridge:
         return ("\n".join(f"- {a['id']} {a.get('device', '')}: {str(a.get('command', ''))[:60]}" for a in pending[:5])
                 or "기다리는 승인 요청이 없어요."), rows
 
+    async def end_call(self, args):
+        """Hang up the call this run answers, after its goodbye plays. Never while a read-back waits for an answer."""
+        who = self.d.get("who", lambda: "")()
+        if not who.startswith("ask:"):
+            raise Fail("invalid", "통화 중에만 끊을 수 있어요.")
+        if time.monotonic() - self.confirming.get(who, -1e9) < TAINT_S:
+            raise Fail("invalid", "확인 질문에 답을 들은 뒤에 끊을게요.")
+        await self.d["end_call"](who[4:], str(args.get("reason") or "")[:40])
+        return "통화를 마칠게요.", None
+
     async def auto_approve(self, args):
         """A grant for this call, only from the user's own words: never in a task, never right after reading the web,
         mail, Cygnus or memory in the same run, and always read back once before it starts."""
@@ -1098,7 +1122,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
              OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
-             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS)
+             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
@@ -1162,6 +1186,9 @@ for _n, _m in {
     "music_control": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
                       "no_rest": "앱에는 음악 화면이 없어요(모델 경로에서 맥 데몬으로).",
                       "examples": ({"action": "pause"}, {"action": "explode"})},
+    "end_call": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                 "no_rest": "통화 안에서만 쓰는 동작이에요(앱은 직접 끊어요).",
+                 "examples": ({"reason": "사용자 요청"}, {"reason": "x" * 41})},
     "web_task": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
                  "no_rest": "앱에서는 create_task로 맡겨요(브라우저 작업은 모델 경로에서).",
                  "examples": ({"goal": "도쿄 왕복 항공권 비교"}, {"goal": ""})},

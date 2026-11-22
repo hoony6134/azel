@@ -328,3 +328,37 @@ def test_meta_lines_and_tool_labels(tgw):
     assert g.tool_label("macbook__delegate") == "macbook에서 작업 위임" and g.tool_label("macbook__read_file") == "macbook 파일 읽는 중"
     assert g.tool_label("macbook__run_command") == "macbook에서 명령 실행 중" and g.tool_label("memory_recall") == "기억 찾는 중"
     assert g.tool_label("mcp__macbook__list_dir") == "macbook 파일 보는 중" and g.tool_label("web_search") == "웹 검색 중"
+
+
+def test_an_instruction_in_a_finish_call_continues_the_same_task(tgw, monkeypatch):
+    g, c, notes = tgw
+    sent = []
+
+    async def link_send(m):
+        sent.append(m)
+
+    async def voip(payload):
+        return {"sent": 1}
+    monkeypatch.setattr(g, "link_send", link_send)
+    monkeypatch.setattr(g, "send_voip_push", voip)
+    parent = {"id": "aaaabbbbcccc", "goal": "대시보드 구현 방법 연구", "status": "done", "notify": "call", "device": "macbook",
+              "owner": g.DEVICE, "steps": [], "result": "세 가지 방법", "persona": "azel",
+              "jobs": [{"device": "macbook", "job_id": "abcdefabcdef", "status": "done",
+                        "session_id": "0f8c2b4e-1111-2222-3333-444455556666", "cwd": "/Users/jh/dev/sandbox"}]}
+    c.portal.call(g.task_save, parent)
+    c.portal.call(g.real_place_call, "task", "맡기신 연구 끝났어요.", "call-fc-1", None, None,
+                  {"kind": "task", "id": parent["id"], "label": "연구"})
+    assert g.call_task["call-fc-1"] == parent["id"]
+    g.session_task["azel:fc"] = (g.call_task.pop("call-fc-1"), time.time())  # what the call's start log does
+
+    async def in_call(body, origin):
+        g.origin_ctx.set(origin)
+        return await g.task_create(body, "voice")
+    t = c.portal.call(in_call, {"goal": "그거 2번 방법으로 프로토타입까지 만들어 줘", "persona": "azel"}, "azel:fc")
+    assert t["parent_task"] == parent["id"] and t["device"] == "macbook" and t["notify"] == "call"
+    assert t["resume"] == {"device": "macbook", "session_id": "0f8c2b4e-1111-2222-3333-444455556666",
+                           "cwd": "/Users/jh/dev/sandbox"}
+    prompt = g.task_prompt(t, [])
+    assert 'resume="0f8c2b4e-1111-2222-3333-444455556666"' in prompt and 'cwd="/Users/jh/dev/sandbox"' in prompt
+    other = c.portal.call(in_call, {"goal": "새로운 조사 해 줘", "persona": "azel"}, "azel:elsewhere")
+    assert not other.get("parent_task")  # another call: a new task

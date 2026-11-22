@@ -82,6 +82,9 @@ COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
 warm_pool = Pool()
 call_warm_keys: dict[str, str] = {}  # call_log id -> its warm process key, closed when the call ends
 call_started: dict[str, float] = {}  # call_log id -> when it started (a call whose end never came expires)
+call_task: dict[str, str] = {}  # finish call id -> its task, until the call starts
+session_task: dict[str, tuple] = {}  # "<persona>:<session>" of a finish call -> (task id, since): its continuation parent
+CONTINUE_S = 3 * 3600
 CALL_TTL_S = 2 * 3600
 
 
@@ -1290,6 +1293,8 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
     if extra:  # e.g. the overnight report after the briefing: said as written, never left to a model
         opening = f"{opening or ''} {extra}".strip()
     call_id = call_id or uuid.uuid4().hex
+    if (context or {}).get("kind") == "task" and (context or {}).get("id") and reason == "task":
+        call_task[call_id] = context["id"]  # its follow-up instructions continue that task
     origin_session = origin_session if origin_session is not None else (origin_ctx.get() or None)  # call_user now
     settings = await load_settings()
     persona = (persona_by_id(settings, persona_id) if persona_id else None) or primary_persona(settings)
@@ -2112,6 +2117,8 @@ async def handle_link(ws):
                 if isinstance(m.get("log_id"), str):
                     call_warm_keys[m["log_id"]] = warm_key
                     call_started[m["log_id"]] = time.time()
+                if (tid := call_task.pop(str(m.get("call_id") or ""), None)):
+                    session_task[warm_key] = (tid, time.time())  # a task's finish call: new work here continues it
                 asyncio.create_task(prewarm(warm_key, pid))
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
                 call_started.pop(m.get("log_id"), None)
@@ -3596,6 +3603,14 @@ async def recent_open_task(origin, persona):
     return next((t for t in open_ if origin and t.get("origin_session") == origin), None)  # this call's own only
 
 
+async def continuation_parent(origin):
+    """The task whose finish call this is (within CONTINUE_S), or None."""
+    got = session_task.get(origin or "")
+    if not got or time.time() - got[1] > CONTINUE_S:
+        return None
+    return task_live.get(got[0]) or await state.call("GET", task_key(got[0]))
+
+
 async def task_create(body, source="api"):
     full_only()
     spec = check_task(body)
@@ -3604,6 +3619,13 @@ async def task_create(body, source="api"):
         if not t:
             raise HTTPException(409, "어떤 작업 말씀이세요? 이 통화에서 맡기신 진행 중인 작업이 없어요.")
         return {**t, **await task_set_notify(t["id"], want), "notify_updated": True}
+    parent = await continuation_parent(origin_ctx.get())
+    if parent:  # an instruction in a task's finish call: the same task carried on (device, cwd, its Claude Code session)
+        spec["parent_task"] = parent["id"]
+        spec["device"] = spec["device"] or parent.get("device")
+        spec["notify"] = body.get("notify") or parent.get("notify") or spec["notify"]
+        if job := next((j for j in reversed(parent.get("jobs") or []) if j.get("session_id")), None):
+            spec["resume"] = {k: job.get(k) for k in ("device", "session_id", "cwd")}
     settings = await load_settings()
     spec["backend"], spec["fallback_reason"] = await task_backend_for(spec, settings)
     if spec["backend"] == "claude_code" and not CLAUDE_OK:
@@ -3665,6 +3687,11 @@ def task_prompt(t, devices):
     if t["device"] and t["device"] in limited:
         note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
     note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
+    if t.get("parent_task"):
+        note += f" 이 작업은 앞서 맡긴 작업({t['parent_task']})을 이어서 하는 거야: 같은 기기와 폴더에서 그 결과에 이어서 해."
+        if (r := t.get("resume")) and r.get("session_id"):
+            note += (f" 그 기기의 Claude Code 대화를 이어서 써: {r['device']}__delegate에 resume=\"{r['session_id']}\", "
+                     f"cwd=\"{r['cwd']}\"를 주고 맡겨.")
     note += (" 간단하고 짧은 일은 기기 도구(read_file, list_dir, run_command, browser)로 직접 해. 여러 파일을 고치는 코딩이나"
              " 파일을 써 가며 하는 깊은 조사처럼 그 기기에서 오래, 여러 단계가 필요한 일은 그 기기의 delegate로 그 기기의"
              " Claude Code에 맡겨. 맡겼으면 기다리지 말고 job_id를 남기고 끝내: 시스템이 그 작업이 끝날 때까지 기다렸다가 그"
@@ -3802,6 +3829,7 @@ async def await_jobs(t, deadline):
             state_ = got.get("job_status") or got.get("status")
             if state_ in ("done", "failed"):
                 j["status"] = state_
+                j.update({k: got[k] for k in ("session_id", "cwd", "output_file") if isinstance(got.get(k), str)})
                 open_jobs.remove(j)
                 out = str(got.get("result") or got.get("summary") or "").strip()
                 task_step(t, "job_" + state_, label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업 "
@@ -4322,7 +4350,7 @@ async def overnight_list():
 def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
             "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
-            "origin_session", "notified_at", "when", "scheduled_for", "auto_approve", "reported")
+            "origin_session", "notified_at", "parent_task", "when", "scheduled_for", "auto_approve", "reported")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
@@ -4496,6 +4524,7 @@ bridge = tools_bridge.Bridge(
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
     auto_grant=lambda scope, devices, minutes: grant_create(scope, devices, minutes, by="voice"),
     auto_end=lambda scope: end_grants(scope),
+    end_call=lambda session, reason: link_send({"type": "end_call", "session": session, "reason": reason}),
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway

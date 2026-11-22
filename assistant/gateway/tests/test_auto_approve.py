@@ -237,3 +237,19 @@ def test_device_and_phone_reads_taint_and_tasks_need_the_app_for_phone(agw):
     g.fake.db["kv"]["task-cccccccccccc"] = {"id": "cccccccccccc", "source": "voice", "status": "running"}
     r = in_ask(g, lambda: b.run("phone_location", {}, caller="api"), who="task:cccccccccccc")
     assert not r["ok"] and "앱에서 맡긴 작업만" in r["spoken"]
+
+
+def test_end_call_hangs_up_this_call_but_never_mid_question(agw, monkeypatch):
+    g, c, _ = agw
+    sent = []
+
+    async def link_send(m):
+        sent.append(m)
+    monkeypatch.setattr(g, "link_send", link_send)
+    r = in_ask(g, lambda: g.bridge.run("end_call", {"reason": "사용자 요청"}, caller="voice"), who="ask:azel:e1")
+    assert r["ok"] and sent == [{"type": "end_call", "session": "azel:e1", "reason": "사용자 요청"}]
+    in_ask(g, lambda: g.bridge.run("auto_approve", {}, caller="voice"), who="ask:azel:e2")  # a read-back is out
+    r = in_ask(g, lambda: g.bridge.run("end_call", {}, caller="voice"), who="ask:azel:e2")
+    assert not r["ok"] and "답을 들은 뒤" in r["spoken"] and len(sent) == 1
+    r = in_ask(g, lambda: g.bridge.run("end_call", {}, caller="api"), who="task:abcabcabcabc")
+    assert not r["ok"] and len(sent) == 1  # a task never hangs up anyone

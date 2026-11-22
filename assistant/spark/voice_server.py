@@ -548,7 +548,7 @@ class GatewayLinks:
         elif t == "context":
             if lk.brain and isinstance(msg.get("value"), str):
                 self.take_context(msg.get("session"), msg["value"], msg.get("persona"))
-        elif t in ("settings", "call", "announce", "auto_state", "phone_query") and lk.mode != "full":
+        elif t in ("settings", "call", "announce", "auto_state", "phone_query", "end_call") and lk.mode != "full":
             return  # shared settings, call openings, announcements and phone data: full gateways only
         elif t == "phone_query":
             PHONE_TASKS.add(task := asyncio.create_task(phone_query(lk, msg)))
@@ -571,6 +571,9 @@ class GatewayLinks:
             ctx = msg.get("context")
             self.openings[msg["call_id"]]["context"] = {k: str(ctx.get(k) or "")[:60] for k in ("kind", "label", "id")} \
                 if isinstance(ctx, dict) and ctx.get("kind") in ("task", "schedule") else None
+        elif t == "end_call":  # the assistant hangs up (the user said "끊어"): after its goodbye has played
+            if hook := end_hooks.get(msg.get("session")):
+                asyncio.get_running_loop().create_task(hook(msg))
         elif t == "auto_state":  # the gateway started or ended the call's auto-approve grant
             if hook := call_hooks.get(msg.get("session")):
                 asyncio.get_running_loop().create_task(hook(msg))
@@ -587,6 +590,7 @@ class GatewayLinks:
 links = GatewayLinks()
 active_calls: dict[str, asyncio.Queue] = {}  # "<persona>:<session>" of each live call -> its announcements
 call_hooks: dict = {}  # "<persona>:<session>" -> the call's handler for the gateway's auto_state frames
+end_hooks: dict = {}  # "<persona>:<session>" -> the call's handler for the gateway's end_call frames
 FALLBACK_OPENING = "전화드렸어요. 맡기신 일 때문에 연락드렸는데, 무엇을 도와드릴까요?"
 DETAIL_NOTE = "(맡기신 작업의 전체 결과예요. 전화로는 요약만 말씀드렸어요.)"
 
@@ -2703,6 +2707,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             current["auto"] = m.get("value") is True
             await send({"type": "auto_approve", "value": current["auto"], "expires_at": m.get("expires_at")})
         call_hooks[call_key] = on_auto_state
+
+        async def on_end_call(m):
+            """Let the reply in progress (the goodbye) finish playing, then tell the app and close the socket."""
+            await asyncio.sleep(0.3)  # the goodbye's reply task starts right after the tool answered
+            while (current["task"] and not current["task"].done()) or current["paused_at"] is not None \
+                    or time.monotonic() < current["play_end"]:
+                await asyncio.sleep(0.2)
+            await send({"type": "hangup", "reason": str(m.get("reason") or "")[:40]})
+            await ws.close()
+        end_hooks[call_key] = on_end_call
         side(announcer(announce_q))
         await send({"type": "mode", "value": current["mode"]})  # the app shows which brain answers
         await send({"type": "state", "value": "listening"})
@@ -2783,30 +2797,39 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     except WebSocketDisconnect:
         pass
     finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
-        phones[:] = [p for p in phones if p["send"] is not send]
-        left = [t for t in {*current["replies"], *current["side"], current["task"]} if t and not t.done()]
-        for t in left:
-            t.cancel()
-        await asyncio.gather(*left, return_exceptions=True)  # its turn is logged before the end
-        ended = time.time()
-        await log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
-        await brain({"type": "call_event", "event": "end", "session": session})
-        links.session_ctx.pop(session, None)
-        for k in [k for k, q in active_calls.items() if k.endswith(f":{session}")]:
-            q = active_calls.pop(k, None)
-            while q is not None and not q.empty():  # taken but never spoken before the hangup: the gateway rings
-                await links.notify({"type": "announced", "id": q.get_nowait().get("id"), "ok": False})
-            call_hooks.pop(k, None)
-            if current.get("auto"):  # its grant ends with the call (a secret call has no call log to end it)
-                await links.notify({"type": "auto_grant", "session": k, "value": False})
-        for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
-            games.pop(k, None)
-        if current["secret"]:  # forget the secret turns: history, title rhythm, a half-asked schedule
-            for store in (history, history_sig, title_gap):
-                for k in [k for k in store if k.endswith(f":{session}")]:
-                    store.pop(k, None)
-            pending_schedule.pop(session, None)
+        async def cleanup():
+            phones[:] = [p for p in phones if p["send"] is not send]
+            left = [t for t in {*current["replies"], *current["side"], current["task"]} if t and not t.done()]
+            for t in left:
+                t.cancel()
+            await asyncio.gather(*left, return_exceptions=True)  # its turn is logged before the end
+            ended = time.time()
+            await log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
+            await brain({"type": "call_event", "event": "end", "session": session})
+            links.session_ctx.pop(session, None)
+            for k in [k for k, q in active_calls.items() if k.endswith(f":{session}")]:
+                q = active_calls.pop(k, None)
+                while q is not None and not q.empty():  # taken but never spoken before the hangup: the gateway rings
+                    await links.notify({"type": "announced", "id": q.get_nowait().get("id"), "ok": False})
+                call_hooks.pop(k, None)
+                end_hooks.pop(k, None)
+                if current.get("auto"):  # its grant ends with the call (a secret call has no call log to end it)
+                    await links.notify({"type": "auto_grant", "session": k, "value": False})
+            for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
+                games.pop(k, None)
+            if current["secret"]:  # forget the secret turns: history, title rhythm, a half-asked schedule
+                for store in (history, history_sig, title_gap):
+                    for k in [k for k in store if k.endswith(f":{session}")]:
+                        store.pop(k, None)
+                pending_schedule.pop(session, None)
 
+        # shielded: a handler cancelled on the way out (the server closed the socket, an abrupt drop) must still end
+        # the call log, its grant and its announcements
+        done = asyncio.ensure_future(cleanup())
+        try:
+            await asyncio.shield(done)
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
@@ -3739,13 +3762,23 @@ if __name__ == "__main__":
                     if m.get("text") and (f := json.loads(m["text"]))["type"] == "auto_approve":
                         auto_frame = f
                         break
-                w.send_text(json.dumps({"type": "hangup"}))
-            time.sleep(0.1)
+                hung = None
+                w.portal.call(links.receive, full, {"type": "end_call", "session": "azel:live", "reason": "사용자 요청"})
+                while True:  # the assistant hangs up: a hangup frame, then the socket closes
+                    m = w.receive()
+                    if m.get("type") == "websocket.close":
+                        break
+                    if m.get("text") and (f := json.loads(m["text"]))["type"] == "hangup":
+                        hung = f
+            for _ in range(40):  # the server's own close: its cleanup (grant end) follows shortly
+                if len([m for m in full.ws.sent if m.get("type") == "auto_grant"]) > len(grant_req):
+                    break
+                time.sleep(0.05)
             results = {m["id"]: m["ok"] for m in full.ws.sent if m.get("type") == "announce_result"}
             results.update({f"{m['id']}:spoken": m["ok"] for m in full.ws.sent if m.get("type") == "announced"})
             grant_end = [m for m in full.ws.sent if m.get("type") == "auto_grant"][len(grant_req):]
             links.remove(full)
-            return opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end
+            return opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end, hung
         def typed_check():
             """Typing during a call: a user turn without STT (no transcript echo, input "text" in the log), captions only
             with speak=false, rejected when too long or too fast, and typing over a reply interrupts it."""
@@ -4142,10 +4175,11 @@ if __name__ == "__main__":
         assert max(gaps, default=0) <= 50 and max(ogaps, default=0) <= 50, (gaps, ogaps)  # no audible gap
         assert osaid == op["parts"] and len(osaid) > 3  # the opening, in order
         assert oev[0][0] < calls[-1][0], "the opening started playing before its last chunk was synthesized"
-        opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end = task_call_check()
+        opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end, hung = task_call_check()
+        assert hung == {"type": "hangup", "reason": "사용자 요청"}  # end_call: the app is told, then the socket closes
         assert grant_req == [{"type": "auto_grant", "session": "azel:live", "value": True, "minutes": 30}], grant_req
         assert auto_frame == {"type": "auto_approve", "value": True, "expires_at": 123.0}
-        assert grant_end == [{"type": "auto_grant", "session": "azel:live", "value": False}]  # ends at hangup
+        assert grant_end == [{"type": "auto_grant", "session": "azel:live", "value": False}], grant_end  # ends at hangup
         assert len(heard) == 2 and others == [], others  # both "여보세요" were heard, neither cut in nor answered
         assert " ".join(opening_said).endswith("더 궁금한 거 물어보세요.") and len(set(opening_said)) == len(opening_said)
         assert opening_said[0].startswith("정훈님, 맡기신") and len(asked) == 1  # one turn: the follow-up, no greeting reply
