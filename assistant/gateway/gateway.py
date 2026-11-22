@@ -40,6 +40,7 @@ import openings
 import connectors
 import google_tools
 import tools_bridge
+import phone_data
 import nim
 import oauth
 import spotify
@@ -695,7 +696,8 @@ def device_prompt(settings, devices):
 
 # (prefix of the tool's own name, label, kind); the first match wins. `kind` picks the app's icon.
 TOOL_LABELS = [("gistra_", "학사 일정 확인 중", "schedule"), ("planit_", "할 일 확인 중", "schedule"),
-               ("memory_", "기억 찾는 중", "memory"), ("infra_", "서버 상태 보는 중", "server")]
+               ("memory_", "기억 찾는 중", "memory"), ("infra_", "서버 상태 보는 중", "server"),
+               ("phone_calendar", "아이폰 캘린더 보는 중", "calendar"), ("phone_", "아이폰 확인 중", "generic")]
 SERVER_LABELS = [("google_calendar", "캘린더 확인 중", "calendar"), ("gmail", "메일 확인 중", "mail"),
                  ("notion", "노션 보는 중", "notes")]
 DEVICE_LABELS = {"run_command": ("{}에서 명령 실행 중", "terminal"), "list_dir": ("{} 파일 보는 중", "files"),
@@ -2038,6 +2040,8 @@ async def handle_link(ws):
             tasks[m["id"]] = served(serve_task(m), m)
         elif m.get("type") in ("tool_call", "tools_list") and isinstance(m.get("id"), str):
             tasks[m["id"]] = served(serve_tool(m), m)
+        elif m.get("type") == "phone_result" and (f := phone_pending.get(m.get("id"))) and not f.done():
+            f.set_result(m)
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "announce_result" and (f := announce_waits.get(m.get("id"))) and not f.done():
@@ -2051,6 +2055,23 @@ async def handle_link(ws):
             tasks.pop(k)
     for t in tasks.values():
         t.cancel()
+
+
+phone_pending: dict[str, asyncio.Future] = {}
+
+
+async def phone_live(kind, args, timeout):
+    """Ask the phone in a call (PHONE_DATA.md §3a) over the link: {"ok", "data"|"error"}. Nothing is stored."""
+    qid = uuid.uuid4().hex[:12]
+    phone_pending[qid] = fut = asyncio.get_running_loop().create_future()
+    try:
+        if not await link_send({"type": "phone_query", "id": qid, "kind": kind, "args": args}):
+            return {"ok": False, "error": "offline"}
+        return await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "offline"}
+    finally:
+        phone_pending.pop(qid, None)
 
 
 async def voice_link():
@@ -2314,6 +2335,39 @@ async def devices():
 def full_only():
     if MODE != "full":
         raise HTTPException(403, "not available on a limited gateway")
+
+
+@app.put("/v1/phone/days")
+async def phone_days_put(body: dict):
+    """The app's daily iPhone summaries (PHONE_DATA.md §3b): checked field by field, merged by date, 30 days kept."""
+    full_only()
+    days = body.get("days")
+    if not isinstance(days, list) or not 1 <= len(days) <= 14:
+        raise HTTPException(400, "days: a list of 1 to 14 day summaries")
+    today = datetime.now(KST).date()
+    try:
+        clean = [phone_data.clean_day(d, today) for d in days]
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    merged = phone_data.merge(await state.call("GET", phone_data.KV), clean, today, time.time())
+    await state.call("PUT", phone_data.KV, merged)
+    return {"stored": len(merged["days"]), "updated": merged["updated"]}
+
+
+@app.get("/v1/phone/days")
+async def phone_days_get():
+    full_only()
+    v = await state.call("GET", phone_data.KV) or {}
+    return {"days": [v["days"][k] for k in sorted(v.get("days", {}))], "updated": v.get("updated"),
+            "keep_days": phone_data.KEEP_DAYS}
+
+
+@app.delete("/v1/phone/days")
+async def phone_days_delete():
+    """Settings → 아이폰 데이터 → delete all (also when sync is turned off)."""
+    full_only()
+    await state.call("PUT", phone_data.KV, {"days": {}, "updated": None})
+    return {"deleted": True}
 
 
 @app.get("/v1/providers/nim/models")
@@ -3743,6 +3797,7 @@ bridge = tools_bridge.Bridge(
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
     web_ok=lambda: searxng_ok(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
+    phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))

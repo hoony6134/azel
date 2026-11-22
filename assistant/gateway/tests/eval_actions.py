@@ -42,6 +42,14 @@ CASES = {
     "music_play": ("아이유 노래 틀어줘", "model"),
     "music_control": ("다음 곡으로 넘겨줘", "model"),
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),
+    "phone_health": ("오늘 걸음 수 얼마야?", "model"),
+    "phone_sleep": ("어제 몇 시간 잤어?", "model"),
+    "phone_workouts": ("이번 주 운동 얼마나 했어?", "model"),
+    "phone_calendar": ("아이폰 캘린더에 내일 뭐 있어?", "model"),
+    "phone_reminders": ("미리 알림에 뭐 있어?", "model"),
+    "phone_contacts": ("연락처에서 김철수 번호 찾아 줘", "model"),
+    "phone_location": ("나 지금 어디야?", "model"),
+    "phone_now_playing": ("지금 듣고 있는 노래 뭐야?", "model"),
 }
 
 

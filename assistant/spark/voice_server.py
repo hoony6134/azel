@@ -546,8 +546,11 @@ class GatewayLinks:
         elif t == "context":
             if lk.brain and isinstance(msg.get("value"), str):
                 self.take_context(msg.get("session"), msg["value"], msg.get("persona"))
-        elif t in ("settings", "call", "announce") and lk.mode != "full":
-            return  # shared settings and call openings come from full gateways only
+        elif t in ("settings", "call", "announce", "phone_query") and lk.mode != "full":
+            return  # shared settings, call openings, announcements and phone data: full gateways only
+        elif t == "phone_query":
+            PHONE_TASKS.add(task := asyncio.create_task(phone_query(lk, msg)))
+            task.add_done_callback(PHONE_TASKS.discard)
         elif t == "settings":
             self.settings = msg.get("value") if isinstance(msg.get("value"), dict) else {}
         elif t == "call":
@@ -580,6 +583,31 @@ links = GatewayLinks()
 active_calls: dict[str, asyncio.Queue] = {}  # "<persona>:<session>" of each live call -> its announcements
 FALLBACK_OPENING = "전화드렸어요. 맡기신 일 때문에 연락드렸는데, 무엇을 도와드릴까요?"
 DETAIL_NOTE = "(맡기신 작업의 전체 결과예요. 전화로는 요약만 말씀드렸어요.)"
+
+
+# ---------- iPhone data relay (PHONE_DATA.md §3a): gateway <-> the phone in a call; nothing is stored ----------
+PHONE_KINDS = {"health", "sleep", "workouts", "calendar", "reminders", "contacts", "location", "now_playing"}
+phones: list = []  # [{"send", "kinds"}], the latest call last; a secret call says no kinds
+phone_asks: dict = {}  # query id -> the link that asked
+PHONE_TASKS: set = set()
+
+
+async def phone_query(lk, msg):
+    qid, kind = msg.get("id"), msg.get("kind")
+    peer = next((p for p in reversed(phones) if kind in p["kinds"]), None)
+    if not isinstance(qid, str) or peer is None:
+        await lk.send({"id": qid, "type": "phone_result", "ok": False, "error": "offline"})
+        return
+    if len(phone_asks) > 50:
+        phone_asks.pop(next(iter(phone_asks)))
+    phone_asks[qid] = lk
+    await peer["send"]({"type": "phone_query", "id": qid, "kind": kind,
+                        "args": msg.get("args") if isinstance(msg.get("args"), dict) else {}})
+
+
+async def phone_result(msg):
+    if (lk := phone_asks.pop(msg.get("id"), None)) is not None:
+        await lk.send({k: msg[k] for k in ("id", "ok", "data", "error") if k in msg} | {"type": "phone_result"})
 
 
 # ---------- brain: context and local tools for Qwen (PROTOCOL.md section 6) ----------
@@ -2685,6 +2713,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     await send({"type": "secret", "value": current["secret"]})
                 if kind == "text":  # typed during the call: a user turn like a transcript, no STT, no VAD
                     await typed_turn(frame)
+                if kind == "phone_hello":  # the categories the phone answers in this call
+                    ks = frame.get("kinds")
+                    phones[:] = [p for p in phones if p["send"] is not send]
+                    phones.append({"send": send, "kinds": PHONE_KINDS & set(ks if isinstance(ks, list) else [])})
+                if kind == "phone_result":  # relayed, never stored or logged (secret calls included)
+                    side(phone_result(frame))
                 if kind == "mode" and (v := frame.get("value")) in BRAIN_MODES:
                     current["mode"] = v
                     CALL_MODE.set(v)  # from the next reply on
@@ -2721,6 +2755,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     except WebSocketDisconnect:
         pass
     finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
+        phones[:] = [p for p in phones if p["send"] is not send]
         left = [t for t in {*current["replies"], *current["side"], current["task"]} if t and not t.done()]
         for t in left:
             t.cancel()
@@ -4624,4 +4659,28 @@ if __name__ == "__main__":
         assert all(n in text for n in ("call_user", "memory_recall", "web_search", "infra_health", "calendar_events",
                                        "spark__run_command", "run_command=명령 실행", "vd-core")), text
         assert "도구가 없다" in text and "서버, 인프라, 노드" in text and len(text) < 4000, len(text)
+
+        async def phone_relay_check():  # PHONE_DATA.md §3a: only a phone that offers the kind is asked
+            got, to_phone = [], []
+
+            class FakeLink:
+                mode = "full"
+
+                async def send(self, obj):
+                    got.append(obj)
+
+            async def phone_send(obj):
+                to_phone.append(obj)
+            lk = FakeLink()
+            phones[:] = [{"send": phone_send, "kinds": {"health"}}]
+            await phone_query(lk, {"id": "q1", "kind": "location"})
+            await phone_query(lk, {"id": "q2", "kind": "health", "args": {"from": "2026-11-22"}})
+            await phone_result({"id": "q2", "ok": True, "data": {"days": []}, "junk": 1})
+            await phone_result({"id": "q9", "ok": True})  # nobody asked: dropped
+            phones.clear()
+            return got, to_phone
+        got, to_phone = asyncio.run(phone_relay_check())
+        assert got == [{"id": "q1", "type": "phone_result", "ok": False, "error": "offline"},
+                       {"id": "q2", "ok": True, "data": {"days": []}, "type": "phone_result"}], got
+        assert to_phone == [{"type": "phone_query", "id": "q2", "kind": "health", "args": {"from": "2026-11-22"}}]
         print("voice_server checks ok")
