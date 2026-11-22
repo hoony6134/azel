@@ -43,6 +43,7 @@ import tools_bridge
 import nim
 import oauth
 import spotify
+import risk
 import wake_enroll
 import claude_api
 from claude_warm import Pool, base_cmd
@@ -1256,6 +1257,18 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
     return {"call_id": call_id, **push}
 
 
+async def serve_auto_grant(m):
+    """{"type":"auto_grant","session","value","devices"?,"minutes"?} from the call (the user's own toggle, or the
+    call hanging up): create or end the session's grant. Its auto_state frame answers."""
+    try:
+        if m.get("value") is True:
+            await grant_create({"session": m["session"]}, m.get("devices"), m.get("minutes", 120), by="app")
+        else:
+            await end_grants({"session": m["session"]})
+    except (HTTPException, StateDown) as e:
+        print("auto grant from the call failed:", type(e).__name__, flush=True)
+
+
 async def place_held_call(kw):
     await asyncio.sleep(3)  # the phone needs a moment after hanging up before it rings again
     try:
@@ -2028,6 +2041,7 @@ async def handle_link(ws):
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
                 asyncio.create_task(post_call_facts(m["log_id"], warm_key.split(":", 1)[0]))
+                asyncio.create_task(end_grants({"session": warm_key}))  # a call's grant ends with it
                 if not call_warm_keys:  # the line is free: the finish calls that waited for it ring now
                     while pending_finish:
                         asyncio.create_task(place_held_call(pending_finish.pop(0)))
@@ -2040,6 +2054,8 @@ async def handle_link(ws):
             tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
+        elif m.get("type") == "auto_grant" and isinstance(m.get("session"), str):  # the call's toggle (the app)
+            asyncio.create_task(serve_auto_grant(m))
         elif m.get("type") == "announce_result" and (f := announce_waits.get(m.get("id"))) and not f.done():
             f.set_result(m)
         elif m.get("type") == "call_answered":
@@ -3008,6 +3024,16 @@ async def create_approval(body: dict):
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
+    if (grant := await grant_for(requester, row["device"])) is not None:  # the user said "알아서 해" for this run
+        tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,
+                                          haiku=None if await brain_mode() == "local" else haiku_classify)
+        print(f"auto-approve: {tier} by {stage} on {row['device']} (grant {grant['id']})", flush=True)
+        if tier == risk.SAFE:
+            await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+            meta.update(decision="auto", grant_id=grant["id"], stage=stage)
+            await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+            await grant_audit(grant, {"at": now, "device": row["device"], "command": row["command"][:200], "stage": stage})
+            return {"approval_id": aid, "status": "approved", "auto": True, "grant_id": grant["id"]}
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     try:  # the app shows it; the command text only (never output), shortened
         await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", type="approval",
@@ -3015,6 +3041,163 @@ async def create_approval(body: dict):
     except Exception as e:
         print("approval push failed:", type(e).__name__, flush=True)
     return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
+
+
+# ---------- auto-approve: the user lets ordinary commands run without a tap for one call or task ----------
+AUTO_MAX_S = 7200
+AUTO_KEY = "/v1/state/kv/auto-grants"
+secret_grants: dict[str, dict] = {}  # secret calls' grants: memory only, nothing persists
+
+
+async def grants_live():
+    """Every unexpired grant (shared ones from kv, secret ones from memory); expired ones end with their summary."""
+    now, rows = time.time(), await state.call("GET", AUTO_KEY) or []
+    live = [g for g in rows if g["expires_at"] > now]
+    for g in [g for g in rows if g["expires_at"] <= now]:
+        await grant_end(g, "expired", rows=live)
+    for gid in [k for k, g in secret_grants.items() if g["expires_at"] <= now]:
+        secret_grants.pop(gid, None)
+    return live + list(secret_grants.values())
+
+
+async def grant_create(scope, devices=None, minutes=120, by="app"):
+    """scope: {"session": "<persona>:<session>"} | {"task": "<id>"}. A new grant for the same scope replaces it."""
+    if not (isinstance(scope, dict) and (ORIGIN_RE.fullmatch(str(scope.get("session") or "")) or
+                                         re.fullmatch(r"[0-9a-f]{12}", str(scope.get("task") or "")))):
+        raise HTTPException(400, "scope: {session} or {task}")
+    if devices is not None and not (isinstance(devices, list) and all(isinstance(d, str) for d in devices)):
+        raise HTTPException(400, "devices: a list of device ids")
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        raise HTTPException(400, "minutes: a positive number (at most 120)")
+    key = {"session": scope["session"]} if scope.get("session") else {"task": scope["task"]}
+    for g in [g for g in await grants_live() if g["scope"] == key]:
+        await grant_end(g, "replaced", summary=False)
+    g = {"id": uuid.uuid4().hex[:10], "scope": key, "devices": devices, "by": by, "created": time.time(),
+         "expires_at": time.time() + min(minutes * 60, AUTO_MAX_S), "secret": is_secret(key.get("session")), "log": []}
+    if g["secret"]:
+        secret_grants[g["id"]] = g
+    else:
+        await state.call("PUT", AUTO_KEY, [*(await state.call("GET", AUTO_KEY) or []), g][-50:])
+    await auto_state(g, True)
+    return g
+
+
+async def grant_end(g, why, rows=None, summary=True):
+    """Revoke a grant (hangup, task end, expiry, the user); a push sums up what ran without a tap (no command text on
+    the lock screen; the app shows them)."""
+    if g["secret"]:
+        secret_grants.pop(g["id"], None)
+    else:
+        left = rows if rows is not None else [x for x in await state.call("GET", AUTO_KEY) or [] if x["id"] != g["id"]]
+        await state.call("PUT", AUTO_KEY, [x for x in left if x["id"] != g["id"]])
+    print(f"auto-approve: grant {g['id']} ended ({why}), {len(g['log'])} ran", flush=True)
+    await auto_state(g, False)
+    if summary and g["log"] and not g["secret"]:
+        try:
+            await send_alert_push("자동 실행 요약", f"자동으로 실행한 명령 {len(g['log'])}개가 있어요. 앱에서 확인해 주세요.",
+                                  type="auto_summary", grant_id=g["id"])
+            await state.call("PUT", f"/v1/state/kv/auto-log-{g['id']}", g["log"])
+        except Exception as e:
+            print("auto-approve summary failed:", type(e).__name__, flush=True)
+
+
+async def grant_for(requester, device):
+    """The live grant covering this run and device: its call's, its task's, or the call a task came from."""
+    if not requester:
+        return None
+    keys = []
+    if requester.get("session"):
+        keys.append({"session": requester["session"]})
+    if tid := requester.get("task_id"):
+        keys.append({"task": tid})
+        t = task_live.get(tid) or await state.call("GET", task_key(tid))
+        if t and t.get("origin_session"):
+            keys.append({"session": t["origin_session"]})  # a task started in a call shares its grant
+    return next((g for g in await grants_live() if g["scope"] in keys and (not g["devices"] or device in g["devices"])),
+                None)
+
+
+async def grant_audit(g, entry):
+    g["log"].append(entry)
+    if not g["secret"]:
+        rows = await state.call("GET", AUTO_KEY) or []
+        await state.call("PUT", AUTO_KEY, [{**x, "log": g["log"]} if x["id"] == g["id"] else x for x in rows])
+
+
+async def auto_state(g, on):
+    """Tell the voice server, so the call's state frames show it (session grants only)."""
+    if g["scope"].get("session"):
+        try:
+            await link_send({"type": "auto_state", "session": g["scope"]["session"], "value": on,
+                             "expires_at": g["expires_at"] if on else None, "grant_id": g["id"]})
+        except Exception:
+            pass
+
+
+async def end_grants(scope):
+    for g in [g for g in await grants_live() if g["scope"] == scope]:
+        await grant_end(g, "finished")
+
+
+async def qwen_classify(system, user):
+    return await llm_json(system, user, max_tokens=200)
+
+
+async def haiku_classify(system, user):
+    if not API_KEY:
+        return None
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(claude_api.API_URL, json=claude_api.request_body(
+            "haiku", system, [], [{"role": "user", "content": user}], max_tokens=200),
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01"})
+    r.raise_for_status()
+    m = r.json()
+    await record_usage({"model": "haiku", "path": "api", "task": "auto_approve",
+                        "input_tokens": (m.get("usage") or {}).get("input_tokens", 0),
+                        "output_tokens": (m.get("usage") or {}).get("output_tokens", 0),
+                        "cost_usd": claude_api.cost_usd("haiku", m.get("usage") or {})})
+    return "".join(b.get("text", "") for b in m.get("content", []) if b.get("type") == "text")
+
+
+def grant_view(g):
+    return {k: g[k] for k in ("id", "scope", "devices", "by", "created", "expires_at")} | {"ran": len(g["log"])}
+
+
+@app.post("/v1/auto-approve")
+async def auto_approve_post(body: dict):
+    """The app's toggle: {"session"|"task", "devices"?, "minutes"? (≤120)} -> the grant."""
+    full_only()
+    scope = {k: body[k] for k in ("session", "task") if body.get(k)}
+    return grant_view(await grant_create(scope, body.get("devices"), body.get("minutes", 120), by="app"))
+
+
+@app.get("/v1/auto-approve")
+async def auto_approve_get():
+    full_only()
+    return [grant_view(g) for g in await grants_live() if not g["secret"]]
+
+
+@app.get("/v1/auto-approve/{gid}")
+async def auto_approve_one(gid: str):
+    """A grant (live or ended) with what ran under it: device, command, when, and which stage judged it safe."""
+    full_only()
+    g = next((g for g in await grants_live() if g["id"] == gid and not g["secret"]), None)
+    if g:
+        return grant_view(g) | {"log": g["log"]}
+    log = await state.call("GET", f"/v1/state/kv/auto-log-{quote(gid, safe='')}")
+    if log is None:
+        raise HTTPException(404, "no such grant")
+    return {"id": gid, "ended": True, "log": log}
+
+
+@app.delete("/v1/auto-approve/{gid}")
+async def auto_approve_delete(gid: str):
+    full_only()
+    g = next((g for g in await grants_live() if g["id"] == gid), None)
+    if not g:
+        raise HTTPException(404, "no such grant")
+    await grant_end(g, "revoked")
+    return Response(status_code=204)
 
 
 @app.get("/v1/approvals")
@@ -3446,6 +3629,7 @@ async def run_task(t):
             print("task not saved:", t["id"], flush=True)
         if t["status"] != "cancelled":
             await task_notify(t)
+        await end_grants({"task": t["id"]})
 
 
 EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\u2B50\u2B55\u2705\u274C]")
@@ -3743,6 +3927,8 @@ bridge = tools_bridge.Bridge(
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
     web_ok=lambda: searxng_ok(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
+    auto_grant=lambda scope, devices, minutes: grant_create(scope, devices, minutes, by="voice"),
+    auto_end=lambda scope: end_grants(scope),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))

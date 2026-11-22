@@ -42,6 +42,7 @@ CASES = {
     "music_play": ("아이유 노래 틀어줘", "model"),
     "music_control": ("다음 곡으로 넘겨줘", "model"),
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),
+    "auto_approve": ("권한 줄 테니까 이번 통화 동안은 알아서 해", "model"),
 }
 
 

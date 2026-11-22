@@ -119,6 +119,27 @@ answering a call the assistant placed; the server then speaks that call's openin
   the assistant speaks or thinks it interrupts first, like a tap (`interrupt`, then the new reply). `speak:false`
   (default true): the reply comes as `reply` captions and `turn_done` with no audio and no filler lines. The mic
   stays live: speech during a typed turn is handled as usual.
+- **Auto-approve** (like Claude Code's auto mode, only when the user grants it): while a grant is live, a device
+  command whose run (this call, or a task started in it, or a task granted directly) asks for approval runs at once
+  when it classifies **safe**; **risky** ones still need a tap, and the daemons' hard_deny is unchanged.
+  - Grant from the call: client → `{"type":"auto_approve","value":true|false,"minutes"?,"devices"?}`; the server answers
+    `{"type":"auto_approve","value","expires_at"}` when the gateway confirms, and every `state` frame carries
+    `"auto": true|false`. `hello.caps` lists `"auto_approve"`. The grant ends at hangup, after `minutes` (≤ 120), or on
+    `value:false`. By voice: the model's `auto_approve` action, only for the call's own ask (never a task), refused
+    right after a web, mail, Cygnus or memory read in the same run, and always read back once ("이번 통화 동안 위험하지
+    않은 명령은 묻지 않고 바로 실행할게요. …맞죠?").
+  - Gateway REST (app): `POST /v1/auto-approve` `{"session"|"task","devices"?,"minutes"?}` → `{"id","scope","devices",
+    "by","created","expires_at","ran"}`; `GET /v1/auto-approve` (live grants); `GET /v1/auto-approve/{id}` (with `log`:
+    device, command, at, stage, also after it ended); `DELETE /v1/auto-approve/{id}` → 204. A task's grant ends with
+    the task.
+  - Tiers (`gateway/risk.py`): deterministic rules first (reads, status, a single named service or container restart,
+    files inside the working directory, `open -a` → safe; recursive or mass delete, service stop/disable/reboot,
+    installs, users and permissions, sending data off-host, secrets-adjacent paths, git push/force, docker rm/prune/
+    volume rm, kill -9, osascript and the like → risky), then the local Qwen, then Haiku (never in local brain mode),
+    then risky. Cached per command+cwd+device; the gateway log says which stage decided.
+  - Audit: the approval's meta has `decision: "auto"`, `grant_id`, `stage`; the grant keeps the list. When a grant with
+    runs ends, a push "자동으로 실행한 명령 N개가 있어요" (type `auto_summary`, `grant_id`; no command text on the lock
+    screen). Secret calls: the grant works but lives in memory only, is never listed, and sends no summary.
 - **Secret calls**: `/v1/call?secret=1`, or `{"type":"secret","value":true}` during a call (the server answers
   `{"type":"secret","value":true}`; turning it off is refused with the same frame: a secret call stays secret). Every
   `state` frame carries `"secret": true|false`. In a secret call:

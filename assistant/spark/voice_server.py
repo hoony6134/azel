@@ -546,7 +546,7 @@ class GatewayLinks:
         elif t == "context":
             if lk.brain and isinstance(msg.get("value"), str):
                 self.take_context(msg.get("session"), msg["value"], msg.get("persona"))
-        elif t in ("settings", "call", "announce") and lk.mode != "full":
+        elif t in ("settings", "call", "announce", "auto_state") and lk.mode != "full":
             return  # shared settings and call openings come from full gateways only
         elif t == "settings":
             self.settings = msg.get("value") if isinstance(msg.get("value"), dict) else {}
@@ -566,6 +566,9 @@ class GatewayLinks:
             ctx = msg.get("context")
             self.openings[msg["call_id"]]["context"] = {k: str(ctx.get(k) or "")[:60] for k in ("kind", "label", "id")} \
                 if isinstance(ctx, dict) and ctx.get("kind") in ("task", "schedule") else None
+        elif t == "auto_state":  # the gateway started or ended the call's auto-approve grant
+            if hook := call_hooks.get(msg.get("session")):
+                asyncio.get_running_loop().create_task(hook(msg))
         elif t == "announce":  # a task finished while its user is on this call: say it here, not in a new call
             q = active_calls.get(msg.get("session")) if isinstance(msg.get("opening"), str) and msg["opening"] else None
             if q is not None:
@@ -578,6 +581,7 @@ class GatewayLinks:
 
 links = GatewayLinks()
 active_calls: dict[str, asyncio.Queue] = {}  # "<persona>:<session>" of each live call -> its announcements
+call_hooks: dict = {}  # "<persona>:<session>" -> the call's handler for the gateway's auto_state frames
 FALLBACK_OPENING = "전화드렸어요. 맡기신 일 때문에 연락드렸는데, 무엇을 도와드릴까요?"
 DETAIL_NOTE = "(맡기신 작업의 전체 결과예요. 전화로는 요약만 말씀드렸어요.)"
 
@@ -2186,7 +2190,7 @@ def real_content(text):
     return len(re.findall(r"[가-힣]", "".join(words))) >= 2 or bool(re.search(r"[A-Za-z]{3,}", text))
 
 
-CALL_CAPS = ("text", "played", "mode", "secret")
+CALL_CAPS = ("text", "played", "mode", "secret", "auto_approve")
 SECRET_PREFIX = "secret-"  # a secret call's throwaway session key (the gateway keys its own rules off this)  # client messages /v1/call understands beyond audio, hangup and interrupt
 TEXT_MAX, TEXT_GAP_S = 1000, 1.0  # a typed message: at most this long, and one per second
 TAIL_GUARD_S = 1.0  # the phone may still be playing this long after the server's estimate (network, buffering)
@@ -2341,8 +2345,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             else:
                 if obj.get("type") == "reply":
                     current["said"].append((time.monotonic(), str(obj.get("text", ""))))
-                if obj.get("type") == "state":  # every state frame says which brain answers, and whether it's secret
-                    obj = {**obj, "mode": current["mode"], "secret": current["secret"]}
+                if obj.get("type") == "state":  # every state frame says which brain answers, secret, auto-approve
+                    obj = {**obj, "mode": current["mode"], "secret": current["secret"], "auto": current.get("auto", False)}
                 await ws.send_text(json.dumps(obj, ensure_ascii=False))
 
     guard = OpeningGuard()
@@ -2651,6 +2655,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             current["task"] = current["opening"] = spawn(speak_opening(op))
         call_key = f"{pid}:{session}"
         active_calls[call_key] = announce_q = asyncio.Queue()
+
+        async def on_auto_state(m):
+            current["auto"] = m.get("value") is True
+            await send({"type": "auto_approve", "value": current["auto"], "expires_at": m.get("expires_at")})
+        call_hooks[call_key] = on_auto_state
         side(announcer(announce_q))
         await send({"type": "mode", "value": current["mode"]})  # the app shows which brain answers
         await send({"type": "state", "value": "listening"})
@@ -2683,6 +2692,10 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                             history[k.rsplit(":", 1)[0] + f":{session}"] = deque(history[k], maxlen=MAX_TURNS * 2)
                         current["secret"] = True
                     await send({"type": "secret", "value": current["secret"]})
+                if kind == "auto_approve":  # the app's toggle: the gateway makes or ends the grant, auto_state answers
+                    await links.notify({"type": "auto_grant", "session": call_key, "value": frame.get("value") is True,
+                                           **({"minutes": frame["minutes"]} if isinstance(frame.get("minutes"), (int, float)) else {}),
+                                           **({"devices": frame["devices"]} if isinstance(frame.get("devices"), list) else {})})
                 if kind == "text":  # typed during the call: a user turn like a transcript, no STT, no VAD
                     await typed_turn(frame)
                 if kind == "mode" and (v := frame.get("value")) in BRAIN_MODES:
@@ -2731,6 +2744,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         links.session_ctx.pop(session, None)
         for k in [k for k, q in active_calls.items() if k.endswith(f":{session}")]:
             active_calls.pop(k, None)
+            call_hooks.pop(k, None)
+            if current.get("auto"):  # its grant ends with the call (a secret call has no call log to end it)
+                await links.notify({"type": "auto_grant", "session": k, "value": False})
         for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
             games.pop(k, None)
         if current["secret"]:  # forget the secret turns: history, title rhythm, a half-asked schedule
@@ -2744,7 +2760,7 @@ if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
         def nomode(f):  # state frames carry the call's brain mode and secret flag; most checks don't care
-            return {k: v for k, v in f.items() if k not in ("mode", "secret")} if isinstance(f, dict) else f
+            return {k: v for k, v in f.items() if k not in ("mode", "secret", "auto")} if isinstance(f, dict) else f
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
         for noise in ["MBC 뉴스 김철수입니다.", "MBC 뉴스 이덕영입니다", "시청해 주셔서 감사합니다", "시청해주셔서 감사합니다!",
@@ -3636,13 +3652,24 @@ if __name__ == "__main__":
                     f = json.loads(m["text"])
                     if f["type"] == "reply":
                         announced.append(f["text"])
-                    if f == {"type": "state", "value": "listening", "mode": f.get("mode"), "secret": False} and announced:
+                    if nomode(f) == {"type": "state", "value": "listening"} and announced:
+                        break
+                w.send_text(json.dumps({"type": "auto_approve", "value": True, "minutes": 30}))  # the app's toggle
+                time.sleep(0.2)
+                grant_req = [m for m in full.ws.sent if m.get("type") == "auto_grant"]
+                w.portal.call(links.receive, full, {"type": "auto_state", "session": "azel:live", "value": True,
+                                                    "expires_at": 123.0, "grant_id": "g1"})
+                while True:
+                    m = w.receive()
+                    if m.get("text") and (f := json.loads(m["text"]))["type"] == "auto_approve":
+                        auto_frame = f
                         break
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.1)
             results = {m["id"]: m["ok"] for m in full.ws.sent if m.get("type") == "announce_result"}
+            grant_end = [m for m in full.ws.sent if m.get("type") == "auto_grant"][len(grant_req):]
             links.remove(full)
-            return opening_said, others, asked, fallback, announced, results, heard
+            return opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end
         def typed_check():
             """Typing during a call: a user turn without STT (no transcript echo, input "text" in the log), captions only
             with speak=false, rejected when too long or too fast, and typing over a reply interrupts it."""
@@ -3933,9 +3960,9 @@ if __name__ == "__main__":
             asyncio.run(placed())
             assert set(voices) == {"vivian"}
             with tc.websocket_connect("/v1/call?session=pm&mode=local", headers={"Authorization": "Bearer app-tok"}) as w:
-                assert json.loads(w.receive_text()) == {"type": "hello", "caps": ["text", "played", "mode", "secret"]}  # first
+                assert json.loads(w.receive_text()) == {"type": "hello", "caps": ["text", "played", "mode", "secret", "auto_approve"]}  # first
                 assert json.loads(w.receive_text()) == {"type": "mode", "value": "local"}  # on connect
-                assert json.loads(w.receive_text()) == {"type": "state", "value": "listening", "mode": "local", "secret": False}
+                assert json.loads(w.receive_text()) == {"type": "state", "value": "listening", "mode": "local", "secret": False, "auto": False}
                 w.send_text(json.dumps({"type": "mode", "value": "bogus"}))  # ignored
                 w.send_text(json.dumps({"type": "mode", "value": "claude_api"}))
                 assert json.loads(w.receive_text()) == {"type": "mode", "value": "claude_api"}  # on each change
@@ -4038,7 +4065,10 @@ if __name__ == "__main__":
         assert max(gaps, default=0) <= 50 and max(ogaps, default=0) <= 50, (gaps, ogaps)  # no audible gap
         assert osaid == op["parts"] and len(osaid) > 3  # the opening, in order
         assert oev[0][0] < calls[-1][0], "the opening started playing before its last chunk was synthesized"
-        opening_said, others, asked, fallback, announced, results, heard = task_call_check()
+        opening_said, others, asked, fallback, announced, results, heard, grant_req, auto_frame, grant_end = task_call_check()
+        assert grant_req == [{"type": "auto_grant", "session": "azel:live", "value": True, "minutes": 30}], grant_req
+        assert auto_frame == {"type": "auto_approve", "value": True, "expires_at": 123.0}
+        assert grant_end == [{"type": "auto_grant", "session": "azel:live", "value": False}]  # ends at hangup
         assert len(heard) == 2 and others == [], others  # both "여보세요" were heard, neither cut in nor answered
         assert " ".join(opening_said).endswith("더 궁금한 거 물어보세요.") and len(set(opening_said)) == len(opening_said)
         assert opening_said[0].startswith("정훈님, 맡기신") and len(asked) == 1  # one turn: the follow-up, no greeting reply
