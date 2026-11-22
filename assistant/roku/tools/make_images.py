@@ -100,6 +100,41 @@ def light_image(w=64, h=54):
     Image.fromarray(np.round(img.reshape(h, 2, w, 2, 4).mean(axis=(1, 3))).astype(np.uint8), "RGBA").save(OUT / "orb_light.png", optimize=True)
 
 
+def channel_art():
+    """The channel icons and splash from the app icon artwork (design/icon/AppIcon-1024.png): the same green ground
+    and porcelain jar, centred, no floor shadow. The ground is the icon's own gradient rebuilt at any aspect ratio
+    (a quadratic fit to its outer pixels); the jar and its soft halo are cut from the icon with a feathered round mask."""
+    src = Image.open(HERE.parent.parent / "design" / "icon" / "AppIcon-1024.png").convert("RGB")
+    a = np.asarray(src).astype(float)
+    # the ground: a quadratic surface fitted to the icon's pixels outside the jar's halo, so it matches the crop
+    gy, gx = np.mgrid[0:1024, 0:1024]
+    far = np.hypot(gx - 512, gy - 512) > 440
+    gu, gv = gx[far] / 1023.0, gy[far] / 1023.0
+    basis = lambda u, v: np.stack([np.ones_like(u), u, v, u * u, u * v, v * v], axis=-1)  # noqa: E731
+    coef = np.linalg.lstsq(basis(gu, gv), a[far], rcond=None)[0]
+    side = 920  # source square around the jar and its halo
+    crop = src.crop((512 - side // 2, 512 - side // 2 + 8, 512 + side // 2, 512 + side // 2 + 8))
+
+    def make(w, h, orb_h, name):
+        yy, xx = np.mgrid[0:h, 0:w]
+        u, v = xx / (w - 1), yy / (h - 1)
+        ground = np.clip(basis(u, v) @ coef, 0, 255)
+        out = Image.fromarray(np.round(ground).astype(np.uint8), "RGB")
+        L = round(orb_h / (620 / side))  # the jar is about 620 px tall in the source
+        piece = crop.resize((L, L), Image.LANCZOS)
+        ys, xs = np.mgrid[0:L, 0:L]
+        d = np.hypot((xs + 0.5) / L - 0.5, (ys + 0.5) / L - 0.5) / 0.5
+        mask = np.clip((1 - d) / 0.22, 0, 1)  # opaque over the jar and its halo, feathered only in the empty ground
+        out.paste(piece, ((w - L) // 2, (h - L) // 2), Image.fromarray(np.round(mask * 255).astype(np.uint8), "L"))
+        out.save(OUT / name, optimize=True)
+
+    make(336, 210, 150, "icon_hd.png")
+    make(540, 405, 270, "icon_fhd.png")
+    make(248, 140, 100, "icon_sd.png")
+    make(1280, 720, 300, "splash_hd.png")
+    make(1920, 1080, 450, "splash_fhd.png")
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     nine("card.9.png", rrect_mask(24, 24, 8), (8, 16, 8, 16))
@@ -110,6 +145,7 @@ def main():
     Image.fromarray(wrap, "RGBA").save(OUT / "rule_wrap.png", optimize=True)
     orb_images()
     light_image()
+    channel_art()
 
 
 if __name__ == "__main__":

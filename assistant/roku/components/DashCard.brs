@@ -3,17 +3,7 @@
 
 sub init()
     m.fill = mkPoster(m.top, "pkg:/images/card.9.png", 0, 0, 414, 200, pal("card"))
-    m.head = CreateObject("roSGNode", "MultiStyleLabel")
-    m.head.translation = [28, 24]
-    m.head.wrap = true
-    m.head.maxLines = 2
-    m.head.lineSpacing = 6
-    m.head.drawingStyles = {
-        default: {fontUri: "pkg:/fonts/PretendardKR-Regular.otf", fontSize: 30, color: "#ECF0ECFF"}
-        crit: {fontUri: "pkg:/fonts/PretendardKR-SemiBold.otf", fontSize: 30, color: "#FF7A6EFF"}
-        soon: {fontUri: "pkg:/fonts/PretendardKR-SemiBold.otf", fontSize: 30, color: "#E9BC6EFF"}
-    }
-    m.top.appendChild(m.head)
+    m.kind = mkLabel(m.top, 28, 24, 358, 30, 24, "sb", pal("danger"))
     m.big = mkLabel(m.top, 28, 24, 0, 48, 44, "sb", pal("text"))
     m.big.width = 0
     m.tail = mkLabel(m.top, 0, 38, 0, 30, 24, "r", pal("text2"))
@@ -48,7 +38,7 @@ sub init()
         m.bl[i].width = 0
         m.bm.Push(mkLabel(m.top, x, 146, 216, 30, 24, "r", pal("text3")))
     end for
-    m.all = [m.head, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down]
+    m.all = [m.kind, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down]
     m.fillBase = pal("card")
 end sub
 
@@ -97,12 +87,15 @@ sub onContent()
     m.meta.width = inner
     m.meta.text = c.d_meta
     m.sent.width = inner
-    m.head.width = inner
-    m.head.height = 90
+    m.kind.width = inner
     if t = "urgent"
-        s = "<" + c.d_hl + ">" + c.d_head + "</" + c.d_hl + "> " + c.d_sent
-        m.head.text = s
-        m.head.visible = true
+        ' the kind on its own line in its colour, then the sentence
+        m.kind.text = c.d_head
+        if c.d_hl = "crit" then m.kind.color = pal("danger") else m.kind.color = pal("amber")
+        show(m.kind, 28, 24)
+        m.sent.text = c.d_sent
+        m.sent.height = 80
+        show(m.sent, 28, 58)
         show(m.meta, 28, 146)
     else if t = "slot"
         m.big.text = c.d_when
