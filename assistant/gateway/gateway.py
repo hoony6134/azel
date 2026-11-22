@@ -129,7 +129,8 @@ DEFAULTS = {
     # weather tool's default place when none is said (Open-Meteo; GIST in 광주)
     "weather_home": {"name": "광주", "lat": 35.2285, "lon": 126.8434},
     # the TV's 내 종목: a name, or "name (TICKER)" to pin the listing (a bare name is looked up; unlisted shows 비상장)
-    "holdings": ["애플 (AAPL)", "토스", "엔비디아 (NVDA)", "삼성전자 (005930)", "SK하이닉스 (000660)"],
+    "holdings": ["애플 (AAPL)", "엔비디아 (NVDA)", "삼성전자 (005930)", "SK하이닉스 (000660)", "SOS랩 (464080)",
+                 "엔트로픽 (ANT)", "SK스퀘어 (402340)", "LS산전 (010120)", "S&P500 (^GSPC)", "세트렉아이 (099320)"],
     "search_backend": "searxng",  # searxng (the user's own, free; local Qwen may use it) | haiku (paid Claude search)
     "searxng_url": os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
@@ -2644,6 +2645,50 @@ async def tv_weather():
     return {"source": r["source"], "place": home["name"], **(r.get("data") or {})}
 
 
+def holding_key(entry):
+    """What two holdings entries are compared by: the name before any `(TICKER)`, spaces and case ignored."""
+    return re.sub(r"\s+", "", re.sub(r"\(.*\)\s*$", "", entry)).lower()
+
+
+async def holdings_update(add, remove):
+    """The voice tool holdings_update: edit the `holdings` setting (the TV's 내 종목). An entry is removed by its name or
+    its ticker; one already there (same name) is replaced, so a ticker can be added later. At most 12."""
+    s = await load_settings()
+    cur = list(s.get("holdings") or [])
+    clean = [" ".join(str(x).split())[:40] for x in add if str(x).strip()]
+    gone = {holding_key(x) for x in remove} | {str(x).strip().upper() for x in remove}
+    tick = lambda e: (m.group(1) if (m := re.search(r"\(([^)]+)\)\s*$", e)) else "")  # noqa: E731
+    removed = [e for e in cur if holding_key(e) in gone or tick(e).upper() in gone]
+    out = [e for e in cur if e not in removed]
+    added = []
+    for e in clean:
+        out = [x for x in out if holding_key(x) != holding_key(e)]
+        out.append(e)
+        added.append(e)
+    if len(out) > 12:
+        raise ValueError("보유 종목은 12개까지 둘 수 있어요.")
+    s["holdings"] = out
+    await save_settings({k: v for k, v in s.items() if k != "personality_default"})
+    tv_quote_cache.value = None  # the TV shows the change on its next poll, not five minutes later
+    name = lambda e: re.sub(r"\s*\(.*\)\s*$", "", e)  # noqa: E731
+
+    def obj(names):  # 을/를 as read aloud: 애플을, 엔비디아를, S&P500을 (오백), a Latin ending 를
+        last = names[-1][-1:] if names else ""
+        if last.isdigit():  # 0 ends 십/백/천, then 일 삼 육 칠 팔 have a final consonant
+            return names + ("을" if last in "013678" else "를")
+        return names + ("을" if "가" <= last <= "힣" and (ord(last) - 0xAC00) % 28 else "를")
+
+    parts = []
+    if added:
+        parts.append(obj(", ".join(name(e) for e in added)) + " 넣었어요")
+    if removed:
+        parts.append(obj(", ".join(name(e) for e in removed)) + " 뺐어요")
+    if not parts:
+        parts.append("목록에 없는 종목이라 바뀐 게 없어요")
+    return {"spoken": f"보유 종목에서 {' 그리고 '.join(parts)}. 지금 {len(out)}개예요.", "holdings": out,
+            "added": added, "removed": removed}
+
+
 async def tv_holdings():
     names = (await load_settings()).get("holdings") or []
     async with httpx.AsyncClient(timeout=stock_quotes.TIMEOUT_S, headers=stock_quotes.UA, follow_redirects=True) as c:
@@ -4874,7 +4919,7 @@ bridge = tools_bridge.Bridge(
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
     task_approve_default=lambda: task_approve_default(),
     set_task_approve_default=lambda v: put_settings({"task_auto_approve_default": v}),
-    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), holdings_update=lambda add, remove: holdings_update(add, remove), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 

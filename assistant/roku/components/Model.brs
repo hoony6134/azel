@@ -872,6 +872,7 @@ function money(v as Float, cur as String) as String
         return s + out + unit
     end if
     if cur = "USD" then return "$" + fmt2(v)
+    if cur = "index" then return fmt2(v)
     return fmt2(v) + " " + cur
 end function
 

@@ -172,6 +172,7 @@ OVERNIGHT_LIST = {"name": "overnight_list", "description": "밤사이 하기로 
 TAINT_TOOLS = {"agenda", "web_search", "web_fetch", "memory_recall", "people_lookup", "task_status", "overnight_list"}
 SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "schedule_update": "예약 변경",
                 "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기", "home_scene": "집 장면 실행",
+                "holdings_update": "보유 종목 바꾸기",
                 "web_task": "브라우저 작업 맡기기"}
 TAINT_S = 600
 
@@ -423,6 +424,15 @@ class Bridge:
                 raise Fail("unavailable", f"지금은 주가를 가져오지 못했어요({type(e).__name__}).")
             return r["spoken"], r, r["spoken"] + " (이 문장대로, 출처와 날짜를 빼지 말고 답해. 날짜가 오늘이 아니면 그날 가격이라고 " \
                 "말하고 '지금'이라고 하지 마.)"
+        if name == "holdings_update":
+            add, remove = list(args.get("add") or []), list(args.get("remove") or [])
+            if not add and not remove:
+                raise Fail("invalid", "add나 remove에 종목을 하나 이상 넣어 주세요.")
+            try:
+                r = await self.d["holdings_update"](add, remove)
+            except ValueError as e:
+                raise Fail("invalid", str(e))
+            return r["spoken"], r, r["spoken"]
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
@@ -1191,6 +1201,14 @@ STOCK_QUOTE = {
                     "(Anthropic, AAPL, 005930), 환율이면 '달러 환율'. 결과 문장대로 답해."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
         "query": {"type": "string", "minLength": 1, "maxLength": 60}}}}
+HOLDINGS_UPDATE = {
+    "name": "holdings_update",
+    "description": ("보유 종목 목록을 바꿀 때 (예: '보유 목록에 OO 추가해줘', 'OO 빼줘'). TV 대시보드의 '내 종목'이 이 목록을 "
+                    "보여 줘요. add/remove에 종목 이름을 넣고, 티커를 알면 '삼성전자 (005930)', '애플 (AAPL)'처럼 괄호에 붙여. "
+                    "기억에 남기는 건 지금처럼 remember로 따로 해."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "add": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1, "maxLength": 40}},
+        "remove": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1, "maxLength": 40}}}}}
 WEB_SEARCH = {
     "name": "web_search",
     "description": ("웹 검색(뉴스, 가격, 사실 확인처럼 지금 정보가 필요할 때; 날씨는 weather, 주가·환율은 stock_quote). 답할 때는 '○○ 기준으로'처럼 출처 "
@@ -1250,7 +1268,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, HOLDINGS_UPDATE, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1311,6 +1329,9 @@ for _n, _m in {
     "stock_quote": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                     "no_rest": "앱에는 주식 화면이 없어요(모델 경로 전용).",
                     "examples": ({"query": "Samsung Electronics"}, {"query": ""})},
+    "holdings_update": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                        "no_rest": "앱은 PUT /v1/settings의 holdings를 써요(말로 바꾸는 건 모델 경로).",
+                        "examples": ({"add": ["SOS랩"]}, {})},
     "web_search": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                    "no_rest": "앱에는 검색 화면이 없어요(모델 경로 전용; claude -p는 자체 WebSearch).",
                    "examples": ({"query": "광주 날씨"}, {"query": ""})},
