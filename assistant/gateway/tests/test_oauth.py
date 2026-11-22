@@ -336,3 +336,20 @@ def test_bridge_runs_spotify_and_mcp_serves_it_to_claude_code_only(tmp_path):
     assert out["error"]["message"] == "unknown tool"
     init = asyncio.run(TB.mcp_handle(b, {"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}}))
     assert init["result"]["serverInfo"]["name"] == "azel"
+
+
+def test_custom_connector_with_oauth_api_key_and_allowlist_together(tmp_path):
+    class Disc:
+        connectors, plugins = [], []
+    conn = connectors.check({"custom": [{"name": "notes", "url": "https://mcp.example.com/mcp", "oauth": True,
+                                         "auth_ref": "notes", "allowed_tools": ["search", "read_*"]}]})
+    servers, allowed, *_ = connectors.run_args(conn, Disc, [], "t", tmp_path)
+    assert servers is None  # OAuth not connected yet: skipped even though it has an allowlist
+    connectors.put_secret(tmp_path, "notes", '{"X-Api-Key": "SECRET-KEY"}')
+    oauth.save(tmp_path, "notes", {"access_token": "SECRET-AT", "expires_at": time.time() + 600, "client_id": "c",
+                                   "token_endpoint": "https://auth.example.com/token"})
+    servers, allowed, *_ = connectors.run_args(conn, Disc, [], "t", tmp_path)
+    assert servers["notes"]["headers"] == {"X-Api-Key": "SECRET-KEY", "Authorization": "Bearer SECRET-AT"}
+    assert "mcp__notes__search" in allowed and "mcp__notes__read_*" in allowed and "mcp__notes" not in allowed
+    (tmp_path / "mcp" / "notes").chmod(0o644)  # a secret file others can read: never sent at all
+    assert connectors.run_args(conn, Disc, [], "t", tmp_path)[0] is None

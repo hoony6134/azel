@@ -423,7 +423,7 @@ def test_connectors_app_shape(gw, monkeypatch):
     got = c.put("/v1/connectors", json=put).json()
     assert [x["enabled"] for x in got["claude_ai"]] == [False, True]
     assert got["custom"] == [{"name": "linear", "url": "https://mcp.linear.app/sse", "transport": "sse", "enabled": True,
-                              "has_secret": False}]
+                              "has_secret": False, "allowed_tools": []}]
     r = c.put("/v1/connectors/secret/linear", json={"value": "lin_secret"})
     assert r.status_code == 204 and r.content == b""
     assert c.get("/v1/connectors").json()["custom"][0]["has_secret"] is True
@@ -1488,6 +1488,18 @@ def test_runs_load_only_enabled_connectors(gw):
     urls = {a["serverUrl"] for a in st["allowedMcpServers"]}
     assert urls == {"https://mcp.example/cygnus", "https://cal.example/mcp", "https://notion.example/mcp", azel}
     assert "mcp__claude_ai_Notion" in args and "mcp__wiki" not in args  # no secret yet: the server is skipped
+
+
+def test_connector_allowed_tools_round_trip(gw):
+    g, c, tmp = gw
+    r = c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp", "allowed_tools": ["Get*"]}]})
+    assert r.json()["custom"][0]["allowed_tools"] == ["Get*"]
+    assert c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp",
+                                                     "allowed_tools": ["a b"]}]}).status_code == 400
+    c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp"}]})  # an older app
+    assert c.get("/v1/connectors").json()["custom"][0]["allowed_tools"] == ["Get*"]  # kept, not wiped
+    c.put("/v1/connectors", json={"custom": [{"name": "ha", "url": "https://ha.example/api/mcp", "allowed_tools": []}]})
+    assert c.get("/v1/connectors").json()["custom"][0]["allowed_tools"] == []
 
 
 def test_connector_secret_is_write_only(gw):
