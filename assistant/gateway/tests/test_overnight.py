@@ -112,6 +112,8 @@ def test_morning_report_composition(tgw):
     assert "4개 중 1개" in notes[0][2]
     text, items = c.portal.call(g.overnight_report)  # the finished ones are told once; the rest come again
     assert [i["id"] for i in items] == ["a00000000004"]
+    told = c.get("/v1/tasks/a00000000001").json()
+    assert told["reported"] and told["notified_at"]  # 6e5ee04's startup re-tell skips it
 
     notes.clear()
     put_task(c, g, id="a00000000005", goal="백업 확인해 줘", status="done", result="백업은 어제 밤 2시에 끝났어요.")
