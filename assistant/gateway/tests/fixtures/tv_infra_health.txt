@@ -1,0 +1,9 @@
+As of 2026-11-23 03:15 KST (cpu = 5-min avg, disk = /)
+✓ exit1 [cygnus] cpu 7% · mem 67% · disk 15% · load 0.05/2 · uptime 142d
+✓ edge1 [cygnus] cpu 37% · mem 66% · disk 19% · load 1.05/2 · uptime 160d
+✓ lab1 [cygnus] cpu 3% · mem 49% · disk 29% · 69°C · load 0.08/4 · uptime 24d
+✓ compute1 [cygnus] cpu 2% · mem 36% · disk 55% · 48°C · load 0.13/4 · uptime 221d
+✓ status1 [cygnus] cpu 19% · mem 62% · disk 22% · load 0.87/2 · uptime 59d
+✓ core1 [cygnus] cpu 3% · mem 68% · disk 73% · load 0.08/2 · uptime 164d
+✓ gpu-core [vujade] cpu 2% · mem 24% · disk 25% · 45°C · load 0.02/12 · uptime 55d
+✓ gpu-spark [vujade] cpu 7% · mem 76% · disk 19% · 62°C · load 1.57/20 · uptime 1d
