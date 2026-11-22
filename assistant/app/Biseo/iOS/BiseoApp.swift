@@ -99,6 +99,11 @@ final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate 
             await PushAction.perform(action: action, userInfo: response.notification.request.content.userInfo)
             return
         }
+        if TaskModel.isOvernightPush(response.notification.request.content.userInfo) {
+            await TaskModel.shared.refresh()
+            await MainActor.run { TaskModel.shared.showList = true }   // the 작업 list, from the home card
+            return
+        }
         if let id = AutoGrantCenter.grantID(from: response.notification.request.content.userInfo) {
             await AutoGrantCenter.shared.openGrant(id: id)
             return

@@ -39,8 +39,11 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
     var error: String?
 
     var isActive: Bool { ["queued", "running", "waiting_approval"].contains(status) }
+    /// Waiting for its time (overnight, or an exact time).
+    var isScheduled: Bool { status == "scheduled" }
+    var scheduledFor: Date?
 
-    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, cost_usd, device, persona, persona_id, created_at, created, backend, fallback_reason, note, notify, error }
+    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, cost_usd, device, persona, persona_id, created_at, created, backend, fallback_reason, note, notify, error, scheduled_for }
 
     init(id: String, goal: String, status: String, steps: [Step] = [], result: String? = nil, cost: Double? = nil, device: String? = nil) {
         self.id = id; self.goal = goal; self.status = status; self.steps = steps; self.result = result; self.cost = cost; self.device = device
@@ -65,6 +68,7 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
         note = (try? c.decodeIfPresent(String.self, forKey: .note)).flatMap { $0.isEmpty ? nil : $0 }
         notify = try? c.decodeIfPresent(String.self, forKey: .notify)
         error = (try? c.decodeIfPresent(String.self, forKey: .error)).flatMap { $0.isEmpty ? nil : $0 }
+        scheduledFor = TaskTime.decode(c, .scheduled_for)
     }
 
     static func == (a: AgentTask, b: AgentTask) -> Bool { a.id == b.id && a.status == b.status && a.steps == b.steps && a.result == b.result }
@@ -87,6 +91,7 @@ enum TaskTime {
 enum TaskBadge {
     static func label(_ status: String) -> String {
         switch status {
+        case "scheduled": return "예약됨"
         case "queued": return "대기"
         case "running": return "진행 중"
         case "waiting_approval": return "승인 필요"
@@ -100,6 +105,7 @@ enum TaskBadge {
     static func color(_ status: String) -> Color {
         switch status {
         case "running", "queued": return Theme.indigo
+        case "scheduled": return Theme.text2
         case "waiting_approval": return Theme.amber
         case "done": return Theme.celadon
         case "failed": return Theme.danger
@@ -140,6 +146,18 @@ enum TaskBackend: String, CaseIterable, Identifiable {
     static func label(_ raw: String) -> String { TaskBackend(rawValue: raw)?.label ?? raw }
 }
 
+/// When a task runs: now, in the overnight window, or at a set time (≤ 7 days, app only).
+enum TaskWhen: Hashable {
+    case now, overnight, at(Date)
+}
+
+/// `overnight` in /v1/settings: the window and how the morning report arrives.
+struct OvernightSettings: Codable, Equatable {
+    var window: [String]          // ["01:00", "06:00"]
+    var report_push: Bool
+    var report_call: Bool
+}
+
 enum TaskNotify: String, CaseIterable, Identifiable {
     case call, push, none
     var id: String { rawValue }
@@ -159,15 +177,21 @@ enum TaskAPI {
         try JSONDecoder().decode(AgentTask.self, from: try await Gateway.send("GET", "/v1/tasks/" + escape(id)))
     }
 
-    static func body(goal: String, device: String?, persona: String?, notify: TaskNotify) -> [String: Any] {
+    static func body(goal: String, device: String?, persona: String?, notify: TaskNotify, when: TaskWhen = .now, autoApprove: Bool = false) -> [String: Any] {
         var b: [String: Any] = ["goal": goal.trimmingCharacters(in: .whitespacesAndNewlines), "notify": notify.rawValue]
+        switch when {
+        case .now: break
+        case .overnight: b["when"] = "overnight"
+        case .at(let d): b["when"] = KST.iso(d)
+        }
+        if when != .now && autoApprove { b["auto_approve"] = true }   // read-only commands only, server side
         if let device { b["device"] = device }
         if let persona { b["persona"] = persona }
         return b
     }
 
-    static func create(goal: String, device: String?, persona: String?, notify: TaskNotify) async throws -> AgentTask? {
-        let data = try await Gateway.send("POST", "/v1/tasks", json: body(goal: goal, device: device, persona: persona, notify: notify))
+    static func create(goal: String, device: String?, persona: String?, notify: TaskNotify, when: TaskWhen = .now, autoApprove: Bool = false) async throws -> AgentTask? {
+        let data = try await Gateway.send("POST", "/v1/tasks", json: body(goal: goal, device: device, persona: persona, notify: notify, when: when, autoApprove: autoApprove))
         return try? JSONDecoder().decode(AgentTask.self, from: data)
     }
 
@@ -196,6 +220,13 @@ final class TaskModel: ObservableObject {
     @Published private(set) var status: SectionStatus = .ok
     /// A finish notification asked to open this task.
     @Published var open: AgentTask?
+    /// The morning "밤사이 한 일" push asked for the task list.
+    @Published var showList = false
+
+    /// Waiting for overnight or a set time, soonest first.
+    var scheduled: [AgentTask] { tasks.filter(\.isScheduled).sorted { ($0.scheduledFor ?? .distantFuture) < ($1.scheduledFor ?? .distantFuture) } }
+
+    nonisolated static func isOvernightPush(_ userInfo: [AnyHashable: Any]) -> Bool { (userInfo["type"] as? String) == "overnight" }
     private var poll: Task<Void, Never>?
 
     var active: [AgentTask] { tasks.filter(\.isActive) }
@@ -220,8 +251,8 @@ final class TaskModel: ObservableObject {
     }
 
     @discardableResult
-    func create(goal: String, device: String?, persona: String?, notify: TaskNotify) async throws -> AgentTask? {
-        let t = try await TaskAPI.create(goal: goal, device: device, persona: persona, notify: notify)
+    func create(goal: String, device: String?, persona: String?, notify: TaskNotify, when: TaskWhen = .now, autoApprove: Bool = false) async throws -> AgentTask? {
+        let t = try await TaskAPI.create(goal: goal, device: device, persona: persona, notify: notify, when: when, autoApprove: autoApprove)
         await refresh()
         return t
     }

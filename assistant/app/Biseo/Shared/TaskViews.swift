@@ -24,6 +24,10 @@ struct RunningTasksCard: View {
                 Text(tasks.status == .ok ? "진행 중인 작업이 없어요" : "").foregroundStyle(Theme.text2)
             }
             SectionNote(status: tasks.status) { Task { await tasks.refresh() } }
+            if !tasks.scheduled.isEmpty {
+                Label("예약된 작업 \(tasks.scheduled.count)개" + (tasks.scheduled.first?.scheduledFor.map { " · 다음 " + KST.dayAndTime($0) } ?? ""),
+                      systemImage: "moon.zzz").font(.footnote).foregroundStyle(Theme.text2)
+            }
             ForEach(tasks.active.prefix(3)) { t in
                 Button { detail = t } label: {
                     HStack(alignment: .top) {
@@ -44,6 +48,7 @@ struct RunningTasksCard: View {
         .sheet(isPresented: $showAll) { NavigationStack { TasksScreen(tasks: tasks, app: app) }.taskSheetSize() }
         .sheet(item: $detail) { t in NavigationStack { TaskDetailView(task: t, tasks: tasks, app: app) }.taskSheetSize() }
         .onChange(of: tasks.open) { _, t in if let t { detail = t; tasks.open = nil } }
+        .onChange(of: tasks.showList) { _, on in if on { showAll = true; tasks.showList = false } }
     }
 }
 
@@ -64,7 +69,7 @@ struct TasksScreen: View {
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(t.goal).foregroundStyle(Theme.text).lineLimit(2)
-                            Text([t.device, t.created_at.map { $0.formatted(date: .abbreviated, time: .shortened) }].compactMap { $0 }.joined(separator: " · "))
+                            Text([t.device, t.scheduledFor.map { "예정 " + KST.dayAndTime($0) } ?? t.created_at.map { $0.formatted(date: .abbreviated, time: .shortened) }].compactMap { $0 }.joined(separator: " · "))
                                 .font(.footnote).foregroundStyle(Theme.text3)
                         }
                         Spacer()
@@ -110,10 +115,13 @@ struct TaskDetailView: View {
                     TaskBadgeView(status: t.status)
                 }
                 if let d = t.device { Label(d, systemImage: "laptopcomputer").font(.footnote).foregroundStyle(Theme.text2) }
+                if t.isScheduled, let at = t.scheduledFor {
+                    Label("\(KST.dayAndTime(at))에 시작해요", systemImage: "moon.zzz").font(.footnote).foregroundStyle(Theme.text2)
+                }
                 if let note = t.note, t.isActive {
                     Label(note, systemImage: "hourglass").font(.footnote).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
                 }
-                if t.isActive, t.notify != nil {
+                if t.isActive || t.isScheduled, t.notify != nil {
                     Toggle("끝나면 전화", isOn: Binding(get: { t.notify == "call" }, set: { on in
                         Task {
                             do { try await tasks.setNotify(t, call: on); message = nil }
@@ -170,7 +178,7 @@ struct TaskDetailView: View {
                 }
                 if let c = t.cost { Text("비용 \(c, format: .currency(code: "USD"))").font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3) }
                 if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
-                if t.isActive {
+                if t.isActive || t.isScheduled {
                     Button("작업 취소", role: .destructive) { confirmCancel = true }
                 }
             }
@@ -210,6 +218,9 @@ struct TaskCreateView: View {
     @State private var notify = TaskNotify.push
     @State private var persona: String? = PersonaModel.shared.selected?.id
     @State private var autoApprove = false
+    @State private var whenChoice = 0              // 0 지금, 1 밤새, 2 시간 지정
+    @State private var whenAt = Date().addingTimeInterval(3600)
+    private var when: TaskWhen { whenChoice == 1 ? .overnight : whenChoice == 2 ? .at(whenAt) : .now }
     @State private var saving = false
     @State private var message: String?
 
@@ -228,15 +239,25 @@ struct TaskCreateView: View {
                         ForEach(PersonaModel.shared.ordered) { Text($0.name).tag(Optional($0.id)) }
                     }
                 }
+                if AppSettings.supportsOvernight {
+                    Picker("언제", selection: $whenChoice) { Text("지금").tag(0); Text("밤새").tag(1); Text("시간 지정").tag(2) }
+                        .pickerStyle(.segmented)
+                    if whenChoice == 2 {
+                        DatePicker("시작", selection: $whenAt, in: Date()...Date().addingTimeInterval(7 * 86_400), displayedComponents: [.date, .hourAndMinute])
+                            .environment(\.timeZone, KST.zone)
+                    }
+                }
                 Picker("끝나면", selection: $notify) {
                     ForEach(TaskNotify.allCases) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                if BrainModeChoice.shared.lastCaps.contains("auto_approve") {
+                if BrainModeChoice.shared.lastCaps.contains("auto_approve") || (AppSettings.supportsOvernight && whenChoice != 0) {
                     Toggle("자동 승인", isOn: $autoApprove)
                 }
                 if autoApprove {
-                    Text("위험하지 않은 명령은 묻지 않고 실행해요. 위험한 건 여전히 물어봐요.").font(.footnote).foregroundStyle(Theme.text3)
+                    Text(whenChoice == 0 ? "위험하지 않은 명령은 묻지 않고 실행해요. 위험한 건 여전히 물어봐요."
+                                         : "읽기만 하는 명령은 묻지 않고 실행해요. 나머지는 아침에 물어봐요.")
+                        .font(.footnote).foregroundStyle(Theme.text3)
                 }
             }
             if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
@@ -250,8 +271,9 @@ struct TaskCreateView: View {
                     saving = true
                     Task {
                         do {
-                            let t = try await tasks.create(goal: goal, device: device, persona: PersonaModel.shared.personas.count > 1 ? persona : nil, notify: notify)
-                            if autoApprove, let id = t?.id {
+                            let t = try await tasks.create(goal: goal, device: device, persona: PersonaModel.shared.personas.count > 1 ? persona : nil,
+                                                           notify: notify, when: when, autoApprove: autoApprove)
+                            if autoApprove, when == .now, let id = t?.id {
                                 if case .success(let g?) = await attempt({ try await AutoApproveAPI.grant(task: id, devices: device.map { [$0] }) }) {
                                     AutoGrantCenter.remember(g.id)
                                 }

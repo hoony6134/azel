@@ -174,3 +174,28 @@ final class IncomingReasonTests: XCTestCase {
         XCTAssertEqual(ctx("schedule", "약 먹기").reason, "알림: 약 먹기", "short ones stay whole")
     }
 }
+
+final class OvernightTaskTests: XCTestCase {
+    func testWhenAndAutoApproveInTheBody() {
+        let now = TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push)
+        XCTAssertNil(now["when"])
+        let night = TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, when: .overnight, autoApprove: true)
+        XCTAssertEqual(night["when"] as? String, "overnight")
+        XCTAssertEqual(night["auto_approve"] as? Bool, true)
+        let at = ISO8601DateFormatter().date(from: "2026-11-23T14:00:00Z")!
+        XCTAssertEqual(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, when: .at(at))["when"] as? String, "2026-11-23T23:00:00+09:00")
+        XCTAssertNil(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, autoApprove: true)["auto_approve"],
+                     "a now task's auto-approve is a grant, not this field")
+    }
+
+    func testScheduledTaskAndPush() throws {
+        let t = try JSONDecoder().decode(AgentTask.self, from: Data(#"{"id":"abc123def456","goal":"논문 요약","status":"scheduled","when":"overnight","scheduled_for":1795370400,"auto_approve":true,"reported":false}"#.utf8))
+        XCTAssertTrue(t.isScheduled)
+        XCTAssertFalse(t.isActive, "no 3 s polling for a task that waits for the night")
+        XCTAssertEqual(t.scheduledFor, Date(timeIntervalSince1970: 1_795_370_400))
+        XCTAssertEqual(TaskBadge.label("scheduled"), "예약됨")
+        XCTAssertTrue(TaskModel.isOvernightPush(["type": "overnight"]))
+        XCTAssertTrue(AppSettings.reportsOvernight(Data(#"{"overnight":{"window":["01:00","06:00"],"report_push":true,"report_call":false}}"#.utf8)))
+        XCTAssertFalse(AppSettings.reportsOvernight(Data(#"{"default_model":"auto"}"#.utf8)))
+    }
+}

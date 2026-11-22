@@ -134,6 +134,12 @@ struct AppSettings: Codable, Equatable {
     /// Whether the gateway knows `user_title` (its GET included the key). Today's gateway doesn't, and
     /// rejects unknown keys on PUT, so the 호칭 rows stay hidden and the field is never sent until it does.
     @MainActor static var supportsUserTitle = false
+    /// The gateway takes `when` on tasks (its settings include `overnight`).
+    @MainActor static var supportsOvernight = false
+
+    static func reportsOvernight(_ data: Data) -> Bool {
+        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["overnight"] != nil
+    }
 
     /// The GET /v1/settings JSON has a `user_title` key (any value, "" or null included).
     static func reportsUserTitle(_ data: Data) -> Bool {
@@ -144,6 +150,8 @@ struct AppSettings: Codable, Equatable {
     var task_backend: String?
     /// auto | local | claude_api | claude_code: the default brain for calls. nil on older gateways.
     var brain_mode: String?
+    /// The overnight work queue (nil on older gateways: the 밤새 choices stay hidden).
+    var overnight: OvernightSettings?
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 
