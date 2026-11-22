@@ -91,6 +91,7 @@ class Refused(Exception):
 def load_config(path: str | os.PathLike) -> dict:
     cfg = dict(DEFAULTS)
     p = Path(path).expanduser()
+    cfg["config_path"] = str(p)
     if p.exists():
         cfg.update(tomllib.loads(p.read_text()))
     cfg["roots"] = [Path(r).expanduser().resolve() for r in cfg["allowed_roots"]]
@@ -671,7 +672,8 @@ def _blocked(data: dict, text: str) -> list[str] | None:
 def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
     status = "failed"  # set to the real outcome last: a client treats anything but running as finished
     try:
-        out = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=CFG["delegate_timeout"])
+        out = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, stdin=subprocess.DEVNULL,  # no 3 s stdin wait
+                             timeout=CFG["delegate_timeout"])
         job["exit_code"] = out.returncode
         try:
             data = json.loads(out.stdout)
@@ -698,6 +700,7 @@ def _run_job(job: dict, argv: list[str], cwd: Path, env: dict) -> None:
         _write_output(job)
     except OSError as e:
         log.warning("delegate output not saved: %s", e)
+    CFG["log_path"].with_name("delegate-mcp").joinpath(f"{job['job_id']}.json").unlink(missing_ok=True)
     job["finished"] = time.time()
     job["status"] = status
 
@@ -726,18 +729,96 @@ def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | Non
         resume_args = ["--resume", resume]
     env = _claude_env()
     allowed = CFG.get("delegate_allowed_tools", DEFAULTS["delegate_allowed_tools"])
+    job_id = uuid.uuid4().hex[:12]
     argv = [CFG["claude_bin"], "-p", task, *resume_args, "--permission-mode", "acceptEdits",
             *(["--allowedTools", *allowed] if allowed else []),
             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
+            *prompt_tool_args(job_id, wd),
             "--output-format", "json", "--append-system-prompt", NO_ATTRIBUTION]
     if model:
         argv += ["--model", model]
+    env["MCP_TOOL_TIMEOUT"] = str((PROMPT_WAIT_S + 30) * 1000)  # the prompt tool waits for the user's tap
     # shortcut: jobs live in memory and are lost on restart (their sessions are remembered on disk)
-    job = {"job_id": uuid.uuid4().hex[:12], "status": "running", "task": task, "cwd": str(wd),
+    job = {"job_id": job_id, "status": "running", "task": task, "cwd": str(wd),
            "model": model, "started": time.time(), **({"resumes": resume} if resume else {})}
     JOBS[job["job_id"]] = job
     threading.Thread(target=_run_job, args=(job, argv, wd, env), daemon=True).start()
     return {"status": "ok", "job_id": job["job_id"]}
+
+
+# ---------- permission prompts for delegated runs ----------
+# A headless `claude -p` cannot ask anyone: a tool outside delegate_allowed_tools was simply refused. With
+# --permission-prompt-tool it asks this daemon's prompt server instead (a stdio MCP server started per run from this
+# file with --prompt-server, exposing nothing else), which files a gateway approval: push, app, Live Activity,
+# auto-approve, exactly like run_command. Devices that cannot reach the gateway (gateway-grant) keep refusing.
+PROMPT_WAIT_S = 300  # the gateway's approval TTL
+PROMPT_TOOL = "mcp__azel_prompt__approve"
+
+
+def prompt_tool_args(job_id: str, wd: Path) -> list[str]:
+    if CFG.get("approval_via") == "gateway-grant" or not CFG.get("config_path"):
+        return []
+    path = CFG["log_path"].with_name("delegate-mcp") / f"{job_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conf = {"mcpServers": {"azel_prompt": {"type": "stdio", "command": sys.executable, "args": [
+        os.path.abspath(__file__), "--prompt-server", "--config", CFG["config_path"]],
+        "env": {"AZEL_PROMPT_CWD": str(wd), "AZEL_REQUESTER": REQUESTER.get()}}}}
+    path.write_text(json.dumps(conf))
+    path.chmod(0o600)  # no secret in it (the server reads the token file itself), but it names the run
+    return ["--mcp-config", str(path), "--permission-prompt-tool", PROMPT_TOOL]
+
+
+def prompt_command(tool_name: str, tool_input: dict) -> str:
+    """What the app shows for one tool use: the command, the URL or the file."""
+    if tool_name == "Bash":
+        return str(tool_input.get("command") or "")[:500]
+    for k in ("url", "file_path", "path", "notebook_path", "query"):
+        if tool_input.get(k):
+            return f"{tool_name} {str(tool_input[k])[:400]}"
+    return f"{tool_name} {json.dumps(tool_input, ensure_ascii=False)[:400]}"
+
+
+def decide_prompt(tool_name: str, tool_input: dict, cwd: str, requester: str = "",
+                  wait_s: float = PROMPT_WAIT_S, poll_s: float = 2) -> dict:
+    """{"behavior": "allow", "updatedInput": …} or {"behavior": "deny", "message": …} for one tool use."""
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    wd = Path(cwd)
+    command = prompt_command(tool_name, tool_input)
+    if tool_name == "Bash":
+        try:
+            hard_deny(shlex.split(command), wd)  # what no approval may unlock stays refused here too
+        except (Refused, ValueError) as e:
+            return {"behavior": "deny", "message": f"이 명령은 승인으로도 실행할 수 없어요: {e}"}
+    try:
+        r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": f"claude:{tool_name}"[:60],
+                                              "command": command, "cwd": str(wd), "in_roots": in_roots(wd),
+                                              **({"requester": requester} if REQUESTER_RE.fullmatch(requester) else {})})
+        aid, status = r["approval_id"], r.get("status")
+        end = time.monotonic() + wait_s
+        while status == "pending" and time.monotonic() < end:
+            time.sleep(poll_s)
+            status = gateway("GET", f"/v1/approvals/{quote(aid, safe='')}").get("status")
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        return {"behavior": "deny", "message": f"승인을 요청하지 못했어요({type(e).__name__}). 이 도구 없이 진행해."}
+    if status == "approved":
+        return {"behavior": "allow", "updatedInput": tool_input}
+    why = "사용자가 거절했어요" if status == "rejected" else "승인 시간이 지났어요"
+    return {"behavior": "deny", "message": f"{why}. 이 도구 없이 할 수 있는 만큼 하고, 못 한 것은 결과에 적어."}
+
+
+def prompt_server(cfg: dict) -> None:
+    """The per-run stdio MCP server behind --permission-prompt-tool: one tool, approve."""
+    CFG.clear()
+    CFG.update(cfg)
+    server = MCPServer(name="azel_prompt")
+
+    @server.tool()
+    def approve(tool_name: str, input: dict, tool_use_id: str = "") -> dict:
+        """Ask the user (through the Azel app) whether this tool use may run."""
+        # a dict, not a JSON string: a str return is wrapped as {"result": …}, which claude rejects as invalid
+        return decide_prompt(tool_name, input, os.environ.get("AZEL_PROMPT_CWD") or str(CFG["roots"][0]),
+                             os.environ.get("AZEL_REQUESTER", ""))
+    server.run("stdio")
 
 
 @logged
@@ -1506,8 +1587,14 @@ async def serve(cfg: dict) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="~/.config/biseo/daemon.toml")
+    ap.add_argument("--prompt-server", action="store_true", help="stdio permission-prompt server for one delegated run")
+    args = ap.parse_args()
+    if args.prompt_server:  # stdout is the MCP channel: logs go to stderr only
+        logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+        prompt_server(load_config(args.config))
+        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(serve(load_config(ap.parse_args().config)))
+    asyncio.run(serve(load_config(args.config)))
 
 
 if __name__ == "__main__":

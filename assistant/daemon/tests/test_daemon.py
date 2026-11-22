@@ -1,10 +1,13 @@
+import asyncio
 import http.server
 import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import anyio
 import httpx
@@ -160,9 +163,11 @@ def test_delegate_mocked(cfg, monkeypatch):
         time.sleep(0.02)
     st = d.job_status(job_id=job_id)
     assert st["job_status"] == "done" and st["summary"] == "did it"
+    conf = seen["argv"][seen["argv"].index("--mcp-config") + 1]  # the run's own prompt-server config
     assert seen["argv"] == ["claude", "-p", "fix bug", "--permission-mode", "acceptEdits",
                             "--allowedTools", *d.DEFAULTS["delegate_allowed_tools"],
                             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
+                            "--mcp-config", conf, "--permission-prompt-tool", "mcp__azel_prompt__approve",
                             "--output-format", "json", "--append-system-prompt", d.NO_ATTRIBUTION,
                             "--model", "sonnet"]
     assert d.list_jobs()["jobs"][0]["job_id"] == job_id
@@ -1016,3 +1021,54 @@ def test_a_refused_run_is_not_done(cfg, monkeypatch):
                                        "is_error": False, "permission_denials": [
         {"tool_name": "Bash", "tool_use_id": "e", "tool_input": {"command": "rm preview/p1.png"}}]})
     assert st["job_status"] == "done" and st["needs_input"] is False
+
+
+def test_delegated_runs_ask_through_the_prompt_tool(cfg, monkeypatch):
+    """A tool outside delegate_allowed_tools goes to the per-run prompt server instead of being refused."""
+    st, argv = run_delegate(monkeypatch, {"result": "끝났어요."})
+    assert argv[argv.index("--permission-prompt-tool") + 1] == "mcp__azel_prompt__approve"
+    conf = Path(argv[argv.index("--mcp-config") + 1])
+    assert not conf.exists()  # the run's config is removed with the run
+    monkeypatch.setitem(d.CFG, "approval_via", "gateway-grant")  # a team device cannot reach the gateway: no prompt
+    _, argv = run_delegate(monkeypatch, {"result": "끝났어요."})
+    assert "--permission-prompt-tool" not in argv
+
+
+def test_prompt_files_a_gateway_approval_and_waits_for_the_tap(cfg, monkeypatch):
+    calls, answers = [], iter(["pending", "approved"])
+
+    def fake_gateway(method, path, body=None):
+        calls.append((method, path, body))
+        return {"approval_id": "ap1", "status": "pending"} if method == "POST" else {"status": next(answers)}
+    monkeypatch.setattr(d, "gateway", fake_gateway)
+    root = str(cfg["roots"][0])
+    out = d.decide_prompt("Bash", {"command": "typst --version"}, root, "task:abc123", poll_s=0)
+    assert out == {"behavior": "allow", "updatedInput": {"command": "typst --version"}}
+    body = calls[0][2]
+    assert body["tool"] == "claude:Bash" and body["command"] == "typst --version" and body["requester"] == "task:abc123"
+    assert body["in_roots"] is True and body["device"] == "testbox"
+    calls.clear()
+    answers = iter(["rejected"])
+    out = d.decide_prompt("WebFetch", {"url": "https://example.com"}, root, poll_s=0)
+    assert out["behavior"] == "deny" and "거절" in out["message"] and calls[0][2]["command"] == "WebFetch https://example.com"
+    calls.clear()
+    out = d.decide_prompt("Bash", {"command": "sudo ls"}, root, poll_s=0)
+    assert out["behavior"] == "deny" and not calls  # what no approval unlocks never reaches the app
+
+
+def test_prompt_server_speaks_mcp_over_stdio(cfg):
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    async def go():
+        params = StdioServerParameters(command=sys.executable, args=[d.__file__, "--prompt-server", "--config",
+                                                                     cfg["config_path"]])
+        async with stdio_client(params) as (r, w), ClientSession(r, w) as s:
+            await s.initialize()
+            tools = (await s.list_tools()).tools
+            res = await s.call_tool("approve", {"tool_name": "WebFetch", "input": {"url": "https://example.com"},
+                                                "tool_use_id": "t1"})
+            return [t.name for t in tools], json.loads(res.content[0].text)
+    names, out = asyncio.run(go())
+    assert names == ["approve"]  # nothing else of the daemon is reachable from a delegated run
+    assert out["behavior"] == "deny" and "승인을 요청하지 못했어요" in out["message"]  # gateway.invalid: refused, never allowed
