@@ -534,8 +534,30 @@ def test_build2_adds_weather_and_holdings():
 
 def test_holdings_setting(gw):
     g, c, _ = gw
-    assert c.get("/v1/settings").json()["holdings"][3] == "삼성전자 (005930)"
+    assert c.get("/v1/settings").json()["holdings"][2] == "삼성전자 (005930)"
     r = c.put("/v1/settings", json={"holdings": ["  애플   (AAPL) ", "카카오"]})
     assert r.status_code == 200 and c.get("/v1/settings").json()["holdings"] == ["애플 (AAPL)", "카카오"]
     for bad in ("애플", [""], ["x" * 41], ["a\nb"], ["a"] * 13):
         assert c.put("/v1/settings", json={"holdings": bad}).status_code == 400, bad
+
+
+def test_holdings_update_by_voice(gw, monkeypatch):
+    g, c, _ = gw
+    r = asyncio.run(g.bridge.run("holdings_update", {"add": ["카카오 (035720)"], "remove": ["엔트로픽", "^GSPC"]}, caller="qwen"))
+    assert r["ok"], r
+    got = c.get("/v1/settings").json()["holdings"]
+    assert "카카오 (035720)" in got and not any(x.startswith(("엔트로픽", "S&P500")) for x in got) and len(got) == 9
+    assert r["spoken"] == "보유 종목에서 카카오를 넣었어요 그리고 엔트로픽, S&P500을 뺐어요. 지금 9개예요."  # 오백을
+    r = asyncio.run(g.bridge.run("holdings_update", {"add": ["카카오"]}, caller="qwen"))  # same name: replaced
+    assert c.get("/v1/settings").json()["holdings"].count("카카오") == 1 and "카카오 (035720)" not in c.get("/v1/settings").json()["holdings"]
+    assert not asyncio.run(g.bridge.run("holdings_update", {}, caller="qwen"))["ok"]
+    big = [f"종목{i}" for i in range(12)]
+    assert asyncio.run(g.bridge.run("holdings_update", {"add": big}, caller="qwen"))["error"]["code"] == "invalid"
+
+
+def test_seed_holdings_cover_the_users_list():
+    import gateway
+    import quote
+    names = [quote.HOLDING.match(h)["name"] for h in gateway.DEFAULTS["holdings"]]
+    assert names == ["애플", "엔비디아", "삼성전자", "SK하이닉스", "SOS랩", "엔트로픽", "SK스퀘어", "LS산전", "S&P500", "세트렉아이"]
+    assert quote.HOLDING.match("S&P500 (^GSPC)")["tick"] == "^GSPC"

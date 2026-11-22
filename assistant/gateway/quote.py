@@ -221,7 +221,7 @@ async def quote(query, client=None, search=None):
     return {"spoken": spoken(p), "data": {**p, "at": p["at"].isoformat() if p.get("at") else None}}
 
 
-HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>[A-Z][A-Z.]{0,6}|\d{6})\)\s*$")
+HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>\^?[A-Z][A-Z.]{0,6}|\d{6})\)\s*$")  # ^GSPC: an index
 
 
 async def closes(symbol, c, rng="5d"):
@@ -268,7 +268,8 @@ async def holding(entry, client=None):
     finally:
         if client is None:
             await c.aclose()
-    return {"name": name, "ticker": tick, "listed": True, "price": p["price"], "currency": p["currency"],
+    return {"name": name, "ticker": tick, "listed": True, "price": p["price"],
+            "currency": "index" if tick.startswith("^") else p["currency"],  # points, not dollars
             "change": p.get("change"), "pct": round(p["pct"], 2) if p.get("pct") is not None else None, "spark": spark,
             "source": p.get("source"), "at": p["at"].isoformat() if p.get("at") else None}
 
