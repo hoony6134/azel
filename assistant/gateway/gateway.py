@@ -3712,6 +3712,16 @@ async def continuation_parent(origin):
     return task_live.get(got[0]) or await state.call("GET", task_key(got[0]))
 
 
+async def hang_up_after_handoff():
+    """Work handed off in a call ends that call (the user's rule): the voice server hangs up once the reply that
+    confirms the task ("끝나면 전화드릴게요") has played."""
+    if origin := origin_ctx.get():
+        try:
+            await link_send({"type": "end_call", "session": origin, "reason": "작업 맡김"})
+        except Exception as e:  # the task stands either way
+            print("hang-up after handoff failed:", type(e).__name__, flush=True)
+
+
 async def task_create(body, source="api"):
     full_only()
     spec = check_task(body)
@@ -3748,6 +3758,7 @@ async def task_create(body, source="api"):
         await kv_list_add("tasks-scheduled", t["id"])
         if spec["when"] == "overnight":
             await kv_list_add("overnight-tasks", t["id"])  # the morning report reads these
+        await hang_up_after_handoff()
         return t
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
@@ -3757,6 +3768,7 @@ async def task_create(body, source="api"):
         task_runs.pop(t["id"], None)
         raise
     start_task(t)
+    await hang_up_after_handoff()
     return t
 
 
