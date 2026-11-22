@@ -30,6 +30,7 @@ import soundfile as sf
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
+import ko_read  # digits read out in Korean for TTS only, shipped beside this file (Dockerfile)
 import late_night  # the gateway's spoken-time rules, shipped beside this file (Dockerfile)
 
 LLM_URL = os.environ.get("LLM_URL", "http://100.64.0.11:8888/v1/chat/completions")
@@ -67,7 +68,7 @@ SYSTEM_BODY = (
     "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
     "없으니, 도구가 없으면 할 수 없다고 하고 다시 물어봐. "
-    "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
+    "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자는 한글로 풀어 쓰지 말고 아라비아 숫자와 단위로 써(1,333원, 2도, 18.5%, 3시 30분). "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
@@ -1689,6 +1690,7 @@ def gap_free(now, buffered_s, pending, inflight=None):
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
+    sentence = ko_read.speakable(sentence)  # "1,333원" is captioned as written and spoken "천삼백삼십삼 원"
     p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
     # Fillers and short openers ("네, 알겠습니다.") repeat constantly: synthesize them once (per voice). Under
@@ -3254,6 +3256,7 @@ if __name__ == "__main__":
         assert not grounded("오전 열 시에 팀 회의가 있어요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
         assert not grounded("내일 일정은 두 건이에요.", "") and grounded("물은 백 도에서 끓어요.", "")
         assert grounded("지금은 오후 열한 시예요.", "")  # the clock is not a plan
+        ko_read.check()  # digits → Korean speech before TTS
         for chat in ("내일 일정이 빡빡하시면 일찍 주무세요.", "오늘 수업 어땠어?", "나 내일 수업 있어.", "과제 같이 할래?",
                      "시험 끝나면 놀러 가자."):
             assert grounded(chat, ""), chat  # chatter, not a claim about the user's plans
