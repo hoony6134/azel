@@ -31,6 +31,8 @@ def start(tmp_path, monkeypatch, **env):
     sys.path.insert(0, str(HERE.parent))
     import gateway
     g = importlib.reload(gateway)
+    # most tests were written for "every command asks": keep that here; test_approval_policy covers the auto default
+    g.DEFAULTS.update(approval_mode="ask", task_auto_approve_default="ask")
     g.fake = fake_state.make()
     g.state.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=g.fake), base_url="http://state")
 

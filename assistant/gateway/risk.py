@@ -225,3 +225,44 @@ async def classify(command, cwd="", device="", qwen=None, haiku=None):
         _cache.pop(next(iter(_cache)))
     _cache[key] = (tier, stage)
     return tier, stage
+
+
+# ---------- the default policy (2026-11-22, the user's rule): approve by default, ask only for what is truly dangerous:
+# deleting, deploying or publishing, power and disks, users and permissions, sending data off the machine, secrets.
+# Reading, writing, installing and running scripts go ahead; a script is scanned for the same dangers.
+DANGER_CMD = re.compile(
+    r"(^|[\s;&|(])(rm|rmdir|unlink|shred|srm|trash|dd|mkfs\S*|fdisk|diskutil\s+(erase|partition|unmount)\S*|shutdown|"
+    r"reboot|halt|poweroff|sudo|su|doas|chown|passwd|useradd|userdel|usermod|visudo|dscl|csrutil|crontab|"
+    r"scp|sftp|rclone|sendmail|mail)\b"
+    r"|\bfind\b[^\n]*\s-(delete|exec\s+rm)\b"
+    r"|\bgit\s+(push|clean|reset\s+--hard|rm|filter-branch|branch\s+-D)\b|\bgit\s+checkout\s+--\s"
+    r"|\b(npm|pnpm|yarn|cargo|gem|twine|poetry|uv)\s+publish\b|\bgh\s+(release\s+create|repo\s+delete)\b"
+    r"|\b(docker|podman)\s+(push|rm|rmi|volume\s+rm|system\s+prune|image\s+prune|container\s+prune)\b"
+    r"|\b(kubectl|helm)\s+(apply|delete|install|upgrade|rollout|scale)\b|\bterraform\s+(apply|destroy)\b"
+    r"|\b(vercel|netlify|fly|flyctl|firebase|wrangler|heroku|railway)\b[^\n]*\b(deploy|--prod|publish)\b"
+    r"|\brsync\b[^\n]*(--delete|--remove-source-files|\S+:\S*)"
+    r"|\b(launchctl\s+(unload|bootout|remove|disable)|systemctl\s+(stop|disable|mask))\b"
+    r"|\b(killall|pkill)\b|\bkill\s+-(9|KILL)\b|\bchmod\s+(-R\s+)?[0-7]*7[0-7]{2}\s+/", re.I)
+DANGER_SCRIPT = re.compile(
+    r"\b(os\.(remove|unlink|rmdir|removedirs)|shutil\.(rmtree|move)|Path\([^)]*\)\.(unlink|rmdir)|\.unlink\(|"
+    r"rmtree|fs\.(rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)|rimraf|send2trash|subprocess[^\n]*\brm\b|"
+    r"git\s+push|twine\s+upload|npm\s+publish|docker\s+push|kubectl\s+(apply|delete)|terraform\s+(apply|destroy)|"
+    r"smtplib|boto3[^\n]*delete|\.delete_object|DROP\s+(TABLE|DATABASE)|TRUNCATE\s+TABLE)", re.I)
+SCRIPT_RUN = re.compile(r"^(python3?|node|bash|sh|zsh|ruby|perl|deno|bun)\b", re.I)
+
+
+def lenient(command, cwd="", script=""):
+    """safe | risky under the default auto-approve policy. `script`: the text of the script the command runs (the
+    daemon sends it), or the inline code of `python -c`."""
+    command = (command or "").strip()
+    if not command:
+        return RISKY
+    if SECRET_PATH.search(command) or DANGER_CMD.search(command):
+        return RISKY
+    if re.search(r"(?:^|[^>])\d?>(?!>)\s*/(?!dev/null|tmp/)", command):
+        return RISKY  # truncating a file by absolute path outside /tmp
+    if script and DANGER_SCRIPT.search(script):
+        return RISKY
+    if SCRIPT_RUN.match(command) and re.search(r"\s-(c|e)\s", command) and DANGER_SCRIPT.search(command):
+        return RISKY
+    return SAFE

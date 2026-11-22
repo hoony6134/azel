@@ -1062,8 +1062,19 @@ def test_prompt_files_a_gateway_approval_and_waits_for_the_tap(cfg, monkeypatch)
     assert body["in_roots"] is True and body["device"] == "testbox"
     calls.clear()
     answers = iter(["rejected"])
+    out = d.decide_prompt("Bash", {"command": "curl -s https://example.com"}, root, poll_s=0)
+    assert out["behavior"] == "deny" and "거절" in out["message"] and calls[0][2]["command"] == "curl -s https://example.com"
+    calls.clear()
     out = d.decide_prompt("WebFetch", {"url": "https://example.com"}, root, poll_s=0)
-    assert out["behavior"] == "deny" and "거절" in out["message"] and calls[0][2]["command"] == "WebFetch https://example.com"
+    assert out == {"behavior": "allow", "updatedInput": {"url": "https://example.com"}} and not calls  # never asked
+    (cfg["roots"][0] / "proj" / "wipe.py").write_text("import os\nos.remove('db.sqlite')\n")
+    answers = iter(["pending", "approved"])
+    d.decide_prompt("Bash", {"command": "cd proj && python3 wipe.py"}, root, poll_s=0)
+    assert "os.remove" in calls[0][2]["script"]  # "cd proj &&" is followed: proj/wipe.py is what runs
+    calls.clear()
+    answers = iter(["pending", "approved"])
+    d.decide_prompt("Bash", {"command": "python3 wipe.py"}, str(cfg["roots"][0] / "proj"), poll_s=0)
+    assert "os.remove" in calls[0][2]["script"]  # the gateway's policy sees what the script does
     calls.clear()
     out = d.decide_prompt("Bash", {"command": "sudo ls"}, root, poll_s=0)
     assert out["behavior"] == "deny" and not calls  # what no approval unlocks never reaches the app
@@ -1079,7 +1090,7 @@ def test_prompt_server_speaks_mcp_over_stdio(cfg):
         async with stdio_client(params) as (r, w), ClientSession(r, w) as s:
             await s.initialize()
             tools = (await s.list_tools()).tools
-            res = await s.call_tool("approve", {"tool_name": "WebFetch", "input": {"url": "https://example.com"},
+            res = await s.call_tool("approve", {"tool_name": "Bash", "input": {"command": "curl -s https://example.com"},
                                                 "tool_use_id": "t1"})
             return [t.name for t in tools], json.loads(res.content[0].text)
     names, out = asyncio.run(go())

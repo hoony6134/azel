@@ -781,11 +781,33 @@ def prompt_command(tool_name: str, tool_input: dict) -> str:
     return f"{tool_name} {json.dumps(tool_input, ensure_ascii=False)[:400]}"
 
 
+SCRIPT_CMD = re.compile(r"(?:^|&&|;|\|)\s*(?:python3?|node|bash|sh|zsh|ruby|perl|deno|bun)\s+(?:-\S+\s+)*([^\s;&|]+\.(?:py|js|mjs|ts|sh|rb|pl))")
+
+
+def script_text(command: str, wd: Path) -> str:
+    """The text of a script the command runs, so the gateway's policy can see whether it deletes or deploys."""
+    out, base = [], wd
+    for part in re.split(r"&&|;|\|\|", command):  # follow "cd dir &&": "cd proj && python3 wipe.py" runs proj/wipe.py
+        part = part.strip()
+        if m := re.match(r"cd\s+(\S+)$", part):
+            base = base / os.path.expanduser(m.group(1).strip("'\""))
+            continue
+        for name in SCRIPT_CMD.findall(part)[:3]:
+            name = os.path.expanduser(name.strip("'\""))
+            try:
+                out.append((Path(name) if os.path.isabs(name) else base / name).read_text(errors="replace")[:8000])
+            except OSError:
+                continue
+    return "\n".join(out)
+
+
 def decide_prompt(tool_name: str, tool_input: dict, cwd: str, requester: str = "",
                   wait_s: float = PROMPT_WAIT_S, poll_s: float = 2) -> dict:
     """{"behavior": "allow", "updatedInput": …} or {"behavior": "deny", "message": …} for one tool use."""
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     wd = Path(cwd)
+    if tool_name != "Bash":  # reading, writing, editing, the web: allowed (user rule 2026-11-22); deleting needs Bash
+        return {"behavior": "allow", "updatedInput": tool_input}
     command = prompt_command(tool_name, tool_input)
     if tool_name == "Bash":
         try:
@@ -795,6 +817,7 @@ def decide_prompt(tool_name: str, tool_input: dict, cwd: str, requester: str = "
     try:
         r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": f"claude:{tool_name}"[:60],
                                               "command": command, "cwd": str(wd), "in_roots": in_roots(wd),
+                                              **({"script": script} if (script := script_text(command, wd)) else {}),
                                               **({"requester": requester} if REQUESTER_RE.fullmatch(requester) else {})})
         aid, status = r["approval_id"], r.get("status")
         end = time.monotonic() + wait_s

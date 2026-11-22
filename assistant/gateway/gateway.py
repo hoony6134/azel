@@ -120,7 +120,9 @@ DEFAULTS = {
     # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
     "overnight": {"window": ["01:00", "06:00"], "report_push": True, "report_call": False, "budget_usd": 5.0},
     # a voice-made task that works on a device: ask (one question first) | auto | ask_each. The app's sheet has its own toggle
-    "task_auto_approve_default": "ask",
+    "task_auto_approve_default": "auto",
+    # approvals: auto = run without a tap unless deleting, deploying and the like (risk.lenient); ask = the old way
+    "approval_mode": "auto",
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "brain_mode": "auto",
@@ -1563,6 +1565,8 @@ async def gather_signals(now):
                 out.append(f"{datetime.fromtimestamp(r['at'], KST):%H:%M} 자율 전화 안 받음: {r.get('reason', '')}")
         return out
 
+    gistra_ok: list[str] = []
+
     async def gistra_due():
         """GISTRA's assignments and todos still open (submitted ones are not listed): the truth on "did I hand it in".
         The checkpoint note once said a submitted 토론지 was "제출 여부 모름" and the judge rang about it twice."""
@@ -1572,7 +1576,9 @@ async def gather_signals(now):
         text = str(await cygnus.call("gistra_assignments", {"scope": "upcoming", "limit": 15}))
         if text.startswith(agenda.GISTRA_FAIL):
             return []
-        return [ln.strip() for ln in text.splitlines() if ln.strip()][:20]
+        rows = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("스냅샷")][:20]
+        gistra_ok.append(" ".join(rows))  # read: the note and the agenda are filtered against it below
+        return rows if any(not EMPTY_DUE.search(r) for r in rows) else ["남은 과제·할 일 없음(모두 제출함)"]
 
     async def calendar_today():
         """Today's Google Calendar and Gistra: in class or a meeting = can't take a call."""
@@ -1587,7 +1593,29 @@ async def gather_signals(now):
         await source(name, fn)
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
+    if gistra_ok:  # the model kept ringing about a submitted 토론지 the note called "제출 여부 모름": cut it in code
+        sig["situation"] = [x for x in ("\n".join(still_due(note.splitlines(), gistra_ok[0])),) if x] if note else []
+        sig["calendar_today"] = still_due(sig.get("calendar_today") or [], gistra_ok[0])
     return sig
+
+
+ASSIGNMENT = re.compile(r"제출|과제|토론지|레포트|리포트|보고서|업로드|퀴즈|숙제")
+EMPTY_DUE = re.compile(r"없습니다|없어요|없음")
+DUE_STOP = {"오늘", "내일", "종일", "LMS", "GIST", "확인", "마감", "미리알림", "까지", "본인이", "제출해야", "여부", "모름"}
+
+
+def still_due(lines, open_text):
+    """Lines about an assignment GISTRA no longer lists as open are dropped (submitted); other lines stay. A line is
+    still due when one of its words (2+ letters, before the dash) appears in GISTRA's open list."""
+    out = []
+    for ln in lines:
+        if ASSIGNMENT.search(ln):
+            words = re.findall(r"[가-힣A-Za-z0-9]{2,}", re.split(r" — | - ", ln)[0])
+            words = [w for w in words if not w.isdigit() and not ASSIGNMENT.fullmatch(w) and w not in DUE_STOP]
+            if not any(w in open_text for w in words):
+                continue
+        out.append(ln)
+    return out
 
 
 DAY_WORD = re.compile(r"(오늘|어제|그저께) (\d{1,2}:\d{2})")
@@ -2454,6 +2482,8 @@ async def put_settings(body: dict):
             raise HTTPException(400, "overnight: {window: [HH:MM, HH:MM], report_push: bool, report_call: bool, "
                                      "budget_usd: 0-100}")
         body["overnight"] = {k: o[k] for k in DEFAULTS["overnight"]}
+    if "approval_mode" in body and body["approval_mode"] not in ("auto", "ask"):
+        raise HTTPException(400, "approval_mode: auto or ask")
     if "task_auto_approve_default" in body and body["task_auto_approve_default"] not in tools_bridge.TASK_APPROVE_DEFAULTS:
         raise HTTPException(400, f"task_auto_approve_default: one of {list(tools_bridge.TASK_APPROVE_DEFAULTS)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
@@ -3333,6 +3363,14 @@ async def create_approval(body: dict):
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
+    if (await load_settings()).get("approval_mode") == "auto" and row["tool"] not in NEVER_AUTO \
+            and risk.lenient(row["command"], row["cwd"], str(body.get("script") or "")[:20000]) == risk.SAFE:
+        # the default (the user's rule): everything but deleting, deploying and the like runs without a tap
+        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+        meta.update(decision="auto", stage="policy")
+        await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+        print(f"auto-approve: policy on {row['device']}: {row['command'][:80]!r}", flush=True)
+        return {"approval_id": aid, "status": "approved", "auto": True}
     if row["tool"] not in NEVER_AUTO and body.get("in_roots") is True and deep_enough(row["cwd"]) \
             and (grant := await grant_for(requester, row["device"])) is not None:  # "알아서 해", inside the daemon's roots
         tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,
