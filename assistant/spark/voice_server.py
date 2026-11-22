@@ -2351,6 +2351,18 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         return max(0.0, play_end - time.monotonic()) if opened[0] else sum(len(p) / 2 / r for _, p, r in held)
     hist.append({"role": "user", "content": text})
 
+    uttered: set[str] = set()
+
+    def repeat(x):
+        """A sentence this reply already said (a re-asked or restarted model began again: "네, 수능! … 네, 수능!")."""
+        if x is None or x in (FILLER, FILLER_LONG):
+            return False
+        k = re.sub(r"[\W_]+", "", x)
+        if len(k) >= 2 and k in uttered:
+            return True
+        uttered.add(k)
+        return False
+
     async def next_chunk():
         """The next text to synthesize. Sentences that queued up while the last one was synthesized go out
         together (fewer, longer TTS calls), but only as many as the audio already sent covers: TTS is not
@@ -2359,6 +2371,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             s = back.pop()  # already addressed when it was set aside
         else:
             s = await sentences.get()
+            while repeat(s):
+                s = await sentences.get()
             if s is None or s in (FILLER, FILLER_LONG):
                 return s
             s = address(s)
@@ -2370,6 +2384,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         room = min(MAX_CHUNK_SYL, buffered() / (SYNTH_MARGIN * max(SYNTH_S_PER_SYL, synth_rate[0])))
         while not back and not sentences.empty():
             nxt = sentences.get_nowait()
+            if repeat(nxt):
+                continue
             nxt = nxt if nxt is None or nxt in (FILLER, FILLER_LONG) else address(nxt)
             if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
                 back.append(nxt)

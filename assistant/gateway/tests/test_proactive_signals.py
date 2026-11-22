@@ -98,3 +98,31 @@ def test_the_judge_reads_open_gistra_assignments(gw, monkeypatch):  # noqa: F811
         return "지금은 Cygnus에 연결할 수 없어요."
     monkeypatch.setattr(cygnus, "call", down)
     assert asyncio.run(g.gather_signals(ts(22, 19, 30)))["gistra_due"] == []  # a failure is no list
+
+
+def test_submitted_assignments_never_reach_the_judge(gw, monkeypatch):  # noqa: F811
+    """Live 2026-11-22 20:00 and 20:30: GISTRA listed nothing open, yet the judge rang about the 토론지 the checkpoint
+    note still called "제출 여부 모름". Such lines are now cut before the judge sees them."""
+    import cygnus
+    g, _, _ = gw
+    open_list = "스냅샷: 11월 22일 (일) 20:30\n\n- 11/23 23:59 컴파일러 프로젝트 [과제]"
+
+    async def fake_call(name, args, raw=False):
+        return open_list
+    monkeypatch.setattr(cygnus, "available", lambda: True)
+    monkeypatch.setattr(cygnus, "call", fake_call)
+
+    async def agenda(f, t):
+        return ("일정 2026-11-22\n### 11/22(일)\n- 종일 12주차 토론지 제출 (GIST LMS)\n"
+                "- 19:30~19:45 12주차 토론지 LMS 업로드 확인 (마감 23:00) (미리알림)\n- 21:00 지온나래 회의")
+    monkeypatch.setattr(g, "agenda_text", agenda)
+    g.fake.db["context"]["azel-checkpoint"] = {"task_id": "azel-checkpoint", "open_questions": [],
+        "updated": datetime.now(g.KST).isoformat(), "summary":
+        "[5] 12주차 토론지 LMS 업로드 — 오늘 23:00까지 — 제출 여부 모름\n[4] 컴파일러 프로젝트 과제 — 11월 23일 23:59\n"
+        "[4] 과기사관 공결 확인서 전송 메일 — 11월 23일 23:59"}
+    sig = asyncio.run(g.gather_signals(time.time()))
+    assert "토론지" not in sig["situation"][0] and "컴파일러" in sig["situation"][0] and "공결" in sig["situation"][0]
+    assert not any("토론지" in x for x in sig["calendar_today"]) and any("지온나래" in x for x in sig["calendar_today"])
+    open_list = "스냅샷: 11월 22일 (일) 20:30\n\n남은 과제/할 일이 없습니다."
+    sig = asyncio.run(g.gather_signals(time.time()))
+    assert sig["gistra_due"] == ["남은 과제·할 일 없음(모두 제출함)"] and "컴파일러" not in sig["situation"][0]

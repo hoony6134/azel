@@ -120,7 +120,9 @@ DEFAULTS = {
     # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
     "overnight": {"window": ["01:00", "06:00"], "report_push": True, "report_call": False, "budget_usd": 5.0},
     # a voice-made task that works on a device: ask (one question first) | auto | ask_each. The app's sheet has its own toggle
-    "task_auto_approve_default": "ask",
+    "task_auto_approve_default": "auto",
+    # approvals: auto = run without a tap unless deleting, deploying and the like (risk.lenient); ask = the old way
+    "approval_mode": "auto",
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "brain_mode": "auto",
@@ -1214,9 +1216,49 @@ async def send_alert_push(title, body, category=None, **extra):
     return await apns_send({"aps": aps, **extra}, "alert")
 
 
-async def apns_send(payload, kind):
+async def push_task_activity(t, approval=None):
+    """Update a task's Live Activity by push (the app is asleep while the phone is locked): its status, and the
+    approval's buttons. The content-state matches TaskActivityAttributes.ContentState key for key."""
+    rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+    cfg, row = apns_config(), rows.get(t["id"])
+    if not cfg or not row:
+        return {"sent": 0}
+    steps = t.get("steps") or []
+    state_ = {"status": t["status"], "step": (steps[-1].get("label") if steps else None), "steps": len(steps),
+              **({"approval": approval} if approval else {})}
+    payload = {"aps": {"timestamp": int(time.time()), "event": "update", "content-state": state_,
+                       **({"alert": {"title": "승인 요청", "body": f"{approval['device']}에서 실행 승인이 필요해요"}}
+                          if approval else {})}}
+    return await apns_send(payload, "liveactivity", tokens=[{"token": row["token"], "env": row["env"],
+                                                             "bundle_id": APP_BUNDLE}])
+
+
+async def task_hold(tid, aid, row, meta):
+    """A task's approval is pending: the task shows "승인 필요" and its Live Activity gets the buttons."""
+    t = task_live.get(tid)
+    if not t or t["status"] not in ("running", "waiting_approval"):
+        return
+    if t["status"] != "waiting_approval":  # the agent loop's own wait_approval already marked it
+        t["status"] = "waiting_approval"
+        task_step(t, "approval", approval_id=aid)
+        await task_save(t)
+    await push_task_activity(t, {"id": aid, "device": row["device"], "command": row["command"][:200],
+                                 "forcedOnce": not always_ok(row["command"]), "risky": False})
+
+
+async def task_release(tid):
+    """Its approval was decided: back to running, buttons gone (unless another one is still pending)."""
+    t = task_live.get(tid)
+    if not t or t["status"] != "waiting_approval":
+        return
+    t["status"] = "running"
+    await task_save(t)
+    await push_task_activity(t)
+
+
+async def apns_send(payload, kind, tokens=None):
     cfg = apns_config()
-    tokens = [t for t in await push_tokens() if t.get("kind", "voip") == kind]
+    tokens = tokens or [t for t in await push_tokens() if t.get("kind", "voip") == kind]
     if not cfg or not tokens:
         return {"sent": 0, "reason": "APNs key or device token not configured"}
     if time.time() - _apns_jwt["ts"] > 50 * 60:  # APNs wants a fresh JWT at most hourly
@@ -1230,7 +1272,7 @@ async def apns_send(payload, kind):
             host = "api.sandbox.push.apple.com" if t["env"] == "sandbox" else "api.push.apple.com"
             r = await c.post(f"https://{host}/3/device/{t['token']}", json=payload, headers={
                 "authorization": f"bearer {_apns_jwt['token']}",
-                "apns-topic": t["bundle_id"] + (".voip" if kind == "voip" else ""),
+                "apns-topic": t["bundle_id"] + {"voip": ".voip", "liveactivity": ".push-type.liveactivity"}.get(kind, ""),
                 "apns-push-type": kind, "apns-priority": "10", "apns-expiration": "0"})
             sent += r.status_code == 200
     return {"sent": sent}
@@ -1563,6 +1605,8 @@ async def gather_signals(now):
                 out.append(f"{datetime.fromtimestamp(r['at'], KST):%H:%M} 자율 전화 안 받음: {r.get('reason', '')}")
         return out
 
+    gistra_ok: list[str] = []
+
     async def gistra_due():
         """GISTRA's assignments and todos still open (submitted ones are not listed): the truth on "did I hand it in".
         The checkpoint note once said a submitted 토론지 was "제출 여부 모름" and the judge rang about it twice."""
@@ -1572,7 +1616,9 @@ async def gather_signals(now):
         text = str(await cygnus.call("gistra_assignments", {"scope": "upcoming", "limit": 15}))
         if text.startswith(agenda.GISTRA_FAIL):
             return []
-        return [ln.strip() for ln in text.splitlines() if ln.strip()][:20]
+        rows = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("스냅샷")][:20]
+        gistra_ok.append(" ".join(rows))  # read: the note and the agenda are filtered against it below
+        return rows if any(not EMPTY_DUE.search(r) for r in rows) else ["남은 과제·할 일 없음(모두 제출함)"]
 
     async def calendar_today():
         """Today's Google Calendar and Gistra: in class or a meeting = can't take a call."""
@@ -1587,7 +1633,29 @@ async def gather_signals(now):
         await source(name, fn)
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
+    if gistra_ok:  # the model kept ringing about a submitted 토론지 the note called "제출 여부 모름": cut it in code
+        sig["situation"] = [x for x in ("\n".join(still_due(note.splitlines(), gistra_ok[0])),) if x] if note else []
+        sig["calendar_today"] = still_due(sig.get("calendar_today") or [], gistra_ok[0])
     return sig
+
+
+ASSIGNMENT = re.compile(r"제출|과제|토론지|레포트|리포트|보고서|업로드|퀴즈|숙제")
+EMPTY_DUE = re.compile(r"없습니다|없어요|없음")
+DUE_STOP = {"오늘", "내일", "종일", "LMS", "GIST", "확인", "마감", "미리알림", "까지", "본인이", "제출해야", "여부", "모름"}
+
+
+def still_due(lines, open_text):
+    """Lines about an assignment GISTRA no longer lists as open are dropped (submitted); other lines stay. A line is
+    still due when one of its words (2+ letters, before the dash) appears in GISTRA's open list."""
+    out = []
+    for ln in lines:
+        if ASSIGNMENT.search(ln):
+            words = re.findall(r"[가-힣A-Za-z0-9]{2,}", re.split(r" — | - ", ln)[0])
+            words = [w for w in words if not w.isdigit() and not ASSIGNMENT.fullmatch(w) and w not in DUE_STOP]
+            if not any(w in open_text for w in words):
+                continue
+        out.append(ln)
+    return out
 
 
 DAY_WORD = re.compile(r"(오늘|어제|그저께) (\d{1,2}:\d{2})")
@@ -2454,6 +2522,8 @@ async def put_settings(body: dict):
             raise HTTPException(400, "overnight: {window: [HH:MM, HH:MM], report_push: bool, report_call: bool, "
                                      "budget_usd: 0-100}")
         body["overnight"] = {k: o[k] for k in DEFAULTS["overnight"]}
+    if "approval_mode" in body and body["approval_mode"] not in ("auto", "ask"):
+        raise HTTPException(400, "approval_mode: auto or ask")
     if "task_auto_approve_default" in body and body["task_auto_approve_default"] not in tools_bridge.TASK_APPROVE_DEFAULTS:
         raise HTTPException(400, f"task_auto_approve_default: one of {list(tools_bridge.TASK_APPROVE_DEFAULTS)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
@@ -3144,6 +3214,16 @@ MAX_PUSH_TOKENS = 10
 async def push_register(body: dict):
     if body.get("bundle_id") != APP_BUNDLE:
         raise HTTPException(400, f"bundle_id must be {APP_BUNDLE}")
+    if body.get("activity_token") is not None:  # a task's Live Activity: its own token, updated by push while locked
+        tok, tid = body.get("activity_token"), body.get("task_id")
+        if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Fa-f]{16,200}", tok)
+                and isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{12}", tid)):
+            raise HTTPException(400, "activity_token (hex) and task_id required")
+        rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+        rows = {k: v for k, v in rows.items() if time.time() - v.get("at", 0) < 86400}  # a day at most
+        rows[tid] = {"token": tok, "env": body.get("env", "sandbox"), "at": time.time()}
+        await state.call("PUT", "/v1/state/kv/activity-tokens", rows)
+        return {"ok": True}
     if not (body.get("voip_token") or body.get("alert_token")):
         raise HTTPException(400, "voip_token and/or alert_token required")  # macOS: alert only
     for kind, tok in (("voip", body.get("voip_token")), ("alert", body.get("alert_token"))):
@@ -3333,6 +3413,17 @@ async def create_approval(body: dict):
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
+    if (await load_settings()).get("approval_mode") == "auto" and row["tool"] not in NEVER_AUTO:
+        # the default (the user's rule): regex, then a model for what it flags; only the truly dangerous asks
+        tier, stage = await risk.lenient_classify(row["command"], row["cwd"], str(body.get("script") or "")[:20000],
+                                                  row["device"], qwen=qwen_classify,
+                                                  haiku=None if await brain_mode() == "local" else haiku_classify)
+        print(f"approval policy: {tier} by {stage} on {row['device']}: {row['command'][:80]!r}", flush=True)
+        if tier == risk.SAFE:
+            await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+            meta.update(decision="auto", stage=f"policy:{stage}")
+            await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+            return {"approval_id": aid, "status": "approved", "auto": True}
     if row["tool"] not in NEVER_AUTO and body.get("in_roots") is True and deep_enough(row["cwd"]) \
             and (grant := await grant_for(requester, row["device"])) is not None:  # "알아서 해", inside the daemon's roots
         tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,
@@ -3358,6 +3449,11 @@ async def create_approval(body: dict):
                               **({"forced_once": True} if once else {}))  # the command only in the app, never here
     except Exception as e:
         print("approval push failed:", type(e).__name__, flush=True)
+    if requester and requester.get("task_id"):
+        try:
+            await task_hold(requester["task_id"], aid, row, meta)
+        except Exception as e:  # the approval stands either way
+            print("task hold failed:", type(e).__name__, flush=True)
     return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
 
 
@@ -3599,6 +3695,11 @@ async def decide(aid: str, body: dict):
         await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
         meta["rule_id"] = rule["id"]
     meta["decision"] = decision
+    if (tid := (meta.get("requester") or {}).get("task_id")) and tid in task_live:
+        try:
+            await task_release(tid)
+        except Exception as e:
+            print("task release failed:", type(e).__name__, flush=True)
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
             **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}

@@ -31,7 +31,10 @@ final class LiveActivities {
             .store(in: &bag)
         // Activities left over from a previous run (the app was killed mid-call).
         for a in ActivityKit.Activity<CallActivityAttributes>.activities { Task { await a.end(nil, dismissalPolicy: .immediate) } }
-        for a in ActivityKit.Activity<TaskActivityAttributes>.activities { tasks[a.attributes.taskID] = a }
+        for a in ActivityKit.Activity<TaskActivityAttributes>.activities {
+            tasks[a.attributes.taskID] = a
+            Self.sendTokens(a, taskID: a.attributes.taskID)  // a relaunch picks up the cards it left running
+        }
         // Tasks that finished (or vanished) while the app was closed: end their cards now.
         Task { [weak self] in
             guard let self, !tasks.isEmpty, case .success(let list) = await attempt({ try await TaskAPI.list() }) else { return }
@@ -40,6 +43,15 @@ final class LiveActivities {
                 let t = list.first { $0.id == id }
                 let final = t.map { TaskActivityAttributes.ContentState(status: $0.status, step: $0.steps.last?.label, steps: $0.steps.count) }
                 await a.end(final.map { .init(state: $0, staleDate: nil) }, dismissalPolicy: .immediate)
+            }
+        }
+    }
+
+    /// Each push token the activity gets (it can change) goes to the gateway, until the activity ends.
+    private static func sendTokens(_ a: ActivityKit.Activity<TaskActivityAttributes>, taskID: String) {
+        Task {
+            for await token in a.pushTokenUpdates {
+                try? await Gateway.registerActivity(token: token, taskID: taskID)
             }
         }
     }
@@ -114,8 +126,13 @@ final class LiveActivities {
             } else if t.isActive, enabled, tasks.count < 3 {
                 let p = PersonaModel.shared.persona(id: t.persona) ?? PersonaModel.shared.selected
                 let attrs = TaskActivityAttributes(taskID: t.id, goal: t.goal, glaze: Self.glaze(p))
-                tasks[t.id] = (try? ActivityKit.Activity.request(attributes: attrs, content: .init(state: s, staleDate: nil)))
-                    ?? ActivityKit.Activity<TaskActivityAttributes>.activities.first { $0.attributes.taskID == t.id }
+                // pushType .token: the gateway updates the card while the phone is locked (an approval's buttons);
+                // without push permission it still starts, updated only while the app runs
+                let made = (try? ActivityKit.Activity.request(attributes: attrs, content: .init(state: s, staleDate: nil),
+                                                              pushType: .token))
+                    ?? (try? ActivityKit.Activity.request(attributes: attrs, content: .init(state: s, staleDate: nil)))
+                tasks[t.id] = made ?? ActivityKit.Activity<TaskActivityAttributes>.activities.first { $0.attributes.taskID == t.id }
+                if let made { Self.sendTokens(made, taskID: t.id) }
             }
         }
     }

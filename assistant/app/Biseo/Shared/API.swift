@@ -290,6 +290,18 @@ enum Gateway {
 
     static func hex(_ token: Data) -> String { token.map { String(format: "%02x", $0) }.joined() }
 
+    /// A task's Live Activity push token: the gateway updates that card (an approval's buttons) while the app sleeps.
+    static func registerActivity(token: Data, taskID: String) async throws {
+        #if DEBUG
+        let env = "sandbox"
+        #else
+        let env = "production"
+        #endif
+        _ = try await send("POST", "/v1/push/register",
+                           json: ["bundle_id": Bundle.main.bundleIdentifier ?? "xyz.scian.biseo", "activity_token": hex(token),
+                                  "task_id": taskID, "env": env] as [String: Any])
+    }
+
     static func registerBody(voip: Data, alert: Data?, bundleID: String, env: String) -> [String: Any] {
         var body: [String: Any] = ["voip_token": hex(voip), "bundle_id": bundleID, "env": env]
         if let alert { body["alert_token"] = hex(alert) }
