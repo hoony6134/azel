@@ -144,6 +144,7 @@ function hostCard(n as Object, now as Integer) as Object
         if c.meta <> "" then c.facts.Push(fact("마지막 응답", fmtHM(seen)))
     else
         if seen > 0 then c.facts.Push(fact("마지막 응답", relAgo(seen, now)))
+        if c.load <> "" then c.facts.Push(fact("부하", c.load))
         if c.upt <> "" then c.facts.Push(fact("가동 시간", c.upt))
     end if
     c.facts.Push(fact("상태", c.dsub))

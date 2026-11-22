@@ -107,7 +107,7 @@ function demoData(inCall as Boolean) as Object
                 {title: "LMS 알림 (최근 7일)", items: [{when: "11/22", due: invalid, date: "2026-11-22", kind: "현대 예술의 이해[01]", title: "강의 개요", note: "새 토론글이 등록되었습니다.", tag: invalid}]}
             ]
         }
-        calendar: [{start: hm(now - 1800), end: hm(now + 2700), what: "자료구조", cal: "MyTT", where: "대학 A동 212호"}, {start: hm(now + 7200), end: hm(now + 10800), what: "연구실 회의", cal: "일반", where: ""}]
+        calendar: [{start: hm(now - 1800), end: hm(now + 2700), what: "자료구조", cal: "MyTT", where: "대학 A동 212호"}, {start: hm(now + 7200), end: hm(now + 10800), what: "프로그래밍 언어 및 컴파일러 중간고사 대비 스터디 모임", cal: "MyTT", where: "도서관 3층 세미나실"}]
         calls: [{at: hm(now + 5400), what: "약 먹기"}]
         next_deadline: {title: "과제 4: 해시 테이블 구현", due: iso(now + 10800), course: "자료구조", source: "gistra"}
     }
