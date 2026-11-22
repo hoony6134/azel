@@ -197,7 +197,7 @@ def test_cygnus_bridge_tools_on_nim(nimgw, monkeypatch):
     enable(c)
     ev = events(c.post("/v1/ask", json={"text": "오늘 마감 뭐야?", "session": "n5", "model": "nim"}))
     sent_tools = [t["function"]["name"] for t in fake.seen[0][2]["tools"]]
-    assert sent_tools == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "overnight_list", "recent_calls", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "agenda", "weather", "stock_quote", "web_search", "web_fetch", "music_play", "music_control", "home_scene", "auto_approve", "web_task", *(t["name"] for t in g.tools_bridge.P.TOOLS), "end_call", "gistra_today"] and got == [("gistra_today", {})]
+    assert sent_tools == ["macbook__list_dir", "call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "overnight_list", "recent_calls", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "agenda", "weather", "stock_quote", "portfolio", "holdings_update", "web_search", "web_fetch", "music_play", "music_control", "home_scene", "auto_approve", "web_task", *(t["name"] for t in g.tools_bridge.P.TOOLS), "end_call", "gistra_today"] and got == [("gistra_today", {})]
     assert ("tool_start", "학사 일정 확인 중") in [(e["phase"], e["label"]) for e in ev if e["type"] == "activity"]
     assert fake.seen[-1][2]["messages"][-1]["content"] == "오늘 마감: 토론지"
     assert not any(m == "tools/call" for m, _ in calls)

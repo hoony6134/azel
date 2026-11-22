@@ -44,6 +44,8 @@ CASES = {
     "agenda": ("이번 주 일정 뭐 있어?", "model"),
     "weather": ("내일 서울 날씨 어때?", "model"),
     "stock_quote": ("삼성전자 주가 얼마야?", "model"),
+    "holdings_update": ("보유 목록에 SOS랩 추가해줘", "model"),
+    "portfolio": ("내 주식 지금 어때?", "model"),
     "music_play": ("아이유 노래 틀어줘", "model"),
     "music_control": ("다음 곡으로 넘겨줘", "model"),
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),

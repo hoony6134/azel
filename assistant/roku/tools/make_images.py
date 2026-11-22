@@ -147,9 +147,62 @@ def tri_image(w=16, h=14):
     Image.fromarray(np.round(img).astype(np.uint8), "RGBA").save(OUT / "tri.png", optimize=True)
 
 
+def wx_images(n=48):
+    """Weather icons for the TV (white + alpha; the card tints them): wx_clear, wx_cloudy, wx_overcast, wx_rain, wx_snow,
+    wx_sleet, wx_shower. Plain shapes from circles and capsules, one weight, so they read as one family at 24-56 px."""
+    N = n * SS
+    y, x = np.mgrid[0:N, 0:N]
+    x, y = (x + 0.5) / SS, (y + 0.5) / SS
+
+    def disc(cx, cy, r):
+        return (np.hypot(x - cx, y - cy) <= r).astype(float)
+
+    def seg(x1, y1, x2, y2, w):
+        dx, dy = x2 - x1, y2 - y1
+        t = np.clip(((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy), 0, 1)
+        return (np.hypot(x - (x1 + t * dx), y - (y1 + t * dy)) <= w / 2).astype(float)
+
+    def cloud(ox=0.0, oy=0.0, k=1.0):
+        c = lambda cx, cy, r: disc(ox + cx * k, oy + cy * k, r * k)  # noqa: E731
+        base = seg(ox + 12 * k, oy + 30 * k, ox + 36 * k, oy + 30 * k, 12 * k)
+        return np.maximum.reduce([c(17, 26, 8), c(26, 20, 11), c(35, 27, 7), base])
+
+    def sun(cx, cy, r, rays=True):
+        out = disc(cx, cy, r)
+        if rays:
+            for i in range(8):
+                a = i * math.pi / 4
+                out = np.maximum(out, seg(cx + math.cos(a) * (r + 4), cy + math.sin(a) * (r + 4),
+                                          cx + math.cos(a) * (r + 9), cy + math.sin(a) * (r + 9), 3.2))
+        return out
+
+    def drops(xs, y0=37, y1=45):
+        return np.maximum.reduce([seg(x0, y0, x0 - 3, y1, 3.2) for x0 in xs])
+
+    def flakes(xs, yy=41):
+        return np.maximum.reduce([disc(x0, yy, 2.6) for x0 in xs])
+
+    up = lambda m, d: np.roll(m, -d * SS, axis=0)  # noqa: E731  lift a cloud to make room for rain under it
+    shapes = {
+        "clear": sun(24, 24, 9),
+        "cloudy": np.maximum(sun(31, 15, 6) * (1 - cloud(-2, 6)), cloud(-2, 6)),
+        "overcast": np.maximum(cloud(6, -2, 0.85) * 0.55 * (1 - cloud(-2, 6)), cloud(-2, 6)),
+        "rain": np.maximum(up(cloud(), 6), drops((18, 26, 34))),
+        "snow": np.maximum(up(cloud(), 6), flakes((17, 25, 33))),
+        "sleet": np.maximum.reduce([up(cloud(), 6), drops((19, 33)), flakes((26,))]),
+        "shower": np.maximum.reduce([sun(33, 12, 5, rays=False) * (1 - up(cloud(-2, 2), 4)), up(cloud(-2, 2), 4),
+                                     drops((17, 25, 33))]),
+    }
+    for name, m in shapes.items():
+        alpha = np.clip(m, 0, 1).reshape(n, SS, n, SS).mean(axis=(1, 3))
+        img = np.dstack([np.full((n, n, 3), 255.0), alpha * 255])
+        Image.fromarray(np.round(img).astype(np.uint8), "RGBA").save(OUT / f"wx_{name}.png", optimize=True)
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     tri_image()
+    wx_images()
     nine("card.9.png", rrect_mask(24, 24, 8), (8, 16, 8, 16))
     nine("focus.9.png", rrect_mask(24, 24, 8, ring=4), (8, 16, 8, 16))
     Image.fromarray(np.full((2, 2, 4), 255, dtype=np.uint8), "RGBA").save(OUT / "rule.png")

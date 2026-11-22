@@ -129,7 +129,8 @@ DEFAULTS = {
     # weather tool's default place when none is said (Open-Meteo; GIST in 광주)
     "weather_home": {"name": "광주", "lat": 35.2285, "lon": 126.8434},
     # the TV's 내 종목: a name, or "name (TICKER)" to pin the listing (a bare name is looked up; unlisted shows 비상장)
-    "holdings": ["애플 (AAPL)", "토스", "엔비디아 (NVDA)", "삼성전자 (005930)", "SK하이닉스 (000660)"],
+    "holdings": ["애플 (AAPL)", "엔비디아 (NVDA)", "삼성전자 (005930)", "SK하이닉스 (000660)", "SOS랩 (464080)",
+                 "엔트로픽 (ANT)", "SK스퀘어 (402340)", "LS산전 (010120)", "S&P500 (^GSPC)", "세트렉아이 (099320)"],
     "search_backend": "searxng",  # searxng (the user's own, free; local Qwen may use it) | haiku (paid Claude search)
     "searxng_url": os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
@@ -2644,6 +2645,84 @@ async def tv_weather():
     return {"source": r["source"], "place": home["name"], **(r.get("data") or {})}
 
 
+def holding_key(entry):
+    """What two holdings entries are compared by: the name before any `(TICKER)`, spaces and case ignored."""
+    return re.sub(r"\s+", "", re.sub(r"\(.*\)\s*$", "", entry)).lower()
+
+
+def josa(word, pair):
+    """Korean particle as read aloud: pair ("은", "는"), ("을", "를") or ("으로", "로"). A word ending in a digit is read
+    as Sino-Korean (0 영 … 9 구; a trailing 0 of 500 is 백); Latin letters count as a vowel ending."""
+    last = word[-1:] if word else ""
+    if last.isdigit():
+        final, rieul = last in "0136781", last in "178"
+    elif "가" <= last <= "힣":
+        jong = (ord(last) - 0xAC00) % 28
+        final, rieul = jong != 0, jong == 8
+    else:
+        final = rieul = False
+    if pair[0] == "으로":
+        return word + ("으로" if final and not rieul else "로")
+    return word + (pair[0] if final else pair[1])
+
+
+async def resolve_holding(name):
+    """The ticker for a holding said by voice (quote.resolve: Naver, Yahoo, then the user's SearXNG for a Korean name)."""
+    url = (await load_settings()).get("searxng_url") or web.SEARXNG_URL
+    async with httpx.AsyncClient(timeout=stock_quotes.TIMEOUT_S, headers=stock_quotes.UA, follow_redirects=True) as c:
+        return await stock_quotes.resolve(name, c, search=lambda q: web.searxng(q, 6, url, fetch_pages=False))
+
+
+async def holdings_update(add, remove):
+    """The voice tool holdings_update: edit the `holdings` setting (the user's portfolio, the TV's 내 종목). A name
+    added without a ticker is resolved and stored as "이름 (TICKER)"; when several listings could match nothing is
+    added and the candidates come back; an unlisted name is kept as is (비상장). An entry is removed by its name or
+    ticker; one already there (same name) is replaced. At most 12."""
+    s = await load_settings()
+    cur = list(s.get("holdings") or [])
+    gone = {holding_key(x) for x in remove} | {str(x).strip().upper() for x in remove}
+    tick = lambda e: (m.group(1) if (m := re.search(r"\(([^)]+)\)\s*$", e)) else "")  # noqa: E731
+    name = lambda e: re.sub(r"\s*\(.*\)\s*$", "", e)  # noqa: E731
+    removed = [e for e in cur if holding_key(e) in gone or tick(e).upper() in gone]
+    out = [e for e in cur if e not in removed]
+    picked, candidates, unlisted = [], {}, []
+    for raw in [" ".join(str(x).split())[:40] for x in add if str(x).strip()]:
+        if not tick(raw):
+            hit = await resolve_holding(raw)
+            if hit and "candidates" in hit:
+                candidates[raw] = hit["candidates"]
+                continue
+            if hit:
+                raw = f"{raw} ({hit['ticker']})"[:40]
+            else:
+                unlisted.append(raw)
+        if tick(raw):
+            picked.append({"name": name(raw), "ticker": tick(raw)})
+        out = [x for x in out if holding_key(x) != holding_key(raw)]
+        out.append(raw)
+    if len(out) > 12:
+        raise ValueError("보유 종목은 12개까지 둘 수 있어요.")
+    changed = bool(picked or unlisted or removed)
+    if changed:
+        s["holdings"] = out
+        await save_settings({k: v for k, v in s.items() if k != "personality_default"})
+        tv_quote_cache.value = None  # the TV and the portfolio tool show the change at once, not five minutes later
+    parts = []
+    if picked:  # "SK하이닉스는 000660으로 넣었어요": the ticker said back, so a wrong pick is caught
+        parts.append(", ".join(josa(p["name"], ("은", "는")) + " " + josa(p["ticker"], ("으로", "로")) for p in picked) + " 넣었어요")
+    if unlisted:
+        parts.append(josa(", ".join(unlisted), ("은", "는")) + " 상장 종목을 못 찾아서 비상장으로 넣었어요")
+    if removed:
+        parts.append(josa(", ".join(name(e) for e in removed), ("을", "를")) + " 뺐어요")
+    for n, cands in candidates.items():
+        parts.append(f"{josa(n, ('은', '는'))} 후보가 여러 개라 넣지 않았어요({', '.join(cands)}). 어느 것인지 말해 주세요")
+    if not parts:
+        parts.append("목록에 없는 종목이라 바뀐 게 없어요")
+    tail = f" 지금 {len(out)}개예요." if changed else ""
+    return {"spoken": ". ".join(parts) + "." + tail, "holdings": out if changed else cur, "picked": picked,
+            "candidates": candidates, "unlisted": unlisted, "removed": removed}
+
+
 async def tv_holdings():
     names = (await load_settings()).get("holdings") or []
     async with httpx.AsyncClient(timeout=stock_quotes.TIMEOUT_S, headers=stock_quotes.UA, follow_redirects=True) as c:
@@ -4874,7 +4953,8 @@ bridge = tools_bridge.Bridge(
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
     task_approve_default=lambda: task_approve_default(),
     set_task_approve_default=lambda v: put_settings({"task_auto_approve_default": v}),
-    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), holdings_update=lambda add, remove: holdings_update(add, remove),
+    portfolio=lambda: tv_quote_cache.get(tv_holdings, TV_QUOTE_S), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 

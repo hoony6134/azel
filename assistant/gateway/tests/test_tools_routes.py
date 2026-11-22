@@ -45,7 +45,7 @@ def test_mcp_server_for_claude_code(tgw):  # noqa: F811
     init = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).json()
     assert init["result"]["serverInfo"]["name"] == "azel"
     tools = c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).json()["result"]["tools"]
-    assert [t["name"] for t in tools] == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "overnight_list", "recent_calls", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "agenda", "weather", "stock_quote", "web_search", "web_fetch", "music_play", "music_control", "home_scene", "auto_approve", "web_task", *[t["name"] for t in g.tools_bridge.P.TOOLS], "end_call", "schedule_create"]
+    assert [t["name"] for t in tools] == ["call_user", "schedule_list", "schedule_cancel", "schedule_update", "create_task", "task_status", "task_cancel", "overnight_list", "recent_calls", "approval_status", "memory_recall", "people_lookup", "remember", "forget", "memory_list", "agenda", "weather", "stock_quote", "portfolio", "holdings_update", "web_search", "web_fetch", "music_play", "music_control", "home_scene", "auto_approve", "web_task", *[t["name"] for t in g.tools_bridge.P.TOOLS], "end_call", "schedule_create"]
     assert c.post("/v1/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"}).status_code == 202
     assert c.post("/v1/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
         "name": "call_user", "arguments": {"reason": "다 됐어요"}}}).json()["result"]["isError"] is False

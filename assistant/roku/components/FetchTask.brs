@@ -129,10 +129,10 @@ function demoData(inCall as Boolean) as Object
         calendar: [{start: hm(now - 1800), end: hm(now + 2700), what: "자료구조", cal: "MyTT", where: "대학 A동 212호"}, {start: hm(now + 7200), end: hm(now + 10800), what: "프로그래밍 언어 및 컴파일러 중간고사 대비 스터디 모임", cal: "MyTT", where: "도서관 3층 세미나실"}]
         calls: [{at: hm(now + 5400), what: "약 먹기"}]
         next_deadline: {title: "과제 4: 해시 테이블 구현", due: iso(now + 10800), course: "자료구조", source: "gistra"}
-        weather: {source: "기상청", place: "광주", now: -0.4, sky: "맑음", high: 15.0, low: -0.4, pop: 60, hourly: [
-            {h: "03", t: 1.0, pop: 0}, {h: "04", t: 2.0, pop: 0}, {h: "05", t: 2.0, pop: 0}, {h: "06", t: 3.0, pop: 30}
-            {h: "07", t: 4.0, pop: 30}, {h: "08", t: 5.0, pop: 20}, {h: "09", t: 7.0, pop: 0}, {h: "10", t: 10.0, pop: 0}
-            {h: "11", t: 12.0, pop: 10}, {h: "12", t: 14.0, pop: 60}, {h: "13", t: 15.0, pop: 70}, {h: "14", t: 14.0, pop: 40}]}
+        weather: {source: "기상청", place: "광주", now: -0.4, sky: "맑음", icon: "clear", high: 15.0, low: -0.4, pop: 60, hourly: [
+            {h: "03", t: 1.0, pop: 0, icon: "clear"}, {h: "04", t: 2.0, pop: 0, icon: "clear"}, {h: "05", t: 2.0, pop: 0, icon: "cloudy"}, {h: "06", t: 3.0, pop: 30, icon: "cloudy"}
+            {h: "07", t: 4.0, pop: 30, icon: "overcast"}, {h: "08", t: 5.0, pop: 20, icon: "overcast"}, {h: "09", t: 7.0, pop: 0, icon: "cloudy"}, {h: "10", t: 10.0, pop: 0, icon: "clear"}
+            {h: "11", t: 12.0, pop: 10, icon: "cloudy"}, {h: "12", t: 14.0, pop: 60, icon: "rain"}, {h: "13", t: 15.0, pop: 70, icon: "shower"}, {h: "14", t: 14.0, pop: 40, icon: "overcast"}]}
         holdings: [
             {name: "애플", ticker: "AAPL", listed: true, price: 342.56, currency: "USD", pct: -1.9, spark: [352.78, 351.91, 352.45, 349.21, 342.56], source: "야후 파이낸스"}
             {name: "토스", listed: false}
