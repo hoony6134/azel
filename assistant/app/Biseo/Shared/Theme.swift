@@ -137,6 +137,17 @@ struct EmptyState: View {
 /// answered and said no (user bug, 2026-11-21: a 400 on persona save read "닿지 않아요").
 /// `title` is short: callers prefix it ("저장하지 못했어요: …").
 enum FriendlyError {
+    /// "items[3].ts" for a decoding failure.
+    static func keyPath(_ e: DecodingError) -> String {
+        let path: [CodingKey]
+        switch e {
+        case .keyNotFound(let k, let c): path = c.codingPath + [k]
+        case .typeMismatch(_, let c), .valueNotFound(_, let c), .dataCorrupted(let c): path = c.codingPath
+        @unknown default: path = []
+        }
+        return path.map { $0.intValue.map { "[\($0)]" } ?? ".\($0.stringValue)" }.joined().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
     static func describe(_ error: Error) -> (title: String, message: String) {
         switch error {
         case GatewayError.rejected(let detail):
@@ -149,6 +160,10 @@ enum FriendlyError {
             return ("지금은 처리할 수 없어요. 잠시 후 다시 시도해 주세요", "서버가 다른 작업 중이에요.")
         case GatewayError.http(let code) where (400..<500).contains(code):
             return ("요청을 처리하지 못했어요 (HTTP \(code))", "서버가 요청을 받지 않았어요.")
+        case let e as DecodingError:
+            // The server answered; the app couldn't read it. Never "닿지 않아요" (live bug, 2026-11-22).
+            Log.call.error("response not decodable at \(Self.keyPath(e), privacy: .public): \(String(describing: e), privacy: .public)")
+            return ("응답 형식이 달라요 (앱 업데이트 필요)", "서버는 답했지만 이 앱이 읽지 못했어요.")
         default:
             return ("\(AssistantName.current)에게 닿지 않아요", "서버에 연결할 수 없어요. 네트워크와 서버 주소를 확인해 주세요.")
         }
