@@ -57,7 +57,7 @@ def test_task_runs_logs_steps_and_calls(tgw):
     end = time.time() + 5
     while not notes and time.time() < end:  # the status is saved a moment before the call goes out
         time.sleep(0.02)
-    assert notes == [("call", "task", "맡기신 맥북 다운로드 폴더 정리 끝났어요. 파일 세 개를 정리했어요.", "azel")]
+    assert notes == [("call", "task", "맡기신 맥북 다운로드 폴더 정리 끝났어요. 파일 세 개를 정리했어요. 더 궁금한 거 있으면 물어보세요.", "azel")]
     assert t["backend"] == "claude_code" and t["fallback_reason"] == "API 키가 없어 Claude Code로 했어요."  # no key here
     assert [x["id"] for x in c.get("/v1/tasks").json()] == [t["id"]]
     row = g.fake.db["usage"][-1]  # a task runs on claude -p: counted as the subscription path, labelled as a task

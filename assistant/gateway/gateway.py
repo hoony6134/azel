@@ -816,7 +816,8 @@ def run_args(settings, devices, requester=""):
     if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
         deny += [f"mcp__{d['id']}__delegate" for d in devices]
     elif requester.startswith("task:"):  # a task never starts another task (no task chains)
-        deny += ["mcp__azel__create_task"]
+        deny += ["mcp__azel__create_task", "mcp__azel__call_user", "mcp__azel__schedule_create",
+                 "mcp__azel__schedule_update", "mcp__azel__schedule_cancel", "mcp__claude_ai_Cygnus_MCP__notify_send"]
     if deny:
         rs = json.loads(run_settings)
         rs.setdefault("permissions", {}).setdefault("deny", [])
@@ -1207,7 +1208,8 @@ def with_title(opening, title):
     return f"{title}, {opening}"
 
 
-async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None):
+async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None,
+                     detail=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
@@ -1229,10 +1231,20 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
     # The opening must reach the voice server before the phone can answer and connect.
     await link_send({"type": "call", "call_id": call_id, "opening": opening or "", "reason": reason,
                      "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {}),
-                     **({"context": context} if context else {})})
+                     **({"context": context} if context else {}),
+                     **({"detail": detail[:4000]} if detail else {})})  # what follow-up questions are answered from
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
                                  "persona": persona["id"], **({"context": context} if context else {})})
     return {"call_id": call_id, **push}
+
+
+async def place_held_call(kw):
+    await asyncio.sleep(3)  # the phone needs a moment after hanging up before it rings again
+    try:
+        r = await place_call(**kw)
+        print("task notify: called after the other call:", (kw.get("context") or {}).get("id"), r.get("call_id"), flush=True)
+    except Exception as e:
+        print("task notify: held call failed:", (kw.get("context") or {}).get("id"), type(e).__name__, flush=True)
 
 
 DEADLINE_PROMPT = (
@@ -1997,6 +2009,9 @@ async def handle_link(ws):
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
                 asyncio.create_task(post_call_facts(m["log_id"], warm_key.split(":", 1)[0]))
+                if not call_warm_keys:  # the line is free: the finish calls that waited for it ring now
+                    while pending_finish:
+                        asyncio.create_task(place_held_call(pending_finish.pop(0)))
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = served(serve_schedule(m), m)
@@ -2006,6 +2021,8 @@ async def handle_link(ws):
             tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
+        elif m.get("type") == "announce_result" and (f := announce_waits.get(m.get("id"))) and not f.done():
+            f.set_result(m)
         elif m.get("type") == "call_answered":
             try:
                 await call_answered(m.get("call_id"))
@@ -3147,9 +3164,40 @@ def check_task(body):
             "device": device, "persona": persona, "backend": backend}
 
 
+NOTIFY_ASK = re.compile(r"(끝나면|끝나고|다\s*되면|완료되면|마치면|끝나는\s*대로)\s*(나한테|저한테|제게|내게)?\s*(전화|연락|알림|알려|푸시)")
+NOTIFY_FILLER = re.compile(r"그\s*(작업|거|것|일)|작업|그거|나한테|저한테|제게|내게|좀|이제|그럼|해\s*줄래요?|해\s*줘요?|"
+                           r"해\s*주세요|해\s*줄\s*수\s*있어|줄래요?|줘요?|주세요|주라|걸어|드려|해요?|[\s\W\d_]")
+WRITES = re.compile(r"저장|파일|작성|만들|써\s*줘|기록|수정|설치|커밋|문서|조사|리서치|정리")
+
+
+def notify_request(goal):
+    """'call' | 'push' when the goal only asks to be told about work already handed over ("그 작업 끝나면 전화해줄래?"),
+    else None (a goal with real work in it, even one that also says "끝나면 전화해 줘")."""
+    m = NOTIFY_ASK.search(goal or "")
+    if not m or NOTIFY_FILLER.sub("", NOTIFY_ASK.sub("", goal)):
+        return None
+    return "push" if m.group(3) in ("알림", "푸시") else "call"
+
+
+async def recent_open_task(origin, persona):
+    """The task a follow-up means: the newest unfinished one from this call, else this persona's within 10 minutes."""
+    now, seen = time.time(), {}
+    for t in [*(await bridge_recent_tasks(10)), *task_live.values()]:  # the runners' own dicts win
+        seen[t["id"]] = t
+    open_ = sorted((t for t in seen.values() if t["status"] in ("queued", "running", "waiting_approval")),
+                   key=lambda t: t.get("created") or 0, reverse=True)
+    return next((t for t in open_ if origin and t.get("origin_session") == origin), None) or \
+        next((t for t in open_ if persona and t.get("persona") == persona and now - (t.get("created") or 0) < 600), None)
+
+
 async def task_create(body, source="api"):
     full_only()
     spec = check_task(body)
+    if want := notify_request(spec["goal"]):  # "그 작업 끝나면 전화해 줘": the running task, not a new one
+        t = await recent_open_task(origin_ctx.get(), spec["persona"])
+        if not t:
+            raise HTTPException(409, "알림을 바꿀 진행 중인 작업이 없어요. 어떤 일을 맡길지 말씀해 주세요.")
+        return {**t, **await task_set_notify(t["id"], want), "notify_updated": True}
     settings = await load_settings()
     spec["backend"], spec["fallback_reason"] = await task_backend_for(spec, settings)
     if spec["backend"] == "claude_code" and not CLAUDE_OK:
@@ -3159,6 +3207,11 @@ async def task_create(body, source="api"):
     t = {"id": uuid.uuid4().hex[:12], **spec, "status": "queued", "created": time.time(), "started": None,
          "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
          "cost_usd": 0.0, "cancel_requested": False, "origin_session": origin_ctx.get() or None}
+    dev = next((d for d in await fresh_devices() if d["id"] == spec["device"]), None) if spec["device"] else None
+    if dev and dev.get("limited") and WRITES.search(spec["goal"]):  # the user's pick stands; say what it can't do
+        word = DEVICE_WORD.get(dev["id"], dev["id"])
+        t["note"] = (f"{word}는 읽기·진단만 되는 기기라 결과를 저장하거나 고치는 건 못 해요. 맥북에서 할까요? "
+                     "우선 거기서 할 수 있는 것부터 해 볼게요.")
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
         await task_save(t)
@@ -3191,9 +3244,13 @@ async def task_backend_for(spec, settings):
 
 
 def task_prompt(t, devices):
-    where = f"작업 기기: {t['device']}." if t["device"] else "작업 기기는 기본 순서대로 골라."
+    where = (f"작업 기기: {t['device']}." if t["device"] else
+             "작업 기기는 기본 순서대로 고르되, 파일 저장·수정·설치처럼 쓰는 일은 한도 기기 말고 전체 권한 기기(맥북)에서 해.")
     limited = [d["id"] for d in devices if d.get("limited")]
     note = f" 한도 기기(읽기·진단만): {', '.join(limited)}." if limited else ""
+    if t["device"] and t["device"] in limited:
+        note += " 사용자가 이 한도 기기를 골랐어: 거기서는 읽기·진단만 하고, 저장할 결과는 작업 결과(텍스트)로 돌려줘."
+    note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
     return f"{where}{note}\n\n목표: {t['goal']}"
 
 
@@ -3400,18 +3457,88 @@ def task_summary(t, title=""):
     return f"{hi}맡기신 {what}이 끝나지 못했어요. {spoken_text(t['error'])}".strip()[:600]
 
 
+BRIEFING_PROMPT = (
+    "맡긴 작업의 결과를 전화로 짧게 알려 주는 말을 써. JSON {\"say\": \"...\"} 하나만 답해. 한국어 구어체 존댓말, 제목·목록·"
+    "마크다운·이모지·URL 없이 문장으로만, 5~9문장(말로 20~40초). '맡기신 {goal} 끝났어요.'로 시작하고, 핵심 결과를 요약하고, "
+    "빠지거나 실패한 게 있으면 한 문장으로만 말하고, '더 궁금한 거 있으면 물어보세요.' 같은 한 문장으로 끝내. 호칭은 넣지 마. "
+    "결과에 없는 건 지어내지 마. 전화를 걸었는지, 확인을 받았는지 같은 진행 과정 이야기는 빼.")
+
+
+def short_summary(t, title):
+    """Without a model: the purpose line and the result's first sentences, about 20 seconds."""
+    first = openings.template("task", title, 0, 0, goal=openings.purpose_rule(t["goal"]) or "작업")
+    body, out = re.split(r"(?<=[.!?。])\s+", spoken_text(t.get("result") or "")), ""
+    for sent in body:
+        if len(out) + len(sent) > 220:
+            break
+        out += sent + " "
+    return f"{first} {out.strip() or '결과는 앱에서 확인해 주세요.'} 더 궁금한 거 있으면 물어보세요."
+
+
+async def task_briefing(t, title):
+    """A finished task's call opening: title once, '맡기신 ○○ 끝났어요', the key findings in a few spoken sentences,
+    one line on what is missing, a closing. Failures and approvals keep task_summary's short form."""
+    if t["status"] != "done" or not t.get("result"):
+        return task_summary(t, title)
+    goal = openings.purpose_rule(t["goal"]) or "작업"
+    try:
+        d = await llm_json(BRIEFING_PROMPT.replace("{goal}", goal), f"작업: {goal}\n결과:\n{t['result'][:6000]}",
+                           max_tokens=1500)
+        say = strip_marks(str((d or {}).get("say") or "")).strip()
+    except Exception as e:
+        print("task briefing failed:", t["id"], type(e).__name__, flush=True)
+        say = ""
+    if len(say) < 20:
+        return short_summary(t, title)
+    say = re.sub(rf"{re.escape(title)}\s*,?\s*", "", say) if title else say  # the title once, at the start
+    return (f"{title}, {say}" if title else say)[:900]
+
+
+announce_waits: dict[str, asyncio.Future] = {}  # announce id -> the voice server's answer
+pending_finish: list[dict] = []  # finish calls held while the user is on another call
+
+
+async def announce_in_call(session, opening, detail, context):
+    """Say a task's result inside the call the user is on now (the voice server speaks it as a turn). True when the
+    voice server took it."""
+    rid = uuid.uuid4().hex
+    announce_waits[rid] = asyncio.get_running_loop().create_future()
+    try:
+        await link_send({"type": "announce", "id": rid, "session": session, "opening": opening, "detail": detail,
+                         "context": context})
+        return (await asyncio.wait_for(announce_waits[rid], 5)).get("ok") is True
+    except (asyncio.TimeoutError, OSError, RuntimeError):
+        return False
+    finally:
+        announce_waits.pop(rid, None)
+
+
 async def task_notify(t, approval=False):
-    """When a task finishes, fails or needs an approval: a call as its persona, or an alert push the app opens
-    as azel://task/<id>."""
+    """When a task finishes, fails or needs an approval: told inside the call the user is on (its origin), a call as
+    its persona (held until hangup when the user is on another call), or an alert push the app opens as
+    azel://task/<id>. Every outcome is logged; nothing is dropped silently."""
     try:
         if t["notify"] == "call":
             settings = await load_settings()
             persona = persona_by_id(settings, t["persona"] or "") or primary_persona(settings)
-            await place_call("task_approval" if approval else "task",
-                             opening=task_summary(t, user_title(settings, persona)), persona_id=t["persona"],
-                             **({"origin_session": t["origin_session"]} if t.get("origin_session") else {}),
-                             context={"kind": "task", "id": t["id"],
-                                      "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]})
+            title = user_title(settings, persona)
+            opening = task_summary(t, title) if approval else await task_briefing(t, title)
+            origin = t.get("origin_session")
+            context = {"kind": "task", "id": t["id"], "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]}
+            detail = f"목표: {t['goal'][:300]}\n결과: {(t.get('result') or t.get('error') or '')[:3000]}"
+            if origin and origin in call_warm_keys.values():
+                if await announce_in_call(origin, opening, detail, context):
+                    print("task notify: told in the current call:", t["id"], flush=True)
+                    return
+                print("task notify: the current call did not take it, calling:", t["id"], flush=True)
+            kw = {"reason": "task_approval" if approval else "task", "opening": opening, "persona_id": t["persona"],
+                  "context": context, "detail": detail, **({"origin_session": origin} if origin else {})}
+            if call_warm_keys and not (origin and origin in call_warm_keys.values()):
+                pending_finish.append(kw)  # the line is busy with another call: ring once it ends
+                print("task notify: on another call, calling after it ends:", t["id"], flush=True)
+                return
+            r = await place_call(**kw)
+            print("task notify: called:", t["id"], r.get("call_id"), "push sent:", r.get("sent"), flush=True)
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
@@ -3440,7 +3567,8 @@ async def fail_orphan_tasks(startup=True):
 
 def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
-            "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note")
+            "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
+            "origin_session")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
@@ -3518,10 +3646,15 @@ async def serve_task(m):
         settings = await load_settings()
         dev = t["device"] or settings["default_device"]
         then = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림 드릴게요.", "none": "앱에서 진행 상황을 볼 수 있어요."}
-        reply.update(task_id=t["id"], say=f"{DEVICE_WORD.get(dev, dev)}에서 시작할게요. {then[t['notify']]}")
+        if t.get("notify_updated"):
+            reply.update(task_id=t["id"], say=f"네, {openings.purpose_rule(t['goal']) or '그 작업'} {then[t['notify']]}")
+        else:
+            reply.update(task_id=t["id"], say=" ".join(x for x in (
+                t.get("note") or f"{DEVICE_WORD.get(dev, dev)}에서 시작할게요.", then[t["notify"]]) if x))
     except (HTTPException, StateDown) as e:
         print("voice task refused:", getattr(e, "detail", e), flush=True)
-        reply.update(ok=False, say="지금은 작업을 맡을 수 없어요.")
+        reply.update(ok=False, say=e.detail if isinstance(e, HTTPException) and e.status_code == 409
+                     else "지금은 작업을 맡을 수 없어요.")
     await link_send(reply)
 
 

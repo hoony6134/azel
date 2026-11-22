@@ -546,7 +546,7 @@ class GatewayLinks:
         elif t == "context":
             if lk.brain and isinstance(msg.get("value"), str):
                 self.take_context(msg.get("session"), msg["value"], msg.get("persona"))
-        elif t in ("settings", "call") and lk.mode != "full":
+        elif t in ("settings", "call", "announce") and lk.mode != "full":
             return  # shared settings and call openings come from full gateways only
         elif t == "settings":
             self.settings = msg.get("value") if isinstance(msg.get("value"), dict) else {}
@@ -562,14 +562,24 @@ class GatewayLinks:
                                                             str(msg.get("persona") or ""))
             origin = msg.get("origin_session")
             self.openings[msg["call_id"]]["origin"] = origin if isinstance(origin, str) and ORIGIN_RE.fullmatch(origin) else ""
+            self.openings[msg["call_id"]]["detail"] = str(msg.get("detail") or "")[:4000]
             ctx = msg.get("context")
             self.openings[msg["call_id"]]["context"] = {k: str(ctx.get(k) or "")[:60] for k in ("kind", "label", "id")} \
                 if isinstance(ctx, dict) and ctx.get("kind") in ("task", "schedule") else None
+        elif t == "announce":  # a task finished while its user is on this call: say it here, not in a new call
+            q = active_calls.get(msg.get("session")) if isinstance(msg.get("opening"), str) and msg["opening"] else None
+            if q is not None:
+                q.put_nowait(msg)
+            asyncio.get_running_loop().create_task(lk.send({"type": "announce_result", "id": msg.get("id"),
+                                                            "ok": q is not None}))
         elif isinstance(msg.get("id"), str) and isinstance(t, str) and msg["id"] in self.queues:
             self.queues[msg["id"]][0].put_nowait(msg)
 
 
 links = GatewayLinks()
+active_calls: dict[str, asyncio.Queue] = {}  # "<persona>:<session>" of each live call -> its announcements
+FALLBACK_OPENING = "전화드렸어요. 맡기신 일 때문에 연락드렸는데, 무엇을 도와드릴까요?"
+DETAIL_NOTE = "(맡기신 작업의 전체 결과예요. 전화로는 요약만 말씀드렸어요.)"
 
 
 # ---------- brain: context and local tools for Qwen (PROTOCOL.md section 6) ----------
@@ -875,20 +885,26 @@ async def opening_audio(op):
         yield s, pcm
 
 
-GREETING = re.compile(r"(여보세요|여보세용|여보|네+|예|응+|어+|안녕(하세요)?|네네)[\s.!?~,]*")
 GREETING_MAX_S = 1.5
 
 
-def is_greeting(text, seconds):
-    return seconds < GREETING_MAX_S and bool(GREETING.fullmatch(text.strip()))
+PICKUP_WORDS = {"여보세요", "여보세용", "여보", "네", "네네", "예", "응", "응응", "어", "왜", "왜요", "누구세요", "누구야", "누구",
+             "안녕", "안녕하세요", "말씀하세요", "그래", "듣고", "있어", "있어요"}
+
+
+def is_ack(text, name=""):
+    """Picking up a placed call: "여보세요", "네", "어 왜", "누구세요", "아젤?" (any length). Never a turn of its own."""
+    words = [w for w in re.split(r"[\s.,!?~…]+", (text or "").strip()) if w]
+    names = tuple(n for n in (name, DEFAULT_NAME) if n)
+    return bool(words) and all(w in PICKUP_WORDS or w.startswith(names) for w in words)
 
 
 class OpeningGuard:
     """Keeps a placed call's opening from being cut off by the callee's "여보세요".
 
-    While the opening plays, speech is held instead of interrupting: the first sentence always finishes;
-    a short greeting (< GREETING_MAX_S) is let go; longer speech interrupts once the first sentence is
-    over. Times are time.monotonic() seconds; the call handler acts on the returned verbs."""
+    From the moment a placed call connects until its opening has played, speech is held instead of interrupting,
+    and the call handler decides on the words (opening_heard): greetings and acks never cut it, only a stop word
+    or a real question does, after the first sentence. Times are time.monotonic() seconds."""
 
     def __init__(self):
         self.first_end = self.play_end = 0.0
@@ -903,14 +919,6 @@ class OpeningGuard:
             return "interrupt"
         self.speech_at = now
         return "hold"
-
-    def tick(self, now):
-        """Held speech still going: 'interrupt' once it is too long for a greeting and sentence one is done."""
-        if (self.speech_at is not None and self.active(now) and now >= self.first_end
-                and now - self.speech_at >= GREETING_MAX_S):
-            self.speech_at = None
-            return "interrupt"
-        return None
 
     def protect(self, now):
         """A placed call's opening is starting: protected until speak_opening knows when sentence one ends."""
@@ -2505,10 +2513,49 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         kw = {"typed": True, "speak": m.get("speak") is not False}
         current["task"] = spawn(interrupt_then_answer(None, t, **kw) if busy else answer(None, t, **kw))
 
-    async def check_greeting(audio):
+    async def announcer(q):
+        """Speak each finished task's result as its own turn, once the call is quiet (nothing playing or thinking)."""
+        while True:
+            m = await q.get()
+            while (current["task"] and not current["task"].done()) or current["paused_at"] is not None \
+                    or time.monotonic() < current["play_end"]:
+                await asyncio.sleep(0.2)
+            current["task"] = spawn(speak_announcement(m))
+            await asyncio.gather(current["task"], return_exceptions=True)
+
+    async def speak_announcement(m):
+        hkey = f"{current_persona(await gateway_settings())['id']}:{session}"
+        if isinstance(m.get("detail"), str) and m["detail"]:
+            history[hkey].append({"role": "assistant", "content": f"{DETAIL_NOTE} {m['detail'][:4000]}"})
+        ctx = m.get("context")
+        if isinstance(ctx, dict) and ctx.get("kind") == "task":
+            await send({"type": "context", "context": {k: str(ctx.get(k) or "")[:60] for k in ("kind", "label", "id")}})
+        gen, said = new_reply(), []
+        try:
+            await send({"type": "state", "value": "speaking"})
+            await send({"type": "reply_start", "reply_id": gen}, gen=gen)
+            async for s, pcm in opening_audio(prepare_opening(m["opening"])):  # gap-free, like an opening
+                await send({"type": "reply", "text": s, "route": "task"}, gen=gen)
+                await send(audio=pcm, gen=gen)
+                said.append(s)
+            await until_played()
+        finally:
+            if said:
+                history[hkey].append({"role": "assistant", "content": " ".join(said)})
+            await send({"type": "state", "value": "listening"}, gen=gen)
+
+    async def opening_heard(audio):
+        """The callee spoke while a placed call's opening was about to play or playing. A greeting or ack lets it
+        play on (once, in full); a stop word or a real question interrupts; anything else is answered after it."""
         text = await transcribe(audio)
-        if text and not is_greeting(text, len(audio) / 16000):
+        if not text or not real_content(text) or is_ack(text, (CALL_PERSONA.get() or {}).get("name", "")):
+            return
+        if STOP_WORDS.search(text) or QUESTION.search(text):
             await interrupt_then_answer(audio, text)
+            return
+        if (op_task := current.get("opening")) and not op_task.done():
+            await asyncio.gather(op_task, return_exceptions=True)
+        await answer(audio, text)
 
     async def answer(audio, text=None, timings=None, typed=False, speak=True):
         """One user turn: spoken (audio, transcribed here) or typed (text; speak=False: captions without audio)."""
@@ -2593,12 +2640,18 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         if briefing:  # the app's "오늘 브리핑": speak a briefing first, interruptible like any reply
             current["task"] = spawn(speak_briefing())
         if call_id:  # the assistant placed this call: say why first (sent ahead over the link)
-            if op and op["parts"]:
-                if op.get("origin") and op["origin"] != f"{pid}:{session}" and not current["secret"]:  # a task's or reminder's call: continue there
-                    history[f"{pid}:{session}"].extend(list(history.get(op["origin"], ()))[-ORIGIN_TURNS:])
-                history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
-                guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
-                current["task"] = spawn(speak_opening(op))
+            if not (op and op["parts"]):  # its opening never arrived: never a silent call
+                op = {**(op or {}), **prepare_opening(FALLBACK_OPENING)}
+            if op.get("origin") and op["origin"] != f"{pid}:{session}" and not current["secret"]:  # a task's or reminder's call: continue there
+                history[f"{pid}:{session}"].extend(list(history.get(op["origin"], ()))[-ORIGIN_TURNS:])
+            if op.get("detail"):  # a task's whole result: follow-up questions are answered from it
+                history[f"{pid}:{session}"].append({"role": "assistant", "content": f"{DETAIL_NOTE} {op['detail']}"})
+            history[f"{pid}:{session}"].append({"role": "assistant", "content": op["text"]})
+            guard.protect(time.monotonic())  # before any frame is read, so an early tap cannot cut it
+            current["task"] = current["opening"] = spawn(speak_opening(op))
+        call_key = f"{pid}:{session}"
+        active_calls[call_key] = announce_q = asyncio.Queue()
+        side(announcer(announce_q))
         await send({"type": "mode", "value": current["mode"]})  # the app shows which brain answers
         await send({"type": "state", "value": "listening"})
         while True:
@@ -2654,12 +2707,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     guard.end(now, 0.0)
                     await resume()  # a click or cough: the reply plays on
                 elif kind == "end":
-                    if guard.speech_at is not None:
-                        act = guard.end(now, len(audio) / 16000)
-                        if act == "check":
-                            spawn(check_greeting(audio))
-                        else:
-                            spawn(interrupt_then_answer(audio))
+                    if guard.speech_at is not None:  # during a placed call's opening: decided on the words
+                        guard.end(now, len(audio) / 16000)
+                        spawn(opening_heard(audio))
                     elif current["paused_at"] is not None:
                         spawn(barge_check(audio, vad_turn.last_voiced_s))
                     elif playing and not vad_turn.barge:
@@ -2668,8 +2718,6 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                         current["task"] = spawn(followup(audio, task))
                     else:
                         current["task"] = spawn(answer(audio))
-            if guard.tick(time.monotonic()) == "interrupt":
-                side(interrupt())  # never awaited here: the loop keeps reading audio meanwhile
     except WebSocketDisconnect:
         pass
     finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
@@ -2681,6 +2729,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         await log({"event": "end", "log_id": log_id, "ended_at": ended, "duration_s": round(ended - started, 1)})
         await brain({"type": "call_event", "event": "end", "session": session})
         links.session_ctx.pop(session, None)
+        for k in [k for k, q in active_calls.items() if k.endswith(f":{session}")]:
+            active_calls.pop(k, None)
         for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
             games.pop(k, None)
         if current["secret"]:  # forget the secret turns: history, title rhythm, a half-asked schedule
@@ -3191,17 +3241,14 @@ if __name__ == "__main__":
         asyncio.run(prefetch_check())
         globals()["tts"] = real[1]
         assert prepare_opening("")["parts"] == [] and prepare_opening("네.")["audio"] is None  # no loop here
-        for text, sec, want in [("여보세요?", 0.8, True), ("네", 0.3, True), ("응응", 0.4, True), ("안녕하세요!", 1.0, True),
-                                ("여보세요", 1.6, False), ("잠깐만요", 0.6, False), ("네 그런데 그거 말고요", 1.2, False)]:
-            assert is_greeting(text, sec) is want, (text, sec)
+        for text, want in [("여보세요?", True), ("네", True), ("응응", True), ("안녕하세요!", True), ("여보세요 여보세요", True),
+                           ("어 왜", True), ("누구세요?", True), ("아젤?", True), ("미아야", True), ("잠깐만요", False),
+                           ("네 그런데 그거 말고요", False), ("내일 일정 뭐야?", False)]:
+            assert is_ack(text, "미아") is want, text  # any length: a long "여보세요" is still just picking up
         g = OpeningGuard()
         assert g.start(0.0) == "interrupt" and g.end(0.5, 0.5) == "answer"  # no opening playing: normal turns
         g.first_end, g.play_end = 2.0, 8.0  # first sentence plays until t=2, the whole opening until t=8
-        assert g.start(0.5) == "hold" and g.tick(1.9) is None  # during sentence one nothing interrupts
-        assert g.end(1.2, 0.7) == "check"  # "여보세요": transcribe, and let it go if it is a greeting
-        assert g.start(1.0) == "hold" and g.tick(1.9) is None and g.tick(2.6) == "interrupt"  # long talk, after s1
-        assert g.end(3.0, 2.0) == "answer"  # that utterance is then answered normally
-        assert g.start(0.2) == "hold" and g.end(1.9, 1.7) == "interrupt"  # long but over before s1 ends: deferred
+        assert g.start(0.5) == "hold" and g.end(1.2, 0.7) == "check"  # held: the words decide (opening_heard)
         assert g.start(9.0) == "interrupt"  # opening finished: ordinary barge-in again
         assert g.wait(9.0) == 0.0 and g.wait(5.0) == 0.0 and g.wait(1.5) == 0.5  # waits only for sentence one
         g.protect(100.0)
@@ -3516,6 +3563,86 @@ if __name__ == "__main__":
                 globals().update(tts=real[0], llm_stream=real[1], SYNTH_S_PER_SYL=saved[0], HOLD_MAX_S=saved[3])
                 synth_rate[0], audio_rate[0] = saved[1], saved[2]
             return play(ev), said, play(oev), oev, osaid, op, calls
+        def task_call_check():
+            """Placed calls: "여보세요" never cuts the opening (said once, in order, no reply to the greeting); an opening
+            that never arrived still speaks; a finish call answers a follow-up from the task's full result; a result
+            for a call in progress is spoken inside it."""
+            from fastapi.testclient import TestClient
+            asked, heard = [], []
+
+            async def stt(audio):
+                heard.append(round(time.monotonic(), 2))
+                return "여보세요"
+
+            async def llm(messages, max_tokens=600):
+                asked.append(json.dumps(messages, ensure_ascii=False))
+                yield "가장 유망한 건 한화생명 돌봄 쪽이에요."
+
+            async def fake_tts(sentence, *a, **k):
+                return b"\0" * 24000, 24000  # half a second each
+            globals().update(transcribe=stt, llm_stream=llm, tts=fake_tts,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            full = links.add(FakeWS())
+            links.receive(full, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+            opening = "정훈님, 맡기신 경쟁사 조사 끝났어요. 한화생명 돌봄 서비스가 가장 가까워요. 다른 두 곳은 규모가 작아요. 더 궁금한 거 물어보세요."
+            links.receive(full, {"type": "call", "call_id": "tk1", "opening": opening, "reason": "task",
+                                 "origin_session": "azel:day", "detail": "목표: 경쟁사 조사\n결과: 한화생명 돌봄, 스타트업 A, 스타트업 B"})
+            tc, hdr = TestClient(app, client=("100.64.0.8", 1)), {"Authorization": "Bearer app-tok"}
+            speech = (np.ones(8000, np.int16) * 3000).tobytes() + np.zeros(12000, np.int16).tobytes()
+            frames = []
+            with tc.websocket_connect("/v1/call?call_id=tk1&session=tk", headers=hdr) as w:
+                t0 = time.monotonic()
+                time.sleep(0.3)
+                w.send_bytes(speech)  # "여보세요" before / as the opening starts
+                time.sleep(1.4)
+                w.send_bytes(speech)  # and again at about 2 s, while it plays
+                while True:
+                    m = w.receive()
+                    f = json.loads(m["text"]) if m.get("text") else {"type": "audio"}
+                    frames.append(f)
+                    if f["type"] == "reply" and f["text"].endswith("물어보세요."):
+                        break
+                time.sleep(1.05)
+                w.send_text(json.dumps({"type": "text", "text": "그중에 제일 유망한 거 뭐야?"}))
+                while True:
+                    m = w.receive()
+                    if not m.get("text"):
+                        continue
+                    if (f := json.loads(m["text"]))["type"] == "turn_done":
+                        break
+                    frames.append(f)
+                w.send_text(json.dumps({"type": "hangup"}))
+            opening_said = [f["text"] for f in frames if f["type"] == "reply" and f.get("route") == "opening"]
+            others = [f for f in frames if f["type"] in ("transcript", "interrupt")]
+            with tc.websocket_connect("/v1/call?call_id=missing&session=tk2", headers=hdr) as w:
+                while True:
+                    m = w.receive()
+                    if m.get("text") and (f := json.loads(m["text"]))["type"] == "reply":
+                        break
+                fallback = f["text"]
+                w.send_text(json.dumps({"type": "hangup"}))
+            announced, results = [], []
+            with tc.websocket_connect("/v1/call?session=live", headers=hdr) as w:
+                while json.loads(w.receive_text()).get("value") != "listening":
+                    pass
+                ann = {"type": "announce", "id": "an1", "session": "azel:live", "opening": "맡기신 정리 끝났어요. 파일 세 개를 옮겼어요.",
+                       "detail": "결과: 파일 세 개", "context": {"kind": "task", "label": "정리", "id": "abcabcabcabc"}}
+                w.portal.call(links.receive, full, ann)  # on the server's loop, as the link would
+                w.portal.call(links.receive, full, {"type": "announce", "id": "an2", "session": "azel:nobody", "opening": "x"})
+                while True:
+                    m = w.receive()
+                    if not m.get("text"):
+                        continue
+                    f = json.loads(m["text"])
+                    if f["type"] == "reply":
+                        announced.append(f["text"])
+                    if f == {"type": "state", "value": "listening", "mode": f.get("mode"), "secret": False} and announced:
+                        break
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.1)
+            results = {m["id"]: m["ok"] for m in full.ws.sent if m.get("type") == "announce_result"}
+            links.remove(full)
+            return opening_said, others, asked, fallback, announced, results, heard
         def typed_check():
             """Typing during a call: a user turn without STT (no transcript echo, input "text" in the log), captions only
             with speak=false, rejected when too long or too fast, and typing over a reply interrupts it."""
@@ -3911,6 +4038,13 @@ if __name__ == "__main__":
         assert max(gaps, default=0) <= 50 and max(ogaps, default=0) <= 50, (gaps, ogaps)  # no audible gap
         assert osaid == op["parts"] and len(osaid) > 3  # the opening, in order
         assert oev[0][0] < calls[-1][0], "the opening started playing before its last chunk was synthesized"
+        opening_said, others, asked, fallback, announced, results, heard = task_call_check()
+        assert len(heard) == 2 and others == [], others  # both "여보세요" were heard, neither cut in nor answered
+        assert " ".join(opening_said).endswith("더 궁금한 거 물어보세요.") and len(set(opening_said)) == len(opening_said)
+        assert opening_said[0].startswith("정훈님, 맡기신") and len(asked) == 1  # one turn: the follow-up, no greeting reply
+        assert "스타트업 B" in asked[0] and DETAIL_NOTE in asked[0]  # answered from the task's whole result
+        assert fallback.startswith("전화드렸어요")  # an opening that never arrived: never silent
+        assert announced == ["맡기신 정리 끝났어요.", "파일 세 개를 옮겼어요."] and results == {"an1": True, "an2": False}
         spoken, rejected, quiet, over, turns, asked = typed_check()
         kinds = lambda fs: [f if f == "audio" else f["type"] for f in fs]  # noqa: E731
         assert "transcript" not in kinds(spoken) and "audio" in kinds(spoken), kinds(spoken)

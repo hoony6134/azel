@@ -228,7 +228,7 @@ def test_agent_loop_openai_backend_runs_tools_and_caps(monkeypatch):
     assert [e["tool"] for e in evs if e.get("phase") == "tool_start"] == ["infra_health", "call_user"]
     assert w.calls[0][2] == "luna" and seen[1]["messages"][-1]["role"] == "tool"
     names = {t["function"]["name"] for t in seen[0]["tools"]}
-    assert "macbook__delegate" not in names and "call_user" in names  # qwen's tool set
+    assert "macbook__delegate" not in names and "call_user" not in names  # a task never rings: the runner does
 
     seen, transport = fake_openai([[("infra_health", {})]] * 50)
     evs = collect(agent_loop.run("nim", "S", "loop", w.bridge(), cfg | {"key": "k"}, 0.003, 30, never))

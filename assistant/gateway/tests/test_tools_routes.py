@@ -81,7 +81,7 @@ def test_api_backed_task_calls_when_done(tgw, monkeypatch):  # noqa: F811
     t = wait_for(c, r.json()["id"], ("done", "failed"))
     assert t["status"] == "done" and t["backend"] == "qwen" and t["result"] == "정리했어요." and t["cost_usd"] == 0.02
     assert seen["backend"] == "qwen" and seen["cfg"]["url"].endswith("/v1/chat/completions") and seen["persona"] == "azel"
-    assert notes == [("call", "task", "맡기신 다운로드 정리 끝났어요. 정리했어요.", "azel")]  # "call" on finish rings
+    assert notes == [("call", "task", "맡기신 다운로드 정리 끝났어요. 정리했어요. 더 궁금한 거 있으면 물어보세요.", "azel")]  # "call" on finish rings
     assert t["fallback_reason"] is None
     assert c.post("/v1/tasks", json={"goal": "x", "backend": "gpt"}).status_code == 400
 

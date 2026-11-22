@@ -107,7 +107,8 @@ OWN_TOOLS = None  # set below: the assistant's own tools, in the order models se
 CREATE_TASK = {
     "name": "create_task",
     "description": ("여러 단계가 필요한 일을 백그라운드 작업으로 맡긴다(정리, 조사, 기기에서 하는 작업). 끝나거나 실패하거나 승인이 "
-                    "필요하면 notify대로 알린다: call(전화), push(알림), none."),
+                    "필요하면 notify대로 알린다: call(전화), push(알림), none. 이미 맡긴 작업에 '그 작업 끝나면 전화해 줘'만 "
+                    "덧붙이는 말이면 새 작업이 아니다: 그 말을 goal로 그대로 보내면 방금 맡긴 작업의 알림만 바뀐다."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["goal"], "properties": { "confirmed": CONFIRMED,
         "goal": {"type": "string", "maxLength": 2000}, "device": {"type": "string", "maxLength": 32},
         "notify": {"type": "string", "enum": ["call", "push", "none"]},
@@ -127,6 +128,7 @@ SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "sche
 TAINT_S = 600
 
 
+TASK_NEVER = {"create_task", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send"}
 SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
 STORING = {"remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task"}
 
@@ -180,6 +182,8 @@ class Bridge:
             if name in OWN_SCHEMAS:
                 check_args(OWN_SCHEMAS[name], args)
             who = self.d.get("who", lambda: "")()
+            if who.startswith("task:") and name in TASK_NEVER:  # notifying is the runner's job, per the task's notify
+                raise Fail("invalid", "작업 중에는 전화·알림·예약을 하지 않아요. 끝나면 정해진 방법으로 알려 드려요.")
             if caller != "app" and self.d.get("secret", lambda: False)() and stores(name, args):
                 raise Fail("invalid", SECRET_LINE)  # a secret call reads, it never writes
             if name in SIDE_EFFECTS and caller != "app" and who and args.get("confirmed") is not True \
@@ -698,8 +702,11 @@ class Bridge:
                 **{k: args[k] for k in ("budget_usd", "max_minutes") if k in args},
                 **({"persona": args.get("persona") or persona_id} if args.get("persona") or persona_id else {})}
         t = await self.d["task_create"](body, "app" if caller == "app" else "tool")
-        how = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림으로 알려 드릴게요.", "none": ""}[notify]
-        return f"작업으로 맡겼어요. {how}".strip() + f" (작업 {t['id']})", \
+        how = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림으로 알려 드릴게요.", "none": ""}[t.get("notify", notify)]
+        if t.get("notify_updated"):  # a follow-up about the task already running: its notify changed, nothing new
+            return f"네, 맡기신 작업이 {how}".strip() + f" (작업 {t['id']})", \
+                self.d.get("task_view", lambda t, full=False: t)(t, True)
+        return " ".join(x for x in (t.get("note"), f"작업으로 맡겼어요. {how}".strip()) if x) + f" (작업 {t['id']})", \
             self.d.get("task_view", lambda t, full=False: t)(t, True)
 
 

@@ -171,6 +171,18 @@ JSON text frames:
   call connects, its history starts with that conversation's last 8 turns, then the opening (which holds the task
   result), so Qwen and Claude both answer with that context. (In memory on the voice server: a reminder that fires
   after a voice-server restart starts without it.)
+  `detail` (task finish/approval calls, ≤ 4000 chars): the task's goal and whole result. The opening is only a short
+  spoken briefing (title once, "맡기신 ○○ 끝났어요", the key findings, one line on what is missing, a closing; made by
+  the local Qwen, else the result's first sentences), so the call's history also gets the whole result, marked as
+  such, and follow-up questions are answered from it. A placed call whose opening never arrived still speaks a
+  fallback line, never silence. During a placed call's opening (from connect until it has played), "여보세요", "네",
+  "어 왜", "누구세요", the assistant's name and the like are never a turn and never cut it; only a stop word or a real
+  question interrupts, anything else is answered after the opening.
+  `{"type":"announce","id","session","opening","detail"?,"context"?}` (full links only): a task finished while its
+  user is on the call `session` (`persona:session`). The voice server speaks `opening` there as its own turn once the
+  call is quiet (captions route `task`, the context chip first) and answers `{"type":"announce_result","id","ok"}`;
+  `ok:false` (no such live call) and the gateway rings instead. While the user is on another call, the gateway holds
+  the finish call until that call ends. Every finish outcome is logged on the gateway.
 - Requests the voice server sends over the link to create something (`tool_call`, `schedule`, `task`) carry
   `origin_session` = the conversation being answered; the gateway keeps it on the task (`origin_session`) or on the
   reminder (kv `origin-<schedule id>`).
