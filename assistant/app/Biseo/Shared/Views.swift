@@ -649,8 +649,6 @@ struct SettingsScreen<Extra: View>: View {
                 Toggle("스스로 판단해서 전화", isOn: p.autonomous.enabled).tint(Theme.celadon).foregroundStyle(Theme.text)
                 if p.wrappedValue.autonomous.enabled {
                     VStack(alignment: .leading, spacing: Theme.s) {
-                        Stepper("하루 최대 \(p.wrappedValue.autonomous.max_per_day)번", value: p.autonomous.max_per_day, in: 1...10)
-                        Stepper("최소 간격 \(gapLabel(p.wrappedValue.autonomous.min_gap_minutes))", value: p.autonomous.min_gap_minutes, in: 30...720, step: 30)
                         row("허용 시간") {
                             HStack(spacing: Theme.xs) {
                                 DatePicker("시작", selection: time(window(p, 0)), displayedComponents: .hourAndMinute).labelsHidden()
@@ -688,10 +686,6 @@ struct SettingsScreen<Extra: View>: View {
             DatePicker(title, selection: time(t.time), displayedComponents: .hourAndMinute).labelsHidden()
                 .disabled(!t.wrappedValue.enabled)
         }
-    }
-
-    private func gapLabel(_ minutes: Int) -> String {
-        minutes % 60 == 0 ? "\(minutes / 60)시간" : "\(minutes / 60)시간 \(minutes % 60)분"
     }
 
     private func window(_ p: Binding<AppSettings.Proactive>, _ i: Int) -> Binding<String> {

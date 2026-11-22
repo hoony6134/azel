@@ -600,13 +600,14 @@ device that created them.
   - Decision: at :00 and :30 the scheduler lease holder gathers signals without Claude (critical alerts
     of the last 24 h, delegated device jobs finished or failed in the last 2 h via each trusted daemon's
     `list_jobs`, approvals pending > 30 min, scheduled calls missed in the last 24 h, task contexts with
-    open questions, the situation note) and asks the local Qwen for `{"call","urgency","reason","opening"}`.
+    open questions, the situation note, calls of the last 12 h with what the user said and autonomous calls
+    that rang unanswered, today's Google Calendar + Gistra agenda) and asks the local Qwen for `{"call","urgency","reason","opening"}`.
   - Fail closed: if the decision log cannot be read (ruchba down, 404, error) nothing rings, and a call is
     rung only after its log row (with the pre-generated `call_id`) is written.
   - Guardrails, all required to ring: `call` is `true`, `urgency` an integer ≥ 4, now inside `window`,
-    fewer than `max_per_day` autonomous calls today, the last one at least `min_gap_minutes` ago, and no
-    autonomous call about the same reason (hash of the normalized reason) in the last 24 h. The call opens
-    with Qwen's `opening` (≤ 200 chars).
+    and no autonomous call about the same reason (hash of the normalized reason) in the last 2 h. The call opens
+    with Qwen's `opening`. There is no count or gap cap: `max_per_day` and `min_gap_minutes` are still
+    accepted in settings but unused; the judge paces itself from the recent calls and the agenda.
   - Every decision is logged, called or not: `GET /v1/proactive/log?limit=50&since=<epoch>` → newest first,
     `[{"id","at","call","urgency","reason","opening","reason_hash","called","blocked_by"
     (no_call|urgency|window|max_per_day|min_gap|duplicate|null),"signals","call_id"}]` (full only).

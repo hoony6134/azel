@@ -261,7 +261,8 @@ def make():
 
     @app.get("/v1/state/history")
     def h_list(limit: int = 20, q: str = ""):
-        rows = [{"id": h["id"], "title": h["turns"][0]["user"] if h["turns"] else None, "turns": len(h["turns"])}
+        rows = [{"id": h["id"], "title": h["turns"][0]["user"] if h["turns"] else None, "turns": len(h["turns"]),
+                 "started_at": h.get("started_at"), "direction": h.get("direction"), "reason": h.get("reason")}
                 for h in db["history"].values() if not q or any(q in t["user"] for t in h["turns"])]
         return rows[:limit]
 
