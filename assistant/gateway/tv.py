@@ -441,8 +441,14 @@ async def build2(d, now=None):
     async def assistant():
         return {"state": "call" if d["in_call"]() else "idle", "persona": await d["persona2"]()}
 
-    names = ("infra", "tasks", "gistra", "calls", "calendar", "assistant")
-    vals = await asyncio.gather(*(section(f) for f in (infra, tasks, gistra, calls, calendar, assistant)))
+    async def weather():
+        return weather_card(await d["weather"](), now) if "weather" in d else None
+
+    async def holdings():
+        return await d["holdings"]() if "holdings" in d else None
+
+    names = ("infra", "tasks", "gistra", "calls", "calendar", "assistant", "weather", "holdings")
+    vals = await asyncio.gather(*(section(f) for f in (infra, tasks, gistra, calls, calendar, assistant, weather, holdings)))
     out = dict(zip(names, vals))
     return {"at": iso(now), **out, "next_deadline": next_deadline(out["gistra"], out["calendar"], now, today)}
 
@@ -492,6 +498,12 @@ async def build_infra_detail(d, now=None):
                                    d["infra_raw"]("infra_alerts"))
     hosts, asof = parse_hosts(h, now)
     groups = parse_monitors(s)
+    hist = {"cpu": {}, "mem": {}}
+    if "query" in d:
+        cpu, mem = await asyncio.gather(*(section(lambda m=m: d["query"](history_query(m))) for m in ("cpu", "mem")))
+        hist = {"cpu": parse_history(cpu), "mem": parse_history(mem)}
+    for host in hosts:
+        host.update(cpu_24h=hist["cpu"].get(host["name"]), mem_24h=hist["mem"].get(host["name"]))
     roles = {g["node"]: g["role"] for g in groups}
     for host in hosts:
         svc = next((g["services"] for g in groups if g["node"] == host["name"]), [])
@@ -536,6 +548,80 @@ async def build_tasks_detail(d, now=None):
     order = {"running": 0, "waiting_approval": 1, "queued": 2, "scheduled": 3}
     return {"at": iso(now), "active": sorted(active, key=lambda r: order[r["status"]])[:LINES],
             "recent": done[:10], "approvals": len(apps)}
+
+
+# ---------- weather, holdings, 24 h host history (charts drawn by the TV from these numbers) ----------
+SKY_WORD = {"맑아요": "맑음", "대체로 맑아요": "대체로 맑음", "구름이 조금 있어요": "구름 조금", "구름이 많아요": "구름 많음",
+            "흐려요": "흐림", "안개가 껴요": "안개", "비가 와요": "비", "비나 눈이 와요": "비나 눈", "눈이 와요": "눈",
+            "소나기가 와요": "소나기", "빗방울이 떨어져요": "빗방울", "빗방울이나 눈날림이 있어요": "빗방울·눈날림",
+            "눈날림이 있어요": "눈날림"}
+
+
+def sky_word(sentence):
+    return SKY_WORD.get(sentence or "", (sentence or "").removesuffix("요").strip() or None)
+
+
+def weather_card(w, now):
+    """The TV's weather card from the gateway's own weather reads (weather.py), KMA first as the voice answers do:
+    {source, place, now, sky, high, low, pop, hourly: [{h: "04", t, pop}] for the next 12 hours (KMA only)}."""
+    import weather as wx
+    if w is None:
+        return None
+    out = {"source": w.get("source"), "place": w.get("place"), "now": None, "sky": None, "high": None, "low": None,
+           "pop": None, "hourly": []}
+    if w.get("source") == "기상청":
+        today = datetime.fromtimestamp(now, KST).strftime("%Y%m%d")
+        lo, hi, pop, sky = wx.day_summary(w.get("vilage") or [], today)
+        obs = {i["category"]: i["obsrValue"] for i in w.get("ncst") or []}
+        t = float(obs["T1H"]) if "T1H" in obs else None
+        if t is not None:  # the morning's forecast high or low already passed: never "지금 10도, 최고 9도"
+            hi, lo = (max(hi, t) if hi is not None else None), (min(lo, t) if lo is not None else None)
+        pty = obs.get("PTY", "0")
+        nxt = next((i["fcstValue"] for i in sorted(w.get("fcst") or [], key=lambda i: (i["fcstDate"], i["fcstTime"]))
+                    if i["category"] == "SKY"), None)
+        out.update(now=t, high=hi, low=lo, pop=pop,
+                   sky=sky_word(wx.KMA_PTY.get(pty) if pty != "0" else wx.KMA_SKY.get(nxt or "")))
+        start = datetime.fromtimestamp(now, KST).strftime("%Y%m%d%H00")
+        hours = {}
+        for i in w.get("vilage") or []:
+            key = i["fcstDate"] + i["fcstTime"]
+            if key >= start and i["category"] in ("TMP", "POP"):
+                hours.setdefault(key, {})[i["category"]] = float(i["fcstValue"])
+        out["hourly"] = [{"h": k[8:10], "t": v.get("TMP"), "pop": int(v["POP"]) if "POP" in v else None}
+                         for k, v in sorted(hours.items())[:12] if "TMP" in v]
+        return out
+    cur, day = w.get("current") or {}, w.get("daily") or {}
+    first = lambda k: (day.get(k) or [None])[0]  # noqa: E731
+    out.update(now=cur.get("temperature_2m"), high=first("temperature_2m_max"), low=first("temperature_2m_min"),
+               pop=first("precipitation_probability_max"), sky=sky_word(wx.SKY.get(cur.get("weather_code"))))
+    return out
+
+
+HISTORY_AGO = (21, 18, 15, 12, 9, 6, 3, 0)  # hours back: 8 points across the last day
+HISTORY_EXPR = {
+    "cpu": 'round(100 * (1 - avg by (node) (rate(node_cpu_seconds_total{{mode="idle"}}[30m]{off}))))',
+    "mem": "round(100 * (1 - avg by (node) (node_memory_MemAvailable_bytes{off} / node_memory_MemTotal_bytes{off})))",
+}
+SERIES = re.compile(r'^\{ago="(\d+)",node="([^"]+)"\}\s+(-?[\d.]+)')
+
+
+def history_query(metric):
+    """One instant PromQL that returns every node's value 21, 18 … 3 hours ago and now, each tagged with `ago`."""
+    parts = []
+    for h in HISTORY_AGO:
+        expr = HISTORY_EXPR[metric].format(off=f" offset {h}h" if h else "")
+        parts.append(f'label_replace({expr}, "ago", "{h}", "", "")')
+    return " or ".join(parts)
+
+
+def parse_history(text):
+    """infra_query lines `{ago="21",node="deneb"} 15` → {node: [8 values, oldest first, None where missing]}."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = SERIES.match(line.strip())
+        if m and int(m.group(1)) in HISTORY_AGO:
+            out.setdefault(m.group(2), [None] * len(HISTORY_AGO))[HISTORY_AGO.index(int(m.group(1)))] = round(float(m.group(3)))
+    return out
 
 
 class Cache:

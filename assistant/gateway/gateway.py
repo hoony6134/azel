@@ -128,6 +128,8 @@ DEFAULTS = {
     "brain_mode": "auto",
     # weather tool's default place when none is said (Open-Meteo; GIST in 광주)
     "weather_home": {"name": "광주", "lat": 35.2285, "lon": 126.8434},
+    # the TV's 내 종목: a name, or "name (TICKER)" to pin the listing (a bare name is looked up; unlisted shows 비상장)
+    "holdings": ["애플 (AAPL)", "토스", "엔비디아 (NVDA)", "삼성전자 (005930)", "SK하이닉스 (000660)"],
     "search_backend": "searxng",  # searxng (the user's own, free; local Qwen may use it) | haiku (paid Claude search)
     "searxng_url": os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
@@ -2546,6 +2548,12 @@ async def put_settings(body: dict):
                 and -90 <= h["lat"] <= 90 and -180 <= h["lon"] <= 180):
             raise HTTPException(400, "weather_home: {name, lat, lon}")
         body["weather_home"] = {k: h[k] for k in ("name", "lat", "lon")}
+    if "holdings" in body:
+        h = body["holdings"]
+        if not (isinstance(h, list) and len(h) <= 12 and all(
+                isinstance(x, str) and 0 < len(x.strip()) <= 40 and not any(ord(ch) < 32 for ch in x) for x in h)):
+            raise HTTPException(400, "holdings: up to 12 names or \"name (TICKER)\", each 1-40 characters")
+        body["holdings"] = [" ".join(x.split()) for x in h]
     if "search_backend" in body and body["search_backend"] not in ("searxng", "haiku"):
         raise HTTPException(400, "search_backend: searxng or haiku")
     if "searxng_url" in body and not (isinstance(body["searxng_url"], str)
@@ -2616,6 +2624,30 @@ async def probe(url, token=False):
 
 tv_cache, tv_cache2 = tv.Cache(), tv.Cache()
 tv_detail_cache = {"infra": tv.Cache(), "tasks": tv.Cache()}
+tv_weather_cache, tv_quote_cache = tv.Cache(), tv.Cache()
+TV_WEATHER_S, TV_QUOTE_S = 600, 300  # the TV polls every minute; KMA, Naver and Yahoo are asked at most this often
+
+
+async def tv_weather():
+    """Raw weather for the TV card: KMA items for weather_home (as the voice answer reads them), Open-Meteo otherwise."""
+    home = (await load_settings())["weather_home"]
+    key = kma_key()
+    async with httpx.AsyncClient(timeout=weather.TIMEOUT_S) as c:
+        if key and weather.in_korea(home["lat"], home["lon"]):
+            try:
+                ncst, fcst, vil = await asyncio.wait_for(weather.kma_now_items(home, key, c, datetime.now(KST)),
+                                                         weather.KMA_BUDGET_S)
+                return {"source": "기상청", "place": home["name"], "ncst": ncst, "fcst": fcst, "vilage": vil}
+            except (httpx.HTTPError, RuntimeError, KeyError, ValueError, TypeError, asyncio.TimeoutError):
+                pass
+        r = await weather.forecast(None, "now", home, client=c)
+    return {"source": r["source"], "place": home["name"], **(r.get("data") or {})}
+
+
+async def tv_holdings():
+    names = (await load_settings()).get("holdings") or []
+    async with httpx.AsyncClient(timeout=stock_quotes.TIMEOUT_S, headers=stock_quotes.UA, follow_redirects=True) as c:
+        return list(await asyncio.gather(*(stock_quotes.holding(n, c) for n in names)))
 
 
 def tv_deps():
@@ -2651,7 +2683,9 @@ def tv_deps():
             "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
             "google_ok": lambda: google_status() == "connected", "calendar": calendar,
             "infra_raw": lambda n, extra=None: cyg.call(n, {}, raw=True, extra=extra), "persona2": persona2, "overnight": overnight,
-            "calendar_rows": calendar_rows}
+            "calendar_rows": calendar_rows, "query": cyg.query,
+            "weather": lambda: tv_weather_cache.get(tv_weather, TV_WEATHER_S),
+            "holdings": lambda: tv_quote_cache.get(tv_holdings, TV_QUOTE_S)}
 
 
 @app.get("/v1/tv")
