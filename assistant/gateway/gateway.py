@@ -3815,6 +3815,8 @@ bridge = tools_bridge.Bridge(
     task_recent=lambda n: bridge_recent_tasks(n), task_view=lambda t, full=False: task_view(t) if full else {**task_view(t, steps=False), "steps": t["steps"][-30:]},
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
+    approval_create=lambda body: create_approval(body), approval_ran=lambda aid, body: approval_ran(aid, body),
+    device_token=lambda url: device_tokens.get(url, TOKEN),
     llm=lambda system, user: llm_json(system, user),
     memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),

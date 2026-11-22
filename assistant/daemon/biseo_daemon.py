@@ -46,6 +46,10 @@ DEFAULTS = {
     # true on jh-only devices: a command not in allowed_commands becomes an approval request instead of a refusal.
     # Team devices (vd-spark, vd-core) and sadr keep false.
     "approve_unlisted": False,
+    # "gateway": the daemon files and checks approvals with the gateway itself. "gateway-grant": for devices the gateway
+    # can reach but that cannot reach it: the daemon answers needs_approval and runs only against a grant
+    # (HMAC with this daemon's token) the gateway signs after the user's tap.
+    "approval_via": "gateway",
     "approval_wait_s": 120,  # run_command(…, approval_id) on a still-pending approval waits this long for the tap
     "log_path": "~/.local/state/biseo/daemon.jsonl",
     "read_max_bytes": 256_000,
@@ -341,6 +345,71 @@ def _used_file() -> Path:
     return CFG["log_path"].with_name("used_approvals.txt")
 
 
+GRANT_MAX_S = 600  # a grant may be valid for at most this long
+NONCE_TTL_S = 900  # an issued nonce is forgotten after this
+_issued: dict[str, float] = {}  # nonce -> issue time (memory only: a restart makes the gateway ask again)
+
+
+def grant_mac(token: str, approval_id: str, device: str, command: str, cwd: str, nonce: str, exp: int) -> str:
+    """HMAC-SHA256 over the grant's fields, keyed by the device's daemon token (the gateway computes the same)."""
+    msg = "azel-grant-v1\n" + json.dumps([approval_id, device, command, cwd, nonce, int(exp)],
+                                         ensure_ascii=False, separators=(",", ":"))
+    return hmac.new(token.encode(), msg.encode(), "sha256").hexdigest()
+
+
+def _issue_nonce() -> str:
+    now = time.time()
+    with _lock:
+        for n in [n for n, t in _issued.items() if now - t > NONCE_TTL_S]:
+            del _issued[n]
+        if len(_issued) >= 500:
+            _issued.pop(min(_issued, key=_issued.get))
+        n = uuid.uuid4().hex
+        _issued[n] = now
+        return n
+
+
+def _used_nonces_file() -> Path:
+    return CFG["log_path"].with_name("used_nonces.txt")
+
+
+def _claim_nonce(nonce: str) -> None:
+    """Spend an issued nonce once; the used list is persisted (0600) so a restart cannot replay a grant."""
+    f = _used_nonces_file()
+    with _lock:
+        if nonce not in _issued:
+            raise Refused("grant nonce unknown or expired")
+        if f.exists() and nonce in f.read_text().split():
+            raise Refused("grant already used")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(nonce + "\n")
+        del _issued[nonce]
+
+
+def check_grant(grant: dict, command: str, wd: Path) -> None:
+    """Refuse unless the grant is the gateway's (HMAC), for exactly this device/command/cwd, unexpired, and its nonce
+    is one this daemon issued. Does not spend it."""
+    keys = ("approval_id", "device", "command", "cwd", "nonce", "exp", "mac")
+    if not isinstance(grant, dict) or any(k not in grant for k in keys):
+        raise Refused("malformed grant")
+    aid, dev, cmd, cwd, nonce, exp, mac = (grant[k] for k in keys)
+    if not all(isinstance(v, str) and v for v in (aid, dev, cmd, cwd, nonce, mac)) or isinstance(exp, bool) \
+            or not isinstance(exp, int):
+        raise Refused("malformed grant")
+    good = grant_mac(CFG["token"], aid, dev, cmd, cwd, nonce, exp)
+    if not hmac.compare_digest(good, mac):
+        raise Refused("grant signature does not match")
+    now = time.time()
+    if now > exp:
+        raise Refused("grant expired")
+    if exp - now > GRANT_MAX_S + 5:
+        raise Refused("grant is valid for too long")
+    if dev != CFG["id"] or cmd != command or cwd != str(wd):
+        raise Refused("grant does not match this device/command/cwd")
+
+
 def _claim_approval(approval_id: str) -> None:
     """Mark an approval id used (persisted, so a restart can't replay it)."""
     f = _used_file()
@@ -431,9 +500,11 @@ def search(query: str, path: str | None = None) -> dict:
 
 
 @logged
-def run_command(command: str, cwd: str | None = None, approval_id: str | None = None) -> dict:
+def run_command(command: str, cwd: str | None = None, approval_id: str | None = None,
+                grant: dict | None = None) -> dict:
     """Run an allowlisted command (no shell). Risky commands need the user's approval via the gateway:
-    the first call returns pending_approval; call again with the approval_id once approved."""
+    the first call returns pending_approval (or needs_approval with a nonce when this device uses grants);
+    call again with the approval_id, or with the gateway's signed `grant`, once approved."""
     tokens = shlex.split(command)
     if not tokens:
         raise Refused("empty command")
@@ -442,9 +513,21 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     unlisted = not listed and not risky
     if unlisted and not CFG["approve_unlisted"]:  # an approval id cannot unlock it here either
         raise Refused("command not in allowed_commands")
-    wd = run_dir(cwd, approved=bool(approval_id) or (unlisted and CFG["approve_unlisted"]))
-    hard_deny(tokens, wd)  # before any approval is created, and for approved runs too
-    if not approval_id and (risky or unlisted):
+    via_grant = CFG["approval_via"] == "gateway-grant"
+    if grant and approval_id:
+        raise Refused("send a grant or an approval id, not both")
+    if approval_id and via_grant:
+        raise Refused("this device takes a signed grant, not an approval id")
+    wd = run_dir(cwd, approved=bool(approval_id or grant) or (unlisted and CFG["approve_unlisted"]))
+    hard_deny(tokens, wd)  # before any approval is created, and for approved and granted runs too
+    if grant:
+        check_grant(grant, command, wd)
+        _claim_nonce(grant["nonce"])
+        approval_id = None  # the gateway already spent the approval and audits the run
+    elif not approval_id and via_grant and (risky or unlisted):  # nobody is contacted: the gateway proxy files it
+        return {"status": "needs_approval", "command": command, "cwd": str(wd), "device": CFG["id"],
+                "nonce": _issue_nonce()}
+    if not grant and not approval_id and (risky or unlisted):
         r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": "run_command", "command": command,
                                               "cwd": str(wd), **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
         if r.get("status") != "approved":  # an "always" rule approves it on the spot
@@ -467,7 +550,7 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
         except httpx.HTTPStatusError:
             raise Refused("approval already used, stale or not for this device")
         _claim_approval(approval_id)
-    else:
+    elif not grant:
         check_args(tokens, wd)
     try:
         out = subprocess.run(tokens, cwd=wd, capture_output=True, timeout=CFG["command_timeout"])
