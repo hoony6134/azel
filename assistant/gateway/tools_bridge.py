@@ -148,7 +148,8 @@ class Bridge:
         cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
         own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if await self.mode() == "local" else OWN_TOOLS
         g_defs, _ = self.d.get("google", lambda: ([], None))()
-        return [*dev_defs, *own, *cyg_defs, *g_defs], where
+        s_defs, _ = self.d.get("spotify", lambda: ([], None))()
+        return [*dev_defs, *own, *cyg_defs, *g_defs, *s_defs], where
 
     # ---------- one call ----------
     async def call(self, name, args, persona_id=None, caller="api", on_progress=None, where=None):
@@ -267,7 +268,7 @@ class Bridge:
             except ValueError as e:
                 raise Fail("invalid", str(e))
             return r["text"][:200], r, f"{r['text']}\n(출처: {r['url']}; 말할 때는 사이트 이름만.)"
-        for source in ("cygnus", "google"):  # read-only sources with their own allowlist and checks
+        for source in ("cygnus", "google", "spotify"):  # sources with their own allowlist and checks
             defs, run = self.d.get(source, lambda: ([], None))()
             if run and name in {t["name"] for t in defs}:
                 return await run(name, args)
@@ -886,6 +887,7 @@ NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); t
     "device": "기기 작업은 앱에서 create_task로 맡겨요(명령 실행은 승인과 함께 모델 경로에서만).",
     "cygnus": "앱에 아직 화면이 없는 개인 조회예요.",
     "google": "앱에 아직 화면이 없는 개인 조회예요.",
+    "spotify": "음악은 말로 틀어요(모델 경로 전용); 앱에는 연결 화면만 있어요.",
 }
 
 
@@ -896,12 +898,15 @@ async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
     mid, method = msg.get("id"), msg.get("method")
     if mid is None:
         return None
+    # claude -p has no Spotify connector of its own: the gateway's grant serves it here (never to external)
+    extra = bridge.d.get("spotify", lambda: ([], None))()[0] if scope == "full" else []
+    allowed = allowed | {t["name"] for t in extra}
     if method == "initialize":
         result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
                   "capabilities": {"tools": {}}, "serverInfo": {"name": "azel", "version": "1"}}
     elif method == "tools/list":
         result = {"tools": [{"name": t["name"], "description": t["description"], "inputSchema": t["input_schema"]}
-                            for t in MCP_TOOLS if t["name"] in allowed]}
+                            for t in (*MCP_TOOLS, *extra) if t["name"] in allowed]}
     elif method == "tools/call":
         p = msg.get("params") or {}
         if p.get("name") not in allowed:

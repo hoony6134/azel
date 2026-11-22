@@ -326,6 +326,23 @@ device that created them.
     or `{"value": "{\"X-Api-Key\": \"…\"}"}` (a JSON object of headers) → **204**. Write-only: stored in
     `~/.config/biseo/mcp/<name>` (0600) on **this** gateway only, never returned by any route; restarts this gateway's warm
     Claude processes. Each full gateway that should use the server needs its own copy.
+  - **OAuth connectors** (`gateway/oauth.py`, PKCE S256): built-in providers (`spotify`) and custom servers marked
+    `"oauth": true` in `custom[]` (endpoints discovered from the server's 401: RFC 9728 protected-resource metadata,
+    then RFC 8414/OIDC metadata; client id pre-registered, else RFC 7591 dynamic registration). The GET shape adds
+    `"oauth": {"<name>": "needs_consent"|"connected"|"expired"}` and `"oauth": true` on such custom servers.
+    - `POST /v1/connectors/{name}/authorize` `{"client_id"?, "redirect_uri"?}` → `{"url", "state", "redirect_uri",
+      "expires_in": 600}`; the app opens `url`. `redirect_uri`: `azel://oauth/callback` (default), a loopback
+      `http://127.0.0.1:<port>/…`, or this gateway's `GET /v1/oauth/callback` (tailnet, or `BISEO_PUBLIC_URL`'s HTTPS
+      address through the proxy). A client id, once given, is stored with the grant. 404 unknown name, 400 bad input
+      (e.g. no client id for a provider without registration).
+    - `POST /v1/connectors/{name}/authorize/finish` `{"code", "state"}` → `{"name", "status"}`: what the app sends
+      after its scheme or loopback redirect. The state is single-use, 10 minutes.
+    - `GET /v1/oauth/callback?code&state` (no token: the pending state is the check) → a short HTML page.
+    - `GET /v1/connectors/{name}/oauth` → `{"name", "status"}`; `DELETE /v1/connectors/{name}/oauth` → 204
+      (forgets the grant).
+    Tokens live in `~/.config/biseo/oauth/<name>.json` (0600) on this gateway, are refreshed each minute when close to
+    expiry (under a lock), and are never returned, logged or sent anywhere but the provider. A custom OAuth server
+    with no live token is skipped like one with a missing secret. Spotify setup: `SPOTIFY.md`.
 - NVIDIA NIM provider (full gateways only; `gateway/nim.py`). The hosted, OpenAI-compatible API, never a local
   container. Setting `"providers":{"nim":{"enabled":false,"base_url":"https://integrate.api.nvidia.com/v1",
   "model":"nvidia/nemotron-3-ultra-550b-a55b","prices":{}}}`; GET adds the read-only `"has_key"`. A partial
