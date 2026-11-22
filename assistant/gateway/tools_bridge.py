@@ -155,7 +155,7 @@ OVERNIGHT_LIST = {"name": "overnight_list", "description": "밤사이 하기로 
 
 # Prompt injection: text read from the web, mail/calendar, Cygnus or memory may carry instructions. After such a read
 # in the same run (ask or task), a side-effect action from a model needs a read-back the user confirmed.
-TAINT_TOOLS = {"web_search", "web_fetch", "memory_recall", "people_lookup"}
+TAINT_TOOLS = {"web_search", "web_fetch", "memory_recall", "people_lookup", "task_status", "overnight_list"}
 SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "schedule_update": "예약 변경",
                 "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기", "home_scene": "집 장면 실행",
                 "web_task": "브라우저 작업 맡기기"}
@@ -176,7 +176,7 @@ AUTO_APPROVE = {
 }
 AUTO_Q = "이번 통화 동안 위험하지 않은 명령은 묻지 않고 바로 실행할게요. 지우기나 설치 같은 건 여전히 여쭤볼게요. 맞죠?"
 SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
-STORING = {"remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task"}
+STORING = {"remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task", "web_task"}
 
 
 def stores(name, args):
@@ -195,6 +195,7 @@ class Bridge:
         self.d = deps
         self.recent = {}  # (at, cron) -> (monotonic, say): a model repeating the same call_user creates nothing
         self.tainted = {}  # run id (ask:<session> | task:<id>) -> monotonic of its last web/mail/Cygnus/memory read
+        self.auto_asked = {}  # run id -> when auto_approve's read-back was asked (confirmed only counts after it)
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -240,8 +241,10 @@ class Bridge:
                 raise Need("confirm", q, f"아직 아무것도 하지 않았어요. 사용자에게 '{q}'라고 묻고, 사용자가 맞다고 하면 "
                            "같은 내용에 confirmed=true를 더해 다시 불러.", resend={**args, "confirmed": True})
             out = await self.dispatch(name, args, persona_id, caller, on_progress, where)
-            if who and (name in TAINT_TOOLS or name.endswith("__browser") or any(name in {t["name"] for t in self.d.get(src, lambda: ([], None))()[0]}
-                                                   for src in ("cygnus", "google"))):
+            # what a run just read may carry instructions: web, mail, Cygnus, memory, any device tool's output (a file,
+            # a page, a command's output), the phone, a task's result
+            if who and (name in TAINT_TOOLS or "__" in name or name in P.NAMES or any(
+                    name in {t["name"] for t in self.d.get(src, lambda: ([], None))()[0]} for src in ("cygnus", "google"))):
                 self.tainted[who] = time.monotonic()
             if isinstance(out, dict):  # a device tool's own result
                 r = result(not out["is_error"], out["content"],
@@ -323,6 +326,11 @@ class Bridge:
             return f"밤사이 작업 {len(items)}개: " + ", ".join(
                 f"{i['goal'][:24]}({word.get(i['status'], i['status'])})" for i in items[:5]), items
         if name in P.NAMES:  # read only: live from the phone in a call, else the synced daily summaries
+            who = self.d.get("who", lambda: "")()
+            if who.startswith("task:"):  # a task may read the phone only when the user made it in the app
+                t = await self.d["task_get"](who[5:]) if self.d.get("task_get") else None
+                if not t or t.get("source") != "app":
+                    raise Fail("invalid", "작업에서는 아이폰 정보를 볼 수 없어요. 앱에서 맡긴 작업만 돼요.")
             try:
                 return await P.run(name, args, self.d["state"], self.d.get("phone_live"), self.now())
             except P.Unavailable as e:
@@ -815,7 +823,10 @@ class Bridge:
         if args.get("off"):
             await self.d["auto_end"](scope)
             return "자동 실행을 껐어요. 이제 명령마다 승인을 받을게요.", None
-        if args.get("confirmed") is not True:
+        asked = self.auto_asked.pop(who, None)
+        if args.get("confirmed") is not True or asked is None or time.monotonic() - asked > TAINT_S:
+            # confirmed counts only after this run asked the read-back first (a forged confirmed=true asks anyway)
+            self.auto_asked[who] = time.monotonic()
             raise Need("confirm", AUTO_Q, f"아직 켜지 않았어요. 사용자에게 '{AUTO_Q}'라고 묻고, 맞다고 하면 confirmed=true로 다시 불러.",
                        resend={**args, "confirmed": True})
         g = await self.d["auto_grant"](scope, args.get("devices"), args.get("minutes", 120))

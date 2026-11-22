@@ -29,7 +29,8 @@ def test_window_and_next_start(tgw):
 def test_settings_validation(tgw):
     _, c, _ = tgw
     assert c.get("/v1/settings").json()["overnight"] == {"window": ["01:00", "06:00"], "report_push": True,
-                                                         "report_call": False}
+                                                         "report_call": False, "budget_usd": 5.0}
+    assert c.put("/v1/settings", json={"overnight": {"budget_usd": -1}}).status_code == 400
     assert c.put("/v1/settings", json={"overnight": {"window": ["25:00", "06:00"]}}).status_code == 400
     assert c.put("/v1/settings", json={"overnight": {"window": ["02:00", "02:00"]}}).status_code == 400
     r = c.put("/v1/settings", json={"overnight": {"window": ["23:30", "05:00"], "report_call": True}})
@@ -151,7 +152,8 @@ def test_night_approvals_wait_for_the_morning(tgw, monkeypatch):
 
     auto = put_task(c, g, id="b00000000002", status="running", auto_approve=True)
     c.portal.call(g.grant_create, {"task": auto["id"]}, None, 240)  # what run_task does for auto_approve
-    r = c.portal.call(g.create_approval, {"device": "macbook", "command": "ls -la", "requester": f"task:{auto['id']}"})
+    r = c.portal.call(g.create_approval, {"device": "macbook", "command": "ls -la", "requester": f"task:{auto['id']}",
+                                          "cwd": "/Users/jh/dev/proj", "in_roots": True})  # as the daemon files it
     assert r["status"] == "approved" and r["auto"]  # the grant comes first, the classifier decides
     r = c.portal.call(g.create_approval, {"device": "macbook", "command": "rm -rf /", "requester": f"task:{auto['id']}"})
     assert r["status"] == "pending" and r["expires_at"] > time.time() + 3 * 3600  # risky: still waits for the morning
@@ -184,3 +186,19 @@ def test_auto_approve_task_runs_under_a_task_grant(tgw):
     wait_for(c, tid, ("done",))
     assert [(s, by) for s, _, by in made] == [({"task": tid}, "app")]
     assert not [x for x in c.portal.call(g.grants_live) if x["scope"] == {"task": tid}]  # ended with the task
+
+
+
+def test_a_spent_night_budget_starts_nothing_more(tgw, monkeypatch):
+    g, c, notes = tgw
+    started = []
+    monkeypatch.setattr(g, "start_task", lambda t: started.append(t["id"]))
+
+    async def spent(now):
+        return 5.0
+    monkeypatch.setattr(g, "overnight_spent", spent)
+    t = put_task(c, g, id="b00000000009", status="scheduled", when="overnight", scheduled_for=0)
+    g.fake.db["kv"]["tasks-scheduled"] = [t["id"]]
+    night = g.datetime(2026, 11, 23, 2, 0, tzinfo=g.KST)
+    c.portal.call(g.overnight_tick, night)
+    assert started == [] and g.fake.db["kv"][f"task-{t['id']}"]["status"] == "scheduled"  # waits for the morning
