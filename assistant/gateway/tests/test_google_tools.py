@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -49,8 +50,9 @@ class FakeGoogle:
                  "end": {"dateTime": "2026-11-23T22:00:00+09:00"}, "description": "SECRET-DESC"},
                 {"summary": "취소됨", "status": "cancelled", "start": {"date": "2026-11-24"}, "end": {"date": "2026-11-25"}},
                 {"summary": "생일", "start": {"date": "2026-11-24"}, "end": {"date": "2026-11-25"}}]})
-        if "/calendars/hidden" in url:
-            raise AssertionError("a calendar the user hides was read")
+        if "/calendars/hidden" in url:  # hidden in the UI, read anyway: the user wants every calendar
+            return httpx.Response(200, json={"items": [{"summary": "생일", "start": {"date": "2026-11-24"},
+                                                        "end": {"date": "2026-11-25"}}]})  # also on primary: kept once
         if url.endswith("/messages?q=is%3Aunread&maxResults=2") or "/messages?q=" in url:
             return httpx.Response(200, json={"messages": [{"id": "abc123def456"}]})
         if "/messages/abc123def456" in url and "format=metadata" in url:
@@ -122,3 +124,67 @@ def test_invalid_grant_marks_expired(tmp_path):
 def test_scope_sets_start_read_only():
     assert all(s.endswith(".readonly") for s in GT.SCOPE_SETS["read"])
     assert set(GT.SCOPE_SETS["read"]) <= set(GT.SCOPE_SETS["calendar_write"])  # a re-consent adds, never drops
+
+
+class ManyCalendars:
+    """15 calendars over two calendarList pages: primary, selected, unselected, hidden, a deleted one, one that fails,
+    one too slow for the budget, one whose events come in two pages, and one repeating another's event."""
+    def __init__(self):
+        self.read = []
+
+    async def __call__(self, request):
+        url, q = str(request.url), dict(request.url.params)
+        if url.startswith("https://oauth2.example/token"):
+            return httpx.Response(200, json={"access_token": "AT", "expires_in": 3600})
+        if "/calendarList" in url:
+            assert q.get("showHidden") == "true"
+            first = [{"id": "primary", "primary": True, "summary": "me@example.com"},
+                     {"id": "classes", "summary": "수업", "selected": True},
+                     {"id": "contest", "summary": "contest", "summaryOverride": "대회 일정", "selected": False},
+                     {"id": "hw", "summary": "과제 일정", "hidden": True},
+                     {"id": "gone", "summary": "지운 것", "deleted": True},
+                     {"id": "ko.south_korea#holiday@group.v.calendar.google.com", "summary": "대한민국의 휴일"},
+                     {"id": "broken", "summary": "고장"}]
+            if q.get("pageToken") != "p2":
+                return httpx.Response(200, json={"items": first, "nextPageToken": "p2"})
+            return httpx.Response(200, json={"items": [{"id": "slow", "summary": "느린 것"}, {"id": "paged", "summary": "긴 것"},
+                                                       {"id": "shared", "summary": "공유"}] +
+                                             [{"id": f"extra{i}", "summary": f"기타{i}"} for i in range(5)]})
+        cal = url.split("/calendars/")[1].split("/events")[0]
+        self.read.append(cal)
+        ev = lambda title, hh: {"summary": title, "start": {"dateTime": f"2026-11-23T{hh}:00:00+09:00"},  # noqa: E731
+                                "end": {"dateTime": f"2026-11-23T{hh}:50:00+09:00"}}
+        if cal == "broken":
+            return httpx.Response(500)
+        if cal == "slow":
+            await asyncio.sleep(2)
+            return httpx.Response(200, json={"items": [ev("늦은 일정", "08")]})
+        if cal == "paged":
+            if q.get("pageToken") == "e2":
+                return httpx.Response(200, json={"items": [ev("둘째 쪽 일정", "17")]})
+            return httpx.Response(200, json={"items": [ev("첫째 쪽 일정", "16")], "nextPageToken": "e2"})
+        items = {"primary": [ev("랩미팅", "10")], "classes": [ev("컴파일러", "11")], "contest": [ev("ICPC 예선", "13")],
+                 "hw": [ev("리포트 마감", "23")], "shared": [ev("랩미팅", "10")],
+                 "ko.south_korea%23holiday@group.v.calendar.google.com": []}.get(cal, [])
+        return httpx.Response(200, json={"items": items})
+
+
+def test_every_calendar_is_read_in_parallel_within_the_budget(tmp_path, monkeypatch):
+    setup(tmp_path)
+    monkeypatch.setattr(GT, "CAL_BUDGET_S", 0.6)
+    fake = ManyCalendars()
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fake)) as c:
+            return await GT.events(tmp_path, "2026-11-23", "2026-11-23", client=c), await GT.call(
+                tmp_path, "calendar_events", {"from": "2026-11-23", "to": "2026-11-23"}, client=c)
+    t0 = time.monotonic()
+    (rows, missed), text = asyncio.run(go())
+    assert time.monotonic() - t0 < 2.5  # two reads, each bounded by the budget, never the slow calendar's 2 s each
+    assert "gone" not in fake.read and {"hw", "contest", "extra4", "paged"} <= set(fake.read)  # hidden/unselected too
+    got = [(r["start"], r["title"], r["cal"]) for r in rows]
+    assert got == [("10:00", "랩미팅", None), ("11:00", "컴파일러", "수업"), ("13:00", "ICPC 예선", "대회 일정"),
+                   ("16:00", "첫째 쪽 일정", "긴 것"), ("17:00", "둘째 쪽 일정", "긴 것"), ("23:00", "리포트 마감", "과제 일정")], got
+    assert sorted(missed) == ["고장", "느린 것"]  # the 랩미팅 on 공유 is the primary's again: kept once, unlabeled
+    assert "- 11/23(Mon) 13:00~13:50 ICPC 예선 (대회 일정)" in text and "- 11/23(Mon) 10:00~10:50 랩미팅\n" in text
+    assert text.endswith("못 읽은 캘린더: 고장, 느린 것")

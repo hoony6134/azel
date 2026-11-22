@@ -43,8 +43,8 @@ def test_both_sources_merged_by_day_and_time_with_duplicates_dropped(tmp_path):
                          "- 20:00~22:00 고정 지온나래 정기회의 (정기 회의) — 지온나래 · 구관 토론실",
                          "- 23:59 마감 할 일 컴파일러 프로젝트",
                          "### 11/24(화)",
-                         "- 종일 생일 (구글 캘린더)"], out
-    assert "구관 토론실 (구글 캘린더)" not in out  # the calendar's copy of the Gistra meeting is dropped
+                         "- 종일 생일 (기본 캘린더)"], out
+    assert "구관 토론실 (기본 캘린더)" not in out  # the calendar's copy of the Gistra meeting is dropped
     assert "SECRET" not in out and "취소됨" not in out and "[t-" not in out
 
 
@@ -55,7 +55,7 @@ def test_a_failing_source_is_named_and_the_other_still_answers(tmp_path):
     setup(tmp_path)
     out = asyncio.run(agenda.merged("2026-11-23", "2026-11-24", calendar_via(tmp_path, FakeGoogle()),
                                     gistra_text("지금은 Cygnus를 볼 수 없어요. (ConnectError)")))
-    assert "20:00~22:00 지온나래 정기회의 @ 구관 토론실 (구글 캘린더)" in out and "Gistra는 지금 못 읽었어요" in out
+    assert "20:00~22:00 지온나래 정기회의 @ 구관 토론실 (기본 캘린더)" in out and "Gistra는 지금 못 읽었어요" in out
 
     async def down(f, t):
         raise httpx.ConnectError("no route")
@@ -95,7 +95,7 @@ def test_the_agenda_tool_reads_both_sources_at_once(tmp_path, monkeypatch):
     r = asyncio.run(g.bridge.run("agenda", {}, caller="qwen"))
     assert r["ok"] and r["spoken"] == "일정 2건을 확인했어요.", r
     assert sorted(seen) == [("calendar", today, today), ("gistra_schedule", today, today)]
-    assert "치과 (구글 캘린더)" in r["data"]["text"] and "마감 과제 리포트" in r["data"]["text"]
+    assert "치과 (기본 캘린더)" in r["data"]["text"] and "마감 과제 리포트" in r["data"]["text"]
     bad = asyncio.run(g.bridge.run("agenda", {"from": "2026-11-01", "to": "2027-01-01"}, caller="qwen"))
     assert not bad["ok"] and bad["error"]["code"] == "invalid"
     assert "agenda" in g.tools_bridge.TAINT_TOOLS  # event titles are outside text: actions after it need a read-back
