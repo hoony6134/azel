@@ -1447,7 +1447,8 @@ CHECKPOINT = "azel-checkpoint"  # the Claude checkpoint's raw note; fallback whe
 CHECKPOINT_PROMPT = (
     "자율 전화 판단용 상황 메모를 써. GISTRA(과제·시험·수업), Planit(할 일), 캘린더, 메일을 확인해서 "
     "앞으로 48시간 안에 마감이거나 사용자의 결정·답장이 필요한 것만, 한 줄에 하나씩 '[긴급도 1-5] 무엇 — 언제까지 — "
-    "왜 사용자가 필요함' 형식으로 10줄 이내로 써. 이미 제출했거나 완료로 표시된 것(GISTRA 제출 여부, Planit 완료)은 "
+    "왜 사용자가 필요함' 형식으로 10줄 이내로 써. 과제 제출 여부는 꼭 gistra_assignments(upcoming)로 확인해: 거기 없는 "
+    "과제는 이미 낸 거야. 이미 제출했거나 완료로 표시된 것(GISTRA 제출 여부, Planit 완료)은 "
     "쓰지 마. 제출 여부를 확인할 수 없으면 '제출 여부 모름'이라고 써, 미제출이라고 단정하지 마. "
     "없으면 '없음'이라고만 써. 인사나 설명은 쓰지 마."
 )
@@ -1464,7 +1465,10 @@ DECIDE_PROMPT = (
     "넘어서도 끝난 흔적이 없고 마감이 다가올 때만 다시 걸어. 안 받은 전화는 아직 전달되지 않은 거야.\n"
     "calendar_today(오늘 일정)를 봐: 지금 수업·회의·시험·발표 중이면 전화를 받을 수 없어. 그 일정이 끝난 뒤에도 늦지 "
     "않으면 call=false로 두고, 끝나기를 기다릴 수 없을 만큼 급할 때(대규모 서버 장애, 1시간 안 마감인데 미완료)만 걸어.\n"
-    "상황 메모는 몇 시간 늦을 수 있어. 완료 여부가 불확실하면 미완료로 단정하지 말고 긴급도를 낮춰.\n"
+    "gistra_due(GISTRA에서 지금 조회한, 아직 안 낸 과제·할 일)가 제출 여부의 기준이야: 여기에 없는 과제는 이미 냈거나 "
+    "끝난 거니 상황 메모나 캘린더에 남아 있어도 전화하지 마.\n"
+    "상황 메모는 몇 시간 늦을 수 있어. 완료 여부가 불확실하면 미완료로 단정하지 말고 긴급도를 낮춰. '제출 여부 모름'인 "
+    "마감은 마감 1시간 전부터만 전화해. 사용자가 캘린더에 직접 걸어 둔 미리알림이 있는 일은 그 알림에 맡기고 전화하지 마.\n"
     "urgency: 5 = 지금 안 걸면 확실히 손해, 4 = 오늘 안에 꼭 알아야 하고 다른 알림으로는 안 닿음, 3 이하 = 전화 말고 "
     "나중에 말해도 됨.\n"
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
@@ -1559,6 +1563,17 @@ async def gather_signals(now):
                 out.append(f"{datetime.fromtimestamp(r['at'], KST):%H:%M} 자율 전화 안 받음: {r.get('reason', '')}")
         return out
 
+    async def gistra_due():
+        """GISTRA's assignments and todos still open (submitted ones are not listed): the truth on "did I hand it in".
+        The checkpoint note once said a submitted 토론지 was "제출 여부 모름" and the judge rang about it twice."""
+        import cygnus
+        if MODE != "full" or not cygnus.available():
+            return []
+        text = str(await cygnus.call("gistra_assignments", {"scope": "upcoming", "limit": 15}))
+        if text.startswith(agenda.GISTRA_FAIL):
+            return []
+        return [ln.strip() for ln in text.splitlines() if ln.strip()][:20]
+
     async def calendar_today():
         """Today's Google Calendar and Gistra: in class or a meeting = can't take a call."""
         if MODE != "full":
@@ -1568,7 +1583,7 @@ async def gather_signals(now):
 
     for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
                      ("tasks", contexts), ("device_jobs", lambda: device_jobs(now)),
-                     ("recent_calls", recent_calls), ("calendar_today", calendar_today)):
+                     ("recent_calls", recent_calls), ("calendar_today", calendar_today), ("gistra_due", gistra_due)):
         await source(name, fn)
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
@@ -1672,7 +1687,7 @@ async def llm_json(system, user, max_tokens=300):
 
 async def qwen_decide(signals, now):
     """Qwen's verdict, normalized; never trusted beyond its shape (the guardrails decide what happens)."""
-    if not any(v for k, v in signals.items() if k not in ("recent_calls", "calendar_today")):  # context, not a reason
+    if not any(v for k, v in signals.items() if k not in ("recent_calls", "calendar_today", "gistra_due")):  # context
         return {"call": False, "urgency": 0, "reason": "신호 없음", "opening": ""}
     when = datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d %H:%M (%a)")
     try:

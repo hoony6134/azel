@@ -1705,11 +1705,13 @@ _N = rf"(\d{{1,2}}|{_NATIVE}|{_SINO})"
 _BEFORE_UNIT = rf"(\d{{1,2}}|{_NATIVE}|(?<![가-힣])(?:{_SINO}))"  # a Sino numeral never starts mid-word
 # "오시면" (if you come) is not 5 o'clock: a Sino hour is not followed by a verb ending
 _SI = r"시(?!간|[면는고다어지겠죠니오세려라길서가])"
-_HOUR = (rf"(\d{{1,2}}|{_NATIVE}|(?<![가-힣])(?:[이삼사오]?십[일이삼사오육칠팔구]?(?=\s*{_SI})|[삼오육칠팔](?=\s*{_SI})"
+# a native hour never starts mid-word either ("아이디어에 대한 시장" read "한 시" as 1 o'clock), except after 오후/밤…
+_NATIVE_HOUR = rf"(?:(?<![가-힣])|(?<=오전|오후|아침|저녁|새벽)|(?<=밤|낮))(?:{_NATIVE})"
+_HOUR = (rf"(\d{{1,2}}|{_NATIVE_HOUR}|(?<![가-힣])(?:[이삼사오]?십[일이삼사오육칠팔구]?(?=\s*{_SI})|[삼오육칠팔](?=\s*{_SI})"
          rf"|[일이사구](?=\s+{_SI})))")  # "일시" (date/time) needs a space to be 1 o'clock
 DAYS = "월화수목금토일"
 REL_RE = re.compile(_BEFORE_UNIT + r"\s*(분|시간)\s*만?\s*(뒤|후|있다가|지나서)")
-CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _HOUR + r"\s*시(?!간)\s*(반|" + _N + r"\s*분)?")
+CLOCK_RE = re.compile(r"(오전|오후|아침|저녁|밤|새벽|낮)?\s*" + _HOUR + r"\s*시(?!간|[장작험청설민스])\s*(반|" + _N + r"\s*분)?")
 WEEKDAY_RE = re.compile(r"(다음\s*주|담주|이번\s*주)?\s*([월화수목금토일])요일")
 SCHED_LIST = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거).{0,8}(목록|뭐|있|확인|알려|된 거|돼 있)")
 SCHED_CANCEL = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거|전화).{0,8}취소|취소.{0,6}(예약|알람)|^\s*취소(해\s*줘|해요|요)?[.!]?\s*$")
@@ -1742,7 +1744,8 @@ def schedule_intent(text, session=""):
     if SCHED_WAKE.search(text):
         return "create"
     target = OTHER_TARGET.search(text)
-    if SCHED_CALL.search(text) and (not target or target.group(1) in ("나", "저")) and parse_when(text)[0]:
+    if SCHED_CALL.search(text) and (not target or target.group(1) in ("나", "저")) and parse_when(text)[0] \
+            and not TASK_NOTIFY.search(text):  # "…다 끝나면 전화해줘" reports on work: a task, never a timed call
         return "create"  # "내일 3시에 전화해 줘"; not "엄마한테 전화해 줘"
     asked = pending_schedule.get(session)
     if asked and time.time() - asked[0] < 90:
@@ -5369,6 +5372,13 @@ if __name__ == "__main__":
         assert said[0] == AUTO_Q and said[1].startswith("네, 이번 통화 동안") and said[3].startswith("알겠어요")
         assert notified == [{"type": "auto_grant", "session": "azel:a", "value": True}]  # "아니" grants nothing
         assert not pending_auto
+        said = ("실버 텔러 아이디어에 대한 시장 조사를 진행을 하고 국내외 시장 현황과 그다음에 비즈니스 아이디어에 대한 "
+                "생각을 하고 그거에 대해서 나한테 문서로 보내줘 그다음에 다 끝나면 전화해줘")
+        assert schedule_intent(said) is None and task_intent(said) == "call"  # "대한 시장" is no 1 o'clock
+        for t, h in [("세 시에 전화해 줘", 3), ("오후세시에 깨워줘", 15), ("열한시 반에 알려줘", 11),
+                     ("한 시에 전화해", 1), ("내일 3시에 전화해 줘", 3)]:
+            assert parse_when(t)[0] and parse_when(t)[0].hour == h, t
+        assert not CLOCK_RE.search("대한 시장") and not CLOCK_RE.search("한 시장에서 샀어")
         # a notify clause alone is no task; with the work it is (the cut-in joined to its unanswered turn)
         assert task_intent("그러고 끝나고 전화해줘.") is None and task_intent("끝나면 알려줘") is None
         assert task_intent("스탭메이트 시장 조사를 맥북에서 해서 다운로드 폴더에 저장해줘. 그러고 끝나고 전화해줘.") == "call"
