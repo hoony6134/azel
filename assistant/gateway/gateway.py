@@ -36,6 +36,7 @@ import agent_loop
 import cron
 import late_night
 import weather
+import agenda
 import web
 import openings
 import connectors
@@ -279,7 +280,7 @@ VOICE_STYLE = VOICE_BASE + (
 # Full gateways on the Messages API path (claude_path "api", opt-in): Cygnus through our read-only bridge, no
 # Gmail or Calendar (those are claude.ai connectors).
 FULL_API_STYLE = VOICE_BASE + (
-    "사용자의 일정, 과제, 할 일, 기억, 서버 상태는 주어진 Cygnus 도구로 확인하고, 확인하지 못한 것은 지어내지 마. "
+    "사용자의 일정은 agenda 도구(구글 캘린더와 Gistra를 합친 것)로, 과제, 할 일, 기억, 서버 상태는 주어진 Cygnus 도구로 확인하고, 확인하지 못한 것은 지어내지 마. "
     "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해. 기기 작업은 주어진 기기 도구로만 해. "
     "위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
@@ -746,7 +747,7 @@ OWN_LABELS = {"memory_recall": "기억 찾는 중", "people_lookup": "사람 찾
               "web_fetch": "웹페이지 읽는 중", "call_user": "전화 예약 중", "schedule_list": "예약 확인 중",
               "schedule_cancel": "예약 취소 중", "schedule_update": "예약 바꾸는 중", "schedule_create": "예약하는 중",
               "create_task": "작업 맡기는 중", "task_status": "작업 확인 중", "task_cancel": "작업 멈추는 중",
-              "approval_status": "승인 확인 중", "calendar_events": "캘린더 확인 중", "gmail_search": "메일 찾는 중",
+              "approval_status": "승인 확인 중", "agenda": "일정 확인 중", "calendar_events": "캘린더 확인 중", "gmail_search": "메일 찾는 중",
               "gmail_read": "메일 읽는 중", "music_play": "음악 트는 중", "music_control": "음악 조작 중",
               "home_scene": "집 기기 조작 중"}
 GENERIC = ("도구 준비 중", "generic")
@@ -4537,7 +4538,7 @@ bridge = tools_bridge.Bridge(
     auto_end=lambda scope: end_grants(scope),
     end_call=lambda session, reason: link_send({"type": "end_call", "session": session, "reason": reason}),
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
-    weather=lambda place, when: weather_now(place, when), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
@@ -4598,6 +4599,22 @@ async def web_search(query, n):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
     res = await run_tool({"id": "web", "name": browse, "input": {"url": url, "max_chars": 3000}}, where)
     return {"text": str(res.get("content", ""))[:1500], "sources": [{"title": "DuckDuckGo", "url": url}], "cost_usd": 0.0}
+
+
+async def agenda_text(f, t):
+    """Google Calendar and Gistra for one range, merged (agenda.py); a missing or failing source is named, not hidden."""
+    import cygnus
+
+    async def calendar(f, t):
+        if MODE != "full":
+            raise RuntimeError("이 게이트웨이에는 구글 연결이 없어요")
+        return await google_tools.events(HOME, f, t)
+
+    async def gistra(f, t):
+        if not cygnus.available():
+            raise RuntimeError("Cygnus 토큰이 없어요")
+        return await cygnus.call("gistra_schedule", {"from": f, "to": t})
+    return await agenda.merged(f, t, calendar, gistra)
 
 
 async def weather_now(place, when):

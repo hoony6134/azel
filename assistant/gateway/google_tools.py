@@ -237,7 +237,8 @@ async def call(home, name, args, client=None):
             await http.aclose()
 
 
-async def _events(http, h, a):
+async def _event_rows(http, h, a):
+    """Events in the selected calendars as rows {day, start, end, title, where, line}, by start (KST)."""
     tmin = datetime.combine(a["from"], datetime.min.time(), KST).isoformat()
     tmax = datetime.combine(a["to"] + timedelta(days=1), datetime.min.time(), KST).isoformat()
     cals = (await http.get(f"{CAL}/users/me/calendarList", headers=h, params={"minAccessRole": "reader"})).json()
@@ -251,16 +252,36 @@ async def _events(http, h, a):
             if e.get("status") == "cancelled":
                 continue
             s, en = e.get("start", {}), e.get("end", {})
+            title, loc = e.get("summary", "(제목 없음)")[:80], (e.get("location") or "")[:40]
             if "dateTime" in s:
                 st, et = datetime.fromisoformat(s["dateTime"]).astimezone(KST), datetime.fromisoformat(en["dateTime"]).astimezone(KST)
-                when = f"{st:%m/%d(%a) %H:%M}~{et:%H:%M}"
+                row = {"day": st.date(), "start": f"{st:%H:%M}", "end": f"{et:%H:%M}",
+                       "when": f"{st:%m/%d(%a) %H:%M}~{et:%H:%M}"}
             else:
-                when = f"{s.get('date', '')} 종일"
-            where = f" @ {e['location'][:40]}" if e.get("location") else ""
-            rows.append((s.get("dateTime") or s.get("date") or "", f"- {when} {e.get('summary', '(제목 없음)')[:80]}{where}"))
-    rows.sort()
+                row = {"day": Date.fromisoformat(s["date"]) if s.get("date") else a["from"], "start": "", "end": "",
+                       "when": f"{s.get('date', '')} 종일"}
+            rows.append({**row, "key": s.get("dateTime") or s.get("date") or "", "title": title, "where": loc})
+    return sorted(rows, key=lambda r: r["key"])
+
+
+async def _events(http, h, a):
+    rows = [f"- {r['when']} {r['title']}" + (f" @ {r['where']}" if r["where"] else "") for r in await _event_rows(http, h, a)]
     head = f"캘린더 {a['from']}~{a['to']} (KST)"
-    return head + ("\n" + "\n".join(r for _, r in rows) if rows else "\n일정 없음")
+    return head + ("\n" + "\n".join(rows) if rows else "\n일정 없음")
+
+
+async def events(home, f, t, client=None):
+    """calendar_events as rows for agenda.py; raises (Expired, httpx errors, no grant) instead of answering in words."""
+    if status(home) != "connected":
+        raise Expired("Google 연결이 없거나 만료됐어요")
+    a = _check("calendar_events", {"from": f, "to": t})
+    http = client or httpx.AsyncClient(timeout=20)
+    try:
+        token = await access_token(home, http)
+        return await _event_rows(http, {"Authorization": f"Bearer {token}"}, a)
+    finally:
+        if client is None:
+            await http.aclose()
 
 
 async def _search(http, h, a):

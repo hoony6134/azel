@@ -379,6 +379,43 @@ PLANS_ASK = (r"해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게)
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)|" + PLANS_ASK, re.I)
 NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
+# "오늘 일정", "내일 뭐 있어", "이번 주 일정": the gateway's agenda tool (Google Calendar and Gistra merged) is read
+# once before any model runs, so every path answers from both, not from whichever one tool the model picks.
+AGENDA_ASK = re.compile(r"일정(?!한)|스케줄|캘린더|약속|" + PLANS_ASK)
+AGENDA_WAIT_S = 8
+
+
+def agenda_range(text, now):
+    """(from, to) dates of the schedule a question asks about, or None when it is not a schedule question."""
+    if not AGENDA_ASK.search(text):
+        return None
+    today = late_night.day_for(0, now)
+    if re.search(r"다음 ?주|담주", text):
+        start = today + timedelta(days=7 - today.weekday())
+        return start, start + timedelta(days=6)
+    if re.search(r"이번 ?주", text):
+        return today, today + timedelta(days=6 - today.weekday())
+    if "주말" in text:
+        sat = today if today.weekday() == 6 else today + timedelta(days=5 - today.weekday())
+        return sat, today + timedelta(days=6 - today.weekday())
+    word, add = late_night.day_word(text)
+    day = late_night.day_for(add, now) if word else today
+    return day, day
+
+
+async def agenda_prefetch(text, gw_names, timings):
+    """The merged schedule as a context block for this turn ('' when there is no gateway agenda or no question)."""
+    span = agenda_range(text, datetime.now(KST)) if "agenda" in gw_names else None
+    if not span:
+        return ""
+    try:
+        got = await asyncio.wait_for(gateway_tool("agenda", {"from": span[0].isoformat(), "to": span[1].isoformat()}),
+                                     AGENDA_WAIT_S)
+    except (RuntimeError, asyncio.TimeoutError, httpx.HTTPError):
+        timings["agenda"] = "failed"  # the model still has the agenda tool
+        return ""
+    timings["agenda"] = "ok"
+    return f"\n\n[일정, 방금 확인: 구글 캘린더와 Gistra를 합친 것]\n{got.strip()}\n"
 NO_GATEWAY = "지금 Claude 게이트웨이에 연결이 안 돼요."
 TASK_WORDS = {"code": r"코드|레포|빌드|버그|커밋|테스트 ?돌|에러|함수 ?짜|스크립트", "mac": r"macbook|맥북|파일|폴더|터미널|바탕화면|다운로드",
               "schedule": r"일정(?!한)|할 ?일|과제|캘린더|회의|수업|마감|알람|브리핑|플래닛|planit|" + PLANS_ASK}
@@ -1844,6 +1881,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
     route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
     address = Address(user_title(settings, persona), hkey, not any(m["role"] == "assistant" for m in hist))
+    fetched = {"agenda": ""}  # agenda_prefetch's block, read by both model paths
 
     async def via_claude():
         if offline:  # never Claude in local mode: say so and offer the switch
@@ -1882,7 +1920,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         try:
             personal = task == "schedule" or bool(PERSONAL.search(text))  # this utterance only, not history
             thinking.append(Unthink())  # Claude/NIM output gets the same filter as Qwen's
-            async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(prior),
+            async for delta in unthink(claude_stream(text, hkey, model, task, personal, recent_context(prior) + fetched["agenda"],
                                                      on_event=watch), thinking[-1]):
                 got_text.set()
                 buf += delta
@@ -1908,6 +1946,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 for s in split_ready(await task_reply(bare, job), final=True)[0]:
                     await sentences.put(s)
                 return
+            if not play:
+                fetched["agenda"] = await agenda_prefetch(bare, gw_names, timings)
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
@@ -1915,7 +1955,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             system = (local_prompt if offline or play else str)(system_prompt(
                 name, length, ctx, persona_text(persona, settings), user_title(settings, persona))) \
                 + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
-                + play
+                + fetched["agenda"] + play
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
             # No-tool turns pass through as the model said them (user decision 2026-11-22: "툴콜을 안 할 때의 안전장치는
             # 최대한 덜어내고 할루시네이션만 잡는 쪽으로"). Two checks remain, and each first re-asks Qwen once:
@@ -1927,7 +1967,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
 
             async def say(s):
-                sources = ctx + "\n".join(m["content"] for m in messages if m["role"] == "user" and m["content"] not in notes)
+                sources = ctx + fetched["agenda"] + "\n".join(m["content"] for m in messages if m["role"] == "user" and m["content"] not in notes)
                 if not grounded(s, sources):
                     timings["ungrounded"] = s[:80]
                     raise Recheck("personal", s)
@@ -3181,6 +3221,45 @@ if __name__ == "__main__":
         assert client_activity({"phase": "tool_start", "kind": "mail"})["kind"] == "mail"
         assert client_activity({"phase": "tool_start", "kind": "<script>"})["kind"] == "generic"
         assert "SECRET" not in json.dumps(seen) and said == ["내일은 수업이 없어요."]
+
+        async def agenda_check(ask, fail=False):  # the schedule fast path: one agenda read (both sources) before Claude
+            calls, contexts = [], []
+
+            async def fake_gw_tool(name, args, on_say=None):
+                calls.append((name, args))
+                if fail:
+                    raise RuntimeError("down")
+                return "일정 (구글 캘린더와 Gistra를 합친 것, KST)\n- 09:00~10:00 치과 (구글 캘린더)\n- 20:00~22:00 고정 정기회의"
+
+            async def fake_claude(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
+                contexts.append(context)
+                yield "내일은 치과와 정기회의가 있어요."
+
+            async def fake_tts(sentence):
+                return b"", 24000
+            saved = gateway_tool, claude_stream, tts, dict(gw_tools)
+            globals().update(gateway_tool=fake_gw_tool, claude_stream=fake_claude, tts=fake_tts)
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            try:
+                said = [s async for s, *_ in respond(ask, f"ag{len(ask)}{fail}", time.perf_counter(), {})]
+            finally:
+                globals().update(gateway_tool=saved[0], claude_stream=saved[1], tts=saved[2])
+                gw_tools.clear()
+                gw_tools.update(saved[3])
+            return calls, contexts, said
+        now = datetime.now(KST)
+        tomorrow = late_night.day_for(1, now).isoformat()
+        calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘"))
+        assert calls == [("agenda", {"from": tomorrow, "to": tomorrow})], calls
+        assert "치과 (구글 캘린더)" in contexts[0] and "고정 정기회의" in contexts[0] and said == ["내일은 치과와 정기회의가 있어요."]
+        calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘", fail=True))
+        assert calls and "치과" not in contexts[0] and said, (calls, said)  # agenda down: Claude still answers (its own tools)
+        assert asyncio.run(agenda_prefetch("오늘 광주 날씨 어때?", ("agenda",), {})) == ""  # not a schedule question
+        assert asyncio.run(agenda_prefetch("내일 일정", ("web_search",), {})) == ""  # an older gateway without agenda
+        mon = late_night.day_for(0, now) - timedelta(days=late_night.day_for(0, now).weekday())
+        assert agenda_range("이번 주 일정 뭐 있어?", now) == (late_night.day_for(0, now), mon + timedelta(days=6))
+        assert agenda_range("다음 주 일정", now) == (mon + timedelta(days=7), mon + timedelta(days=13))
+        assert agenda_range("일정 알려줘", now) == (late_night.day_for(0, now),) * 2 and agenda_range("일정한 속도", now) is None
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen

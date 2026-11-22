@@ -155,7 +155,7 @@ OVERNIGHT_LIST = {"name": "overnight_list", "description": "밤사이 하기로 
 
 # Prompt injection: text read from the web, mail/calendar, Cygnus or memory may carry instructions. After such a read
 # in the same run (ask or task), a side-effect action from a model needs a read-back the user confirmed.
-TAINT_TOOLS = {"web_search", "web_fetch", "memory_recall", "people_lookup", "task_status", "overnight_list"}
+TAINT_TOOLS = {"agenda", "web_search", "web_fetch", "memory_recall", "people_lookup", "task_status", "overnight_list"}
 SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "schedule_update": "예약 변경",
                 "schedule_cancel": "예약 취소", "create_task": "작업 맡기기", "remember": "기억하기", "home_scene": "집 장면 실행",
                 "web_task": "브라우저 작업 맡기기"}
@@ -371,6 +371,16 @@ class Bridge:
             return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
                 f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마. 같은 걸 다시 검색하지 " \
                 "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
+        if name == "agenda":
+            today = L.day_for(0, datetime.now(KST)).isoformat()
+            f = args.get("from") or today
+            try:
+                text = await self.d["agenda"](f, args.get("to") or f)
+            except ValueError as e:
+                raise Fail("invalid", f"{e}")
+            n = sum(1 for x in text.splitlines() if x.startswith("- "))
+            return (f"일정 {n}건을 확인했어요." if n else "그 기간엔 일정이 없어요."), {"text": text}, text + \
+                "\n(이 목록대로만 답해: 없는 일정은 지어내지 말고, 못 읽은 곳이 있으면 짧게 그렇다고 말해.)"
         if name == "weather":
             try:
                 r = await self.d["weather"](str(args.get("place") or "").strip(), args.get("when") or "now")
@@ -1071,6 +1081,14 @@ FORGET = {
 MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것 목록(최근 순, 직접 기억한 것과 통화에서 자동으로 남긴 것).",
                "input_schema": {"type": "object", "additionalProperties": False, "properties": {
                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
+AGENDA = {
+    "name": "agenda",
+    "description": ("사용자 일정: 구글 캘린더와 Gistra(수업·시험·과제·할 일·회의·학사)를 합친 날짜별 목록. '오늘 일정', '내일 뭐 "
+                    "있어', '이번 주 일정'처럼 일정을 물으면 이걸 불러(둘 중 하나만 보지 마). from~to는 YYYY-MM-DD(최대 31일, "
+                    "비우면 오늘). 목록에 없는 일정은 지어내지 마."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "from": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "to": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}}}}
 WEATHER = {
     "name": "weather",
     "description": ("날씨(기온, 최고·최저, 비 올 확률, 하늘). 날씨를 물으면 웹 검색 말고 이걸 불러. place는 사용자가 말한 "
@@ -1137,7 +1155,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEATHER, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1187,6 +1205,9 @@ ACTIONS = {
                     "rest": ("GET", "/v1/memories"), "examples": ({}, {"limit": 0})},
 }
 for _n, _m in {
+    "agenda": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+               "no_rest": "앱은 캘린더와 Gistra를 직접 보여 줘요(모델 경로 전용).",
+               "examples": ({"from": "2026-11-23", "to": "2026-11-29"}, {"from": "2026-11-23", "to": "2027-03-01"})},
     "weather": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                 "no_rest": "앱에는 날씨 화면이 없어요(모델 경로 전용).",
                 "examples": ({"place": "광주", "when": "tomorrow"}, {"when": "next_year"})},
