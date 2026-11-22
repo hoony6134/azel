@@ -1859,6 +1859,7 @@ async def remember_alert(names, now):
 # ---------- scheduled calls ("내일 10시에 깨워 줘"); no Claude involved ----------
 REPEAT_RE = re.compile(r"daily|weekdays|weekly:[0-6]")  # weekly:<dow>, 0 = Monday
 MAX_DAYS, MAX_ATTEMPTS, RETRY_EVERY_S, ANSWER_WAIT_S = 30, 3, 120, 60
+WAKE_ATTEMPTS = 15  # a wake call rings every 2 min for up to 30 min until answered (user, 2026-11-23)
 LATE_S = 600  # a scheduled call more than 10 min late (gateway down) becomes missed instead of ringing
 
 
@@ -2175,17 +2176,20 @@ async def update_item(item, **fields):
 
 
 async def fire_scheduled(now):
-    """Due items ring; unanswered ones retry every RETRY_EVERY_S up to MAX_ATTEMPTS, then count as missed.
+    """Due items ring; unanswered ones retry every RETRY_EVERY_S up to MAX_ATTEMPTS (wake: WAKE_ATTEMPTS), then count as missed.
     User-requested calls fire even with proactive.enabled off (the user asked for that time)."""
     for item in await schedule_list():
         since = now - (item["last_attempt"] or 0)
-        if item["status"] in ("pending", "fired") and now - item["at"] > LATE_S:
+        tries = WAKE_ATTEMPTS if item.get("kind") == "wake" else MAX_ATTEMPTS
+        window = (tries - 1) * RETRY_EVERY_S  # the retries themselves may run past the 10-minute grace
+        if item["status"] == "pending" and now - item["at"] > LATE_S or \
+                item["status"] == "fired" and now - item["at"] > window + LATE_S:
             await missed(item, now, late=True)  # gateway was down: no 07:00 alarm at 13:00
         elif item["status"] == "pending" and item["at"] <= now:
             await attempt(item, now)
-        elif item["status"] == "fired" and item["attempts"] < MAX_ATTEMPTS and since >= RETRY_EVERY_S:
+        elif item["status"] == "fired" and item["attempts"] < tries and since >= RETRY_EVERY_S:
             await attempt(item, now)
-        elif item["status"] == "fired" and item["attempts"] >= MAX_ATTEMPTS and since >= ANSWER_WAIT_S:
+        elif item["status"] == "fired" and item["attempts"] >= tries and since >= ANSWER_WAIT_S:
             await missed(item, now)
 
 

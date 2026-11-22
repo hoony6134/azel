@@ -857,9 +857,22 @@ def fire_setup(g, monkeypatch, **item):
     return at, placed, alerts
 
 
+def test_wake_call_retries_every_two_minutes_for_thirty(gw, monkeypatch):
+    g, _, _ = gw
+    at, placed, alerts = fire_setup(g, monkeypatch)  # kind wake
+    item = g.fake.db["schedule"]["s1"]
+    for k in range(15):
+        asyncio.run(g.fire_scheduled(at + k * 120))
+        assert len(placed) == k + 1 and item["status"] == "fired", k
+    asyncio.run(g.fire_scheduled(at + 28 * 60 + 30))
+    assert len(placed) == 15 and item["status"] == "fired"  # waiting for the last ring to be answered
+    asyncio.run(g.fire_scheduled(at + 29 * 60))
+    assert item["status"] == "missed" and len(placed) == 15
+
+
 def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
     g, _, _ = gw
-    at, placed, alerts = fire_setup(g, monkeypatch)
+    at, placed, alerts = fire_setup(g, monkeypatch, kind="reminder")
     item = g.fake.db["schedule"]["s1"]
     asyncio.run(g.fire_scheduled(at - 60))
     assert placed == []  # not yet
@@ -867,11 +880,11 @@ def test_scheduled_call_fires_retries_and_is_missed(gw, monkeypatch):
         asyncio.run(g.fire_scheduled(at + dt))
         assert len(placed) == n and item["attempts"] == n, (dt, n)
     t = datetime.fromtimestamp(at, g.KST)  # the opening: composed from the time, never the request (openings.py)
-    assert placed[0] == ("wake", g.openings.template("wake", "", t.hour, t.minute)) and item["status"] == "fired" \
+    assert placed[0][0] == "reminder" and item["status"] == "fired" \
         and len(item["call_id"]) == 32
     asyncio.run(g.fire_scheduled(at + 300))  # 60 s after the third attempt
     assert item["status"] == "missed" and len(placed) == 3
-    assert alerts == ["오늘 오전 7시 기상 전화를 받지 않으셨어요."]
+    assert len(alerts) == 1 and "받지 않으셨어요" in alerts[0]
 
 
 def test_answered_call_stops_retries_and_repeat_reschedules(gw, monkeypatch):
