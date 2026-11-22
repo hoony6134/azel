@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent), str(HERE.parents[1] / "spark")]
 sys.argv = [sys.argv[0], "--check"]  # import the voice server without its speech models
 import voice_server as V  # noqa: E402
+import quote  # noqa: E402
 import weather  # noqa: E402
 import web  # noqa: E402
 from test_tools_bridge import World  # noqa: E402
@@ -29,9 +30,10 @@ NUM = r"(\d[\d,.]*|[일이삼사오육칠팔구십백천만억]{2,})"  # Qwen sa
 CASES = [  # (said, the tool it must use, what the answer must hold)
     ("광주 날씨 알려줄래?", "weather", rf"{NUM} ?도"),
     ("내일 서울 날씨 어때?", "weather", rf"{NUM} ?도|비|맑|흐"),
-    ("그러면 클로드 그 엔트로픽 있잖아 엔트로픽의 주가 지금 알려줘", "web_search", r"상장|주가|비공개|주식"),
-    ("삼성전자 주가 지금 얼마야?", "web_search", rf"{NUM} ?원"),
-    ("지금 1달러 환율 얼마야?", "web_search", rf"{NUM} ?원"),
+    ("그러면 클로드 그 엔트로픽 있잖아 엔트로픽의 주가 지금 알려줘", "stock_quote", rf"{NUM} ?달러|상장"),
+    ("삼성전자 주가 지금 얼마야?", "stock_quote", rf"{NUM} ?원"),
+    ("엔비디아 주식 얼마야?", "stock_quote", rf"{NUM} ?달러"),
+    ("지금 1달러 환율 얼마야?", "stock_quote", rf"{NUM} ?원"),
 ]
 ANNOUNCE_ONLY = re.compile(r"^[^.?!]*(찾아|알아|확인해)\s*볼게요\.?$")
 
@@ -54,7 +56,7 @@ async def main():
         if not r:
             raise RuntimeError("searxng found nothing")
         return r
-    b.d.update(weather=wx, web_search=sx, web_fetch=web.fetch, cygnus=lambda: ([], None), mode=local, web_ok=up)
+    b.d.update(weather=wx, stock_quote=quote.quote, web_search=sx, web_fetch=web.fetch, cygnus=lambda: ([], None), mode=local, web_ok=up)
 
     async def gateway_tool(name, args, on_say=None):  # the link to the gateway, as the bridge answers it
         used.append(name)

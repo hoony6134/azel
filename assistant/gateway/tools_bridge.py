@@ -317,6 +317,14 @@ class Bridge:
             except Exception as e:  # noqa: BLE001  Open-Meteo down or slow
                 raise Fail("unavailable", f"지금은 날씨를 가져오지 못했어요({type(e).__name__}).")
             return r["spoken"], r, r["spoken"] + " (Open-Meteo 기준. 이 문장대로 답해.)"
+        if name == "stock_quote":
+            try:
+                r = await self.d["stock_quote"](str(args["query"]).strip())
+            except LookupError as e:
+                raise Fail("not_found", str(e))
+            except Exception as e:  # noqa: BLE001  the quote sources down or slow
+                raise Fail("unavailable", f"지금은 주가를 가져오지 못했어요({type(e).__name__}).")
+            return r["spoken"], r, r["spoken"] + " (네이버 증권·Yahoo Finance 기준. 이 문장대로 답해.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
@@ -955,9 +963,16 @@ WEATHER = {
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
         "place": {"type": "string", "maxLength": 40},
         "when": {"type": "string", "enum": ["now", "today", "tomorrow", "day_after"]}}}}
+STOCK_QUOTE = {
+    "name": "stock_quote",
+    "description": ("주가와 환율(현재가 또는 마지막 종가, 전날 대비). 주가나 환율을 물으면 웹 검색 말고 이걸 불러. query는 "
+                    "회사 영어 이름이나 티커, 종목 코드(예: Samsung Electronics, Anthropic, AAPL, 005930), 환율이면 "
+                    "'달러 환율', '엔화 환율'. 결과 문장대로 답하고, 못 찾으면 그렇다고만 말해(비상장일 수 있어)."),
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
+        "query": {"type": "string", "minLength": 1, "maxLength": 60}}}}
 WEB_SEARCH = {
     "name": "web_search",
-    "description": ("웹 검색(뉴스, 가격·주가·환율, 사실 확인처럼 지금 정보가 필요할 때; 날씨는 weather). 답할 때는 '○○ 기준으로'처럼 출처 "
+    "description": ("웹 검색(뉴스, 가격, 사실 확인처럼 지금 정보가 필요할 때; 날씨는 weather, 주가·환율은 stock_quote). 답할 때는 '○○ 기준으로'처럼 출처 "
                     "사이트 이름만 짧게 말하고 URL은 읽지 마."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
         "query": {"type": "string", "maxLength": 200}, "max": {"type": "integer", "minimum": 1, "maximum": 8}}}}
@@ -998,7 +1013,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEATHER, WEB_SEARCH, WEB_FETCH,
+             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEATHER, STOCK_QUOTE, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1049,6 +1064,9 @@ for _n, _m in {
     "weather": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                 "no_rest": "앱에는 날씨 화면이 없어요(모델 경로 전용).",
                 "examples": ({"place": "광주", "when": "tomorrow"}, {"when": "next_year"})},
+    "stock_quote": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                    "no_rest": "앱에는 주식 화면이 없어요(모델 경로 전용).",
+                    "examples": ({"query": "Samsung Electronics"}, {"query": ""})},
     "web_search": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                    "no_rest": "앱에는 검색 화면이 없어요(모델 경로 전용; claude -p는 자체 WebSearch).",
                    "examples": ({"query": "광주 날씨"}, {"query": ""})},

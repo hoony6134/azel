@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import agent_loop
 import cron
 import late_night
+import quote as stock_quotes  # not "quote": urllib.parse.quote is used everywhere here
 import weather
 import web
 import openings
@@ -3967,7 +3968,7 @@ bridge = tools_bridge.Bridge(
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
     web_ok=lambda: searxng_ok(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
-    weather=lambda place, when: weather_now(place, when), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
+    weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: stock_quotes.quote(q), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
