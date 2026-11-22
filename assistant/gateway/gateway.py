@@ -96,7 +96,9 @@ DEFAULTS = {
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
-    "brain_mode": "auto",  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
+    "brain_mode": "auto",
+    "search_backend": "searxng",  # searxng (the user's own, free; local Qwen may use it) | haiku (paid Claude search)
+    "searxng_url": os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL),  # auto | local (Qwen only) | claude_api | claude_code: what answers and runs tasks
     "personality": "",  # free text up to 600 chars; "" = PERSONALITY_DEFAULT (the primary persona's)
     "personas": [],  # managed through /v1/personas; empty = the assistant migrates to persona azel
     "reply_length": "normal",  # brief | normal | detailed: drives both Qwen's and Claude's answer length
@@ -2151,6 +2153,11 @@ async def put_settings(body: dict):
         if not (isinstance(bp, list) and all(p in ("api", "nim", "claude_code") for p in bp)):
             raise HTTPException(400, "budget_paths: a list of api, nim, claude_code")
         body["budget_paths"] = sorted(set(bp), key=("api", "nim", "claude_code").index)
+    if "search_backend" in body and body["search_backend"] not in ("searxng", "haiku"):
+        raise HTTPException(400, "search_backend: searxng or haiku")
+    if "searxng_url" in body and not (isinstance(body["searxng_url"], str)
+                                      and re.fullmatch(r"https?://[^\s]{3,300}", body["searxng_url"])):
+        raise HTTPException(400, "searxng_url: an http(s) URL")
     if "brain_mode" in body and body["brain_mode"] not in BRAIN_MODES:
         raise HTTPException(400, f"brain_mode: one of {list(BRAIN_MODES)}")
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
@@ -3442,6 +3449,7 @@ bridge = tools_bridge.Bridge(
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
+    web_ok=lambda: searxng_ok(),
     mode=lambda: brain_mode(),
     web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None))  # never on a limited gateway
@@ -3451,10 +3459,43 @@ async def none():
     return None
 
 
-async def web_search(query, n):
-    """Haiku with the server-side search (path api, held to the paid budget); a spent budget or no key: the
-    daemon's browse on a search page instead."""
+searxng_health = {"ok": None, "at": 0.0}  # the last time SearXNG answered (or didn't), for local mode's tool list
+
+
+async def searxng_ok():
+    """Is the user's SearXNG reachable? Cached 5 min; local mode offers web_search only while it is."""
     settings = await load_settings()
+    if settings.get("search_backend", "searxng") != "searxng":
+        return False
+    if time.time() - searxng_health["at"] < 300 and searxng_health["ok"] is not None:
+        return searxng_health["ok"]
+    try:
+        async with httpx.AsyncClient(timeout=4) as c:
+            r = await c.get(settings.get("searxng_url") or web.SEARXNG_URL, params={"q": "test", "format": "json"})
+        ok = r.status_code == 200 and isinstance(r.json().get("results"), list)
+    except Exception:  # noqa: BLE001
+        ok = False
+    searxng_health.update(ok=ok, at=time.time())
+    return ok
+
+
+async def web_search(query, n):
+    """The user's SearXNG first (free; the only search local mode may use). When it fails or finds nothing:
+    Haiku with the server-side search (path api, held to the paid budget), never in local mode; with a spent
+    budget or no key, the daemon's browse on a search page instead."""
+    settings = await load_settings()
+    local = await brain_mode(settings) == "local"
+    if settings.get("search_backend", "searxng") == "searxng":
+        try:
+            r = await web.searxng(query, n, settings.get("searxng_url") or web.SEARXNG_URL)
+            searxng_health.update(ok=True, at=time.time())
+            if r:
+                return r
+        except Exception as e:  # noqa: BLE001  unreachable, slow or broken: say so in the log, then fall back
+            searxng_health.update(ok=False, at=time.time())
+            print("searxng failed:", type(e).__name__, flush=True)
+        if local:
+            raise HTTPException(503, "지금은 웹 검색 결과를 찾지 못했어요.")
     spent = "api" in settings["budget_paths"] and await month_cost(settings) >= settings["monthly_budget_usd"]
     if API_KEY and not spent:
         r = await web.search(API_KEY, query, n)
