@@ -161,6 +161,7 @@ def test_delegate_mocked(cfg, monkeypatch):
     st = d.job_status(job_id=job_id)
     assert st["job_status"] == "done" and st["summary"] == "did it"
     assert seen["argv"] == ["claude", "-p", "fix bug", "--permission-mode", "acceptEdits",
+                            "--allowedTools", *d.DEFAULTS["delegate_allowed_tools"],
                             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
                             "--output-format", "json", "--append-system-prompt", d.NO_ATTRIBUTION,
                             "--model", "sonnet"]
@@ -960,3 +961,53 @@ def test_needs_approval_carries_in_roots_too(cfg, gw):
     assert r["status"] == "needs_approval" and r["in_roots"] is True
     with tempfile.TemporaryDirectory(dir=d.Path.home()) as sub:
         assert d.run_command(command="pwd", cwd=sub)["in_roots"] is False
+
+
+def run_delegate(monkeypatch, payload, rc=0):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, rc, json.dumps(payload).encode(), b"")
+    monkeypatch.setattr(d.subprocess, "run", fake_run)
+    job_id = d.delegate(task="실버텔러 시장 조사해서 PDF로", cwd="proj")["job_id"]
+    for _ in range(100):
+        if d.job_status(job_id=job_id)["job_status"] != "running":
+            break
+        time.sleep(0.02)
+    return d.job_status(job_id=job_id), seen["argv"]
+
+
+def test_delegate_pre_allows_research_and_build_tools(cfg, monkeypatch):
+    st, argv = run_delegate(monkeypatch, {"result": "PDF를 ~/Desktop/silverteller.pdf에 저장했어요."})
+    allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowedTools")]
+    assert {"WebSearch", "WebFetch", "Bash(python3:*)", "Bash(uv:*)", "Bash(mkdir:*)"} <= set(allowed)
+    assert "Bash(rm:*)" not in allowed and argv[argv.index("--disallowedTools") + 1:][:3] == \
+        ["Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)"] and d.NO_ATTRIBUTION in argv
+    assert st["job_status"] == "done" and "blocked" not in st
+
+
+def test_delegate_allowed_tools_come_from_the_config(cfg, monkeypatch, tmp_path):
+    monkeypatch.setitem(d.CFG, "delegate_allowed_tools", ["WebSearch"])
+    _, argv = run_delegate(monkeypatch, {"result": "ok"})
+    assert argv[argv.index("--allowedTools"):argv.index("--disallowedTools")] == ["--allowedTools", "WebSearch"]
+    monkeypatch.setitem(d.CFG, "delegate_allowed_tools", [])
+    _, argv = run_delegate(monkeypatch, {"result": "ok"})
+    assert "--allowedTools" not in argv  # an empty list: nothing pre-allowed
+    conf = tmp_path / "bad.toml"
+    conf.write_text('delegate_allowed_tools = "WebSearch"\n')
+    with pytest.raises(SystemExit, match="delegate_allowed_tools"):
+        d.load_config(conf)
+
+
+def test_a_refused_run_is_not_done(cfg, monkeypatch):
+    """Live 2026-11-23 (job 60ac064254d1): every WebSearch, WebFetch and python3 refused, yet the task read as done."""
+    st, _ = run_delegate(monkeypatch, {"result": "조사를 못 했어요.", "is_error": False, "permission_denials": [
+        {"tool_name": "WebSearch", "tool_use_id": "a"}, {"tool_name": "WebFetch", "tool_use_id": "b"},
+        {"tool_name": "Bash", "tool_use_id": "c", "tool_input": {"command": "python3 make_pdf.py"}},
+        {"tool_name": "WebSearch", "tool_use_id": "d"}]})
+    assert st["job_status"] == "failed" and st["needs_input"] is True and st["blocked"] == ["Bash", "WebFetch", "WebSearch"]
+    st, _ = run_delegate(monkeypatch, {"result": "I need you to allow WebSearch/WebFetch/python3 to finish this."})
+    assert st["job_status"] == "failed" and st["needs_input"] is True and st["blocked"] == []  # said only in words
+    st, _ = run_delegate(monkeypatch, {"result": "권한 설계 문서를 정리해서 docs/permissions.md에 저장했어요."})
+    assert st["job_status"] == "done"  # talking about permissions is not being refused

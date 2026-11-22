@@ -3852,6 +3852,13 @@ def strip_meta(text):
     return (META_LINES.sub("", text or "").strip() or None) if text else text
 
 
+# the daemon's BLOCKED_TEXT, for daemons from before it marked a refused run (needs_input)
+JOB_BLOCKED = re.compile(r"(permission|권한)[^.\n]{0,40}(denied|refused|blocked|not granted|required|needed|거부|없|필요)"
+                         r"|\ballow (WebSearch|WebFetch|Bash)|grant (me )?(the )?permission|wasn't (allowed|permitted)", re.I)
+TOOL_KO = {"WebSearch": "웹 검색", "WebFetch": "웹 페이지 읽기", "Bash": "명령 실행", "Write": "파일 쓰기", "Edit": "파일 고치기",
+           "Read": "파일 읽기"}
+
+
 async def await_jobs(t, deadline):
     """Keep the task running while a job it delegated runs on the device: poll <device>__job_status until done or
     failed, within the task's time cap (and its cancel). The task's result becomes the job's result."""
@@ -3881,6 +3888,12 @@ async def await_jobs(t, deadline):
                 j.update({k: got[k] for k in ("session_id", "cwd", "output_file") if isinstance(got.get(k), str)})
                 open_jobs.remove(j)
                 out = str(got.get("result") or got.get("summary") or "").strip()
+                if got.get("needs_input") or state_ == "done" and JOB_BLOCKED.search(out):  # an older daemon says done
+                    names = [TOOL_KO.get(n.split("(")[0], n) for n in got.get("blocked") or []]
+                    task_step(t, "job_blocked", label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업이 권한에 막힘",
+                              job_id=j["job_id"])
+                    raise TaskLimit("blocked", f"기기 작업이 권한 때문에 막혀서 끝내지 못했어요"
+                                    + (f"({', '.join(dict.fromkeys(names))})" if names else "") + f". {out[:300]}".rstrip())
                 task_step(t, "job_" + state_, label=f"{DEVICE_WORD.get(j['device'], j['device'])} 작업 "
                           f"{'끝남' if state_ == 'done' else '실패'}", job_id=j["job_id"])
                 if state_ == "failed":
