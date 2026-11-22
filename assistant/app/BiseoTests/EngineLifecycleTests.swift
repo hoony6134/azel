@@ -44,3 +44,20 @@ final class EngineLifecycleTests: XCTestCase {
         XCTAssertEqual(v, 1, accuracy: 0.01)
     }
 }
+
+/// 2026-11-22: unsigned macOS test runs started real audio in the app host and flooded the Mac
+/// with microphone prompts. Under XCTest nothing may touch the mic, the engine or a permission.
+final class TestHostAudioGuardTests: XCTestCase {
+    func testTheTestHostNeverUsesAudioHardware() async throws {
+        XCTAssertTrue(Config.isTestHost)
+        XCTAssertFalse(AudioIO.hardware, "AudioIO runs as a fake here")
+        let audio = AudioIO()
+        try audio.start()                                   // no engine, no input node, no prompt
+        XCTAssertTrue(audio.isRunning)
+        audio.stop()
+        XCTAssertFalse(audio.isRunning)
+        let granted = await SetupFlow.requestMic()
+        XCTAssertFalse(granted, "no permission request from tests")
+        XCTAssertThrowsError(try WakeClipRecorder().record { _ in }, "the wake-clip recorder doesn't open the mic")
+    }
+}

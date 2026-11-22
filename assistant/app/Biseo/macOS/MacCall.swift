@@ -69,9 +69,32 @@ final class MacCall: ObservableObject {
     @Published private(set) var talking = false
     /// The brain answering this call (server-reported; the picked one until it says).
     @Published private(set) var brainMode: String?
+    /// The server takes typed turns on this call (`text` in its caps).
+    @Published private(set) var canType = false
+    /// Secret (incognito): nothing kept, no recording, no captions on the Lock Screen.
+    @Published private(set) var secret = false
+    @Published private(set) var canSecret = false
+    /// Auto-approve: safe device commands run without a tap until `autoExpires`.
+    @Published private(set) var autoOn = false
+    @Published private(set) var autoExpires: Date?
+    @Published private(set) var canAuto = false
+    /// The panel's text field is open (it grows to fit).
+    @Published var typing = false { didSet { if typing != oldValue { resizePanel() } } }
+    @Published var typedDraft = ""
     private var pttCall = false
     /// Started by the wake word: the mic is live from the start and the call ends after 30 s of quiet.
-    private var wakeCall = false
+    @Published private var wakeCall = false
+
+    /// The panel's listening glow: while the push-to-talk key is held, and in a wake-started call
+    /// whenever the mic is live and the assistant is listening (so it visibly hears the user).
+    var hearing: Bool {
+        Self.hears(talking: talking, wake: wakeCall, inCall: inCall, muted: muted, held: held, state: state)
+    }
+
+    nonisolated static func hears(talking: Bool, wake: Bool, inCall: Bool, muted: Bool, held: Bool, state: String) -> Bool {
+        if talking { return true }
+        return wake && inCall && !muted && !held && (state == "listening" || state.isEmpty)
+    }
     private var fadeTask: Task<Void, Never>?
     private var idleTask: Task<Void, Never>?
 
@@ -183,6 +206,7 @@ final class MacCall: ObservableObject {
         state = ""
         error = nil
         if usePanel { showPanel() }
+        guard AudioIO.hardware else { return }   // the test host never asks for the mic or dials out
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: connect()
         case .notDetermined:
@@ -196,6 +220,44 @@ final class MacCall: ObservableObject {
     }
 
     func hangUp() { end(error: nil, keepPanel: false) }
+
+    func setAuto(_ on: Bool, minutes: Int, devices: [String]?) {
+        guard inCall else { return }
+        client.sendAutoApprove(on, minutes: minutes, devices: devices)
+    }
+
+    func setSecret(_ on: Bool) {
+        guard inCall else { return }
+        client.sendSecret(on)
+    }
+
+    func sendTyped(_ text: String, speak: Bool) {
+        guard inCall else { return }
+        client.sendText(text, speak: speak)
+        log.typed(text)
+        turnDone = false; drainedAt = nil; fadeTask?.cancel()   // a new turn, like speaking
+        scheduleIdle()
+    }
+
+    /// A key typed while the panel is key: opens the field with that character. Space and
+    /// control keys keep their meaning (mute, Esc).
+    func typeKey(_ chars: String) -> Bool {
+        guard canType, !typing, let c = chars.unicodeScalars.first,
+              !CharacterSet.whitespacesAndNewlines.contains(c), !CharacterSet.controlCharacters.contains(c) else { return false }
+        typedDraft = chars
+        typing = true
+        return true
+    }
+
+    static func panelHeight(typing: Bool) -> CGFloat { typing ? 176 : 112 }
+
+    private func resizePanel() {
+        guard let p = panel else { return }
+        var f = p.frame
+        f.size.height = Self.panelHeight(typing: typing)   // grows upward from the bottom edge
+        p.setFrame(f, display: true, animate: false)
+        if typing { p.makeKey() }
+    }
 
     func chooseBrain(_ m: BrainMode) {
         BrainModeChoice.shared.choose(m, inCall: inCall, client: client, current: { [weak self] in self?.brainMode }) { [weak self] in self?.error = $0 }
@@ -225,6 +287,7 @@ final class MacCall: ObservableObject {
     func toggleRecording() {
         guard inCall else { return }
         if client.isRecording { client.stopRecording() } else {
+            guard !secret else { self.error = "시크릿 통화는 녹음하지 않아요"; return }
             do { try client.startRecording(session: activeSession) } catch { self.error = "녹음 시작 실패" }
         }
         recording = client.isRecording
@@ -252,7 +315,9 @@ final class MacCall: ObservableObject {
             let mode = BrainModeChoice.shared.takeForCall()
             brainMode = mode
             if pendingUtterance != nil { client.sending = false }   // nothing live goes ahead of the utterance
-            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode)
+            let wantSecret = BrainModeChoice.shared.takeSecretForCall()
+            secret = wantSecret
+            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
             connectedAt = Date()
             AzelFiles.micLive.create()
             if let id = pendingUtterance { pendingUtterance = nil; sendUtterance(id) }
@@ -264,6 +329,29 @@ final class MacCall: ObservableObject {
 
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
+        if let caps = CallClient.caps(event) {
+            canType = caps.contains("text")
+            canSecret = caps.contains("secret")
+            canAuto = caps.contains("auto_approve")
+            Task { @MainActor in BrainModeChoice.shared.remember(caps: caps) }
+        }
+        if let a = CallClient.reportedAuto(event) {
+            autoOn = a.on
+            if !a.on { autoExpires = nil } else if let e = a.expires { autoExpires = e }
+            if a.on { Task { @MainActor in await AutoGrantCenter.shared.refresh() } }   // remember the grant for 설정 → 승인
+        }
+        if let s = CallClient.reportedSecret(event), s != secret {
+            secret = s
+            if s && recording { toggleRecording() }   // a secret call keeps no recording
+        }
+        if event.type == "text_rejected" {
+            let hint = CallLog.rejection(event.reason)
+            error = hint
+            Task { [weak self] in   // a hint, not a failure: it goes away by itself
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if self?.error == hint { self?.error = nil }
+            }
+        }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
         scheduleIdle()
         switch event.type {
@@ -304,6 +392,14 @@ final class MacCall: ObservableObject {
         pendingUtterance = nil
         AzelFiles.micLive.remove()
         brainMode = nil
+        canType = false
+        secret = false
+        canSecret = false
+        autoOn = false
+        autoExpires = nil
+        canAuto = false
+        typing = false
+        typedDraft = ""
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
     }
@@ -342,6 +438,12 @@ final class MacCall: ObservableObject {
 /// Esc (cancelOperation) hangs up; Space toggles mute.
 final class CallPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    /// Typing on the focused panel opens the text field (when the server takes typed turns).
+    override func keyDown(with event: NSEvent) {
+        let handled = event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+            && MainActor.assumeIsolated { MacCall.shared.typeKey(event.characters ?? "") }
+        if !handled { super.keyDown(with: event) }
+    }
     override func cancelOperation(_ sender: Any?) { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
     override func close() { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
 }
@@ -349,6 +451,8 @@ final class CallPanel: NSPanel {
 /// DESIGN §8.2: jar · captions · route chip and close, on material, radius 30.
 struct CallPanelView: View {
     @ObservedObject var call: MacCall
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @FocusState private var typingFocus: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var jarState: JarState { call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : .offline }
@@ -378,7 +482,9 @@ struct CallPanelView: View {
                     }
                     .lineLimit(1)
                     .accessibilityElement(children: .combine)
-                } else if let user { Text(user).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2) }
+                } else if let u = call.lines.last(where: { $0.mine }) {
+                    Text(u.typed == true ? "\(Image(systemName: "keyboard")) \(u.text)" : u.text).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
+                }
                 if let reply { PanelReply(call: call, reply: reply) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -387,9 +493,11 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     if call.recording { Circle().fill(Theme.danger).frame(width: 8, height: 8).accessibilityLabel("녹음 중") }
                     Menu {
-                        Button(call.muted ? "음소거 해제" : "음소거") { call.toggleMute() }.keyboardShortcut(.space, modifiers: [])
+                        Button(call.muted ? "음소거 해제" : "음소거") { call.toggleMute() }
+                            .keyboardShortcut(call.typing ? nil : KeyboardShortcut(.space, modifiers: []))
+                        if call.canType { Button("입력하기") { call.typing = true } }
                         Button(call.held ? "대기 해제" : "대기") { call.toggleHold() }
-                        Button(call.recording ? "녹음 중지" : "녹음") { call.toggleRecording() }
+                        Button(call.recording ? "녹음 중지" : "녹음") { call.toggleRecording() }.disabled(call.secret && !call.recording)
                     } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("통화 제어")
                     Button { call.hangUp() } label: {
@@ -401,23 +509,42 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     // §17.8: the persona's name before the route chip.
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
-                    if let m = BrainMode.chip(call.brainMode) {
-                        Text(m).font(.caption.weight(.semibold)).foregroundStyle(Theme.indigo)
-                            .onTapGesture { if call.brainMode == BrainMode.local.rawValue { call.chooseBrain(.auto) } }
-                            .help(call.brainMode == BrainMode.local.rawValue ? "클릭하면 자동으로 바꿔요" : "")
-                    }
+                    BrainModeControl(current: call.brainMode, pick: { call.chooseBrain($0) },
+                                     secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) },
+                                 auto: call.autoOn, autoExpires: call.autoExpires, canAuto: call.canAuto,
+                                 setAuto: { call.setAuto($0, minutes: $1, devices: $2) })
                     if let r = call.log.lastRoute { RouteChip(route: r) }
                 }
             }
         }
         .padding(.horizontal, Theme.l)
         .frame(width: 460, height: 112)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .overlay(alignment: .bottom) {
+            if call.typing {
+                CallTypingField(text: $call.typedDraft, focus: $typingFocus, send: { call.sendTyped($0, speak: $1) },
+                                close: { call.typing = false })
+                    .padding(.horizontal, Theme.l).padding(.bottom, Theme.m)
+                    .onAppear { typingFocus = true }
+            }
+        }
+        .frame(width: 460, height: MacCall.panelHeight(typing: call.typing))
         .background {
             if reduceTransparency { Theme.bgRaised } else { Rectangle().fill(.ultraThinMaterial) }
+            if call.secret { Color.black.opacity(0.3) }
         }
         .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous)
-            .strokeBorder(call.talking ? Theme.celadon : Theme.stroke, lineWidth: call.talking ? 1.5 : 1))
+            .strokeBorder(call.hearing ? Theme.celadon : Theme.stroke, lineWidth: call.hearing ? 1.5 : 1))
+        .overlay {
+            // The listening glow, shared by push-to-talk and wake: a soft celadon rim inside the edge.
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .strokeBorder(Theme.celadon, lineWidth: 6).blur(radius: 6)
+                .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+                .opacity(call.hearing ? 0.55 : 0)
+                .allowsHitTesting(false)
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: call.hearing)
         .environment(\.colorScheme, .dark)
     }
 }

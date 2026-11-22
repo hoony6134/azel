@@ -7,6 +7,8 @@ struct CallLine: Identifiable, Codable, Equatable {
     var route: String? = nil
     /// The user talked over this reply (`interrupt`): shown dimmed with a "…" tail.
     var interrupted = false
+    /// Typed during the call rather than spoken (optional so saved logs still decode).
+    var typed: Bool? = nil
 }
 
 /// What the call screens show, built from server events. Reply sentences of one turn join into one
@@ -14,13 +16,41 @@ struct CallLine: Identifiable, Codable, Equatable {
 struct CallLog: Equatable {
     var lines: [CallLine] = []
     private var replyOpen = false
+    /// A typed line waiting for the server's echo (if it sends one), so it shows once.
+    private var pendingTyped: String?
+
+    /// The user typed this; shown at once as their line, with the keyboard mark.
+    mutating func typed(_ text: String) {
+        lines.append(CallLine(mine: true, text: text, typed: true))
+        replyOpen = false
+        pendingTyped = text
+    }
+
+    /// `text_rejected`: the server ignored the typed line, so it leaves the captions.
+    mutating func rejectTyped() {
+        if let i = lines.indices.last, lines[i].typed == true { lines.remove(at: i) }
+        pendingTyped = nil
+    }
+
+    /// The hint for `{"type":"text_rejected","reason":…}`.
+    static func rejection(_ reason: String?) -> String {
+        switch reason {
+        case "too_long": return "1000자까지 보낼 수 있어요"
+        case "too_fast": return "조금 천천히 보내 주세요"
+        default: return "입력을 보내지 못했어요"
+        }
+    }
 
     mutating func apply(_ event: CallEvent) {
         switch event.type {
+        case "text_rejected":
+            rejectTyped()
         case "transcript":
             guard let t = LegacyText.clean(event.text) else { return }
-            lines.append(CallLine(mine: true, text: t))
             replyOpen = false
+            if let p = pendingTyped, p == t { pendingTyped = nil; return }   // the server echoed the typed line
+            pendingTyped = nil
+            lines.append(CallLine(mine: true, text: t))
         case "reply":
             guard let t = LegacyText.clean(event.text) else {
                 // A bare legacy marker: mark the reply it belongs to instead of showing the text.

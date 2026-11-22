@@ -51,7 +51,8 @@ final class LiveActivities {
     static func callState(_ c: CallManager) -> CallActivityAttributes.ContentState {
         let last = c.lines.last
         return .init(state: c.held ? "held" : (c.connectedAt == nil ? "connecting" : c.displayState),
-                     caption: last.map { String($0.text.suffix(120)) }, mine: last?.mine ?? false, muted: c.muted)
+                     caption: c.secret ? nil : last.map { String($0.text.suffix(120)) }, mine: last?.mine ?? false, muted: c.muted,
+                     secret: c.secret)
     }
 
     private func syncCall() {
@@ -64,7 +65,8 @@ final class LiveActivities {
                 Task { await call.update(.init(state: s, staleDate: nil)) }
             } else if enabled {
                 let p = c.activePersona ?? PersonaModel.shared.selected
-                let attrs = CallActivityAttributes(name: p?.name ?? AssistantName.current, glaze: Self.glaze(p), startedAt: Date())
+                let name = c.callerName ?? p?.name ?? AssistantName.current
+                let attrs = CallActivityAttributes(name: CallContext.callerLine(name, c.callContext), glaze: Self.glaze(p), startedAt: Date())
                 call = try? ActivityKit.Activity.request(attributes: attrs, content: .init(state: s, staleDate: nil))
                 lastCall = s
             }

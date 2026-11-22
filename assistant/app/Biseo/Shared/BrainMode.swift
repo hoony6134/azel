@@ -23,11 +23,17 @@ enum BrainMode: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The call-screen chip: nil for 자동.
-    static func chip(_ raw: String?) -> String? {
-        guard let raw, let m = BrainMode(rawValue: raw), m != .auto else { return nil }
-        return m == .local ? "로컬만" : m.label
+    /// The call header's mode text: 자동 / 로컬 / Claude API / Claude Code.
+    var short: String {
+        switch self {
+        case .auto: return "자동"
+        case .local: return "로컬"
+        case .claude_api: return "Claude API"
+        case .claude_code: return "Claude Code"
+        }
     }
+
+    static func current(_ raw: String?) -> BrainMode { raw.flatMap(BrainMode.init(rawValue:)) ?? .auto }
 }
 
 /// The per-call choice from the long-press picker, and whether the gateway knows modes at all.
@@ -38,6 +44,20 @@ final class BrainModeChoice: ObservableObject {
     @Published var supported = false
     /// For the next call only; nil = the setting's default.
     @Published var next: BrainMode?
+    /// The next call starts secret (home's "시크릿으로 걸기").
+    @Published var nextSecret = false
+    /// The caps the last call's server listed, so home can offer what calls support.
+    @Published var lastCaps: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "callCaps") ?? [])
+
+    func remember(caps: [String]) {
+        lastCaps = Set(caps)
+        UserDefaults.standard.set(caps, forKey: "callCaps")
+    }
+
+    func takeSecretForCall() -> Bool {
+        defer { nextSecret = false }
+        return nextSecret
+    }
 
     /// Taken once by the call that starts next.
     func takeForCall() -> String? {
@@ -69,15 +89,24 @@ struct BrainModeMenu: ViewModifier {
     /// The mode in effect, to tick it.
     var current: String?
     var pick: (BrainMode) -> Void
+    /// Home only: "시크릿으로 걸기", when the last call's server supported secret calls.
+    var secretCall: (() -> Void)? = nil
 
     func body(content: Content) -> some View {
-        if choice.supported {
+        let secret = secretCall != nil && choice.lastCaps.contains("secret")
+        if choice.supported || secret {
             content.contextMenu {
-                ForEach(BrainMode.allCases) { m in
-                    Button { pick(m) } label: {
-                        if let h = m.hint { Text(m.label); Text(h) } else { Text(m.label) }
-                        if (current ?? "auto") == m.rawValue { Image(systemName: "checkmark") }
+                if choice.supported {
+                    ForEach(BrainMode.allCases) { m in
+                        Button { pick(m) } label: {
+                            if let h = m.hint { Text(m.label); Text(h) } else { Text(m.label) }
+                            if (current ?? "auto") == m.rawValue { Image(systemName: "checkmark") }
+                        }
                     }
+                }
+                if secret, let secretCall {
+                    Divider()
+                    Button { secretCall() } label: { Label("시크릿으로 걸기", systemImage: "eye.slash") }
                 }
             }
         } else {
@@ -87,7 +116,135 @@ struct BrainModeMenu: ViewModifier {
 }
 
 extension View {
-    func brainModeMenu(current: String?, pick: @escaping (BrainMode) -> Void) -> some View {
-        modifier(BrainModeMenu(current: current, pick: pick))
+    func brainModeMenu(current: String?, pick: @escaping (BrainMode) -> Void, secretCall: (() -> Void)? = nil) -> some View {
+        modifier(BrainModeMenu(current: current, pick: pick, secretCall: secretCall))
+    }
+}
+
+/// The call header's quiet mode control: the mode as plain text with a chevron, opening a native
+/// menu with a check on the current one (PM, 2026-11-22: no pill, no sub-text).
+struct BrainModeControl: View {
+    @ObservedObject private var choice = BrainModeChoice.shared
+    var current: String?
+    var pick: (BrainMode) -> Void
+    /// This call is secret / the server can make it secret (`secret` in caps).
+    var secret = false
+    var canSecret = false
+    var setSecret: (Bool) -> Void = { _ in }
+    /// Auto-approve for this call: on/off, when it ends, whether the server offers it.
+    var auto = false
+    var autoExpires: Date? = nil
+    var canAuto = false
+    var setAuto: (Bool, Int, [String]?) -> Void = { _, _, _ in }
+    @AppStorage("autoMinutes") private var autoMinutes = 60
+    @State private var devices: [String] = []
+    @State private var autoDevices: Set<String> = []
+
+    var body: some View {
+        HStack(spacing: Theme.s) {
+            menu
+            if auto {
+                // Subtle: the glyph and the time left; a tap turns it off.
+                Button { setAuto(false, autoMinutes, nil) } label: {
+                    TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                        HStack(spacing: 2) {
+                            Image(systemName: "bolt.shield").font(.caption2)
+                            if let r = AutoGrant.remaining(autoExpires, now: ctx.date) { Text(r) }
+                        }
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("자동 승인 켜짐, 끄기")
+            }
+        }
+        .task(id: canAuto) { if canAuto, devices.isEmpty, case .success(let d) = await attempt({ try await TaskAPI.devices() }) { devices = d } }
+    }
+
+    @ViewBuilder private var menu: some View {
+        if choice.supported || canSecret || canAuto {
+            let m = BrainMode.current(current)
+            Menu {
+                if choice.supported {
+                    Picker("두뇌", selection: Binding(get: { m }, set: { pick($0) })) {
+                        ForEach(BrainMode.allCases) { Text($0.short).tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                }
+                if canAuto {
+                    Divider()
+                    Toggle(isOn: Binding(get: { auto }, set: { setAuto($0, autoMinutes, autoDevices.isEmpty ? nil : Array(autoDevices)) })) {
+                        Label("자동 승인", systemImage: "bolt.shield")
+                    }
+                    if !auto {
+                        Picker("시간", selection: $autoMinutes) {
+                            Text("30분").tag(30); Text("1시간").tag(60); Text("2시간").tag(120)
+                        }
+                        if !devices.isEmpty {
+                            Menu("기기: " + (autoDevices.isEmpty ? "전체" : autoDevices.sorted().joined(separator: ", "))) {
+                                ForEach(devices, id: \.self) { d in
+                                    Toggle(d, isOn: Binding(get: { autoDevices.contains(d) },
+                                                            set: { if $0 { autoDevices.insert(d) } else { autoDevices.remove(d) } }))
+                                }
+                            }
+                        }
+                    }
+                }
+                if canSecret {
+                    Divider()
+                    // A secret call stays secret (the server refuses turning it off), so it can only be switched on.
+                    Toggle(isOn: Binding(get: { secret }, set: { if $0 { setSecret(true) } })) { Label("시크릿", systemImage: "eye.slash") }
+                        .disabled(secret)
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    if secret { Image(systemName: "eye.slash").font(.caption2).accessibilityLabel("시크릿") }
+                    Text(choice.supported ? m.short : (secret ? "시크릿" : "통화 옵션"))
+                    Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                }
+                .font(.footnote)
+                .foregroundStyle(m == .auto ? Theme.text3 : Theme.text2)
+            }
+            #if os(macOS)
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            #endif
+            .accessibilityLabel("두뇌: \(m.short)")
+        }
+    }
+}
+
+/// Typing during a call: a field that sends on return, and 말로 답하기.
+struct CallTypingField: View {
+    @Binding var text: String
+    @AppStorage("typedSpeak") private var speak = true
+    var focus: FocusState<Bool>.Binding
+    var send: (String, Bool) -> Void
+    var close: () -> Void
+
+    var body: some View {
+        VStack(spacing: Theme.xs) {
+            HStack(spacing: Theme.s) {
+                TextField("입력해서 말하기", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .focused(focus)
+                    .onSubmit(submit)
+                    .submitLabel(.send)
+                Button { submit() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
+                    .buttonStyle(.plain).foregroundStyle(Theme.celadon)
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityLabel("보내기")
+                Button { close() } label: { Image(systemName: "xmark.circle.fill").font(.title3) }
+                    .buttonStyle(.plain).foregroundStyle(Theme.text3).accessibilityLabel("입력 닫기")
+            }
+            Toggle("말로 답하기", isOn: $speak).font(.footnote).foregroundStyle(Theme.text2)
+                .toggleStyle(.switch).controlSize(.mini)
+        }
+    }
+
+    private func submit() {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        send(t, speak)
+        text = ""
     }
 }

@@ -14,6 +14,7 @@ struct HomeView: View {
 
     @StateObject private var tilt = TiltModel()
     @ObservedObject private var brain = BrainModeChoice.shared
+    @ObservedObject private var approvals = ApprovalCenter.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     /// CoreMotion only while the home screen is really in view: foreground, no call cover, motion allowed.
@@ -110,7 +111,8 @@ struct HomeView: View {
                             in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
         }
         .buttonStyle(.plain)
-        .brainModeMenu(current: brain.next?.rawValue) { brain.next = $0 }
+        .brainModeMenu(current: brain.next?.rawValue, pick: { brain.next = $0 },
+                       secretCall: { brain.nextSecret = true; call.startCall() })
         .disabled(model.statusError != nil)
         .opacity(model.statusError != nil ? 0.5 : 1)
         .accessibilityHint(model.statusError != nil ? FriendlyError.describe(model.statusError!).title : "통화를 시작합니다")
@@ -133,8 +135,8 @@ struct HomeView: View {
                 Task { try? await Task.sleep(nanoseconds: 2_000_000_000); withAnimation { toast = nil } }
             }
             .accessibilityHint("이전 대화 맥락을 비웁니다")
-            if !model.approvals.isEmpty {
-                quick("승인 \(model.approvals.count)건", "checkmark.shield", label: "승인 \(model.approvals.count)건") { tab = 2 }
+            if !approvals.pending.isEmpty {
+                quick("승인 \(approvals.pending.count)건", "checkmark.shield", label: "승인 \(approvals.pending.count)건") { tab = 2 }
             }
         }
     }

@@ -168,6 +168,35 @@ def test_delegate_mocked(cfg, monkeypatch):
     assert d.delegate(task="x", cwd="escape")["status"] == "refused"
 
 
+def test_delegate_token_only_for_the_delegate(cfg, monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append((argv[0], kw.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN")))
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"result": "ok"}).encode(), b"")
+
+    def wait(job_id):
+        for _ in range(100):
+            if d.job_status(job_id=job_id)["job_status"] != "running":
+                break
+            time.sleep(0.02)
+
+    monkeypatch.setattr(d.subprocess, "run", fake_run)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    d.CFG["claude_token_file"] = str(tmp_path / "missing")  # never read the real ~/.config token in tests
+    wait(d.delegate(task="a", cwd="proj")["job_id"])  # no token file: nothing is added
+    tok = tmp_path / "claude_oauth_token"
+    tok.write_text("long-lived-token\n")
+    d.CFG["claude_token_file"] = str(tok)
+    tok.chmod(0o644)
+    assert d.delegate(task="b", cwd="proj")["status"] == "refused"  # readable by others
+    tok.chmod(0o600)
+    wait(d.delegate(task="c", cwd="proj")["job_id"])
+    assert [s[1] for s in seen] == [None, "long-lived-token"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in os.environ  # the daemon's own environment stays clean
+    assert d.run_command(command="echo hi", cwd="proj")["status"] == "ok"  # run_command never sees it
+
+
 def test_log_lines(cfg):
     d.read_file(path="proj/a.txt")
     d.read_file(path="../secret.txt")

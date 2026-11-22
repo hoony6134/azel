@@ -171,3 +171,113 @@ final class ApprovalFlapTests: XCTestCase {
         XCTAssertEqual(shown, ["a"], "second poll presents it; a reappearance after vanishing doesn't")
     }
 }
+
+final class ForcedOnceDecideTests: XCTestCase {
+    func testForcedReasonFromASecretCall() {
+        let body = Data(#"{"ok":true,"forced_once":true,"forced_reason":"시크릿 통화에서 온 요청이라 이번 한 번만 허용했어요."}"#.utf8)
+        XCTAssertEqual(ApprovalAPI.forcedNote(body), "시크릿 통화에서 온 요청이라 이번 한 번만 허용했어요.")
+        XCTAssertEqual(ApprovalAPI.forcedNote(Data(#"{"forced_once":true}"#.utf8)), "이번 한 번만 허용했어요")
+        XCTAssertNil(ApprovalAPI.forcedNote(Data(#"{"ok":true}"#.utf8)))
+        XCTAssertNil(ApprovalAPI.forcedNote(Data()), "an empty answer is fine")
+    }
+}
+
+/// User bug, 2026-11-22: an approval answered on the iPhone stayed open on the Mac, and tapping it
+/// there showed "처리할 수 없어요" (409).
+@MainActor
+final class DecidedElsewhereTests: XCTestCase {
+    override func setUp() async throws {
+        URLProtocol.registerClass(FakeServer.self)
+        Config.testOverride = (gateway: "https://fake.test", token: "test-token")
+        FakeServer.routes = [:]
+    }
+
+    override func tearDown() async throws {
+        URLProtocol.unregisterClass(FakeServer.self)
+        Config.testOverride = nil
+        FakeServer.routes = [:]
+        ApprovalCenter.shared.presented = nil
+    }
+
+    func testWhatTheOtherDeviceDidAndAlreadyDecided() {
+        XCTAssertEqual(ApprovalCenter.elsewhereText(ApprovalRequest(["id": "1", "status": "approved", "decision": "once"])), "다른 기기에서 허용했어요")
+        XCTAssertEqual(ApprovalCenter.elsewhereText(ApprovalRequest(["id": "1", "status": "denied"])), "다른 기기에서 거부했어요")
+        XCTAssertEqual(ApprovalCenter.elsewhereText(ApprovalRequest(["id": "1", "status": "expired"])), "만료됐어요")
+        XCTAssertEqual(ApprovalCenter.elsewhereText(ApprovalRequest(["id": "1", "status": "used"])), "다른 기기에서 허용했어요")
+        XCTAssertTrue(ApprovalCenter.alreadyDecided(GatewayError.http(409)))
+        XCTAssertTrue(ApprovalCenter.alreadyDecided(GatewayError.rejected("approval already decided")))
+        XCTAssertFalse(ApprovalCenter.alreadyDecided(GatewayError.http(500)))
+    }
+
+    func testAFresherCopyLeavesThePendingListAtOnce() {
+        let c = ApprovalCenter.shared
+        c.update(ApprovalRequest(["id": "zz9", "status": "pending", "command": "ls"]))
+        XCTAssertTrue(c.pending.contains { $0.id == "zz9" })
+        c.update(ApprovalRequest(["id": "zz9", "status": "approved", "command": "ls"]))
+        XCTAssertFalse(c.pending.contains { $0.id == "zz9" }, "the badge drops it")
+    }
+
+    func testAPushForADecidedApprovalIsIgnored() async {
+        FakeServer.routes = ["GET /v1/approvals/ap77": (200, #"{"id":"ap77","status":"denied","command":"rm x"}"#)]
+        await ApprovalCenter.shared.open(id: "ap77")
+        XCTAssertNil(ApprovalCenter.shared.presented, "stale: never shown")
+        FakeServer.routes = ["GET /v1/approvals/ap78": (200, #"{"id":"ap78","status":"pending","command":"ls"}"#)]
+        await ApprovalCenter.shared.open(id: "ap78")
+        XCTAssertEqual(ApprovalCenter.shared.presented?.id, "ap78")
+    }
+
+    func testForegroundRefreshDropsWhatWasDecidedMeanwhile() async {
+        let c = ApprovalCenter.shared
+        c.update(ApprovalRequest(["id": "fg1", "status": "pending", "command": "ls"]))
+        FakeServer.routes = ["GET /v1/approvals": (200, #"[{"id":"fg1","status":"approved","decision":"once","command":"ls"}]"#)]
+        await c.refresh()                                      // what the app does on becoming active
+        XCTAssertFalse(c.pending.contains { $0.id == "fg1" })
+        XCTAssertNil(c.presented, "nothing stale pops up")
+    }
+
+    func testTappingADecidedOneIsA409NotAnError() async {
+        FakeServer.routes = ["POST /v1/approvals/ap79": (409, #"{"detail":"approval already decided"}"#)]
+        do {
+            _ = try await ApprovalAPI.decide("ap79", .once)
+            XCTFail("expected 409")
+        } catch {
+            XCTAssertTrue(ApprovalCenter.alreadyDecided(error), "the sheet turns this into 다른 기기에서 …, not an error")
+        }
+    }
+}
+
+final class AutoApproveTests: XCTestCase {
+    func testFramesAndGrantShape() throws {
+        let d = JSONDecoder()
+        let on = try d.decode(CallEvent.self, from: Data(#"{"type":"auto_approve","value":true,"expires_at":1795310000}"#.utf8))
+        XCTAssertEqual(CallClient.reportedAuto(on)?.on, true)
+        XCTAssertEqual(CallClient.reportedAuto(on)?.expires, Date(timeIntervalSince1970: 1_795_310_000))
+        let state = try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening","auto":true}"#.utf8))
+        XCTAssertEqual(CallClient.reportedAuto(state)?.on, true, "a voice grant just flips the state frame")
+        XCTAssertNil(CallClient.reportedAuto(try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening"}"#.utf8))))
+
+        let g = AutoGrant(["id": "a1b2c3d4e5", "scope": ["task": "abc123def456"], "devices": ["맥북"], "by": "app",
+                           "created": 1_795_300_000, "expires_at": 1_795_307_200, "ran": 2,
+                           "log": [["device": "macbook", "command": "brew services restart redis", "at": 1_795_300_100, "stage": "rules"]]])
+        XCTAssertEqual(g.scope, "작업")
+        XCTAssertEqual(g.devices, ["macbook"])
+        XCTAssertEqual(g.log.first?.command, "brew services restart redis")
+        XCTAssertEqual(AutoGrant.stageLabel(g.log.first?.stage), "규칙")
+        XCTAssertTrue(g.isLive(now: Date(timeIntervalSince1970: 1_795_300_200)))
+        XCTAssertFalse(AutoGrant(["id": "x", "ended": true, "log": []]).isLive())
+    }
+
+    func testRemainingTimeAndPush() {
+        let now = Date(timeIntervalSince1970: 0)
+        XCTAssertEqual(AutoGrant.remaining(now.addingTimeInterval(23 * 60), now: now), "23분 남음")
+        XCTAssertEqual(AutoGrant.remaining(now.addingTimeInterval(65 * 60), now: now), "1시간 5분 남음")
+        XCTAssertEqual(AutoGrant.remaining(now.addingTimeInterval(120 * 60), now: now), "2시간 남음")
+        XCTAssertEqual(AutoGrantCenter.grantID(from: ["type": "auto_summary", "grant_id": "a1b2c3d4e5"]), "a1b2c3d4e5")
+        XCTAssertNil(AutoGrantCenter.grantID(from: ["type": "approval", "approval_id": "x"]))
+    }
+
+    func testCallToggleFrame() throws {
+        let client = CallClient()
+        client.sendAutoApprove(true, minutes: 30, devices: ["macbook"])   // no socket: nothing sent, no crash
+    }
+}

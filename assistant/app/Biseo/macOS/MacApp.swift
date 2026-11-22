@@ -24,7 +24,7 @@ struct BiseoMacApp: App {
         MenuBarExtra {
             Popover(model: model, wake: wake, history: history)
         } label: {
-            Image(nsImage: JarIcon.make(filled: call.inCall, dot: !model.approvals.isEmpty || !approvals.pending.isEmpty))
+            Image(nsImage: JarIcon.make(filled: call.inCall, dot: !approvals.pending.isEmpty))
                 .accessibilityLabel("Azel")
         }
         .menuBarExtraStyle(.window)
@@ -147,6 +147,7 @@ struct Popover: View {
     @ObservedObject var history: HistoryModel
     @ObservedObject private var call = MacCall.shared
     @ObservedObject private var tasks = TaskModel.shared
+    @ObservedObject private var approvals = ApprovalCenter.shared
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -194,9 +195,9 @@ struct Popover: View {
                     }
                     .buttonStyle(.plain)
                 }
-                if !model.approvals.isEmpty {
+                if !approvals.pending.isEmpty {
                     Button { show() } label: {
-                        Label("승인 \(model.approvals.count)건", systemImage: "checkmark.shield").frame(maxWidth: .infinity, alignment: .leading)
+                        Label("승인 \(approvals.pending.count)건", systemImage: "checkmark.shield").frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.bordered).tint(Theme.amber)
                 }
@@ -229,7 +230,7 @@ struct Popover: View {
         .padding(Theme.l)
         .frame(width: 340)
         .background(Theme.bgRaised)
-        .task { await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh(); await TaskModel.shared.refresh() }
+        .task { await ApprovalCenter.shared.refresh(); await model.refresh(); await wake.refresh(); await history.refresh(); await PersonaModel.shared.refresh(); await TaskModel.shared.refresh() }
     }
 
     private func small(_ title: String, _ icon: String, action: @escaping () -> Void) -> some View {
@@ -323,6 +324,7 @@ struct MainWindow: View {
     @ObservedObject var wake: WakeModel
     @ObservedObject var history: HistoryModel
     @ObservedObject var schedule: ScheduleModel
+    @ObservedObject private var approvals = ApprovalCenter.shared
     @State private var section: String? = "home"
 
     var body: some View {
@@ -332,7 +334,7 @@ struct MainWindow: View {
                     List(selection: $section) {
                         Label("홈", systemImage: "circle.circle").tag("home")
                         Label("기록", systemImage: "clock").tag("history")
-                        Label("승인", systemImage: "checkmark.shield").tag("approvals").badge(model.approvals.count)
+                        Label("승인", systemImage: "checkmark.shield").tag("approvals").badge(approvals.pending.count)
                         Label("설정", systemImage: "gearshape").tag("settings")
                     }
                     .navigationSplitViewColumnWidth(min: 160, ideal: 180)

@@ -44,3 +44,39 @@ final class ProactiveTests: XCTestCase {
         XCTAssertEqual(items[1].ts, Date(timeIntervalSince1970: 1_795_305_600))
     }
 }
+
+/// Live bug, 2026-11-22: the log decoded `ts` but the server sends `at`, and the decoding error read
+/// as "아젤에게 닿지 않아요".
+final class ProactiveLogShapeTests: XCTestCase {
+    private let server = #"""
+    [{"id":"p7","at":1795309200,"call":true,"urgency":3,"reason":"과제 마감이 2시간 남았어요","opening":"과제 마감이 두 시간 남았어요.","called":false,"blocked_by":"min_gap","signals":{"deadline":true},"call_id":null,"persona_id":"azel"},
+     {"id":"p8","at":1795312800.5,"call":true,"urgency":4,"reason":"회의 10분 전","opening":"곧 회의예요.","called":true,"blocked_by":null,"signals":{},"call_id":"c1","persona_id":"azel"},
+     {"id":"p9","at":1795316400,"call":false,"urgency":1,"reason":"급한 일 없음","opening":"","called":false,"blocked_by":"no_call","signals":{},"call_id":null,"persona_id":null}]
+    """#
+
+    func testDecodesTheServersShape() throws {
+        let items = try JSONDecoder().decode([ProactiveDecision].self, from: Data(server.utf8))
+        XCTAssertEqual(items.map(\.id), ["p7", "p8", "p9"])
+        XCTAssertEqual(items[0].ts, Date(timeIntervalSince1970: 1_795_309_200))
+        XCTAssertEqual(items[0].urgency, "3")
+        XCTAssertEqual(items[0].notCalledBecause, "간격 제한으로 안 걸었어요")
+        XCTAssertEqual(items[0].opening, "과제 마감이 두 시간 남았어요.")
+        XCTAssertTrue(items[1].called)
+        XCTAssertNil(items[1].notCalledBecause)
+        XCTAssertEqual(items[2].notCalledBecause, "전화할 필요 없다고 판단했어요")
+        XCTAssertNil(items[2].opening, "empty opening hidden")
+        // The old shape still reads.
+        let old = try JSONDecoder().decode(ProactiveDecision.self, from: Data(#"{"ts":1795309200,"call":true,"reason":"x"}"#.utf8))
+        XCTAssertTrue(old.called)
+    }
+
+    func testADecodingErrorIsNeverUnreachable() {
+        do {
+            _ = try JSONDecoder().decode([ProactiveDecision].self, from: Data(#"[{"call":true}]"#.utf8))
+            XCTFail("expected a decoding error")
+        } catch {
+            XCTAssertEqual(FriendlyError.describe(error).title, "응답 형식이 달라요 (앱 업데이트 필요)")
+            XCTAssertEqual(FriendlyError.keyPath(error as! DecodingError), "[0].ts")
+        }
+    }
+}

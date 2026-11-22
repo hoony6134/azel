@@ -80,3 +80,17 @@ final class QuietCloseTests: XCTestCase {
         XCTAssertFalse(CallOverlay.shouldClose(turnDone: true, playing: true, drainedFor: 20, after: wait), "still speaking")
     }
 }
+
+#if os(macOS)
+final class ListeningGlowTests: XCTestCase {
+    func testWakeCallsGlowLikePushToTalk() {
+        XCTAssertTrue(MacCall.hears(talking: true, wake: false, inCall: true, muted: false, held: false, state: "thinking"), "key held")
+        XCTAssertTrue(MacCall.hears(talking: false, wake: true, inCall: true, muted: false, held: false, state: ""), "wake: from the handoff on")
+        XCTAssertTrue(MacCall.hears(talking: false, wake: true, inCall: true, muted: false, held: false, state: "listening"))
+        XCTAssertFalse(MacCall.hears(talking: false, wake: true, inCall: true, muted: false, held: false, state: "thinking"), "the turn ended")
+        XCTAssertFalse(MacCall.hears(talking: false, wake: true, inCall: true, muted: true, held: false, state: "listening"), "muted")
+        XCTAssertFalse(MacCall.hears(talking: false, wake: true, inCall: false, muted: false, held: false, state: "listening"), "dismissed")
+        XCTAssertFalse(MacCall.hears(talking: false, wake: false, inCall: true, muted: false, held: false, state: "listening"), "a hotkey toggle call keeps the plain border")
+    }
+}
+#endif

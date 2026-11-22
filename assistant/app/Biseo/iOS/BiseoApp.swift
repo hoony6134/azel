@@ -46,8 +46,11 @@ struct BiseoApp: App {
             .onOpenURL { url in if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } } }
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
-                if scenePhase == .active { ApprovalCenter.shared.start() } else { ApprovalCenter.shared.stop() }
-                if scenePhase == .active { Task { await PhoneDataSync.upload(force: false) } }
+                if scenePhase == .active {
+                    ApprovalCenter.shared.start()
+                    Task { await ApprovalCenter.shared.refresh() }   // stale sheets never survive a return
+                    Task { await PhoneDataSync.upload(force: false) }
+                } else { ApprovalCenter.shared.stop() }
             }
         }
     }
@@ -83,6 +86,7 @@ struct RootView: View {
             CallScreen()
         }
         .approvalSheet(active: !call.inCall)
+        .autoGrantSheet()
     }
 }
 
@@ -95,6 +99,15 @@ final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate 
         let action = response.actionIdentifier
         if action != UNNotificationDefaultActionIdentifier && action != UNNotificationDismissActionIdentifier {
             await PushAction.perform(action: action, userInfo: response.notification.request.content.userInfo)
+            return
+        }
+        if TaskModel.isOvernightPush(response.notification.request.content.userInfo) {
+            await TaskModel.shared.refresh()
+            await MainActor.run { TaskModel.shared.showList = true }   // the 작업 list, from the home card
+            return
+        }
+        if let id = AutoGrantCenter.grantID(from: response.notification.request.content.userInfo) {
+            await AutoGrantCenter.shared.openGrant(id: id)
             return
         }
         if let id = ApprovalCenter.approvalID(from: response.notification.request.content.userInfo) {

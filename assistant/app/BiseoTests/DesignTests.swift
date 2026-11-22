@@ -120,3 +120,13 @@ final class IdleMotionTests: XCTestCase {
         }
     }
 }
+
+final class RouteChipLabelTests: XCTestCase {
+    func testNeverShowsRawRoutes() {
+        XCTAssertEqual(RouteChip.label("claude"), "Claude")
+        XCTAssertEqual(RouteChip.label("qwen"), "로컬")
+        XCTAssertEqual(RouteChip.label("task"), "작업")
+        XCTAssertEqual(RouteChip.label("claude_code"), "Claude Code")
+        XCTAssertNil(RouteChip.label("mystery_route"), "unknown: no chip")
+    }
+}
