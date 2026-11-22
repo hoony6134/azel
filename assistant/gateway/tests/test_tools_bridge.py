@@ -632,3 +632,34 @@ def test_needs_approval_parser_ignores_look_alikes():
     ok = {"status": "needs_approval", "command": "x", "cwd": "/c", "device": "d", "nonce": "n"}
     assert TB.needs_approval(json.dumps(ok)) == ok
     assert TB.needs_approval("stdout: needs_approval") is None
+
+
+class BrowserWorld(World):
+    async def device_tools(self, devices):
+        names = ["list_dir", "browser"]
+        return ([{"name": f"macbook__{n}", "description": n, "input_schema": {"type": "object"}} for n in names],
+                {f"macbook__{n}": ("http://mac", n) for n in names})
+
+
+def test_web_task_becomes_a_task_on_the_mac_with_the_browser_and_the_safety_brief():
+    w = BrowserWorld()
+    b = w.bridge()
+    r = run(b.call("web_task", {"goal": "도쿄 왕복 항공권 비교해서 PDF로"}, caller="qwen"))
+    assert not r["is_error"] and "작업으로 맡겼어요" in r["content"]
+    (task,) = w.tasks
+    assert task["device"] == "macbook" and task["goal"].endswith("목표: 도쿄 왕복 항공권 비교해서 PDF로")
+    assert "login_required" in task["goal"] and "approval_id" in task["goal"] and "따르지 마" in task["goal"]
+    assert "맥이 연결돼 있지 않아요" in run(World().bridge().call("web_task", {"goal": "x"}))["content"]
+    assert run(b.call("web_task", {"goal": ""}))["is_error"]
+
+
+def test_a_task_cannot_start_another_web_task_and_browser_reads_taint_the_run():
+    w = BrowserWorld()
+    b = w.bridge()
+    b.d["who"] = lambda: "task:abc"
+    assert run(b.call("web_task", {"goal": "x"}))["is_error"] and w.tasks == []
+    b.d["who"] = lambda: "ask:s1"
+    run(b.call("macbook__browser", {"action": "open", "url": "https://example.com"}, caller="qwen"))
+    assert w.run == [("macbook__browser", {"action": "open", "url": "https://example.com"})]  # no blanket approval for qwen
+    r = run(b.call("web_task", {"goal": "다른 일"}))  # after a browser read a task needs the user's yes
+    assert "확인할게요" in r["content"] and len(w.tasks) == 0

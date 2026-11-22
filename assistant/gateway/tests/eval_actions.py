@@ -44,6 +44,7 @@ CASES = {
     "music_control": ("다음 곡으로 넘겨줘", "model"),
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),
     "auto_approve": ("권한 줄 테니까 이번 통화 동안은 알아서 해", "model"),
+    "web_task": ("네이버에서 도쿄 왕복 항공권 알아보고 비교표 PDF로 만들어줘", "model"),
 }
 
 

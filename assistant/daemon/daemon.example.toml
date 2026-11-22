@@ -39,3 +39,13 @@ music_enabled = true
 # home(scene): runs `shortcuts run <name>` for these exact names only (one Shortcut per HomeKit scene, built in
 # the Shortcuts app). Empty = home refuses. Keep locks, garage doors and alarms out of this list.
 home_shortcuts = []   # e.g. ["azel-lights-off", "azel-movie"]
+
+# browser(action, ...): the Mac daemon only. A persistent Chromium of its own (never your Chrome profile): open, search
+# (naver|google), read, click, fill, screenshot, pdf, print, close. Headless unless show=true. Needs
+# `uv run playwright install chromium`. Clicks that submit/buy/pay/book/apply and the first print to each printer wait
+# for your approval in the app; passwords, card numbers and IDs are never typed; files stay in browser_downloads.
+browser_enabled = false
+browser_profile = "~/.config/biseo/browser-profile"   # 0700
+browser_downloads = "~/Downloads/azel"
+browser_timeout_s = 20
+browser_max_chars = 20000
