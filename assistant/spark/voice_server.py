@@ -128,7 +128,7 @@ def character_line(name, text, title=""):
     framing a character like "귀엽고 따뜻한 동생" was read as a description of the user ("귀여우시네요"). `title`: how to
     address the user (the user_title setting); without one, never a made-up 오빠/형/언니/누나."""
     text = text.strip().rstrip(".。 ")
-    address = (f"사용자를 '{title}'(이)라고 부른다. 그 호칭은 자연스러운 곳에서만 쓰고 매 문장마다 부르지는 마. " if title else
+    address = (f"사용자를 '{title}'(이)라고 부른다. 그 호칭은 한 답에 많아야 한 번, 자연스러운 곳에서만 쓰고, '네, {title}'로 답을 시작하는 버릇은 들이지 마. " if title else
                "사용자를 오빠, 형, 언니, 누나처럼 새로 부르지 말고 지금까지 부르던 대로 불러. ")
     return (f"너({name})의 성격과 말투: {text}. 이것은 너 자신의 성격이야. 사용자를 이 말로 묘사하거나 칭찬하지 말고, "
             "말투와 태도로만 드러내. 성격에 나오는 관계 말(동생, 친구, 선배, 비서 같은 것)은 너의 말투와 친밀도만 정해. "
@@ -1361,6 +1361,31 @@ LOOKUP_S = 8.0  # the lookup itself; past this, it is said that it failed
 ROUTE_SYSTEM = ("너는 음성 비서의 조회 판단기야. 사용자의 마지막 말에 답하려면 아래 읽기 도구로 지금 데이터를 봐야 하는지 정해. "
                 "필요하면 다른 말 없이 JSON 한 줄 {\"name\": 도구, \"args\": {…}}, 필요 없으면 NONE 한 단어만 출력해. "
                 "잡담, 감정, 농담, 게임, 상식, 계산, 비서 자신에 대한 질문은 NONE. 확실하지 않으면 NONE.\n도구:\n")
+# "서버 괜찮아?" read host load only and answered "모두 정상" while a service was down (live 2026-11-23 03:14): any
+# server question reads hosts, problem services and alerts together, and the answer leads with what is wrong
+INFRA_READ = ("infra_status", "infra_alerts", "infra_health")
+INFRA_HEAD = {"infra_status": "문제 있는 서비스", "infra_alerts": "울리는 경보", "infra_health": "서버별 상태"}
+INFRA_NOTE = ("(멈추거나 문제 있는 서비스와 경보가 있으면 그것부터, 어느 서버에서 언제부터인지 말하고, 나머지 서버 상태는 그다음에 "
+              "짧게 말해. '모두 정상'은 세 항목 모두 문제가 없을 때만 말해. 사용자가 말한 경보나 서비스 이름이 있으면 여기서 찾아 답해.)")
+TOOL_ACTIVITY = (("infra_", "서버 상태 확인 중", "server"), ("phone_", "아이폰 데이터 확인 중", "generic"),
+                 ("agenda", "일정 확인 중", "calendar"), ("gistra_", "학사 일정 확인 중", "calendar"),
+                 ("calendar_", "캘린더 확인 중", "calendar"), ("gmail_", "메일 확인 중", "mail"),
+                 ("memory_", "기억 찾는 중", "memory"), ("people_", "기억 찾는 중", "memory"),
+                 ("weather", "날씨 확인 중", "web"), ("stock_quote", "시세 확인 중", "web"), ("web_", "웹에서 찾는 중", "web"))
+
+
+def tool_activity(name):
+    return next(((label, kind) for pre, label, kind in TOOL_ACTIVITY if name.startswith(pre)), ("확인 중", "generic"))
+
+
+async def infra_read(names, session):
+    """The three infra reads at once, under their own headings, with how to answer from them."""
+    lines = [TOOL_TAG + " " + json.dumps({"name": n, "args": {}}) for n in names]
+    got = await asyncio.gather(*(run_tool(x, session, None) for x in lines), return_exceptions=True)
+    parts = [f"[{INFRA_HEAD[n]}]\n{r if isinstance(r, str) else '가져오지 못했어요.'}" for n, r in zip(names, got)]
+    return "\n".join(parts) + "\n" + INFRA_NOTE
+
+
 LOOKUP_ACK = "네, 볼게요."
 LOOKUP_SLOW = "죄송해요, 조회가 늦어져서 지금은 가져오지 못했어요."  # said only while a lookup that already started is still running
 LOOKUP_SLOW_S = 1.2
@@ -1400,6 +1425,13 @@ async def route_lookup(text, recent, tools):
     return {"name": d["name"], "args": d.get("args") or d.get("arguments") or {}}
 
 
+# "확인해 봤는데, 모두 정상으로 나와요" with no tool behind it (live 2026-11-23 03:14, a real service was down): the
+# outcome of a check nobody made. Never spoken; the lookup runs instead.
+CHECKED = re.compile(r"(확인|조회|살펴|점검|찾아)\s*(해\s*)?(봤|보니|본\s*결과)|(확인|조회)\s*(했는데|했더니|결과)|(나와|나오)(요|네요|는데)")
+# "다음과 같아요." and nothing after it (live 2026-11-23 03:41): held until content follows
+LEAD_IN = re.compile(r"(다음|아래)(과|와)\s*같(아요|습니다|아|은데요?)[.!:]?\s*$")
+LEAD_NOTE = "방금 목록을 말하겠다고만 하고 내용이 없었어. 그 내용을 바로 말해."
+TOOL_TALK = re.compile(r"도구(를|로|가|는)|툴(을|로)")  # our own nudge wording, parroted (live 2026-11-23): never spoken
 PROMISE_NOTE = "방금은 하겠다는 말만 하고 내용이 없었어. 같은 말은 반복하지 말고, 지금 바로 그 내용을 말로 이어서 해."
 STUB_NOTE = "방금 답이 너무 짧아서 아무 내용이 없었어. 이미 한 말은 반복하지 말고, 질문에 네 성격대로 내용을 담아 이어서 답해."
 INTERJECTION = re.compile(r"아+|어+|오+|음+|응+|네+|예|그거|그게|뭐+|헐|와+|우와|아이고|진짜|정말|그러니까|있잖아|맞다|글쎄")
@@ -2199,13 +2231,23 @@ class Address:
     rewritten: the model's own vocatives stay as it said them (user decision 2026-11-22, fewer filters)."""
 
     def __init__(self, title, hkey, first_reply):
-        self.title, self.hkey, self.started = title, hkey, False
+        self.title, self.hkey, self.started, self.named = title, hkey, False, False
         self.due = bool(title) and first_reply
 
     def __call__(self, s):
+        """'' for a sentence that was only the title again ("네, 대표님."): the title at most once per reply (live
+        2026-11-23: "네, 대표님" opened and ended every other sentence)."""
         first, self.started = not self.started, True
-        if first and self.due and self.title not in s:
-            return f"{self.title}, {s}"
+        t = self.title
+        if not t:
+            return s
+        if self.named:
+            s = re.sub(rf"^\s*(?:(?:네|예)\s*,\s*)?{re.escape(t)}\s*[,.!~]+\s*", "", s)
+            s = re.sub(rf"\s*,\s*{re.escape(t)}(?=\s*[,.!?~]|\s*$)", "", s).strip()
+            return s if re.search(r"[가-힣A-Za-z0-9]", s) else ""
+        if first and self.due and t not in s:
+            s = f"{t}, {s}"
+        self.named = t in s
         return s
 
     def done(self):
@@ -2341,7 +2383,15 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             # an action claimed with no action tool, and the user's own plans stated with no source.
             asked = needs_answer(bare)  # a real question (not "여보세요?", "응"): a bare interjection is asked again once
             rechecked, stubbed, notes = False, False, set()  # notes: our own re-ask texts, never a source
-            announced, guessed, looked, tool_nudged = [], [], [], False  # "찾아볼게요" / a figure before any lookup
+            announced, guessed, looked, tool_nudged, lead = [], [], [], False, []
+            base_system = messages[0]["content"]
+
+            def renote(note, said=""):
+                """A correction for the next try only, in the system prompt: never a user or assistant turn the model
+                could take for words said (it parroted the nudge, live 2026-11-23), and gone after this turn."""
+                messages[0] = {"role": "system", "content": base_system + "\n\n[이번 답에만 해당] " + note + (
+                    f" 이미 한 말: '{said}'. 반복하지 말고 이어서 말해." if said else "")}  # "찾아볼게요" / a figure before any lookup
+            lookup_turn = bool(requested or wanted or LIVE_Q.search(bare) or WEB_LIVE.search(bare))  # anything to look up
             live = asked and bool(LIVE_Q.search(bare)) and any(t["name"] in ("web_search", "weather") for t in gw_defs)
             wants_lookup = bool(LIVE_Q.search(bare) or WEB_LIVE.search(bare) or agenda_range(bare, datetime.now(KST)))
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
@@ -2349,7 +2399,15 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 """Run a tool line. A read-only lookup gets an ack past LOOKUP_SLOW_S and gives up at LOOKUP_S (None);
                 an action tool keeps its own wait (an approval can take minutes)."""
                 name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
-                job = asyncio.create_task(run_tool(line, session, on_say))
+                if on_event:  # the call's activity (it showed [] for every Qwen-path lookup, live 2026-11-23)
+                    label, kind = tool_activity(name)
+                    await on_event({"type": "activity", "phase": "tool_start", "tool": name, "label": label,
+                                    "kind": kind, "route": "qwen"})
+                infra = [t["name"] for t in gw_defs if t["name"] in INFRA_READ]
+                if name in INFRA_READ and len(infra) > 1:  # a server question reads the whole picture, not one part
+                    job = asyncio.create_task(infra_read(infra, session))
+                else:
+                    job = asyncio.create_task(run_tool(line, session, on_say))
                 if "__" in name or not READ_ONLY.search(name):  # device tools and actions: their own wait
                     return await job
                 if not (await asyncio.wait({job}, timeout=LOOKUP_SLOW_S))[0]:
@@ -2371,16 +2429,31 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if not looked and live and (FIGURE.search(s) or LISTING.search(s)):
                     guessed.append(s)  # today's figure or a listing claim before any lookup: from memory, never said
                     return
-                if not looked and (is_promise(s, wants_lookup) or (requested and wanted and future(s))):
-                    # held with or without tools: a promise is never spoken before its result exists
-                    announced.append(s)  # a promise to look: said only once the tool actually runs
+                if TOOL_TALK.search(s):
+                    return  # "바로 도구를 불러서 찾아볼게요": our nudge parroted, never said
+                promise = is_promise(s, wants_lookup) or (future(s) and bool(LOOKUP_VERB.search(s))) or \
+                    (requested and wanted and future(s))
+                if promise and (looked or not lookup_turn):
+                    return  # after the result, or in chat with nothing to look up ("내일 다시 확인해 드릴게요"): dropped
+                if promise:
+                    announced.append(s)  # held: a promise is never spoken before its result exists
                     return
+                if not looked and lookup_turn and CHECKED.search(s):
+                    guessed.append(s)  # "확인해 봤는데 정상" with no tool: never said, the lookup runs instead
+                    return
+                if LEAD_IN.search(s):
+                    lead.append(s)  # "다음과 같아요." waits for what follows it
+                    return
+                for x in lead:
+                    await sentences.put(x)
+                lead.clear()
                 await sentences.put(s)
 
             # tool-first: the decision runs beside Qwen's own first answer, which is held (not spoken) until it is in
             ro_tools = [t for t in gw_defs if "__" not in t["name"] and READ_ONLY.search(t["name"])]
             first_stream = None
-            if ro_tools and requested and not play:
+            # every turn but a bare "응"/"고마워": "네모클로 응답 안 한대" is a statement and still needs the data
+            if ro_tools and not play and not TRIVIAL.fullmatch(bare.strip()):
                 pump_q: asyncio.Queue = asyncio.Queue()
 
                 async def pump(msgs):
@@ -2484,10 +2557,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         if rechecked:
                             raise Ungrounded if e.kind == "personal" else Unconfirmed
                         rechecked = True
-                        said = " ".join(said_round[:-1])
-                        note = RECHECK[e.kind].format(s=e.sentence[:80])
-                        notes.add(note)
-                        messages += [{"role": "assistant", "content": said or "…"}, {"role": "user", "content": note}]
+                        renote(RECHECK[e.kind].format(s=e.sentence[:80]), " ".join(said_round[:-1]))
                         continue
                     if (announced or guessed) and not looked and rounds < 3:  # promised or guessed, looked nothing up
                         timings["announce_only"] = timings.get("announce_only", 0) + 1
@@ -2496,10 +2566,24 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         if not tool_nudged:
                             tool_nudged = True
                             hint = f" 이 요청에는 {wanted['name']}{arg_hint(wanted)}가 맞아." if wanted else ""
-                            messages += [{"role": "assistant", "content": " ".join(said_round)},
-                                         {"role": "user", "content": TOOL_NUDGE + hint}]
+                            renote(TOOL_NUDGE + hint)
                             continue
                         names = {t["name"] for t in gw_defs}  # twice: look it up for Qwen, then let it answer
+                        try:  # the same decision as tool-first, now with Qwen's own words as the hint it needs data
+                            routed = await asyncio.wait_for(route_lookup(request_text, prior, ro_tools), ROUTE_S) \
+                                if ro_tools else None
+                        except (asyncio.TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError):
+                            routed = None
+                        if routed:
+                            line = TOOL_TAG + " " + json.dumps(routed, ensure_ascii=False)
+                            looked.append(line)
+                            pending_lookup.pop(hkey, None)
+                            if (result := await lookup(line)) is None:
+                                await sentences.put(LOOKUP_SLOW)
+                                return
+                            messages += [{"role": "assistant", "content": line},
+                                         {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
+                            continue
                         span = agenda_range(bare, datetime.now(KST)) if "agenda" in names else None
                         pick_ = "agenda" if span else "weather" if WEATHER_Q.search(bare) and "weather" in names else \
                             "stock_quote" if re.search(r"주가|주식|종가|환율", bare) and "stock_quote" in names else \
@@ -2528,15 +2612,20 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     if requested and not stubbed and not confirmed["ok"] and said_round and all(map(future, said_round)):
                         stubbed = True  # "정리해 드릴게요." and nothing after it (live 2026-11-22): the content, now
                         timings["promise_only"] = " ".join(said_round)[:40]
-                        messages += [{"role": "assistant", "content": " ".join(said_round)},
-                                     {"role": "user", "content": PROMISE_NOTE}]
+                        renote(PROMISE_NOTE, " ".join(said_round))
                         continue
                     if asked and not stubbed and stub(" ".join(said_round), user_title(settings, persona)):
                         stubbed = True  # "아, 그거!" to a question: ask for the rest, once (live 2026-11-22, 서아)
                         timings["stub"] = " ".join(said_round)[:40]
-                        messages += [{"role": "assistant", "content": " ".join(said_round) or "…"},
-                                     {"role": "user", "content": STUB_NOTE}]
+                        renote(STUB_NOTE, " ".join(said_round))
                         continue
+                    if lead and not stubbed:  # "다음과 같아요." was the end of it: ask for the list, once
+                        stubbed = True
+                        timings["lead_only"] = lead[0][:40]
+                        renote(LEAD_NOTE, " ".join(x for x in said_round if x not in lead))
+                        lead.clear()
+                        continue
+                    lead.clear()  # a lead-in with nothing after it twice: dropped, never said
                     break
             except Ungrounded:
                 return await via_claude()  # twice unsourced: Claude checks the real data (local: says it can't)
@@ -2589,7 +2678,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 return s
             if not (s := ko_read.strip_foreign(s)) or (ko_read.english_only(s) and not ASKS_ENGLISH.search(text)):
                 return await next_chunk()  # nothing but stray Chinese/Japanese, or a model's English working note
-            s = address(s)
+            if not (s := address(s)):
+                return await next_chunk()  # only the title again: nothing to say
         if s is None or s in (FILLER, FILLER_LONG):
             return s
         # as much as the audio ahead covers (the held audio before playback starts), never more than MAX_CHUNK_SYL.
@@ -2604,6 +2694,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     not (nxt := ko_read.strip_foreign(nxt)) or (ko_read.english_only(nxt) and not ASKS_ENGLISH.search(text))):
                 continue
             nxt = nxt if nxt is None or nxt in (FILLER, FILLER_LONG) else address(nxt)
+            if nxt == "":
+                continue
             if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
                 back.append(nxt)
                 break
@@ -3842,7 +3934,11 @@ if __name__ == "__main__":
             a = Address("대표님", "t", i == 0)
             replies.append([a(x) for x in said])
             a.done()
-        assert replies == [["대표님, 네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["그럼요."], ["오늘은 쉬세요."]], replies
+        assert replies == [["대표님, 네, 확인했어요.", "그리고요."], ["대표님, 맑아요."], ["그럼요."], ["오늘은 쉬세요."]], replies
+        a = Address("대표님", "tic", False)  # live 2026-11-23: "네, 대표님" opened and closed every other sentence
+        assert [a(x) for x in ("네, 대표님. 세 종목이 한꺼번에 빠지니 속상하시죠.", "너무 속상해하지 마세요, 대표님.", "네, 대표님.",
+                               "대표님 회사 일은 내일 봐요.")] == \
+            ["네, 대표님. 세 종목이 한꺼번에 빠지니 속상하시죠.", "너무 속상해하지 마세요.", "", "대표님 회사 일은 내일 봐요."]
         # live 2026-11-22: a promise and nothing after it is re-asked; a reply with content is not
         assert all(map(future, ["네, 그 서비스의 핵심과 구체적인 작동 방식을 정리해 드릴게요."]))
         assert not all(map(future, ["정리해 드릴게요.", "핵심은 회의 피로를 줄이는 거예요."]))
@@ -3921,7 +4017,7 @@ if __name__ == "__main__":
             said = [s async for s, *_ in respond(user, "ack", time.perf_counter(), {})]
             return said, calls
         said, calls = asyncio.run(ack_check(["네.", "물은 100도에서 끓어요."]))
-        assert said == ["네.", "물은 100도에서 끓어요."] and STUB_NOTE in [m["content"] for m in calls[1]], said  # asked once more
+        assert said == ["네.", "물은 100도에서 끓어요."] and STUB_NOTE in " ".join(m["content"] for m in calls[1]), said  # asked once more
         said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
         assert said == ["네.", LOOKUP_FAILED], said  # a promise with nothing behind it is never said; the turn says so
         said, _ = asyncio.run(ack_check(["네, 100도예요."]))
@@ -3942,12 +4038,12 @@ if __name__ == "__main__":
             links.settings = {}
         # the two hallucination checks: re-asked once with a note, then the old handling
         said, calls = asyncio.run(ack_check(["오전 열 시에 팀 회의가 있어요.", "회의는 지금 확인이 안 돼요."], user="오늘 좀 피곤하다"))
-        assert said == ["회의는 지금 확인이 안 돼요."] and "확인된 게 없어" in calls[1][-1]["content"], said
+        assert said == ["회의는 지금 확인이 안 돼요."] and "확인된 게 없어" in calls[1][0]["content"], said
         said, calls = asyncio.run(ack_check(["오전 열 시에 팀 회의가 있어요."], user="오늘 좀 피곤하다"))
         assert said == ["클로드가 답해요."] and len(calls) == 2, said  # twice: Claude checks the real data
         said, calls = asyncio.run(ack_check(["네, 지금 전화 드릴게요.", "지금은 제가 직접 걸 수가 없어요. 어떻게 할까요?"],
                                             user="나중에 전화해 줄 수 있어?"))
-        assert said == ["지금은 제가 직접 걸 수가 없어요.", "어떻게 할까요?"] and "도구가 없었어" in calls[1][-1]["content"], said
+        assert said == ["지금은 제가 직접 걸 수가 없어요.", "어떻게 할까요?"] and "도구가 없었어" in calls[1][0]["content"], said
         async def title_turns():  # same session all day: a new title must not be fought by the old turns
             seen = []
 
@@ -5444,7 +5540,7 @@ if __name__ == "__main__":
                                                  "앤트로픽은 비상장이라 주가가 없어요."])
             said = asyncio.run(run("그러면 엔트로픽 주가 지금 알려줘", "s"))
             assert [x for x, _ in said] == ["앤트로픽은 비상장이라 주가가 없어요."], said  # the promise is never said
-            assert TOOL_NUDGE in [m["content"] for m in ann[1]] and ran == [{"name": "web_search", "args": {"query": "앤트로픽 주가"}}]
+            assert TOOL_NUDGE in " ".join(m["content"] for m in ann[1]) and ran == [{"name": "web_search", "args": {"query": "앤트로픽 주가"}}]
             ann.clear(), ran.clear()
             globals()["llm_stream"] = announcer(["광주 날씨 확인해 볼게요.", "확인해 볼게요.", "지금 광주는 9도예요."])
             said = asyncio.run(run("광주 날씨 알려줄래?", "s"))
@@ -5518,7 +5614,7 @@ if __name__ == "__main__":
             ann.clear(), ran.clear(), fetched_calls.clear()
             globals()["llm_stream"] = announcer([promise, promise, "내일은 컴파일러 수업이 있어요."])
             said = asyncio.run(local_run(ask))
-            assert TOOL_NUDGE in [m["content"] for m in ann[1]], ann
+            assert TOOL_NUDGE in " ".join(m["content"] for m in ann[1]), ann
             assert ran == [{"name": "agenda", "args": {"from": span[0].isoformat(), "to": span[1].isoformat()}}], ran
             assert said == ["내일은 컴파일러 수업이 있어요."], said  # the promise is never said, only the answer
             gw_tools.update(at=time.time(), defs=[{"name": "call_user", "description": "전화"}])  # nothing to look with
@@ -5531,7 +5627,7 @@ if __name__ == "__main__":
             globals()["llm_stream"] = announcer(['확인할게요. <tool_call>{"name": "agenda", "arguments": {}}</tool_call>',
                                                  "내일은 수업이 하나 있어요."])
             said = asyncio.run(local_run(ask))
-            assert ran == [{"name": "agenda", "args": {}}] and TOOL_NUDGE not in [m["content"] for m in ann[-1]], ann
+            assert ran == [{"name": "agenda", "args": {}}] and TOOL_NUDGE not in " ".join(m["content"] for m in ann[-1]), ann
             assert said == ["내일은 수업이 하나 있어요."], said  # "확인할게요" before the call: held, never said
             ann.clear(), ran.clear()  # small talk: "잠깐만요." is just words, never a nudge or a forced lookup
             globals()["llm_stream"] = announcer(["잠깐만요. 따뜻한 차 한 잔 하고 쉬어요."])
@@ -5610,6 +5706,55 @@ if __name__ == "__main__":
             assert [x for x, *_ in said] == [LOOKUP_ACK, LOOKUP_SLOW] and ann == [], said  # never silent, never a guess
             globals()["run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = fake_run_tool, (1.2, 8.0)
             route_lookup = no_route
+            # live 2026-11-23 03:14: "확인해 봤는데 모두 정상" with no tool while NemoClaw was down. A server question
+            # reads all three infra tools; the answer sees the down service; a checked result with no tool is never said
+            infra_all = [{"name": n, "description": n, "input_schema": {"type": "object", "properties": {}}}
+                         for n in ("infra_health", "infra_status", "infra_alerts")]
+            gw_tools.update(at=time.time(), defs=infra_all)
+            canned = {"infra_health": "deneb CPU 12%", "infra_status": "멈춤: Vuja De claw (NemoClaw) http, vd-spark, 03:02부터",
+                      "infra_alerts": "경보 없음"}
+
+            async def infra_tool(raw, session, on_say=None):
+                d = json.loads(raw[len(TOOL_TAG):])
+                ran.append(d)
+                return canned[d["name"]]
+            globals()["run_tool"], route_lookup = infra_tool, route_infra
+            ran.clear(), ann.clear()
+            events = []
+
+            async def lrun_ev(text, session):
+                CALL_MODE.set("local")
+
+                async def ev(e):
+                    events.append(e)
+                return [x async for x in respond(text, session, time.perf_counter(), {}, on_event=ev)]
+            globals()["llm_stream"] = announcer(["vd-spark의 NemoClaw가 03시 2분부터 멈춰 있어요. 나머지 서버는 괜찮아요."])
+            said = asyncio.run(lrun_ev("서버 상태 확인해줘. 지금 서버 중에 뭐 하나 터진 것 같다.", "tf5"))
+            assert sorted(d["name"] for d in ran) == ["infra_alerts", "infra_health", "infra_status"], ran
+            assert "[문제 있는 서비스]" in ann[0][-1]["content"] and "NemoClaw" in ann[0][-1]["content"]
+            assert events and events[0]["label"] == "서버 상태 확인 중" and events[0]["route"] == "qwen", events
+            route_lookup = no_route  # the backstop: Qwen claims a check it never made
+            ran.clear(), ann.clear()
+            globals()["llm_stream"] = announcer(["확인해 봤는데, 모두 정상으로 나와요.", "확인해 봤는데, 모두 정상으로 나와요.",
+                                                 "NemoClaw가 멈춰 있어요."])
+            said = [x for x, *_ in asyncio.run(lrun("서버 상태 확인해줘", "tf6"))]
+            assert not any("정상으로 나와요" in x for x in said), said
+            # live 2026-11-23 (슬프다 그래서): our nudge parroted, a promise in chat, and the title in every sentence
+            gw_tools.update(at=time.time(), defs=[])
+            ann.clear()
+            globals()["llm_stream"] = announcer(["네, 대표님. 세 종목이 한꺼번에 빠지니 속상하시죠. 너무 속상해하지 마세요, 네, 대표님. "
+                                                 "우선 주무시고, 내일 다시 한 번 상태 확인해 드릴게요. 네, 대표님. 바로 도구를 불러서 "
+                                                 "찾아볼게요."])
+            said = [x for x, *_ in asyncio.run(lrun("슬프다 그래서", "tf7"))]
+            joined = " ".join(said)
+            assert "도구" not in joined and "확인해 드릴게요" not in joined and "찾아볼게요" not in joined, said
+            assert len(ann) == 1 and "속상" in joined, said  # chat: dropped silently, no re-ask
+            # "다음과 같아요." with nothing after it (live 03:41): asked once for the list, the lead-in never said alone
+            ann.clear()
+            globals()["llm_stream"] = announcer(["메모리에서 찾은 현재 보유 주식 목록은 다음과 같아요.",
+                                                 "애플, 토스, 엔비디아, 삼성전자, SK하이닉스예요."])
+            said = [x for x, *_ in asyncio.run(lrun("내가 갖고 있는 주식 보유 현황 알려줘", "tf8"))]
+            assert said[-1] == "애플, 토스, 엔비디아, 삼성전자, SK하이닉스예요." and LEAD_NOTE in ann[1][0]["content"], said
             # the call as it went: no tools at all, and Qwen only promised. Held, and the turn says it could not look
             gw_tools.update(at=time.time(), defs=[])
             ann.clear()
