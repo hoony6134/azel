@@ -767,22 +767,87 @@ async def recall(text, timings):
     return hits
 
 
+OPENING_CHUNK_SYL = 45  # an opening's later chunks: a few sentences per TTS call
+CHUNK_GROWTH = 1.4  # each chunk at most this much longer than the one before: TTS runs ~0.65x real time, so the
+#                     one playing still covers the next one's synthesis
+
+
+def opening_chunks(parts):
+    """The first sentence alone (ready soonest), then sentences joined into chunks that grow by CHUNK_GROWTH up to
+    OPENING_CHUNK_SYL: fewer TTS calls and smoother prosody, while each chunk's synthesis stays covered by the one
+    playing before it."""
+    out = parts[:1]
+    for p in parts[1:]:
+        cap = min(OPENING_CHUNK_SYL, max(FIRST_MIN_SYL, int(syllables(out[-2] if len(out) > 1 else out[0]) * CHUNK_GROWTH)))
+        if len(out) > 1 and syllables(out[-1]) + syllables(p) <= cap:
+            out[-1] = f"{out[-1]} {p}"
+        else:
+            out.append(p)
+    return out
+
+
 def prepare_opening(text, reason="", persona=""):
-    """Split a placed call's opening and start synthesizing it now, so the phone hears it the moment it
-    connects (the push arrives seconds before the callee answers)."""
-    parts = split_ready(text, final=True)[0] if text else []
-    op = {"text": text, "parts": parts, "audio": None, "reason": reason, "persona": persona}
+    """Split a placed call's opening and start synthesizing it now, chunk by chunk, while the phone rings: the
+    callee hears it as soon as enough is ready to play the rest without a gap, not after all of it."""
+    parts = opening_chunks(split_ready(text, final=True)[0]) if text else []
+    op = {"text": text, "parts": parts, "audio": None, "chunks": None, "started": {}, "reason": reason,
+          "persona": persona}
     if parts:
         try:
-            op["audio"] = asyncio.get_running_loop().create_task(_synth_all(parts, persona))
+            start_opening_synth(op)
         except RuntimeError:
             pass  # no event loop (self-checks): synthesize on connect instead
     return op
 
 
-async def _synth_all(parts, persona=""):
-    CALL_PERSONA.set(pick_persona(links.settings, persona))  # this task only: the voice the call rings with
-    return [(await tts(p))[0] for p in parts]
+def start_opening_synth(op):
+    loop = asyncio.get_running_loop()
+    op["chunks"] = [loop.create_future() for _ in op["parts"]]
+    op["audio"] = loop.create_task(_synth_seq(op))
+
+
+async def _synth_seq(op):
+    """Synthesize the opening's chunks in order (one TTS request at a time), each into its future as it lands."""
+    CALL_PERSONA.set(pick_persona(links.settings, op.get("persona", "")))  # this task only: the call's voice
+    out = []
+    for i, (p, fut) in enumerate(zip(op["parts"], op["chunks"])):
+        op["started"][i] = time.monotonic()
+        try:
+            pcm = (await tts(p))[0]
+        except Exception as e:  # the speaker retries this chunk itself
+            if not fut.done():
+                fut.set_exception(e)
+                fut.exception()  # retrieved: an opening nobody plays (replaced, never answered) logs nothing
+            continue
+        if not fut.done():
+            fut.set_result(pcm)
+        out.append(pcm)
+    return out
+
+
+async def opening_audio(op):
+    """(sentence, pcm) of a placed call's opening, in order, starting only once the ready audio covers the
+    synthesis of the rest (gap_free), or after HOLD_MAX_S at the latest."""
+    parts = op["parts"]
+    if op.get("chunks") is None:
+        start_opening_synth(op)
+    chunks, t0 = op["chunks"], time.monotonic()
+    while time.monotonic() - t0 < HOLD_MAX_S:
+        n = next((i for i, f in enumerate(chunks) if not f.done()), len(chunks))  # chunks ready in a row
+        if n == len(chunks):
+            break
+        ok = [f for f in chunks[:n] if not f.cancelled() and f.exception() is None]
+        now = time.monotonic()
+        if n and gap_free(now, sum(len(f.result()) / 2 / 24000 for f in ok), [syllables(p) for p in parts[n + 1:]],
+                          (op["started"].get(n, now), syllables(parts[n]))):
+            break
+        await asyncio.sleep(0.05)
+    for s, fut in zip(parts, chunks):
+        try:
+            pcm = await fut
+        except Exception:  # its synthesis failed (or was cancelled): once more, here
+            pcm = (await tts(s))[0]
+        yield s, pcm
 
 
 GREETING = re.compile(r"(여보세요|여보세용|여보|네+|예|응+|어+|안녕(하세요)?|네네)[\s.!?~,]*")
@@ -1291,13 +1356,12 @@ async def briefing_sentences(session, name, on_event, persona="", title=""):
         yield FILLER
         await on_event(dict(ROUTING))
         stream = claude_stream(BRIEFING_CLAUDE, session, None, "schedule", personal=True, on_event=on_event)
-    buf, first, said, failed = "", True, [], False
+    buf, said, failed = "", [], False
     try:
         async for delta in unthink(stream, Unthink()):
             buf += delta
-            done, buf = split_ready(buf, final=False, first=first)
+            done, buf = split_ready(buf, final=False)  # whole sentences: a lone clause leaves a hole after it
             for s in done:
-                first = False
                 said.append(s)
                 yield s
     except RuntimeError as e:  # no gateway / Claude failed: say why
@@ -1517,6 +1581,32 @@ PLAY_TAIL_S = float(os.environ.get("PLAY_TAIL_MS", "300")) / 1000  # after the p
 # default and a moving average), and merging leaves a 1.5x margin.
 SYNTH_S_PER_SYL = float(os.environ.get("SYNTH_MS_PER_SYL", "150")) / 1000
 synth_rate = [SYNTH_S_PER_SYL]
+AUDIO_S_PER_SYL = 0.24  # Qwen3-TTS Korean speech, measured 2026-11-22; tracked from real audio like synth_rate
+audio_rate = [AUDIO_S_PER_SYL]
+SYNTH_MARGIN = 1.4  # synthesis estimates are padded this much (the TTS box is shared: rates swing ~0.7-1.0x real time)
+FUTURE_SYL = 25  # an LLM still writing: assume one more sentence of about this size will follow
+HOLD_MAX_S = 6.0  # never hold ready audio back longer than this, whatever the estimates say
+FIRST_MIN_SYL = 12  # an opening's second chunk is at least this long
+MAX_CHUNK_SYL = 60  # merged chunks stay a few sentences long (prosody, and a cut-in loses less)
+
+
+def synth_est(syl):
+    """Seconds Qwen3-TTS needs for a chunk of `syl` syllables, padded (it serves one request at a time)."""
+    return SYNTH_MARGIN * max(SYNTH_S_PER_SYL, synth_rate[0]) * max(syl, 8)
+
+
+def gap_free(now, buffered_s, pending, inflight=None):
+    """Would playback started `now` run without a gap? `buffered_s`: audio ready and not yet played; `inflight`:
+    (started_at, syllables) of the chunk being synthesized; `pending`: syllables of the chunks still to synthesize,
+    in order. Synthesis is sequential, so chunk k is ready at the sum of the synth times before it, and must be
+    ready before the audio queued ahead of it runs out."""
+    ready, plays_until = now, now + buffered_s
+    for start, syl in ([inflight] if inflight else []) + [(None, p) for p in pending]:
+        ready = (max(now, start + synth_est(syl)) if start is not None else ready + synth_est(syl))
+        if ready > plays_until:
+            return False
+        plays_until += audio_rate[0] * syl
+    return True
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
@@ -1532,9 +1622,10 @@ async def tts(sentence: str) -> tuple[bytes, int]:
     t = time.perf_counter()
     r = await client.post(TTS_URL, json=body)
     r.raise_for_status()
+    wav, sr = sf.read(io.BytesIO(r.content), dtype="int16")
     if (n := syllables(sentence)) >= MIN_SYL:
         synth_rate[0] = 0.7 * synth_rate[0] + 0.3 * (time.perf_counter() - t) / n
-    wav, sr = sf.read(io.BytesIO(r.content), dtype="int16")
+        audio_rate[0] = 0.7 * audio_rate[0] + 0.3 * (len(wav) / sr) / n
     if cacheable and len(_tts_cache) < 500:
         _tts_cache[key] = (wav.tobytes(), sr)
     return wav.tobytes(), sr
@@ -1776,7 +1867,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                             buf, state = TOOL_TAG + after, "tool"
                             continue
                         speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
-                        done, rest = split_ready(speak, final=False, first="first_sentence_ms" not in timings)
+                        done, rest = split_ready(speak, final=False)
                         buf = rest + held
                         for s in done:
                             timings.setdefault("first_sentence_ms", ms(t0))
@@ -1831,6 +1922,11 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
 
     producer = asyncio.create_task(produce())
     spoken, back, play_end = [], [], 0.0
+    held, held_since, opened = [], [0.0], [False]  # synthesized audio not sent yet, and since when
+
+    def buffered():
+        """Seconds of audio ahead of the listener: still to play on the phone, or held here before playback."""
+        return max(0.0, play_end - time.monotonic()) if opened[0] else sum(len(p) / 2 / r for _, p, r in held)
     hist.append({"role": "user", "content": text})
 
     async def next_chunk():
@@ -1846,7 +1942,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             s = address(s)
         if s is None or s in (FILLER, FILLER_LONG):
             return s
-        room = max(0.0, play_end - time.monotonic()) / (1.5 * max(SYNTH_S_PER_SYL, synth_rate[0]))
+        # as much as the audio ahead covers (the held audio before playback starts), never more than MAX_CHUNK_SYL.
+        # A short first sentence stays its own chunk (its own caption): the start gate holds it until what
+        # follows is ready, so no hole opens after it.
+        room = min(MAX_CHUNK_SYL, buffered() / (SYNTH_MARGIN * max(SYNTH_S_PER_SYL, synth_rate[0])))
         while not back and not sentences.empty():
             nxt = sentences.get_nowait()
             nxt = nxt if nxt is None or nxt in (FILLER, FILLER_LONG) else address(nxt)
@@ -1856,16 +1955,54 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             s = f"{s} {nxt}"
         return s
 
+    def pending_syl():
+        """Syllables of the sentences known but not synthesized yet, plus one assumed sentence while the LLM writes."""
+        known = [x for x in [*back, *list(sentences._queue)] if x is not None and x not in (FILLER, FILLER_LONG)]
+        more = not producer.done() and None not in back and None not in sentences._queue
+        return [syllables(x) for x in known] + ([FUTURE_SYL] if more else [])
+
+    def ready_to_play():
+        """Start playback only once the held audio covers the synthesis of what follows: no gap mid-reply."""
+        if not speak or time.monotonic() - held_since[0] >= HOLD_MAX_S or buffered() == 0:
+            return True  # muted, held long enough, or nothing audible to protect
+        return gap_free(time.monotonic(), buffered(), pending_syl())
+
+    def take(s, pcm, sr):
+        nonlocal play_end
+        play_end = max(time.monotonic(), play_end) + len(pcm) / 2 / sr  # when the phone finishes this chunk
+        if s not in (FILLER, FILLER_LONG):
+            spoken.append(s)
+        return s, route["value"], pcm, sr
+
     try:
-        while (s := await next_chunk()) is not None:
+        while True:
+            if held and ready_to_play():
+                timings.setdefault("first_audio_ms", ms(t0))
+                timings.setdefault("held_ms", round((time.monotonic() - held_since[0]) * 1000))
+                while held:
+                    yield take(*held.pop(0))
+                opened[0] = True
+            try:  # while audio is held, re-check the gate now and then: the LLM may be slow to send the rest
+                s = await (asyncio.wait_for(next_chunk(), max(0.05, HOLD_MAX_S - (time.monotonic() - held_since[0])))
+                           if held else next_chunk())
+            except asyncio.TimeoutError:
+                held_since[0] = -1e9  # held long enough: play what there is
+                continue
+            if s is None:
+                break
             if not speak and s in (FILLER, FILLER_LONG):
                 continue  # a muted (typed) turn: captions only, and "잠시만요" is not a caption
             pcm, sr = await tts(s) if speak else (b"", 24000)
+            if opened[0] or s in (FILLER, FILLER_LONG):
+                timings.setdefault("first_audio_ms", ms(t0))
+                yield take(s, pcm, sr)  # playing already (its buffer is on the phone), or a filler: as it comes
+            else:
+                if not held:
+                    held_since[0] = time.monotonic()
+                held.append((s, pcm, sr))
+        while held:  # the reply is complete: everything synthesized plays back to back
             timings.setdefault("first_audio_ms", ms(t0))
-            play_end = max(time.monotonic(), play_end) + len(pcm) / 2 / sr  # when the phone finishes this chunk
-            if s not in (FILLER, FILLER_LONG):
-                spoken.append(s)
-            yield s, route["value"], pcm, sr
+            yield take(*held.pop(0))
         await producer  # surfaces LLM errors
         if not spoken and any(f.thought for f in thinking):  # the model only reasoned: a short line, not silence
             pcm, sr = await tts(THINK_FALLBACK) if speak else (b"", 24000)
@@ -2180,15 +2317,12 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     async def speak_opening(op):
         done = False
         try:
-            try:
-                pcms = await op["audio"] if op["audio"] else None  # normally done long before the callee answers
-            except Exception:
-                pcms = None
             gen = new_reply()
             await send({"type": "state", "value": "speaking"})
             await send({"type": "reply_start", "reply_id": gen}, gen=gen)
-            for i, s in enumerate(op["parts"]):
-                pcm = pcms[i] if pcms else (await tts(s))[0]
+            i = -1
+            async for s, pcm in opening_audio(op):  # streams: the first chunks play while the rest synthesize
+                i += 1
                 await send({"type": "reply", "text": s, "route": "opening"}, gen=gen)
                 await send(audio=pcm, gen=gen)
                 if i == 0:
@@ -2198,6 +2332,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         finally:
             if not done:  # TTS failed or cancelled: drop the protection, or the call stays deaf for an hour
                 guard.first_end = guard.play_end = current["play_end"]
+                if op.get("audio"):
+                    op["audio"].cancel()  # cut in or hung up: the rest of the opening is never synthesized
 
     def cut_at():
         """Now in phone playback time: playback stands still while paused."""
@@ -3294,6 +3430,57 @@ if __name__ == "__main__":
             links.remove(full)
             links.remove(br)
             return states, stays, midway, leftover, logs, brain, prompts
+        def chunking_check():
+            """Gap-free playback: replies hold their first chunks until the rest can follow without a gap, a short
+            first sentence takes the next one along, openings stream chunk by chunk, and order never changes."""
+            saved = SYNTH_S_PER_SYL, synth_rate[0], audio_rate[0], HOLD_MAX_S
+            globals().update(SYNTH_S_PER_SYL=0.004, HOLD_MAX_S=3.0)
+            synth_rate[0], audio_rate[0] = 0.004, 0.012
+            calls = []
+
+            async def fake_tts(sentence, *a, **k):  # 4 ms of synthesis and 12 ms of audio per syllable
+                n = syllables(sentence)
+                calls.append((time.monotonic(), sentence))
+                await asyncio.sleep(0.004 * n)
+                return b"\0" * int(0.012 * n * 24000) * 2, 24000
+            text = ("물은 백 도에서 끓어요. 다만 높은 산처럼 기압이 낮은 곳에서는 더 낮은 온도에서 끓어요. "
+                    "그래서 산 위에서 라면을 끓이면 면이 덜 익을 수 있어요. 압력솥은 압력을 높여서 더 뜨겁게 끓여요.")
+
+            async def llm(messages, max_tokens=600):
+                yield text
+
+            def play(events):  # (sent_at, audio_s) -> gaps in ms on a phone playing back to back
+                end, gaps = None, []
+                for at, dur in events:
+                    if end is not None:
+                        gaps.append(max(0.0, at - end) * 1000)
+                    end = max(at, end or at) + dur
+                return gaps
+
+            async def reply():
+                ev, said = [], []
+                async for s, _, pcm, sr in respond("물 끓는 온도", "chunk", time.perf_counter(), {}):
+                    ev.append((time.monotonic(), len(pcm) / 2 / sr))
+                    said.append(s)
+                return ev, said
+
+            async def opening():
+                op = prepare_opening(text * 2)
+                ev, said = [], []
+                async for s, pcm in opening_audio(op):
+                    ev.append((time.monotonic(), len(pcm) / 2 / 24000))
+                    said.append(s)
+                return ev, said, op
+            real = tts, llm_stream
+            globals().update(tts=fake_tts, llm_stream=llm)
+            try:
+                ev, said = asyncio.run(reply())
+                calls.clear()
+                oev, osaid, op = asyncio.run(opening())
+            finally:
+                globals().update(tts=real[0], llm_stream=real[1], SYNTH_S_PER_SYL=saved[0], HOLD_MAX_S=saved[3])
+                synth_rate[0], audio_rate[0] = saved[1], saved[2]
+            return play(ev), said, play(oev), oev, osaid, op, calls
         def typed_check():
             """Typing during a call: a user turn without STT (no transcript echo, input "text" in the log), captions only
             with speak=false, rejected when too long or too fast, and typing over a reply interrupts it."""
@@ -3678,6 +3865,17 @@ if __name__ == "__main__":
         assert [m["event"] for m in slogs] == ["start", "turn", "end"], slogs  # only the normal call's part
         assert "비밀" not in json.dumps(slogs, ensure_ascii=False) and "고양이" not in json.dumps(slogs, ensure_ascii=False)
         assert [e["event"] for e in brain_evs] == ["start", "end"] and all("secret-" not in json.dumps(e) for e in brain_evs)
+        audio_rate[0], synth_rate[0] = 0.24, 0.15
+        assert not gap_free(0.0, 11 * 0.24, [26]) and gap_free(0.0, 37 * 0.24, [22, 24])  # a lone short sentence can't cover
+        assert not gap_free(0.0, 5.0, [], inflight=(-0.5, 40)) and gap_free(0.0, 5.0, [], inflight=(-4.0, 30))
+        sizes = [syllables(c) for c in opening_chunks(split_ready("좋은 아침이에요. " + "오늘은 수업이 하나 있어요. " * 12, final=True)[0])]
+        assert sizes[0] < sizes[1] <= sizes[2] and max(sizes) <= OPENING_CHUNK_SYL, sizes  # grows, then caps
+        assert all(b <= max(FIRST_MIN_SYL, a * CHUNK_GROWTH) + 13 for a, b in zip(sizes, sizes[1:])), sizes
+        gaps, said, ogaps, oev, osaid, op, calls = chunking_check()
+        assert said[0] == "물은 백 도에서 끓어요." and said[-1].endswith("더 뜨겁게 끓여요.") and len(said) >= 3, said  # in order
+        assert max(gaps, default=0) <= 50 and max(ogaps, default=0) <= 50, (gaps, ogaps)  # no audible gap
+        assert osaid == op["parts"] and len(osaid) > 3  # the opening, in order
+        assert oev[0][0] < calls[-1][0], "the opening started playing before its last chunk was synthesized"
         spoken, rejected, quiet, over, turns, asked = typed_check()
         kinds = lambda fs: [f if f == "audio" else f["type"] for f in fs]  # noqa: E731
         assert "transcript" not in kinds(spoken) and "audio" in kinds(spoken), kinds(spoken)
