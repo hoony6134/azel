@@ -424,6 +424,17 @@ class Bridge:
                 raise Fail("unavailable", f"지금은 주가를 가져오지 못했어요({type(e).__name__}).")
             return r["spoken"], r, r["spoken"] + " (이 문장대로, 출처와 날짜를 빼지 말고 답해. 날짜가 오늘이 아니면 그날 가격이라고 " \
                 "말하고 '지금'이라고 하지 마.)"
+        if name == "portfolio":
+            try:
+                rows = await self.d["portfolio"]()
+            except Exception as e:  # noqa: BLE001  the quote sources down or slow
+                raise Fail("unavailable", f"지금은 보유 종목 시세를 가져오지 못했어요({type(e).__name__}).")
+            if not rows:
+                return "보유 종목 목록이 비어 있어요.", {"holdings": []}, "보유 종목 목록이 비어 있어요."
+            import quote as Q
+            lines = Q.portfolio_lines(rows)
+            return f"보유 종목 {len(rows)}개 시세예요.", {"holdings": rows}, "\n".join(lines) + \
+                "\n(이 숫자대로 답해: 날짜가 오늘이 아니면 그날 가격이라고 말하고, 종목이 많으면 크게 움직인 것부터 짧게.)"
         if name == "holdings_update":
             add, remove = list(args.get("add") or []), list(args.get("remove") or [])
             if not add and not remove:
@@ -1201,6 +1212,11 @@ STOCK_QUOTE = {
                     "(Anthropic, AAPL, 005930), 환율이면 '달러 환율'. 결과 문장대로 답해."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
         "query": {"type": "string", "minLength": 1, "maxLength": 60}}}}
+PORTFOLIO = {
+    "name": "portfolio",
+    "description": ("내 주식/보유 종목/포트폴리오 현황: 사용자가 가진 종목 전부의 가격, 전날 대비 등락률, 날짜를 한 번에. "
+                    "'내 주식 어때?', '보유 종목 어떻게 됐어?'에 stock_quote를 여러 번 부르지 말고 이걸 불러."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
 HOLDINGS_UPDATE = {
     "name": "holdings_update",
     "description": ("보유 종목 목록을 바꿀 때 (예: '보유 목록에 OO 추가해줘', 'OO 빼줘'). TV 대시보드의 '내 종목'이 이 목록을 "
@@ -1268,7 +1284,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, HOLDINGS_UPDATE, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, PORTFOLIO, HOLDINGS_UPDATE, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1329,6 +1345,9 @@ for _n, _m in {
     "stock_quote": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                     "no_rest": "앱에는 주식 화면이 없어요(모델 경로 전용).",
                     "examples": ({"query": "Samsung Electronics"}, {"query": ""})},
+    "portfolio": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                  "no_rest": "앱과 TV는 GET /v1/tv?v=2의 holdings로 같은 내용을 봐요(말로 묻는 건 모델 경로).",
+                  "examples": ({}, {"x": 1})},
     "holdings_update": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
                         "no_rest": "앱은 PUT /v1/settings의 holdings를 써요(말로 바꾸는 건 모델 경로).",
                         "examples": ({"add": ["SOS랩"]}, {})},

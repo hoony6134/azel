@@ -557,6 +557,33 @@ SKY_WORD = {"맑아요": "맑음", "대체로 맑아요": "대체로 맑음", "�
             "눈날림이 있어요": "눈날림"}
 
 
+# icon keys the TV draws (assistant/roku/images/wx_*.png): KMA 강수형태 first, else 하늘상태; Open-Meteo by WMO code
+KMA_ICON_PTY = {"1": "rain", "2": "sleet", "3": "snow", "4": "shower", "5": "rain", "6": "sleet", "7": "snow"}
+KMA_ICON_SKY = {"1": "clear", "3": "cloudy", "4": "overcast"}
+
+
+def kma_icon(pty, sky):
+    return KMA_ICON_PTY.get(str(pty or "0")) or KMA_ICON_SKY.get(str(sky or ""))
+
+
+def wmo_icon(code):
+    if code is None:
+        return None
+    if code in (0, 1):
+        return "clear"
+    if code == 2:
+        return "cloudy"
+    if code in (3, 45, 48):
+        return "overcast"
+    if code in (56, 57, 66, 67):
+        return "sleet"
+    if 71 <= code <= 77 or code in (85, 86):
+        return "snow"
+    if 80 <= code <= 82 or code >= 95:
+        return "shower"
+    return "rain" if 51 <= code <= 65 else None
+
+
 def sky_word(sentence):
     return SKY_WORD.get(sentence or "", (sentence or "").removesuffix("요").strip() or None)
 
@@ -567,8 +594,8 @@ def weather_card(w, now):
     import weather as wx
     if w is None:
         return None
-    out = {"source": w.get("source"), "place": w.get("place"), "now": None, "sky": None, "high": None, "low": None,
-           "pop": None, "hourly": []}
+    out = {"source": w.get("source"), "place": w.get("place"), "now": None, "sky": None, "icon": None, "high": None,
+           "low": None, "pop": None, "hourly": []}
     if w.get("source") == "기상청":
         today = datetime.fromtimestamp(now, KST).strftime("%Y%m%d")
         lo, hi, pop, sky = wx.day_summary(w.get("vilage") or [], today)
@@ -579,21 +606,24 @@ def weather_card(w, now):
         pty = obs.get("PTY", "0")
         nxt = next((i["fcstValue"] for i in sorted(w.get("fcst") or [], key=lambda i: (i["fcstDate"], i["fcstTime"]))
                     if i["category"] == "SKY"), None)
-        out.update(now=t, high=hi, low=lo, pop=pop,
+        out.update(now=t, high=hi, low=lo, pop=pop, icon=kma_icon(pty, nxt),
                    sky=sky_word(wx.KMA_PTY.get(pty) if pty != "0" else wx.KMA_SKY.get(nxt or "")))
         start = datetime.fromtimestamp(now, KST).strftime("%Y%m%d%H00")
         hours = {}
         for i in w.get("vilage") or []:
             key = i["fcstDate"] + i["fcstTime"]
-            if key >= start and i["category"] in ("TMP", "POP"):
-                hours.setdefault(key, {})[i["category"]] = float(i["fcstValue"])
-        out["hourly"] = [{"h": k[8:10], "t": v.get("TMP"), "pop": int(v["POP"]) if "POP" in v else None}
+            if key >= start and i["category"] in ("TMP", "POP", "SKY", "PTY"):
+                v = i["fcstValue"]
+                hours.setdefault(key, {})[i["category"]] = float(v) if i["category"] in ("TMP", "POP") else v
+        out["hourly"] = [{"h": k[8:10], "t": v.get("TMP"), "pop": int(v["POP"]) if "POP" in v else None,
+                          "icon": kma_icon(v.get("PTY"), v.get("SKY"))}
                          for k, v in sorted(hours.items())[:12] if "TMP" in v]
         return out
     cur, day = w.get("current") or {}, w.get("daily") or {}
     first = lambda k: (day.get(k) or [None])[0]  # noqa: E731
     out.update(now=cur.get("temperature_2m"), high=first("temperature_2m_max"), low=first("temperature_2m_min"),
-               pop=first("precipitation_probability_max"), sky=sky_word(wx.SKY.get(cur.get("weather_code"))))
+               pop=first("precipitation_probability_max"), sky=sky_word(wx.SKY.get(cur.get("weather_code"))),
+               icon=wmo_icon(cur.get("weather_code")))
     return out
 
 

@@ -221,7 +221,82 @@ async def quote(query, client=None, search=None):
     return {"spoken": spoken(p), "data": {**p, "at": p["at"].isoformat() if p.get("at") else None}}
 
 
-HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>\^?[A-Z][A-Z.]{0,6}|\d{6})\)\s*$")  # ^GSPC: an index
+HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>\^?[A-Z][A-Z0-9.]{0,6}|\d{6})\)\s*$")  # ^GSPC: an index
+
+
+# Market indices by the names people say; their Yahoo symbols start with ^ and have no currency (points)
+INDEX = {"s&p500": "^GSPC", "sp500": "^GSPC", "에스앤피500": "^GSPC", "s&p": "^GSPC", "코스피": "^KS11", "kospi": "^KS11",
+         "코스닥": "^KQ11", "kosdaq": "^KQ11", "나스닥": "^IXIC", "nasdaq": "^IXIC", "나스닥종합": "^IXIC",
+         "다우": "^DJI", "다우존스": "^DJI", "dow": "^DJI", "dowjones": "^DJI"}
+
+
+def index_of(name):
+    return INDEX.get(re.sub(r"[\s·\-_]+", "", str(name)).lower().replace("지수", ""))
+
+
+async def naver_items(q, c):
+    try:
+        r = await c.get(NAVER_AC, params={"q": q, "target": "stock"})
+        return r.json().get("items") or []
+    except (httpx.HTTPError, ValueError):
+        return []
+
+
+async def yahoo_quotes(q, c):
+    try:
+        r = await c.get(YAHOO_SEARCH, params={"q": q, "quotesCount": 8, "newsCount": 0})
+        return r.json().get("quotes") or []
+    except (httpx.HTTPError, ValueError):
+        return []
+
+
+def as_ticker(sym):
+    """Yahoo symbol → the ticker the holdings list keeps: 000660.KS → 000660, AAPL stays."""
+    m = re.fullmatch(r"(\d{6})\.K[SQ]", sym or "")
+    return m[1] if m else sym
+
+
+async def resolve(name, c, search=None):
+    """A holding's name → {"ticker", "name"} when one listing clearly matches, {"candidates": ["이름 (TICKER)", …]} when
+    several might, or None (not listed). Indices by name first; then Naver (an exact Korean name), Yahoo (an exact
+    company name or symbol; equities only unless the name says ETF, so SK하이닉스 is never a 2x ETF), and for a Korean
+    name the same web check the voice quote uses (a KRX/NASDAQ code that sounds like the name)."""
+    q = " ".join(str(name).split())
+    if ix := index_of(q):
+        return {"ticker": ix, "name": q}
+    key = re.sub(r"\s+", "", q).lower()
+    near = []
+    if re.search(r"[가-힣]", q):
+        for it in await naver_items(q, c):
+            code, nm = str(it.get("code") or ""), str(it.get("name") or "")
+            tick = code  # a Korean 6-digit code, or a foreign ticker Yahoo also knows
+            if not tick:
+                continue
+            if re.sub(r"\s+", "", nm).lower() == key:
+                return {"ticker": tick, "name": nm}
+            near.append(f"{nm} ({tick})")
+    kinds = ("EQUITY", "ETF") if "etf" in key else ("EQUITY",)
+    quotes = [x for x in await yahoo_quotes(q, c) if x.get("quoteType") in kinds]
+    bare = lambda v: re.sub(r"[\s.,]+", "", re.sub(r"\b(inc|corp|corporation|co|ltd|limited|plc|holdings|group|"
+                                                  r"company|n\.?v|s\.?a|ag)\b\.?", "", str(v or ""), flags=re.I)).lower()  # noqa: E731
+    for x in quotes:  # "Apple" is "Apple Inc."
+        names = {bare(x.get(k)) for k in ("shortname", "longname")} | {str(x.get("symbol") or "").lower()}
+        if bare(q) in names or key in names:
+            return {"ticker": as_ticker(x["symbol"]), "name": q}
+    if re.search(r"[가-힣]", q) and quotes:  # 에스케이하이닉스 ~ "SK hynix": a Korean listing that sounds like what was said
+        score = lambda x: max(sounds_like(q, str(x.get(k) or "")) for k in ("shortname", "longname"))  # noqa: E731
+        ranked = sorted(((score(x), x) for x in quotes), key=lambda t: -t[0])
+        home = [t for t in ranked if re.search(r"\.K[SQ]$", t[1]["symbol"])]
+        if home and home[0][0] >= 0.75:
+            return {"ticker": as_ticker(home[0][1]["symbol"]), "name": q}
+        if ranked[0][0] >= 0.9 and (len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= 0.15):
+            return {"ticker": as_ticker(ranked[0][1]["symbol"]), "name": q}
+    near += [f"{x.get('shortname') or x.get('longname') or x['symbol']} ({as_ticker(x['symbol'])})" for x in quotes[:3]]
+    if not near and search and re.search(r"[가-힣]", q):
+        hit = await search_find(q, c, search)
+        if hit:
+            return {"ticker": hit.get("code") or as_ticker(hit.get("symbol") or ""), "name": q}
+    return {"candidates": near[:3]} if near else None
 
 
 async def closes(symbol, c, rng="5d"):
@@ -242,10 +317,10 @@ async def holding(entry, client=None):
     c = client or httpx.AsyncClient(timeout=TIMEOUT_S, headers=UA, follow_redirects=True)
     try:
         if tick is None:
-            hit = (await naver_find(name, c) if re.search(r"[가-힣]", name) else None) or await yahoo_find(name, c)
-            if not hit:
+            hit = await resolve(name, c)
+            if not hit or "ticker" not in hit:  # unlisted, or several could match: no guess on the TV
                 return {"name": name, "listed": False}
-            tick = hit.get("code") or hit.get("symbol") or hit.get("ticker")
+            tick = hit["ticker"]
         try:
             if re.fullmatch(r"\d{6}", tick):
                 try:
@@ -272,6 +347,24 @@ async def holding(entry, client=None):
             "currency": "index" if tick.startswith("^") else p["currency"],  # points, not dollars
             "change": p.get("change"), "pct": round(p["pct"], 2) if p.get("pct") is not None else None, "spark": spark,
             "source": p.get("source"), "at": p["at"].isoformat() if p.get("at") else None}
+
+
+def portfolio_lines(holdings):
+    """The portfolio as short lines a voice answer reads: '애플 342.56달러, 1.90% 내림 (11월 21일)', '토스 비상장'."""
+    out = []
+    for h in holdings:
+        if not h.get("listed", True):
+            out.append(f"{h['name']} 비상장")
+        elif h.get("price") is None:
+            out.append(f"{h['name']} 시세를 못 받았어요")
+        else:
+            cur = h.get("currency")
+            fig = f"{h['price']:,.2f}" if cur == "index" else figure(h["price"], cur) + CURRENCY.get(cur, cur or "")
+            pct = h.get("pct")
+            move = "" if pct is None or abs(pct) < 0.01 else f", {abs(pct):.2f}% {'오름' if pct > 0 else '내림'}"
+            at = datetime.fromisoformat(h["at"]) if h.get("at") else None
+            out.append(f"{h['name']} {fig}{move}" + (f" ({at.month}월 {at.day}일)" if at else ""))
+    return out
 
 
 if __name__ == "__main__":  # a live look: python quote.py 삼성전자

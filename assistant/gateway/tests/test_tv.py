@@ -446,13 +446,16 @@ def test_weather_card_from_recorded_kma():
     assert len(w["hourly"]) == 12 and w["hourly"][0]["h"] == rec["now"][11:13]  # from this hour on
     assert all(isinstance(h["t"], float) and 0 <= h["pop"] <= 100 for h in w["hourly"])
     assert not w["sky"].endswith("요")  # a TV word, not a spoken sentence
+    assert w["icon"] in tv.KMA_ICON_SKY.values() or w["icon"] in tv.KMA_ICON_PTY.values()
+    assert all(h["icon"] in ("clear", "cloudy", "overcast", "rain", "snow", "sleet", "shower") for h in w["hourly"])
+    assert tv.kma_icon("4", "1") == "shower" and tv.kma_icon("0", "3") == "cloudy" and tv.wmo_icon(73) == "snow"
 
 
 def test_weather_card_falls_back_to_recorded_open_meteo():
     import json
     d = json.loads((FIX / "tv_openmeteo.json").read_text())
     w = tv.weather_card({"source": "Open-Meteo", "place": "광주", **d}, NOW)
-    assert w["now"] == 1.7 and w["sky"] == "맑음" and w["hourly"] == []
+    assert w["now"] == 1.7 and w["sky"] == "맑음" and w["icon"] == "clear" and w["hourly"] == []
     assert w["high"] == d["daily"]["temperature_2m_max"][0] and w["low"] == d["daily"]["temperature_2m_min"][0]
     assert tv.weather_card(None, NOW) is None
 
@@ -543,16 +546,38 @@ def test_holdings_setting(gw):
 
 def test_holdings_update_by_voice(gw, monkeypatch):
     g, c, _ = gw
+    answers = {"SK하이닉스": {"ticker": "000660", "name": "SK하이닉스"}, "삼성": {"candidates": ["SamsungElec (005930)",
+               "SAMSUNG ELECTRONICS CO (SSNLF)"]}, "토스": None, "코스피": {"ticker": "^KS11", "name": "코스피"}}
+
+    async def resolve(name):  # quote.resolve itself is tested on recorded responses above
+        return answers[name]
+
+    monkeypatch.setattr(g, "resolve_holding", resolve)
     r = asyncio.run(g.bridge.run("holdings_update", {"add": ["카카오 (035720)"], "remove": ["엔트로픽", "^GSPC"]}, caller="qwen"))
     assert r["ok"], r
     got = c.get("/v1/settings").json()["holdings"]
     assert "카카오 (035720)" in got and not any(x.startswith(("엔트로픽", "S&P500")) for x in got) and len(got) == 9
-    assert r["spoken"] == "보유 종목에서 카카오를 넣었어요 그리고 엔트로픽, S&P500을 뺐어요. 지금 9개예요."  # 오백을
-    r = asyncio.run(g.bridge.run("holdings_update", {"add": ["카카오"]}, caller="qwen"))  # same name: replaced
-    assert c.get("/v1/settings").json()["holdings"].count("카카오") == 1 and "카카오 (035720)" not in c.get("/v1/settings").json()["holdings"]
+    assert r["spoken"] == "카카오는 035720으로 넣었어요. 엔트로픽, S&P500을 뺐어요. 지금 9개예요."  # 영으로, 오백을
+    r = asyncio.run(g.bridge.run("holdings_update", {"add": ["SK하이닉스", "삼성", "토스", "코스피"]}, caller="qwen"))
+    got = c.get("/v1/settings").json()["holdings"]
+    assert "SK하이닉스 (000660)" in got and "토스" in got and "코스피 (^KS11)" in got and not any(x.startswith("삼성 ") for x in got)
+    assert r["data"]["picked"] == [{"name": "SK하이닉스", "ticker": "000660"}, {"name": "코스피", "ticker": "^KS11"}]
+    assert r["data"]["candidates"] == {"삼성": answers["삼성"]["candidates"]} and r["data"]["unlisted"] == ["토스"]
+    assert r["spoken"].startswith("SK하이닉스는 000660으로, 코스피는 ^KS11로 넣었어요. 토스는 상장 종목을 못 찾아서 비상장으로")
+    assert "삼성은 후보가 여러 개라 넣지 않았어요(SamsungElec (005930), SAMSUNG ELECTRONICS CO (SSNLF))" in r["spoken"]
+    before = c.get("/v1/settings").json()["holdings"]
+    r = asyncio.run(g.bridge.run("holdings_update", {"add": ["삼성"]}, caller="qwen"))  # only candidates: nothing saved
+    assert c.get("/v1/settings").json()["holdings"] == before and "지금" not in r["spoken"]
     assert not asyncio.run(g.bridge.run("holdings_update", {}, caller="qwen"))["ok"]
-    big = [f"종목{i}" for i in range(12)]
+    big = [f"종목{i} (00000{i % 10})" for i in range(12)]
     assert asyncio.run(g.bridge.run("holdings_update", {"add": big}, caller="qwen"))["error"]["code"] == "invalid"
+
+
+def test_josa_as_read_aloud():
+    import gateway as gw_
+    assert gw_.josa("000660", ("으로", "로")) == "000660으로" and gw_.josa("AAPL", ("으로", "로")) == "AAPL로"
+    assert gw_.josa("^KS11", ("으로", "로")) == "^KS11로" and gw_.josa("서울", ("으로", "로")) == "서울로"
+    assert gw_.josa("SK하이닉스", ("은", "는")) == "SK하이닉스는" and gw_.josa("애플", ("을", "를")) == "애플을"
 
 
 def test_seed_holdings_cover_the_users_list():
@@ -561,3 +586,74 @@ def test_seed_holdings_cover_the_users_list():
     names = [quote.HOLDING.match(h)["name"] for h in gateway.DEFAULTS["holdings"]]
     assert names == ["애플", "엔비디아", "삼성전자", "SK하이닉스", "SOS랩", "엔트로픽", "SK스퀘어", "LS산전", "S&P500", "세트렉아이"]
     assert quote.HOLDING.match("S&P500 (^GSPC)")["tick"] == "^GSPC"
+
+
+def resolve_transport():
+    """Yahoo search and the KOSPI chart from tests/fixtures/tv_resolve.json (recorded); Naver's search unreachable, as
+    it was from the gateway host when recorded."""
+    import json
+    import httpx
+    rec = {**json.loads((FIX / "tv_resolve.json").read_text()), **json.loads((FIX / "tv_quotes.json").read_text())}
+
+    def handle(req):
+        url = str(req.url)
+        if "ac.stock.naver.com" in url:
+            raise httpx.ConnectTimeout("timed out", request=req)
+        if "finance/search" in url:
+            key = f"search:{req.url.params['q']}"
+            return httpx.Response(200, json=rec[key]) if key in rec else httpx.Response(400, json={})
+        sym = url.split("/chart/")[1].split("?")[0].replace("%5E", "^")
+        key = f"chart:{sym}:{req.url.params['range']}"
+        return httpx.Response(200, json=rec[key]) if key in rec else httpx.Response(404, json={"chart": {"result": None}})
+    return httpx.MockTransport(handle)
+
+
+def test_resolve_names_to_tickers_without_guessing():
+    import httpx
+    import quote
+
+    async def run():
+        async with httpx.AsyncClient(transport=resolve_transport()) as c:
+            return [await quote.resolve(n, c) for n in ("SK하이닉스", "Apple", "Samsung", "Toss", "S&P 500", "에스앤피500",
+                                                         "코스피", "나스닥", "다우존스", "알수없는회사")]
+
+    hynix, apple, samsung, toss, sp, sp2, kospi, nasdaq, dow, nobody = asyncio.run(run())
+    assert hynix == {"ticker": "000660", "name": "SK하이닉스"}  # the Korean listing, not the 2x ETF Yahoo lists first
+    assert apple["ticker"] == "AAPL"  # "Apple" is "Apple Inc."
+    assert "candidates" in samsung and samsung["candidates"][0] == "SamsungElec (005930)"  # several: ask, don't guess
+    assert toss == {"candidates": ["TOSS THE COIN LIMITED (TTC.BO)"]}  # a different company: asked, never stored
+    assert sp["ticker"] == sp2["ticker"] == "^GSPC" and kospi["ticker"] == "^KS11"
+    assert nasdaq["ticker"] == "^IXIC" and dow["ticker"] == "^DJI" and nobody is None
+
+
+def test_index_holding_shows_its_level():
+    import httpx
+    import quote
+
+    async def run():
+        async with httpx.AsyncClient(transport=resolve_transport()) as c:
+            return await quote.holding("코스피", c), await quote.holding("KOSPI (^KS11)", c)
+
+    by_name, by_tick = asyncio.run(run())
+    assert by_name["ticker"] == by_tick["ticker"] == "^KS11" and by_name["currency"] == "index"
+    assert by_name["price"] == 4869.96 and by_name["pct"] is not None and len(by_name["spark"]) == 5
+
+
+def test_portfolio_tool_reads_the_holdings(gw, monkeypatch):
+    import httpx
+    import quote
+    g, c, _ = gw
+
+    async def rows():  # the TV row, from recorded Naver/Yahoo answers
+        async with httpx.AsyncClient(transport=quote_transport()) as cl:
+            return [await quote.holding(n, cl) for n in ("삼성전자 (005930)", "애플 (AAPL)", "토스")]
+
+    monkeypatch.setattr(g, "tv_holdings", rows)
+    g.tv_quote_cache = g.tv.Cache()
+    r = asyncio.run(g.bridge.run("portfolio", {}, caller="qwen"))
+    assert r["ok"] and r["spoken"] == "보유 종목 3개 시세예요." and len(r["data"]["holdings"]) == 3
+    lines = quote.portfolio_lines(r["data"]["holdings"])
+    assert lines[0].startswith("삼성전자 180,900원, 8.13% 내림 (") and lines[2] == "토스 비상장"
+    assert lines[1].startswith("애플 342.56달러, ")
+    assert quote.portfolio_lines([{"name": "S&P500", "listed": True, "price": 6910.39, "currency": "index", "pct": -3.7,
+                                   "at": None}]) == ["S&P500 6,910.39, 3.70% 내림"]
