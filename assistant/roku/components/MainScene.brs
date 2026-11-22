@@ -1,4 +1,4 @@
-' Azel TV dashboard: three pages (left/right), ambient mode after 5 idle minutes, a settings screen (* key).
+' Azel TV dashboard (1280x720 design size, light on memory): three pages (left/right), ambient mode after 5 idle minutes, a settings screen (* key).
 ' View-only: the only input is paging. Everything is drawn from code so one font (bundled Pretendard, which has
 ' Hangul) is used for every label.
 
@@ -52,20 +52,20 @@ function mkLabel(parent as Object, x as Integer, y as Integer, w as Integer, h a
 end function
 
 sub buildDash()
-    m.title = mkLabel(m.dash, 96, 48, 1000, 80, 60, "0xE8EEF2FF")
-    m.dots = mkLabel(m.dash, 96, 132, 400, 40, 30, "0x6B7A88FF")
-    m.clock = mkLabel(m.dash, 1500, 48, 324, 70, 56, "0xE8EEF2FF")
+    m.title = mkLabel(m.dash, 64, 32, 700, 54, 40, "0xE8EEF2FF")
+    m.dots = mkLabel(m.dash, 64, 90, 300, 28, 20, "0x6B7A88FF")
+    m.clock = mkLabel(m.dash, 956, 32, 260, 50, 38, "0xE8EEF2FF")
     m.clock.horizAlign = "right"
-    m.status = mkLabel(m.dash, 900, 128, 924, 40, 28, "0x8FA3B3FF")
+    m.status = mkLabel(m.dash, 500, 88, 716, 28, 20, "0x8FA3B3FF")
     m.status.horizAlign = "right"
     m.colTitle = []
     m.colBody = []
     for i = 0 to 2
-        x = 96 + i * 600
-        t = mkLabel(m.dash, x, 220, 540, 50, 36, "0x7FD1AEFF")
-        b = mkLabel(m.dash, x, 290, 540, 700, 32, "0xD5DDE3FF")
+        x = 64 + i * 400
+        t = mkLabel(m.dash, x, 146, 360, 34, 24, "0x7FD1AEFF")
+        b = mkLabel(m.dash, x, 192, 360, 470, 22, "0xD5DDE3FF")
         b.wrap = true
-        b.lineSpacing = 12
+        b.lineSpacing = 8
         b.vertAlign = "top"
         b.maxLines = 14
         m.colTitle.push(t)
@@ -74,21 +74,21 @@ sub buildDash()
 end sub
 
 sub buildAmbient()
-    m.aClock = mkLabel(m.ambient, 0, 0, 900, 260, 220, "0x9FB4C4FF")
-    m.aText = mkLabel(m.ambient, 0, 0, 1100, 260, 40, "0x6B7A88FF")
+    m.aClock = mkLabel(m.ambient, 0, 0, 600, 170, 150, "0x9FB4C4FF")
+    m.aText = mkLabel(m.ambient, 0, 0, 740, 170, 28, "0x6B7A88FF")
     m.aText.wrap = true
-    m.aText.lineSpacing = 14
+    m.aText.lineSpacing = 10
     m.aText.vertAlign = "top"
 end sub
 
 sub buildSettings()
-    head = mkLabel(m.settings, 96, 80, 1500, 80, 56, "0xE8EEF2FF")
+    head = mkLabel(m.settings, 64, 50, 1000, 54, 38, "0xE8EEF2FF")
     head.text = "Azel TV 설정"
     m.setItems = []
     for i = 0 to 2
-        m.setItems.push(mkLabel(m.settings, 96, 260 + i * 100, 1600, 70, 38, "0x8FA3B3FF"))
+        m.setItems.push(mkLabel(m.settings, 64, 170 + i * 66, 1100, 48, 26, "0x8FA3B3FF"))
     end for
-    hint = mkLabel(m.settings, 96, 640, 1700, 200, 30, "0x6B7A88FF")
+    hint = mkLabel(m.settings, 64, 430, 1150, 140, 20, "0x6B7A88FF")
     hint.text = "위아래로 고르고 확인(OK)을 누르세요." + Chr(10) + "토큰은 게이트웨이 ~/.config/biseo/tv_token 의 내용이에요(보기 전용)." + Chr(10) + "뒤로 가기로 돌아가요."
     m.setIdx = 0
     refreshSettings()
@@ -111,6 +111,8 @@ end sub
 ' ---------- modes ----------
 
 sub showDash()
+    m.top.findNode("fade").control = "stop"
+    m.ambient.opacity = 1
     m.mode = "dash"
     m.dash.visible = true
     m.ambient.visible = false
@@ -121,6 +123,7 @@ end sub
 
 sub showAmbient()
     m.mode = "ambient"
+    m.top.findNode("fade").control = "start"
     m.dash.visible = false
     m.ambient.visible = true
     m.settings.visible = false
@@ -128,6 +131,8 @@ sub showAmbient()
 end sub
 
 sub showSettings()
+    m.top.findNode("fade").control = "stop"
+    m.ambient.opacity = 1
     m.mode = "settings"
     m.dash.visible = false
     m.ambient.visible = false
@@ -315,11 +320,11 @@ sub updateAmbient()
     if td <> invalid and td.today <> invalid and td.today.Count() > 0 then lines.push(td.today[0])
     if m.err <> "" then lines.push("연결 끊김")
     m.aText.text = joinLines(lines, "")
-    ' move a little every minute so nothing burns in (all spots stay inside the 5% title-safe area)
-    spots = [[120, 140], [700, 90], [800, 300], [200, 480], [600, 500], [420, 280]]
+    ' move a little every minute so nothing burns in (all spots stay inside the title-safe area)
+    spots = [[80, 90], [460, 60], [520, 200], [130, 320], [400, 330], [280, 190]]
     p = spots[m.minutes mod 6]
     m.aClock.translation = [p[0], p[1]]
-    m.aText.translation = [p[0] + 8, p[1] + 250]
+    m.aText.translation = [p[0] + 6, p[1] + 165]
 end sub
 
 ' ---------- input ----------
