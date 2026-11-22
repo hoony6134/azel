@@ -88,8 +88,16 @@ enum ApprovalAPI {
     /// and a body without it would be taken as a deny.
     static func body(_ d: ApprovalDecision) -> [String: Any] { ["decision": d.rawValue, "approve": d != .deny] }
 
-    static func decide(_ id: String, _ d: ApprovalDecision) async throws {
-        _ = try await Gateway.send("POST", "/v1/approvals/" + escape(id), json: body(d))
+    /// Returns the server's note when it allowed less than asked (`forced_once`: e.g. an "always" from
+    /// a secret call becomes once).
+    @discardableResult
+    static func decide(_ id: String, _ d: ApprovalDecision) async throws -> String? {
+        forcedNote(try await Gateway.send("POST", "/v1/approvals/" + escape(id), json: body(d)))
+    }
+
+    static func forcedNote(_ data: Data) -> String? {
+        guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], (o["forced_once"] as? Bool) == true else { return nil }
+        return (o["forced_reason"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "이번 한 번만 허용했어요"
     }
 
     /// Pending plus recent history where the gateway offers it (an older one returns pending only).
@@ -196,9 +204,11 @@ final class ApprovalCenter: ObservableObject {
         if case .success(let a?) = await attempt({ try await ApprovalAPI.get(id) }) { show(a) }
     }
 
-    func decide(_ a: ApprovalRequest, _ d: ApprovalDecision) async throws {
-        try await ApprovalAPI.decide(a.id, d)
+    @discardableResult
+    func decide(_ a: ApprovalRequest, _ d: ApprovalDecision) async throws -> String? {
+        let note = try await ApprovalAPI.decide(a.id, d)
         await refresh()
+        return note
     }
 
     nonisolated static func approvalID(from userInfo: [AnyHashable: Any]) -> String? {
@@ -216,6 +226,8 @@ struct ApprovalSheet: View {
     @ObservedObject private var center = ApprovalCenter.shared
     @State private var message: String?
     @State private var working = false
+    /// The server allowed only once (`forced_reason`): shown with 닫기 instead of closing.
+    @State private var forced: String?
 
     /// Decided or expired on the server: the sheet says so and offers 닫기 instead of closing by
     /// itself. A poll that merely misses the item changes nothing.
@@ -255,7 +267,12 @@ struct ApprovalSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                if let state = settled(now: ctx.date) {
+                if let forced {
+                    VStack(spacing: Theme.s) {
+                        Label(forced, systemImage: "checkmark.circle").foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                        Button("닫기") { onDone() }.frame(maxWidth: .infinity).frame(height: 40)
+                    }
+                } else if let state = settled(now: ctx.date) {
                     VStack(spacing: Theme.s) {
                         Label(state, systemImage: "checkmark.circle").foregroundStyle(Theme.text2)
                         Button("닫기") { onDone() }.frame(maxWidth: .infinity).frame(height: 40)
@@ -288,7 +305,9 @@ struct ApprovalSheet: View {
     private func decide(_ d: ApprovalDecision) {
         working = true
         Task {
-            do { try await ApprovalCenter.shared.decide(request, d); onDone() }
+            do {
+                if let note = try await ApprovalCenter.shared.decide(request, d) { forced = note } else { onDone() }
+            }
             catch { message = "보내지 못했어요: " + FriendlyError.describe(error).title }
             working = false
         }

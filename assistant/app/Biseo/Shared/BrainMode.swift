@@ -144,7 +144,9 @@ struct BrainModeControl: View {
                 }
                 if canSecret {
                     Divider()
-                    Toggle(isOn: Binding(get: { secret }, set: { setSecret($0) })) { Label("시크릿", systemImage: "eye.slash") }
+                    // A secret call stays secret (the server refuses turning it off), so it can only be switched on.
+                    Toggle(isOn: Binding(get: { secret }, set: { if $0 { setSecret(true) } })) { Label("시크릿", systemImage: "eye.slash") }
+                        .disabled(secret)
                 }
             } label: {
                 HStack(spacing: 3) {

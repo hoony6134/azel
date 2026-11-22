@@ -134,3 +134,11 @@ final class SecretCallTests: XCTestCase {
         XCTAssertTrue(c.lastCaps.contains("secret"))
     }
 }
+
+final class SecretStaysOnTests: XCTestCase {
+    /// The server refuses turning secret off and answers with the real state.
+    func testRefusedOffKeepsSecret() throws {
+        let answer = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"secret","value":true}"#.utf8))
+        XCTAssertEqual(CallClient.reportedSecret(answer), true)
+    }
+}

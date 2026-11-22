@@ -171,3 +171,13 @@ final class ApprovalFlapTests: XCTestCase {
         XCTAssertEqual(shown, ["a"], "second poll presents it; a reappearance after vanishing doesn't")
     }
 }
+
+final class ForcedOnceDecideTests: XCTestCase {
+    func testForcedReasonFromASecretCall() {
+        let body = Data(#"{"ok":true,"forced_once":true,"forced_reason":"시크릿 통화에서 온 요청이라 이번 한 번만 허용했어요."}"#.utf8)
+        XCTAssertEqual(ApprovalAPI.forcedNote(body), "시크릿 통화에서 온 요청이라 이번 한 번만 허용했어요.")
+        XCTAssertEqual(ApprovalAPI.forcedNote(Data(#"{"forced_once":true}"#.utf8)), "이번 한 번만 허용했어요")
+        XCTAssertNil(ApprovalAPI.forcedNote(Data(#"{"ok":true}"#.utf8)))
+        XCTAssertNil(ApprovalAPI.forcedNote(Data()), "an empty answer is fine")
+    }
+}
