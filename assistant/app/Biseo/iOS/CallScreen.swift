@@ -70,8 +70,12 @@ struct CallScreen: View {
                         .background(.ultraThinMaterial, in: Capsule())
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
-                    .contentTransition(.opacity).animation(Theme.state, value: jarState)
+                // One Text (icon inline) so the crossfade swaps a single label; a Label with
+                // contentTransition left the old state drawn under the new one (user bug, 2026-11-22).
+                Text("\(Image(systemName: jarState.symbol)) \(jarState.spokenLabel)").font(.headline).foregroundStyle(jarState.color)
+                    .contentTransition(.opacity)
+                    .animation(reduceMotion ? nil : Theme.quick, value: jarState)
+                    .accessibilityLabel(jarState.spokenLabel)
                 GeometryReader { geo in
                     MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt, tint: tint).frame(width: geo.size.width, height: geo.size.height)
                         .contentShape(Rectangle())

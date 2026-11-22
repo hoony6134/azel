@@ -93,14 +93,29 @@ struct RouteChip: View {
     let route: String
     @Environment(\.colorSchemeContrast) private var contrast
 
+    /// Korean words only; an unknown route shows no chip (user bug, 2026-11-22: a raw "task").
+    static func label(_ route: String) -> String? {
+        switch route {
+        case "claude", "claude_api", "api": return "Claude"
+        case "claude_code": return "Claude Code"
+        case "qwen", "local": return "로컬"
+        case "nim": return "NIM"
+        case "task": return "작업"
+        default: return nil
+        }
+    }
+
     var body: some View {
-        let color = route == "claude" ? Theme.indigo : Theme.celadon
-        Text(route == "claude" ? "Claude" : route == "qwen" ? "로컬" : route)
-            .font(.footnote.weight(.semibold)).foregroundStyle(color)
-            .padding(.horizontal, Theme.s).padding(.vertical, 3)
-            .background(color.opacity(contrast == .increased ? 0.2 : 0.12), in: Capsule())
-            .overlay(Capsule().strokeBorder(color.opacity(0.6), lineWidth: 1))
-            .accessibilityLabel(route == "claude" ? "Claude 응답" : "로컬 모델 응답")
+        if let text = Self.label(route) {
+            let claude = route.hasPrefix("claude") || route == "api"
+            let color = claude ? Theme.indigo : Theme.celadon
+            Text(text)
+                .font(.footnote.weight(.semibold)).foregroundStyle(color)
+                .padding(.horizontal, Theme.s).padding(.vertical, 3)
+                .background(color.opacity(contrast == .increased ? 0.2 : 0.12), in: Capsule())
+                .overlay(Capsule().strokeBorder(color.opacity(0.6), lineWidth: 1))
+                .accessibilityLabel("\(text) 응답")
+        }
     }
 }
 
