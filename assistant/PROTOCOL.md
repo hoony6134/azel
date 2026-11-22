@@ -690,8 +690,10 @@ device that created them.
              "recent": [{"goal","status": "done"|"failed","at"}]},
    "gistra": {"classes": [{"start","end","name","room"}], "assignments": [{"title","course","due"|null}],
               "todos": [{"text","due"|null}]},
-   "calendar": [{"start","end"|null,"what"}], "calls": [{"at","what"}]}
+   "calendar": [{"start","end"|null,"what","cal","where"}], "calls": [{"at","what"}]}
   ```
+  `calendar` is read from every calendar the user has, timed events only (an imported feed whose name is a URL is
+  left out, the same title at the same minute shows once, and the `MyTT` timetable calendar wins a tie).
   Approvals are a count and the oldest time only, never a command. `tint` is the primary persona's `color` (a tint name
   or `#rrggbb`).
   **Auth**: the gateway token, or the TV token in `~/.config/biseo/tv_token` (0600, ≥ 32 characters; read on every

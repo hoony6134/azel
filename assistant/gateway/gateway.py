@@ -2439,6 +2439,10 @@ def tv_deps():
     async def calendar(today):
         return await google_tools.call(HOME, "calendar_events", {"from": today, "to": today})
 
+    async def calendar_rows(today):
+        rows, _ = await google_tools.events(HOME, today, today)
+        return rows
+
     async def persona2():
         s = await load_settings()
         p = primary_persona(s)
@@ -2454,7 +2458,8 @@ def tv_deps():
     return {"infra": cyg.call, "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
             "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
             "google_ok": lambda: google_status() == "connected", "calendar": calendar,
-            "infra_raw": lambda n, a=None: cyg.call(n, a or {}, raw=True), "persona2": persona2, "overnight": overnight}
+            "infra_raw": lambda n, a=None: cyg.call(n, a or {}, raw=True), "persona2": persona2, "overnight": overnight,
+            "calendar_rows": calendar_rows}
 
 
 @app.get("/v1/tv")

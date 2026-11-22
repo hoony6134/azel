@@ -97,7 +97,7 @@ function demoData(inCall as Boolean) as Object
             assignments: [{title: "과제 4: 해시 테이블 구현", course: "자료구조", due: iso(now + 10800)}]
             todos: [{text: "컴파일러 프로젝트", due: iso(now + 90000)}]
         }
-        calendar: [{start: hm(now + 7200), end: hm(now + 10800), what: "연구실 회의"}]
+        calendar: [{start: hm(now - 1800), end: hm(now + 2700), what: "자료구조", cal: "MyTT", where: "대학 A동 212호"}, {start: hm(now + 7200), end: hm(now + 10800), what: "연구실 회의", cal: "일반", where: ""}]
         calls: [{at: hm(now + 5400), what: "약 먹기"}]
     }
 end function

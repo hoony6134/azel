@@ -307,14 +307,21 @@ function buildV2(d as Object, now as Integer) as Object
 
     ' 오늘: classes, calendar events and scheduled calls, one timetable from now to midnight
     slots = []
+    ' the calendars first (the gateway puts MyTT, the timetable, ahead and merges the same event across calendars),
+    ' then GISTRA's classes; a class already on the timetable at the same minute is not shown twice
+    if d.calendar <> invalid
+        for each e in arr(d.calendar)
+            if sv(e.start) <> "종일"
+                meta = sv(e.cal)
+                if meta = "" then meta = "캘린더"
+                if sv(e.where) <> "" then meta = meta + " · " + sv(e.where)
+                addSlot(slots, sv(e.start), sv(e["end"]), sv(e.what), meta, nowHM)
+            end if
+        end for
+    end if
     if gistra <> invalid
         for each k in arr(gistra.classes)
             addSlot(slots, sv(k.start), sv(k["end"]), sv(k.name), "수업 · " + sv(k.room), nowHM)
-        end for
-    end if
-    if d.calendar <> invalid
-        for each e in arr(d.calendar)
-            if sv(e.start) <> "종일" then addSlot(slots, sv(e.start), sv(e["end"]), sv(e.what), "캘린더", nowHM)
         end for
     end if
     for each e in arr(d.calls)
@@ -419,6 +426,9 @@ sub addSlot(slots as Object, start as String, endT as String, what as String, me
     if start = "" then return
     if endT <> "" and endT <= nowHM then return
     if endT = "" and start < nowHM then return
+    for each o in slots
+        if o.name = start and o.sent = clean(what) then return
+    end for
     c = newCard("slot", 560)
     c.when = start
     if endT <> "" then c.tail = "–" + endT

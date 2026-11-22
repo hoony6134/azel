@@ -193,6 +193,25 @@ def parse_calendar(text):
     return out[:LINES]
 
 
+PRIORITY_CAL = "MyTT"  # the user's timetable calendar: its events come first among those that start together
+
+
+def calendar_events(rows):
+    """Structured Google Calendar rows (google_tools.events) → the TV's timed events, from every calendar the user has.
+    Timed events only (all-day ones are deadlines and holidays: GISTRA and the strip carry those); a calendar that is
+    just an imported feed (its name is a URL, such as the LMS export) is left out. The same title at the same minute
+    is shown once, and MyTT wins a tie."""
+    out, seen = [], set()
+    for r in sorted(rows, key=lambda r: (r.get("start", ""), 0 if r.get("cal") == PRIORITY_CAL else 1)):
+        cal = r.get("cal") or ""
+        if not r.get("start") or cal.startswith("http") or (r["start"], r["title"]) in seen:
+            continue
+        seen.add((r["start"], r["title"]))
+        out.append({"start": r["start"], "end": r.get("end") or None, "what": r["title"][:WIDTH],
+                    "cal": cal or "캘린더", "where": (r.get("where") or "")[:WIDTH]})
+    return out[:LINES]
+
+
 def iso(ts):
     return datetime.fromtimestamp(ts, KST).isoformat(timespec="seconds") if ts else None
 
@@ -235,7 +254,11 @@ async def build2(d, now=None):
         return [{"at": datetime.fromtimestamp(at, KST).strftime("%H:%M"), "what": w} for at, w in sorted(out)[:8]]
 
     async def calendar():
-        return parse_calendar(await d["calendar"](today)) if d["google_ok"]() else None
+        if not d["google_ok"]():
+            return None
+        if "calendar_rows" in d:
+            return calendar_events(await d["calendar_rows"](today))
+        return parse_calendar(await d["calendar"](today))
 
     async def assistant():
         return {"state": "call" if d["in_call"]() else "idle", "persona": await d["persona2"]()}

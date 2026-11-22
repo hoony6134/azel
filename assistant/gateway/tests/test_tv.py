@@ -187,3 +187,22 @@ def test_tv_route_versions(gw):
     path.write_text("t" * 40)
     path.chmod(0o600)
     assert c.get("/v1/tv?v=2", headers={"Authorization": "Bearer " + "t" * 40}).status_code == 200
+
+
+def test_calendar_events_from_every_calendar_myTT_first():
+    rows = [{"day": None, "start": "19:00", "end": "20:00", "title": "연구실 회의", "where": "B동", "cal": "일반"},
+            {"day": None, "start": "13:00", "end": "14:15", "title": "자료구조", "where": "A동 212호", "cal": "MyTT"},
+            {"day": None, "start": "13:00", "end": "14:15", "title": "자료구조", "where": "", "cal": "강의"},  # same one, twice
+            {"day": None, "start": "", "end": "", "title": "12주차 토론지", "where": "", "cal": "GISTRA"},  # all-day
+            {"day": None, "start": "09:00", "end": "10:00", "title": "lms feed", "where": "", "cal": "https://lms.gist.ac.kr/x"}]
+    out = tv.calendar_events(rows)
+    assert [(e["start"], e["what"], e["cal"], e["where"]) for e in out] == [
+        ("13:00", "자료구조", "MyTT", "A동 212호"), ("19:00", "연구실 회의", "일반", "B동")]
+
+
+def test_build2_uses_the_structured_calendar_when_there_is():
+    async def rows(today):
+        return [{"start": "21:00", "end": "22:00", "title": "스터디", "where": "", "cal": "공부"}]
+
+    out = asyncio.run(tv.build2(deps2(calendar_rows=rows), NOW))
+    assert out["calendar"] == [{"start": "21:00", "end": "22:00", "what": "스터디", "cal": "공부", "where": ""}]
