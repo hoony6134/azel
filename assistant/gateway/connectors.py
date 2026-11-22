@@ -98,6 +98,8 @@ def check(conn):
             raise ValueError("connectors.custom[].oauth: true for a server that signs in with OAuth")
         if not (isinstance(c.get("name"), str) and SLUG.fullmatch(c["name"])) or c["name"] in names:
             raise ValueError("connectors.custom[].name: a unique ASCII slug")
+        if c["name"].lower() in oauth.PROVIDERS:  # its grant is the built-in provider's: never a custom server's
+            raise ValueError(f"connectors.custom[].name: {c['name']} is reserved")
         names.add(c["name"])
         if not (isinstance(c.get("url"), str) and re.fullmatch(r"https?://[^\s]{1,500}", c["url"]) and secure_url(c["url"])):
             raise ValueError("connectors.custom[].url: https, or http only to a tailnet address (100.64.0.0/10)")
@@ -177,7 +179,7 @@ def _headers(home, ref):
     return {"Authorization": f"Bearer {raw}"}
 
 
-def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
+def run_args(conn, disc, devices, token, home, tokens=None, extra=None, own_only=False):
     """(mcp_servers for --mcp-config, allowed tool prefixes, run-scoped --settings JSON, extra env) for one run.
     `tokens`: daemon url -> its own bearer (team devices); others get `token`. A limited device's `delegate` is
     denied in the run's settings."""
@@ -185,6 +187,8 @@ def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
     servers = {d["id"]: {"type": "http", "url": d["url"],
                          "headers": {"Authorization": f"Bearer {tokens.get(d['url'], token)}", **(extra or {})}}
                for d in devices}
+    if own_only:  # a secret call: the device daemons only (the gateway adds its own azel server), nothing that stores
+        conn, disc = {"claude_ai": {}, "custom": []}, type("NoConnectors", (), {"connectors": [], "plugins": disc.plugins})
     for c in conn.get("custom", []):
         h = _headers(home, c.get("auth_ref"))
         if c.get("oauth"):
@@ -192,7 +196,7 @@ def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
             # file (an API key); no token yet, or an unsafe secret file: skipped like a server whose secret is missing
             ref = c.get("auth_ref")
             static = h if ref and (home / "mcp" / ref).exists() else {}
-            token = oauth.bearer(home, c["name"])
+            token = oauth.bearer(home, c["name"], c["url"])
             h = None if static is None or token is None else {**static, **token}
         if c.get("enabled", True) and h is not None and c["name"] not in servers:
             servers[c["name"]] = {"type": c.get("transport", "http"), "url": c["url"], **({"headers": h} if h else {})}
@@ -204,7 +208,7 @@ def run_args(conn, disc, devices, token, home, tokens=None, extra=None):
     settings = {"enabledPlugins": {p: False for p in disc.plugins}}
     if deny := [f"mcp__{d['id']}__delegate" for d in devices if d.get("limited")]:
         settings["permissions"] = {"deny": deny}
-    if disc.connectors:  # shortcut: until discovery ran, every claude.ai connector loads (slow, but nothing missing)
+    if disc.connectors or own_only:  # shortcut: until discovery ran, every claude.ai connector loads (slow, but nothing missing)
         settings["allowedMcpServers"] = [{"serverUrl": c["url"]} for c in ai] + \
                                         [{"serverUrl": s["url"]} for s in servers.values()]
     return servers or None, allowed, json.dumps(settings, sort_keys=True), {"ENABLE_TOOL_SEARCH": "false"}

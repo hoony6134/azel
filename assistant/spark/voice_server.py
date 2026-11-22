@@ -2581,27 +2581,33 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("text"):
-                kind = json.loads(msg["text"]).get("type")
+                try:
+                    frame = json.loads(msg["text"])
+                except ValueError:
+                    frame = None
+                if not isinstance(frame, dict):  # not a JSON object: ignored, never a crash of the call
+                    continue
+                kind = frame.get("type")
                 if kind == "hangup":
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
                     side(tap_interrupt())
                 if kind == "played":  # the phone finished reply N: playback really ends now, not at the estimate
                     current["reports"] = True
-                    if json.loads(msg["text"]).get("reply_id") == current["audio_gen"]:
+                    if frame.get("reply_id") == current["audio_gen"]:
                         current["played"] = current["audio_gen"]
                         if current["paused_at"] is None:
                             current["play_end"] = time.monotonic()
                 if kind == "secret":  # on midway: from here nothing is stored; off is refused (a secret call stays one)
-                    if json.loads(msg["text"]).get("value") is True and not current["secret"]:
+                    if frame.get("value") is True and not current["secret"]:
                         old, session = session, f"{SECRET_PREFIX}{uuid.uuid4().hex[:12]}"
                         for k in [k for k in history if k.endswith(f":{old}")]:  # the context so far, as a copy
                             history[k.rsplit(":", 1)[0] + f":{session}"] = deque(history[k], maxlen=MAX_TURNS * 2)
                         current["secret"] = True
                     await send({"type": "secret", "value": current["secret"]})
                 if kind == "text":  # typed during the call: a user turn like a transcript, no STT, no VAD
-                    await typed_turn(json.loads(msg["text"]))
-                if kind == "mode" and (v := json.loads(msg["text"]).get("value")) in BRAIN_MODES:
+                    await typed_turn(frame)
+                if kind == "mode" and (v := frame.get("value")) in BRAIN_MODES:
                     current["mode"] = v
                     CALL_MODE.set(v)  # from the next reply on
                     await send({"type": "mode", "value": v})
@@ -3423,6 +3429,10 @@ if __name__ == "__main__":
                     pass
                 midway = f["value"]
                 turn(w, "이건 비밀이야")
+                for junk in ("not json", "[1, 2]", "null", '"text"'):
+                    w.send_text(junk)  # ignored, the call goes on
+                time.sleep(1.05)
+                turn(w, "아직 있어?")
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.1)
             logs = [m for m in full.ws.sent if m.get("type") == "call_log"]

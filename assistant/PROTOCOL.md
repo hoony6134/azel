@@ -130,7 +130,10 @@ answering a call the assistant placed; the server then speaks that call's openin
   - reading is allowed (memory_recall, people_lookup, web, device reads, Cygnus/Google reads, music); anything that
     stores is refused with "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?": remember, forget,
     schedule_*, create_task, call_user with a time or rule, the voice fast paths for scheduling and tasks. A device
-    command's approval still works once; "always" becomes once (`forced_reason`);
+    command's approval still works once; "always" becomes once (`forced_reason`). Limit: the approval row itself
+    (device, command, cwd) is stored like any other, because the user must see the command to approve it;
+  - on the `claude -p` path a secret run loads no claude.ai or custom connectors (only the device daemons and azel),
+    so nothing can write through Cygnus, Gmail or Calendar;
   - usage rows record cost only (model, path, tokens, cost; never text), as they always do;
   - a call made secret midway keeps what was already logged; from then on nothing more, except the call log's end
     time and the brain's end event, under the original session.

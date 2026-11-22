@@ -1743,3 +1743,28 @@ def test_oauth_routes_consent_through_the_gateway_callback(gw, monkeypatch):
     assert c.post("/v1/connectors/spotify/authorize/finish", json={"code": "x", "state": "bogus"}).status_code == 400
     assert c.delete("/v1/connectors/spotify/oauth").status_code == 204
     assert c.get("/v1/connectors/spotify/oauth").json()["status"] == "needs_consent"
+
+
+
+def test_claude_runs_deny_daemon_music_and_home_and_secret_runs_have_no_connectors(gw):
+    g, c, tmp = gw
+    devs = [{"id": "macbook", "url": "http://100.64.0.8:8765/mcp"}]
+    st = {"connectors": {"claude_ai": {"Gmail": True}, "custom": []}}
+    for req in ("ask:azel:call-1", "task:abcabcabcabc", ""):
+        _, _, rs, _ = g.run_args(st, devs, req)
+        deny = json.loads(rs)["permissions"]["deny"]
+        assert "mcp__macbook__music" in deny and "mcp__macbook__home" in deny, req
+    servers, allowed, rs, _ = g.run_args(st, devs, "ask:azel:secret-0123456789ab")
+    assert not any(a.startswith("mcp__claude_ai_") for a in allowed) and set(servers) <= {"macbook", "azel"}
+    assert all("claude_ai" not in json.dumps(x) for x in json.loads(rs).get("allowedMcpServers", []))
+
+
+def test_moving_an_oauth_connector_forgets_its_grant(gw):
+    g, c, tmp = gw
+    g.oauth.save(tmp, "notes", {"access_token": "SECRET-AT", "expires_at": time.time() + 600, "client_id": "c",
+                                "token_endpoint": "https://auth.example.com/token", "server_origin": "https://mcp.example.com"})
+    body = {"claude_ai": [], "custom": [{"name": "notes", "url": "https://mcp.example.com/mcp", "oauth": True}]}
+    assert c.put("/v1/connectors", json=body).status_code == 200 and g.oauth.load(tmp, "notes")  # unchanged: kept
+    body["custom"][0]["url"] = "https://other.example.com/mcp"
+    assert c.put("/v1/connectors", json=body).status_code == 200 and g.oauth.load(tmp, "notes") is None
+    assert c.put("/v1/connectors", json={"claude_ai": [], "custom": [{"name": "spotify", "url": "https://x.example/mcp"}]}).status_code == 400

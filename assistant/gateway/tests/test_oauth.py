@@ -17,6 +17,12 @@ import oauth  # noqa: E402
 import spotify  # noqa: E402
 
 GW_CB = "http://100.64.0.8:8892/v1/oauth/callback"
+PUBLIC_HOSTS = {"auth.example.com", "mcp.example.com", "accounts.spotify.com"}
+
+
+@pytest.fixture(autouse=True)
+def fake_dns(monkeypatch):  # no real DNS in tests: these names are public, anything else resolves privately
+    monkeypatch.setattr(oauth.web, "_public", lambda host: host in PUBLIC_HOSTS)
 SECRETS = ("SECRET-AT", "SECRET-RT", "SECRET-AT2", "SECRET-RT2")
 
 
@@ -112,7 +118,7 @@ def test_finish_stores_tokens_private_and_state_is_single_use(tmp_path):
     d = json.loads(p.read_text())
     assert d["client_id"] == "my-client-id" and d["refresh_token"] == "SECRET-RT" and d["redirect_uri"] == oauth.APP_REDIRECT
     assert oauth.status(tmp_path, "spotify") == "connected"
-    assert oauth.bearer(tmp_path, "spotify") == {"Authorization": "Bearer SECRET-AT"}
+    assert oauth.bearer(tmp_path, "spotify", "https://evil.example.com/mcp") is None  # bound to no MCP server
 
     async def again():
         async with client(fake) as c:
@@ -161,7 +167,7 @@ def test_refused_refresh_marks_expired(tmp_path):
         async with client(fake) as c:
             await oauth.refresh_due(tmp_path, c)
     run(go())
-    assert oauth.status(tmp_path, "spotify") == "expired" and oauth.bearer(tmp_path, "spotify") is None
+    assert oauth.status(tmp_path, "spotify") == "expired" and oauth.load(tmp_path, "spotify")["expired"]
     assert spotify.bridge(tmp_path) == ([], None)
 
 
@@ -233,7 +239,8 @@ def test_an_oauth_custom_connector_gets_its_live_token_or_is_skipped(tmp_path):
     servers, *_ = connectors.run_args(conn, Disc, [], "t", tmp_path)
     assert servers is None  # no grant yet: skipped, never called without auth
     oauth.save(tmp_path, "notes", {"access_token": "SECRET-AT", "expires_at": time.time() + 600, "client_id": "c",
-                                   "token_endpoint": "https://auth.example.com/token"})
+                                   "token_endpoint": "https://auth.example.com/token",
+                                   "server_origin": "https://mcp.example.com"})
     servers, *_ = connectors.run_args(conn, Disc, [], "t", tmp_path)
     assert servers["notes"]["headers"] == {"Authorization": "Bearer SECRET-AT"}
     with pytest.raises(ValueError):
@@ -347,9 +354,42 @@ def test_custom_connector_with_oauth_api_key_and_allowlist_together(tmp_path):
     assert servers is None  # OAuth not connected yet: skipped even though it has an allowlist
     connectors.put_secret(tmp_path, "notes", '{"X-Api-Key": "SECRET-KEY"}')
     oauth.save(tmp_path, "notes", {"access_token": "SECRET-AT", "expires_at": time.time() + 600, "client_id": "c",
-                                   "token_endpoint": "https://auth.example.com/token"})
+                                   "token_endpoint": "https://auth.example.com/token",
+                                   "server_origin": "https://mcp.example.com"})
     servers, allowed, *_ = connectors.run_args(conn, Disc, [], "t", tmp_path)
     assert servers["notes"]["headers"] == {"X-Api-Key": "SECRET-KEY", "Authorization": "Bearer SECRET-AT"}
     assert "mcp__notes__search" in allowed and "mcp__notes__read_*" in allowed and "mcp__notes" not in allowed
     (tmp_path / "mcp" / "notes").chmod(0o644)  # a secret file others can read: never sent at all
     assert connectors.run_args(conn, Disc, [], "t", tmp_path)[0] is None
+
+
+
+def test_grant_is_bound_to_its_server_and_provider_names_are_reserved(tmp_path):
+    class Disc:
+        connectors, plugins = [], []
+    oauth.save(tmp_path, "notes", {"access_token": "SECRET-AT", "expires_at": time.time() + 600, "client_id": "c",
+                                   "token_endpoint": "https://auth.example.com/token",
+                                   "server_origin": "https://mcp.example.com"})
+    moved = connectors.check({"custom": [{"name": "notes", "url": "https://evil.example.org/mcp", "oauth": True}]})
+    assert connectors.run_args(moved, Disc, [], "t", tmp_path)[0] is None  # same name, other server: no token
+    for name in ("spotify", "Spotify"):
+        with pytest.raises(ValueError, match="reserved"):
+            connectors.check({"custom": [{"name": name, "url": "https://evil.example.org/mcp", "oauth": True}]})
+
+
+def test_discovery_refuses_names_that_resolve_to_private_addresses(tmp_path):
+    assert not oauth.safe_endpoint("https://rebind.example.net/token")  # resolves privately (fake DNS)
+    assert oauth.safe_endpoint("https://auth.example.com/token") and not oauth.safe_endpoint("https://10.1.2.3/x")
+
+
+def test_secret_runs_load_no_connectors_and_music_home_only_through_azel(tmp_path):
+    class Disc:
+        connectors = [{"name": "Gmail", "url": "https://gmail.mcp.example/mcp", "status": "connected"}]
+        plugins = []
+    conn = connectors.check({"claude_ai": {"Gmail": True}, "custom": [{"name": "wiki", "url": "https://mcp.example.com/mcp"}]})
+    dev = [{"id": "macbook", "url": "http://100.64.0.8:8765/mcp"}]
+    servers, allowed, settings, _ = connectors.run_args(conn, Disc, dev, "t", tmp_path, own_only=True)
+    assert set(servers) == {"macbook"} and not any("Gmail" in a or "wiki" in a for a in allowed)
+    assert json.loads(settings)["allowedMcpServers"] == [{"serverUrl": "http://100.64.0.8:8765/mcp"}]
+    servers, allowed, *_ = connectors.run_args(conn, Disc, dev, "t", tmp_path)
+    assert "mcp__claude_ai_Gmail" in allowed  # a normal run keeps them

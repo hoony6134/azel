@@ -32,6 +32,8 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 
+import web
+
 PENDING_S = 600
 SLUG = re.compile(r"[A-Za-z0-9_-]{1,40}")
 APP_REDIRECT = "azel://oauth/callback"
@@ -90,11 +92,19 @@ def status(home, name):
     return "connected"
 
 
-def bearer(home, name):
-    """{"Authorization": "Bearer …"} while the access token is valid, else None (sync, for a run's --mcp-config;
-    refresh_due keeps it fresh)."""
+def origin(url):
+    u = urlsplit(url or "")
+    return f"{u.scheme}://{u.netloc}".lower() if u.scheme and u.netloc else ""
+
+
+def bearer(home, name, url):
+    """{"Authorization": "Bearer …"} while the access token is valid and the grant was made for `url`'s server
+    (same origin), else None (sync, for a run's --mcp-config; refresh_due keeps it fresh). A connector renamed or
+    pointed elsewhere never receives another server's token."""
     d = load(home, name)
-    if d and d.get("access_token") and not d.get("expired") and time.time() < d.get("expires_at", 0) - 30:
+    if not d or not d.get("server_origin") or d["server_origin"] != origin(url):
+        return None
+    if d.get("access_token") and not d.get("expired") and time.time() < d.get("expires_at", 0) - 30:
         return {"Authorization": f"Bearer {d['access_token']}"}
     return None
 
@@ -113,7 +123,9 @@ def safe_endpoint(url):
         return tailnet
     if u.scheme != "https" or not host or host == "localhost" or host.endswith(".localhost"):
         return False
-    return tailnet or ip is None or not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+    if ip is not None:
+        return tailnet or ip.is_global
+    return web._public(host)  # a name: every address it resolves to must be public (no rebinding to 127.0.0.1)
 
 
 def check_redirect(uri, gateway_callback):
@@ -171,6 +183,7 @@ async def discover(server_url, http):
     if "S256" not in meta.get("code_challenge_methods_supported", ["S256"]):
         raise ValueError("the server does not support PKCE S256")
     cfg["resource"] = prm.get("resource") or server_url
+    cfg["server_origin"] = origin(server_url)  # the grant is bound to this server
     cfg["scopes"] = list(prm.get("scopes_supported") or [])
     return cfg
 
@@ -249,6 +262,7 @@ async def finish(home, name, code, state, http):
     if not t.get("access_token"):
         raise ValueError("the provider returned no access token")
     save(home, name, {"client_id": p["client_id"], "redirect_uri": p["redirect_uri"],
+                      "server_origin": cfg.get("server_origin"),
                       "token_endpoint": cfg["token_endpoint"], "resource": cfg.get("resource"),
                       "scopes": t.get("scope", " ".join(cfg.get("scopes") or [])).split(),
                       "access_token": t["access_token"], "refresh_token": t.get("refresh_token"),

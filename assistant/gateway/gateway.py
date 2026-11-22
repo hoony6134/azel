@@ -809,12 +809,14 @@ def run_args(settings, devices, requester=""):
     custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
-                                                              {"X-Azel-Requester": requester} if requester else None)
-    deny = []
+                                                              {"X-Azel-Requester": requester} if requester else None,
+                                                              own_only=is_secret(requester))  # secret: no connectors
+    # music and home scenes only through azel's music_*/home_scene, which carry the confirm and taint guards
+    deny = [f"mcp__{d['id']}__{t}" for d in devices for t in ("music", "home")]
     if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
-        deny = [f"mcp__{d['id']}__delegate" for d in devices]
+        deny += [f"mcp__{d['id']}__delegate" for d in devices]
     elif requester.startswith("task:"):  # a task never starts another task (no task chains)
-        deny = ["mcp__azel__create_task"]
+        deny += ["mcp__azel__create_task"]
     if deny:
         rs = json.loads(run_settings)
         rs.setdefault("permissions", {}).setdefault("deny", [])
@@ -856,7 +858,7 @@ async def prewarm(session, persona_id=None):
     prompt (the call's persona) and devices as ask_claude_code would use for a chat turn, so that turn reuses it.
     `session` is the key the voice server's asks use: "<persona>:<call session>"."""
     if not (WARM and CLAUDE_OK and MODE == "full") or not isinstance(session, str) or not session \
-            or session.startswith(COLD_SESSIONS):
+            or session.startswith(COLD_SESSIONS) or is_secret(session):
         return
     current_persona.set(persona_id if isinstance(persona_id, str) else None)  # this task only
     try:
@@ -2158,6 +2160,11 @@ async def put_settings(body: dict):
             body["connectors"] = connectors.check(body["connectors"])
         except ValueError as e:
             raise HTTPException(400, str(e))
+        # an OAuth grant belongs to the server it was made for: a custom server moved or removed loses it
+        new = {c["name"]: c["url"] for c in body["connectors"]["custom"]}
+        for c in ((await load_settings()).get("connectors") or {}).get("custom", []):
+            if c.get("oauth") and new.get(c["name"]) != c["url"]:
+                oauth.forget(HOME, c["name"])
     if "default_model" in body and body["default_model"] not in CHOOSABLE:
         raise HTTPException(400, f"default_model: one of {list(CHOOSABLE)}")
     if "task_defaults" in body:
