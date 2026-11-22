@@ -262,7 +262,8 @@ class Bridge:
             first = re.split(r"(?<=[.!?。])\s+|\n", r["text"].strip())[0] if r["text"] else "찾은 결과가 없어요."
             lead = f"[{site} 기준] " if site else ""  # the citation in front, where a model copies it from
             return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
-                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마.)"
+                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마. 같은 걸 다시 검색하지 " \
+                "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
