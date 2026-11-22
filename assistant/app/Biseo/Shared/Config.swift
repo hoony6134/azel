@@ -53,31 +53,53 @@ enum Config {
 }
 
 enum Keychain {
-    private static let base: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "xyz.scian.biseo",
-        kSecAttrAccount as String: "token",
-    ]
+    static let service = "xyz.scian.biseo"
 
-    static func read() -> String? {
-        var query = base
+    private static func base(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+    }
+
+    static func read(account: String = "token") -> String? {
+        var query = base(account)
         query[kSecReturnData as String] = true
         var out: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess, let data = out as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
-    static func write(_ value: String?) {
-        SecItemDelete(base as CFDictionary)
+    static func write(_ value: String?, account: String = "token") {
+        SecItemDelete(base(account) as CFDictionary)
         guard let value, !value.isEmpty else { return }
-        var item = base
+        var item = base(account)
         item[kSecValueData as String] = Data(value.utf8)
         #if os(iOS)
-        // AfterFirstUnlock so a VoIP push can connect while the phone is locked.
+        // AfterFirstUnlock so a VoIP push, a Siri ringback or a call from the lock screen can
+        // connect while the phone is locked.
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         #endif
         SecItemAdd(item as CFDictionary, nil)
     }
+
+    /// The item's protection class (`kSecAttrAccessible`), for the check below and tests.
+    static func accessibility(account: String = "token") -> String? {
+        var query = base(account)
+        query[kSecReturnAttributes as String] = true
+        var out: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess else { return nil }
+        return (out as? [String: Any])?[kSecAttrAccessible as String] as? String
+    }
+
+    #if os(iOS)
+    /// An item written by an older build (or restored) with a stricter class is moved to
+    /// AfterFirstUnlock, so a locked phone can still reach the gateway. Run while unlocked.
+    static func ensureReadableWhileLocked(account: String = "token") {
+        guard let current = accessibility(account: account),
+              current != (kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String) else { return }
+        let update = [kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        let status = SecItemUpdate(base(account) as CFDictionary, update as CFDictionary)
+        if status != errSecSuccess, let value = read(account: account) { write(value, account: account) }
+    }
+    #endif
 }
 
 /// Conversation id sent as `session` on outgoing calls: one per prefix per local day, so the server

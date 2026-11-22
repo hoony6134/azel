@@ -1,3 +1,4 @@
+import Intents
 import SwiftUI
 import UserNotifications
 
@@ -44,6 +45,12 @@ struct BiseoApp: App {
             .preferredColorScheme(nil)
             .tint(Theme.celadon)
             .onOpenURL { url in if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } } }
+            // "아젤한테 전화해줘" through Siri's calling intent: the documented way to start an
+            // outgoing CallKit call while the app is in the background or the phone is locked.
+            .onContinueUserActivity(NSStringFromClass(INStartCallIntent.self)) { activity in
+                let name = (activity.interaction?.intent as? INStartCallIntent)?.contacts?.first?.displayName
+                CallManager.shared.startCall(persona: StartCallIntentHandler.persona(named: name), ringbackOnFailure: true)
+            }
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
                 if scenePhase == .active {
@@ -128,7 +135,13 @@ final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate 
 /// Alert pushes (task finished, missed scheduled calls): ask for permission once, on first
 /// launch, then register with APNs on every launch so a changed token is re-sent.
 final class PushAppDelegate: NSObject, UIApplicationDelegate {
+    /// Siri's INStartCallIntent is handled in the app (no Intents extension).
+    func application(_ application: UIApplication, handlerFor intent: INIntent) -> Any? {
+        intent is INStartCallIntent ? StartCallIntentHandler() : nil
+    }
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        if application.isProtectedDataAvailable { Keychain.ensureReadableWhileLocked() }   // a locked phone must reach the gateway
         Task { @MainActor in
             let center = UNUserNotificationCenter.current()
             let settings = await center.notificationSettings()
@@ -146,5 +159,28 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
         Log.call.error("alert push registration failed: \(error.localizedDescription, privacy: .public)")
+    }
+}
+
+/// "아젤한테 전화해줘": any contact Siri hears is taken as the assistant (or a persona by name);
+/// the call itself starts in the app (continueInApp → onContinueUserActivity).
+final class StartCallIntentHandler: NSObject, INStartCallIntentHandling {
+    @MainActor static func persona(named name: String?) -> Persona? {
+        PersonaModel.shared.match(name: name) ?? PersonaModel.shared.primary
+    }
+
+    func resolveContacts(for intent: INStartCallIntent, with completion: @escaping ([INStartCallContactResolutionResult]) -> Void) {
+        let people = intent.contacts ?? []
+        if people.isEmpty {
+            let me = INPerson(personHandle: INPersonHandle(value: AssistantName.current, type: .unknown), nameComponents: nil,
+                              displayName: AssistantName.current, image: nil, contactIdentifier: nil, customIdentifier: "azel")
+            completion([.success(with: me)])
+        } else {
+            completion(people.map { .success(with: $0) })
+        }
+    }
+
+    func handle(intent: INStartCallIntent, completion: @escaping (INStartCallIntentResponse) -> Void) {
+        completion(INStartCallIntentResponse(code: .continueInApp, userActivity: nil))
     }
 }

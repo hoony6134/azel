@@ -15,6 +15,8 @@ struct ApprovalRequest: Identifiable, Equatable {
     /// The server allows only "once" for this command (it never becomes an always-allow rule).
     var forcedOnce: Bool
     var forcedReason: String?
+    /// The server's risk tier says risky (`risky: true` or `tier: "risky"`).
+    var risky: Bool
 
     init(_ d: [String: Any]) {
         id = describe(d["id"] ?? "")
@@ -27,6 +29,7 @@ struct ApprovalRequest: Identifiable, Equatable {
         status = (d["status"] as? String) ?? "pending"
         decision = d["decision"] as? String
         forcedOnce = (d["forced_once"] as? Bool) ?? false
+        risky = (d["risky"] as? Bool) ?? ((d["tier"] as? String) == "risky")
         forcedReason = (d["forced_reason"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 

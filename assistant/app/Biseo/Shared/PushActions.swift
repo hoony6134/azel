@@ -7,7 +7,7 @@ import UserNotifications
 enum PushAction {
     static let scheduleCategory = "SCHEDULE", taskCategory = "TASK"
     /// Approval pushes: APPROVAL with 항상 허용, APPROVAL_ONCE when the server allows only once.
-    static let approvalCategory = "APPROVAL", approvalOnceCategory = "APPROVAL_ONCE"
+    static let approvalCategory = "APPROVAL", approvalOnceCategory = "APPROVAL_ONCE", approvalRiskyCategory = "APPROVAL_RISKY"
 
     static var categories: Set<UNNotificationCategory> {
         [UNNotificationCategory(identifier: scheduleCategory, actions: [
@@ -17,16 +17,22 @@ enum PushAction {
          UNNotificationCategory(identifier: taskCategory, actions: [
             UNNotificationAction(identifier: "STOP", title: "작업 중지", options: [.destructive]),
          ], intentIdentifiers: []),
-         // Approving can run a command on a device: ask for Face ID / passcode first.
-         UNNotificationCategory(identifier: approvalCategory, actions: [
-            UNNotificationAction(identifier: "APPROVE_ONCE", title: "허용", options: [.authenticationRequired]),
-            UNNotificationAction(identifier: "DENY", title: "거부", options: [.destructive]),
-            UNNotificationAction(identifier: "APPROVE_ALWAYS", title: "항상 허용", options: [.authenticationRequired]),
-         ], intentIdentifiers: []),
-         UNNotificationCategory(identifier: approvalOnceCategory, actions: [
-            UNNotificationAction(identifier: "APPROVE_ONCE", title: "허용", options: [.authenticationRequired]),
-            UNNotificationAction(identifier: "DENY", title: "거부", options: [.destructive]),
-         ], intentIdentifiers: [])]
+         // Locked phone (user request, 2026-11-22): a plain 허용 and 거부 work as they are; what
+         // grants power (항상 허용, or any 허용 the server marks forced-once or risky) asks for Face ID,
+         // the passcode, or an unlocked Apple Watch on the wrist (.authenticationRequired).
+         UNNotificationCategory(identifier: approvalCategory, actions: approvalActions(onceNeedsAuth: false, always: true),
+                                intentIdentifiers: []),
+         UNNotificationCategory(identifier: approvalOnceCategory, actions: approvalActions(onceNeedsAuth: true, always: false),
+                                intentIdentifiers: []),
+         UNNotificationCategory(identifier: approvalRiskyCategory, actions: approvalActions(onceNeedsAuth: true, always: true),
+                                intentIdentifiers: [])]
+    }
+
+    static func approvalActions(onceNeedsAuth: Bool, always: Bool) -> [UNNotificationAction] {
+        var out = [UNNotificationAction(identifier: "APPROVE_ONCE", title: "허용", options: onceNeedsAuth ? [.authenticationRequired] : []),
+                   UNNotificationAction(identifier: "DENY", title: "거부", options: [.destructive])]
+        if always { out.append(UNNotificationAction(identifier: "APPROVE_ALWAYS", title: "항상 허용", options: [.authenticationRequired])) }
+        return out
     }
 
     struct Request: Equatable {

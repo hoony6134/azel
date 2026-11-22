@@ -63,7 +63,7 @@ final class LiveActivities {
     /// The oldest pending approval as the Lock Screen shows it; no command text in a secret call.
     static func pendingApproval(_ pending: [ApprovalRequest], secret: Bool) -> PendingApproval? {
         guard let a = pending.min(by: { ($0.created ?? .distantPast) < ($1.created ?? .distantPast) }) else { return nil }
-        return PendingApproval(id: a.id, device: a.device, command: secret ? nil : a.command, forcedOnce: a.forcedOnce)
+        return PendingApproval(id: a.id, device: a.device, command: secret ? nil : a.command, forcedOnce: a.forcedOnce, risky: a.risky)
     }
 
     /// Re-applies everything (after a decision from the Lock Screen, or a new approval).

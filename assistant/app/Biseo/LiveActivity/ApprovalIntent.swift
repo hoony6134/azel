@@ -24,3 +24,27 @@ struct ApprovalDecisionIntent: LiveActivityIntent {
         return .result()
     }
 }
+
+/// The same decision, but one that grants power: 항상 허용, or 허용 on an approval the server marks
+/// forced-once or risky. iOS asks for Face ID, the passcode, or an unlocked Apple Watch first.
+struct ApprovalAuthDecisionIntent: LiveActivityIntent {
+    static var title: LocalizedStringResource = "승인 결정 (잠금 해제 필요)"
+    static var openAppWhenRun = false
+    static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
+
+    @Parameter(title: "승인") var approvalID: String
+    @Parameter(title: "결정") var decision: String   // once | always
+
+    init() {}
+    init(approvalID: String, decision: String) { self.approvalID = approvalID; self.decision = decision }
+
+    func perform() async throws -> some IntentResult {
+        try await ApprovalDecisionIntent(approvalID: approvalID, decision: decision).perform()
+        return .result()
+    }
+}
+
+extension PendingApproval {
+    /// 허용 here needs authentication (forced-once or risky); 항상 허용 always does; 거부 never.
+    var onceNeedsAuth: Bool { forcedOnce || risky }
+}

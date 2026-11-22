@@ -66,6 +66,9 @@ targets:
         NSMotionUsageDescription: 위치를 물어보실 때 걷는 중인지, 이동 중인지 함께 알려 드리기 위해 사용합니다.
         NSAppleMusicUsageDescription: 지금 듣는 음악과 최근 들은 곡을 물어보시면 답하기 위해 사용합니다.
         NSSupportsLiveActivities: true
+        # Siri's calling intent, handled in the app ("아젤한테 전화해줘", also from a locked phone)
+        INIntentsSupported: [INStartCallIntent]
+        NSUserActivityTypes: [INStartCallIntent]
         NSSupportsLiveActivitiesFrequentUpdates: true
         # macOS (ignored on iOS): menu-bar only, no Dock icon
         LSUIElement: true
