@@ -773,14 +773,22 @@ class Bridge:
         q = str(args["query"]).strip()
         if not q:
             raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
-        recs = [r for r in await self.d["memory_search"](q, 8) if self.mine(r, persona_id) and r.get("score", 1) >= 0.25]
+        hits = [r for r in await self.d["memory_search"](q, 12) if self.mine(r, persona_id) and r.get("score", 1) >= 0.25]
+        # Facts first. A past call's transcript is only what the user said there: its assistant lines held failed
+        # replies and promises ("저장된 보유 내역이 없어서 확인이 안 돼요"), and recalled as memory they outranked the
+        # holdings note and were repeated (live 2026-11-23).
+        notes = [r for r in hits if r.get("kind", "note") != "transcript"]
+        calls = [{**r, "text": user_lines(r["text"])} for r in hits if r.get("kind") == "transcript"]
+        recs = notes[:4] + [r for r in calls if r["text"]][:2]
         cyg = await self.cygnus_read("memory_recall", {"query": q}) if await self.cygnus_ok(persona_id) else ""
-        lines = [f"[아젤 기억 {str(r.get('created', ''))[:10]}] {r['text'][:240]}" for r in recs[:4]]
+        lines = [f"[아젤 기억 {str(r.get('created', ''))[:10]}] {r['text'][:240]}" for r in recs if r in notes] + \
+            [f"[지난 통화 {str(r.get('created', ''))[:10]}, 사용자가 한 말] {r['text'][:200]}" for r in recs if r not in notes]
         if cyg:
             lines.append(f"[Cygnus 기억] {cyg[:900]}")
         if not lines:
             return "기억에서 찾지 못했어요.", {"azel": [], "cygnus": ""}, "기억에서 찾지 못했어요. 지어내지 말고 모른다고 해."
-        spoken = (recs[0]["text"][:120] + " (아젤 기억)") if recs else "Cygnus 기억에서 찾았어요."
+        spoken = (notes[0]["text"][:120] + " (아젤 기억)") if notes else \
+            "지난 통화에서 찾았어요." if recs else "Cygnus 기억에서 찾았어요."
         return spoken, {"azel": recs[:4], "cygnus": cyg}, "\n".join(lines) + "\n(출처를 밝혀 답하고, 없는 사실은 지어내지 마.)"
 
     async def people_lookup(self, args, persona_id):
@@ -1035,6 +1043,12 @@ class Bridge:
                                                             {"id": "ask", "spoken": "그때마다 물어보기"}],
                        resend={**args, "auto_approve": True})
         return False  # not device work (a summary, research by the model itself): nothing to approve
+
+
+def user_lines(transcript):
+    """The user's own lines of a call transcript ("사용자: …"), joined; the assistant's are left out."""
+    return " / ".join(x.split(":", 1)[1].strip() for x in str(transcript).splitlines()
+                      if x.startswith("사용자:") and x.split(":", 1)[1].strip())
 
 
 class Need(Exception):

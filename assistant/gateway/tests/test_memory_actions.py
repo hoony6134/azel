@@ -160,3 +160,17 @@ def test_a_similar_cygnus_memory_is_never_claimed():
     w.save_reply = '[{"status":"대기 중","id":"m_held","reason":"held for owner review"}]'
     r = run(b.run("remember", {"fact": "주말엔 등산"}, "azel"))
     assert "확인을 기다려요" in r["spoken"] and list(w.recs.values())[-1]["meta"].get("cygnus_id") is None
+
+
+def test_recall_puts_facts_first_and_never_returns_past_replies():  # live 2026-11-23: failed replies outranked the fact
+    w = Mem()
+    w.recs[91] = {"id": 91, "kind": "transcript", "created": "2026-11-23T03:22",
+                  "text": "사용자: 내가 갖고 있는 주식 보유 현황 알려줘\n비서: 네, 대표님. 저장된 주식 보유 내역이 없어서 확인이 안 돼요. "
+                          "바로 찾아볼게요."}
+    w.recs[92] = {"id": 92, "kind": "note", "created": "2026-11-23T02:50", "meta": {"memory": True},
+                  "text": "사용자는 애플, 토스, 엔비디아, 삼성전자, SK하이닉스 주식을 보유하고 있다."}
+    b = w.bridge()
+    out = run(b.call("memory_recall", {"query": "주식 보유"}, "azel"))["content"]
+    assert out.index("애플, 토스") < out.index("[지난 통화") and "확인이 안 돼요" not in out and "찾아볼게요" not in out, out
+    assert "내가 갖고 있는 주식 보유 현황 알려줘" in out  # the user's own words from that call stay
+    assert run(b.run("memory_recall", {"query": "주식 보유"}, "azel"))["spoken"].startswith("사용자는 애플")
