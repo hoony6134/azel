@@ -21,6 +21,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from datetime import datetime
@@ -94,10 +95,11 @@ class Listener:
     """The state machine. Audio in/out, the detector and the clock are injected so tests can fake them."""
 
     def __init__(self, cfg, oww, vad, http: httpx.Client, play, ack=None, flush=lambda: None,
-                 clock=time.monotonic, wall=time.time, open_url=None):
+                 clock=time.monotonic, wall=time.time, open_url=None, spawn=None):
         self.cfg, self.oww, self.vad, self.http = cfg, oww, vad, http
         self._play, self.ack, self.flush, self.clock = play, ack, flush, clock
         self.wall, self.open_url = wall, open_url or open_app_url
+        self.spawn = spawn or (lambda fn, *a: threading.Thread(target=fn, args=a, daemon=True).start())
         self.deaf_until, self.was_in_call = 0.0, False
         self.muted_until = 0.0
         self.ring: list[np.ndarray] = []  # last ~2 s, saved with a detection when save_audio is on
@@ -169,8 +171,8 @@ class Listener:
         ring, self.ring = self.ring, []
         session = f"wake-{int(time.time())}"
         one_breath = use_app(self.cfg) and self.cfg["utterance"]
-        if one_breath:  # no ack: it would play over, and flush away, the start of the command
-            pass
+        if one_breath:
+            self.ack_async()
         elif self.ack:
             self.play(*self.ack)
         else:
@@ -327,6 +329,14 @@ class Listener:
         p = d / f"{datetime.now():%Y%m%d-%H%M%S}.wav"
         p.write_bytes(to_wav(pcm))
         return p
+
+    def ack_async(self):
+        """'네?' (or the system beep) the moment the wake word is heard, without waiting for it and without flushing
+        the mic: the command is already being said, and it is captured right after. The ack may be heard in it."""
+        if self.ack:
+            self.spawn(self._play, *self.ack)
+        else:
+            self.spawn(lambda: subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], check=False))
 
     def beep(self):
         subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], check=False)
