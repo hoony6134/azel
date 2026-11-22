@@ -141,8 +141,14 @@ CREATE_TASK = {
                     "description": "보통은 비워 둬(설정의 기본값)"},
         "persona": {"type": "string", "maxLength": 32},
         "budget_usd": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"},
-        "max_minutes": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"}}},
+        "max_minutes": {"type": "number", "minimum": 0, "description": "보통은 비워 둬"},
+        "when": {"type": "string", "maxLength": 40, "description": (
+            "now(기본) | overnight: '자기 전에 해 둬', '밤새 조사해 놔', '자는 동안'처럼 밤사이에 하라는 말이면 overnight. "
+            "밤에 차례로 하고 아침 브리핑에서 알린다. 정확한 시각(ISO)은 앱만 보낸다")},
+        "auto_approve": {"type": "boolean", "description": "앱 전용. 모델은 넣지 마"}}},
 }
+OVERNIGHT_LIST = {"name": "overnight_list", "description": "밤사이 하기로 맡긴 작업 목록과 상태('밤새 할 거 뭐 있어?', '어젯밤 맡긴 거').",
+                  "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
 
 
 # Prompt injection: text read from the web, mail/calendar, Cygnus or memory may carry instructions. After such a read
@@ -305,6 +311,14 @@ class Bridge:
             return say, view
         if name == "approval_status":
             return await self.approval_status(args)
+        if name == "overnight_list":
+            items = await self.d["overnight_list"]()
+            if not items:
+                return "밤사이 하기로 맡긴 작업이 없어요.", []
+            word = {"scheduled": "기다리는 중", "queued": "곧 시작", "running": "하는 중", "waiting_approval": "승인 대기",
+                    "done": "끝남", "failed": "실패", "cancelled": "취소됨"}
+            return f"밤사이 작업 {len(items)}개: " + ", ".join(
+                f"{i['goal'][:24]}({word.get(i['status'], i['status'])})" for i in items[:5]), items
         if name in ("memory_recall", "people_lookup", "remember", "forget", "memory_list"):
             return await getattr(self, name)(args, persona_id)
         if name in MAC_ACTIONS:
@@ -804,7 +818,22 @@ class Bridge:
                 **({"backend": args["backend"]} if args.get("backend") else {}),
                 **{k: args[k] for k in ("budget_usd", "max_minutes") if k in args},
                 **({"persona": args.get("persona") or persona_id} if args.get("persona") or persona_id else {})}
-        t = await self.d["task_create"](body, "app" if caller == "app" else "tool")
+        when = args.get("when") or "now"
+        if when not in ("now", "overnight") and caller != "app":  # only a person picks an exact time (ACTIONS.md §3)
+            raise Fail("invalid", "작업 시각은 now나 overnight만 돼요. 정확한 시각은 앱에서 골라 주세요.")
+        if args.get("auto_approve") and caller != "app":
+            raise Fail("invalid", "자동 승인은 앱에서만 켤 수 있어요.")
+        body.update(when=when, auto_approve=bool(args.get("auto_approve")))
+        try:
+            t = await self.d["task_create"](body, "app" if caller == "app" else "tool")
+        except Exception as e:  # task_create's own 400s (a bad ISO time) as the action's invalid
+            if getattr(e, "status_code", None) == 400:
+                raise Fail("invalid", str(getattr(e, "detail", e)))
+            raise
+        if t.get("status") == "scheduled":
+            how = {"call": "끝나면 아침에 알려 드릴게요.", "push": "결과는 아침에 알려 드릴게요.", "none": ""}[t["notify"]]
+            first = "밤사이에 해 둘게요." if when == "overnight" else "정한 시각에 시작할게요."
+            return f"{first} {how}".strip() + f" (작업 {t['id']})", self.d.get("task_view", lambda t, full=False: t)(t, True)
         how = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림으로 알려 드릴게요.", "none": ""}[t.get("notify", notify)]
         if t.get("notify_updated"):  # a follow-up about the task already running: its notify changed, nothing new
             return f"네, 맡기신 작업이 {how}".strip() + f" (작업 {t['id']})", \
@@ -1015,7 +1044,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1047,6 +1076,8 @@ ACTIONS = {
                     "rest": ("GET", "/v1/tasks/{id}"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
     "task_cancel": {"read_only": False, "scopes": ("internal", "qwen", "app"),
                     "rest": ("POST", "/v1/tasks/{id}/cancel"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
+    "overnight_list": {"read_only": True, "scopes": ("internal", "qwen", "app"),
+                       "rest": ("GET", "/v1/tasks/overnight"), "examples": ({}, {"x": 1})},
     "approval_status": {"read_only": True, "scopes": ("internal", "qwen", "app"),
                         "rest": ("GET", "/v1/approvals/{id}"), "examples": ({}, {"id": "zz"})},
     "memory_recall": {"read_only": True, "scopes": ("internal", "qwen", "app"),

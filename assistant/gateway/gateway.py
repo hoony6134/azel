@@ -109,6 +109,8 @@ DEFAULTS = {
     "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
+    # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
+    "overnight": {"window": ["01:00", "06:00"], "report_push": True, "report_call": False},
     "history_days": 365,  # call history kept this long; 0 = forever
     "task_backend": "claude_api",  # background tasks: claude_api | claude_code | nim | qwen (agent_loop.py)
     "brain_mode": "auto",
@@ -1222,7 +1224,7 @@ def with_title(opening, title):
 
 
 CALL_LABELS = {"morning_briefing": "아침 브리핑", "deadline": "마감 알림", "server_down": "서버 알림", "wake": "깨우기",
-               "task_approval": "승인 필요"}
+               "task_approval": "승인 필요", "overnight_report": "밤사이 작업"}
 LABEL_PREFIX = {"task": "작업 완료: ", "reminder": "알림: "}
 LABEL_MAX = 14
 
@@ -1237,7 +1239,7 @@ def call_label(reason, hint=""):
 
 
 async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None,
-                     detail=None):
+                     detail=None, extra=""):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
     `call_id`: chosen by the caller when it must be recorded before the phone rings."""
     if MODE == "limited":
@@ -1247,6 +1249,8 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
             "아침 브리핑 전화를 걸었어. 오늘 수업과 마감(GISTRA), 오늘 할 일(Planit), 캘린더 일정, "
             "밤사이 서버 상태(Cygnus 인프라)를 확인해서 '좋은 아침이에요'로 시작하는 30초 안쪽 브리핑으로 말해.",
             session=f"briefing-{uuid.uuid4().hex[:8]}", model="sonnet", task="schedule")
+    if extra:  # e.g. the overnight report after the briefing: said as written, never left to a model
+        opening = f"{opening or ''} {extra}".strip()
     call_id = call_id or uuid.uuid4().hex
     origin_session = origin_session if origin_session is not None else (origin_ctx.get() or None)  # call_user now
     settings = await load_settings()
@@ -1339,7 +1343,13 @@ async def scheduler_tick(now, fired):
                 await run_checkpoint()
         except StateDown:
             pass
-    jobs = {"morning_briefing": lambda: place_call("morning_briefing"), "deadline_check": deadline_call}
+    try:
+        await overnight_tick(now)
+    except StateDown:
+        pass
+    mb = p["morning_briefing"]
+    briefing_on = CLAUDE_OK and p["enabled"] and mb["enabled"]
+    jobs = {"morning_briefing": morning_briefing_call, "deadline_check": deadline_call}
     if not CLAUDE_OK or not p["enabled"]:
         jobs = {}  # briefings and deadline checks need Claude; the master switch stops every proactive call
     for key, job in jobs.items():
@@ -1351,6 +1361,13 @@ async def scheduler_tick(now, fired):
                 won = False  # a missed briefing beats several phones ringing at once
             if won:
                 await job()
+    if MODE == "full" and hm == mb["time"] and fired.get("overnight") != today:  # after the briefing above
+        fired["overnight"] = today
+        try:
+            if await take_lease(f"job:overnight:{today}", 86400):
+                await overnight_morning(s, briefing_on)
+        except StateDown:
+            pass
 
 
 RETENTION_AT = "04:00"  # call history older than history_days is deleted daily
@@ -1505,6 +1522,9 @@ async def serve_briefing_context(m):
             pend = await state.call("GET", "/v1/state/approvals") or []
             if pend:
                 facts.append(f"승인 대기 {len(pend)}건")
+            night, _ = await overnight_report()
+            if night:
+                facts.append(night)  # said in the briefing as it stands
             items = await schedule_list()
             if items:
                 i = items[0]
@@ -2269,6 +2289,13 @@ async def put_settings(body: dict):
         raise HTTPException(400, "searxng_url: an http(s) URL")
     if "brain_mode" in body and body["brain_mode"] not in BRAIN_MODES:
         raise HTTPException(400, f"brain_mode: one of {list(BRAIN_MODES)}")
+    if "overnight" in body:
+        o = {**DEFAULTS["overnight"], **(body["overnight"] if isinstance(body["overnight"], dict) else {})}
+        w = o.get("window")
+        if not (isinstance(w, list) and len(w) == 2 and all(isinstance(x, str) and HM_RE.fullmatch(x) for x in w)
+                and w[0] != w[1] and all(isinstance(o[k], bool) for k in ("report_push", "report_call"))):
+            raise HTTPException(400, "overnight: {window: [HH:MM, HH:MM], report_push: bool, report_call: bool}")
+        body["overnight"] = {k: o[k] for k in DEFAULTS["overnight"]}
     if "task_backend" in body and body["task_backend"] not in TASK_BACKENDS:
         raise HTTPException(400, f"task_backend: one of {list(TASK_BACKENDS)}")
     if body.get("task_backend") == "nim":  # the shared default must be able to run
@@ -3055,6 +3082,11 @@ async def create_approval(body: dict):
             await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
             await grant_audit(grant, {"at": now, "device": row["device"], "command": row["command"][:200], "stage": stage})
             return {"approval_id": aid, "status": "approved", "auto": True, "grant_id": grant["id"]}
+    if requester and requester.get("task_id") and await night_quiet() and \
+            ((await state.call("GET", task_key(requester["task_id"])) or {}).get("when") == "overnight"):
+        meta["expires_at"] = await morning_deadline()  # nobody to tap it at night: it waits, and nothing pings now
+        await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+        return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     try:  # the app shows it; the command text only (never output), shortened
         await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", type="approval",
@@ -3332,7 +3364,7 @@ async def approval_ran(aid: str, body: dict):
 TASK_SLOTS = 2
 TASK_DEFAULT_MIN, TASK_DEFAULT_USD = 30, 2.0
 TASK_MAX_ROUNDS = 4  # one approval wait per round
-TASK_STATUSES = ("queued", "running", "waiting_approval", "done", "failed", "cancelled")
+TASK_STATUSES = ("scheduled", "queued", "running", "waiting_approval", "done", "failed", "cancelled")
 TASK_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로"
               " 요약해. 도구가 pending_approval을 돌려주면 그 명령을 다시 시도하지 말고 'APPROVAL_PENDING <approval_id>'"
               "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
@@ -3383,8 +3415,20 @@ def check_task(body):
     backend = body.get("backend")
     if backend is not None and backend not in TASK_BACKENDS:
         raise HTTPException(400, f"backend: one of {list(TASK_BACKENDS)}")
+    when = body.get("when") or "now"
+    if when not in ("now", "overnight"):
+        try:
+            at = datetime.fromisoformat(str(when))
+            if at.tzinfo is None or not time.time() < at.timestamp() <= time.time() + 7 * 86400:
+                raise ValueError
+            when = at.isoformat()
+        except ValueError:
+            raise HTTPException(400, "when: now, overnight or an ISO time with an offset within 7 days")
+    if not isinstance(body.get("auto_approve", False), bool):
+        raise HTTPException(400, "auto_approve: true or false")
     return {"goal": goal.strip(), "notify": notify, "budget_usd": float(budget), "max_minutes": float(minutes),
-            "device": device, "persona": persona, "backend": backend}
+            "device": device, "persona": persona, "backend": backend, "when": when,
+            "auto_approve": bool(body.get("auto_approve", False))}
 
 
 NOTIFY_ASK = re.compile(r"(끝나면|끝나고|다\s*되면|완료되면|마치면|끝나는\s*대로)\s*(나한테|저한테|제게|내게)?\s*(전화|연락|알림|알려|푸시)")
@@ -3433,6 +3477,15 @@ async def task_create(body, source="api"):
     if dev and dev.get("limited") and WRITES.search(spec["goal"]):  # the user's pick stands; say how it works there
         word = DEVICE_WORD.get(dev["id"], dev["id"])
         t["note"] = f"{word}에서 할게요. 바꾸는 명령은 앱에서 승인해 주시면 진행돼요."
+    if spec["when"] != "now":  # 밤새 / a later time: waits for overnight_tick, not started here
+        t.update(status="scheduled", scheduled_for=next_window_start(time.time(), settings) if spec["when"] ==
+                 "overnight" else datetime.fromisoformat(spec["when"]).timestamp())
+        await task_save(t)
+        await task_index_add(t)
+        await kv_list_add("tasks-scheduled", t["id"])
+        if spec["when"] == "overnight":
+            await kv_list_add("overnight-tasks", t["id"])  # the morning report reads these
+        return t
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
         await task_save(t)
@@ -3472,7 +3525,10 @@ def task_prompt(t, devices):
     if t["device"] and t["device"] in limited:
         note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
     note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
-    return f"{where}{note}\n\n목표: {t['goal']}"
+    asked = datetime.fromtimestamp(t.get("created") or time.time(), KST)  # "내일 아침까지" said at 01:00 = this morning
+    night = late_night.prompt_rule(asked)
+    return f"{where}{note}" + (f"\n이 일은 {asked:%-m월 %-d일 %H:%M}에 맡겨졌어.{night}" if night else "") + \
+        f"\n\n목표: {t['goal']}"
 
 
 async def task_round(t, prompt, resume, deadline):
@@ -3607,6 +3663,8 @@ async def run_task(t):
                 raise asyncio.CancelledError
             t.update(status="running", started=time.time(), note=None)
             await task_save(t)
+            if t.get("auto_approve"):  # the app's "알아서 해" for this task: the risk classifier decides; ends with it
+                await grant_create({"task": t["id"]}, None, t["max_minutes"], by="app")
             deadline = time.monotonic() + t["max_minutes"] * 60
             if t.get("backend", "claude_code") != "claude_code":
                 try:
@@ -3785,6 +3843,9 @@ async def task_notify(t, approval=False):
     """When a task finishes, fails or needs an approval: told inside the call the user is on (its origin), a call as
     its persona (held until hangup when the user is on another call), or an alert push the app opens as
     azel://task/<id>. Every outcome is logged; nothing is dropped silently."""
+    if t.get("when") == "overnight" and await night_quiet():  # the morning report tells it; no ping at night
+        task_step(t, "notify_deferred", approval=approval)
+        return
     try:
         if t["notify"] == "call":
             settings = await load_settings()
@@ -3846,10 +3907,155 @@ NOTIFY_RETRY_S = 6 * 3600  # finishes this recent that were never delivered are 
 notify_retried: set[str] = set()
 
 
+# ---------- 밤새 맡기는 일 (overnight queue) ----------
+def in_window(dt, window):
+    hm, (a, b) = dt.strftime("%H:%M"), window
+    return a <= hm < b if a < b else (hm >= a or hm < b)
+
+
+def next_window_start(now_ts, settings):
+    """Now when inside the overnight window, else its next start."""
+    window = settings["overnight"]["window"]
+    dt = datetime.fromtimestamp(now_ts, KST)
+    if in_window(dt, window):
+        return now_ts
+    h, m = map(int, window[0].split(":"))
+    start = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+    return (start if start > dt else start + timedelta(days=1)).timestamp()
+
+
+async def night_quiet(now_ts=None):
+    """Between the window's start and the morning briefing: overnight tasks don't ping the user."""
+    settings = await load_settings()
+    dt = datetime.fromtimestamp(now_ts or time.time(), KST)
+    return in_window(dt, [settings["overnight"]["window"][0], settings["proactive"]["morning_briefing"]["time"]])
+
+
+async def morning_deadline(now_ts=None):
+    """When a night approval stops waiting: three hours after the next morning briefing."""
+    settings = await load_settings()
+    dt = datetime.fromtimestamp(now_ts or time.time(), KST)
+    h, m = map(int, settings["proactive"]["morning_briefing"]["time"].split(":"))
+    at = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+    return ((at if at > dt else at + timedelta(days=1)) + timedelta(hours=3)).timestamp()
+
+
+async def kv_list_add(key, item):
+    rows = await state.call("GET", f"/v1/state/kv/{key}") or []
+    if item not in rows:
+        await state.call("PUT", f"/v1/state/kv/{key}", [*rows, item][-200:])
+
+
+async def kv_list_remove(key, item):
+    rows = await state.call("GET", f"/v1/state/kv/{key}") or []
+    if item in rows:
+        await state.call("PUT", f"/v1/state/kv/{key}", [r for r in rows if r != item])
+
+
+async def overnight_tick(now_dt):
+    """Start this gateway's due scheduled tasks: a timed one when its time comes, overnight ones one at a time and only
+    inside the window (an overnight task waiting for a morning approval also holds the line)."""
+    if MODE != "full":
+        return
+    now, settings = now_dt.timestamp(), await load_settings()
+    ids = await state.call("GET", "/v1/state/kv/tasks-scheduled") or []
+    if not ids:
+        return
+    mine = []
+    for tid in ids:
+        t = await state.call("GET", task_key(tid))
+        if not t or t["status"] != "scheduled":
+            await kv_list_remove("tasks-scheduled", tid)
+        elif t.get("owner") == DEVICE:
+            mine.append(t)
+    night = [t for t in task_live.values() if t.get("when") == "overnight"
+             and t["status"] in ("queued", "running", "waiting_approval")]
+    for t in sorted(mine, key=lambda t: (t["scheduled_for"], t["created"])):
+        if t.get("cancel_requested"):
+            t.update(status="cancelled", finished=now, error="취소됐어요.")
+            await task_save(t)
+            await kv_list_remove("tasks-scheduled", t["id"])
+            continue
+        if t["scheduled_for"] > now:
+            continue
+        if t["when"] == "overnight" and (night or not in_window(now_dt, settings["overnight"]["window"])):
+            continue  # one at a time, and only at night
+        t.update(status="queued")
+        task_runs[t["id"]] = None
+        await task_save(t)
+        await kv_list_remove("tasks-scheduled", t["id"])
+        start_task(t)
+        if t["when"] == "overnight":
+            night.append(t)
+
+
+async def overnight_report():
+    """(spoken text, items) for the overnight tasks not reported yet; ("", []) when there are none."""
+    lines, items = [], []
+    for tid in await state.call("GET", "/v1/state/kv/overnight-tasks") or []:
+        t = await state.call("GET", task_key(tid))
+        if not t or t.get("reported"):
+            continue
+        what = openings.purpose_rule(t["goal"]) or t["goal"][:30]
+        st = t["status"]
+        if st == "done":
+            result = re.split(r"(?<=[.!?。])\s+", spoken_text(t.get("result") or ""))[0][:160]
+            lines.append(f"{what} 끝났어요. {result}".strip())
+        elif st == "failed":
+            lines.append(f"{what} 작업은 끝내지 못했어요.")
+        elif st == "waiting_approval":
+            lines.append(f"{what} 작업은 명령 승인을 기다리고 있어요. 앱에서 확인해 주세요.")
+        elif st in ("scheduled", "queued", "running"):
+            lines.append(f"{what} 작업은 아직 끝나지 않았어요." + (" 오늘 밤에 이어서 할게요." if st == "scheduled" else ""))
+        else:
+            continue
+        items.append(task_view(t, steps=False))
+    return ("밤사이 맡기신 일이에요. " + " ".join(lines)) if lines else "", items
+
+
+async def morning_briefing_call():
+    """The morning briefing, with the overnight report said after it (deterministic text)."""
+    report, _ = await overnight_report()
+    await place_call("morning_briefing", extra=report)
+
+
+async def overnight_morning(settings, briefing_on):
+    """At the briefing time: push the overnight summary, call with it alone if asked and no briefing rang, mark it."""
+    report, items = await overnight_report()
+    if not items:
+        return
+    o = settings["overnight"]
+    done = sum(1 for i in items if i["status"] == "done")
+    if o["report_push"]:
+        try:
+            await send_alert_push("밤사이 한 일", f"맡기신 일 {len(items)}개 중 {done}개 끝났어요.", type="overnight")
+        except Exception as e:
+            print("overnight push failed:", type(e).__name__, flush=True)
+    if o["report_call"] and not briefing_on:
+        await place_call("overnight_report", opening=report)
+    for i in items:
+        if i["status"] in ("done", "failed", "cancelled", "waiting_approval"):  # unfinished ones come again tomorrow
+            t = await state.call("GET", task_key(i["id"]))
+            if t:
+                t["reported"] = True
+                await task_save(t)
+                if t["status"] != "waiting_approval":
+                    await kv_list_remove("overnight-tasks", t["id"])
+
+
+async def overnight_list():
+    """The overnight queue for the app: everything queued with when=overnight that is not reported yet."""
+    out = []
+    for tid in await state.call("GET", "/v1/state/kv/overnight-tasks") or []:
+        if (t := await state.call("GET", task_key(tid))) and not t.get("reported"):
+            out.append(task_view(t, steps=False))
+    return out
+
+
 def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
             "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
-            "origin_session", "notified_at")
+            "origin_session", "notified_at", "when", "scheduled_for", "auto_approve", "reported")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
@@ -3861,6 +4067,11 @@ async def tasks_post(request: Request, body: dict):
 @app.get("/v1/tasks")
 async def tasks_list(request: Request, limit: int = 20):
     return await act("task_status", {"limit": max(1, min(limit, 100))}, request=request)
+
+
+@app.get("/v1/tasks/overnight")
+async def tasks_overnight(request: Request):
+    return await act("overnight_list", dict(request.query_params), request=request)  # unknown ones: invalid, as on tools
 
 
 @app.get("/v1/tasks/{tid}")
@@ -3876,7 +4087,7 @@ async def task_set_notify(tid, notify):
     t = task_live.get(tid) or (await state.call("GET", task_key(tid)) if re.fullmatch(r"[0-9a-f]{12}", tid) else None)
     if not t:
         raise HTTPException(404, "no such task")
-    if t["status"] not in ("queued", "running", "waiting_approval"):
+    if t["status"] not in ("scheduled", "queued", "running", "waiting_approval"):
         raise HTTPException(409, f"task already {t['status']}")
     t["notify"] = notify  # the runner's own dict when it runs here, so its finish uses the new choice
     await task_save(t)
@@ -3902,7 +4113,11 @@ async def task_cancel(tid):
         raise HTTPException(404, "그런 작업이 없어요.")
     if t["status"] in ("done", "failed", "cancelled"):
         raise HTTPException(409, "이미 끝난 작업이에요.")
-    if run := task_runs.get(tid):  # ours: stop it now (the claude process is killed on the way out)
+    if t["status"] == "scheduled":  # not started anywhere: cancelled at once
+        t.update(status="cancelled", finished=time.time(), error="취소됐어요.")
+        await task_save(t)
+        await kv_list_remove("tasks-scheduled", tid)
+    elif run := task_runs.get(tid):  # ours: stop it now (the claude process is killed on the way out)
         run.cancel()
         await asyncio.gather(run, return_exceptions=True)
     else:  # another gateway's: it sees the flag within seconds
@@ -3923,8 +4138,12 @@ async def serve_task(m):
         return
     try:
         current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
-        t = await task_create({k: m[k] for k in ("goal", "device", "persona", "notify") if m.get(k) is not None},
+        t = await task_create({k: m[k] for k in ("goal", "device", "persona", "notify", "when") if m.get(k) is not None},
                               source="voice")
+        if t.get("when") == "overnight":
+            reply.update(task_id=t["id"], say="밤사이에 해 둘게요. 아침에 결과를 알려 드릴게요.")
+            await link_send(reply)
+            return
         settings = await load_settings()
         dev = t["device"] or settings["default_device"]
         then = {"call": "끝나면 전화드릴게요.", "push": "끝나면 알림 드릴게요.", "none": "앱에서 진행 상황을 볼 수 있어요."}
@@ -4006,7 +4225,7 @@ bridge = tools_bridge.Bridge(
     memory_list=lambda n: state.call("GET", "/v1/records", kind="note", memory="true", limit=n) or none_list(),
     memory_delete=lambda rid: state.call("DELETE", f"/v1/records/{int(rid)}"),
     cygnus_can_write=lambda: cygnus_can_write(), persona_shares=lambda pid: persona_shares(pid),
-    web_ok=lambda: searxng_ok(),
+    web_ok=lambda: searxng_ok(), overnight_list=lambda: overnight_list(),
     mode=lambda: brain_mode(), secret=lambda: is_secret(requester_ctx.get()),
     auto_grant=lambda scope, devices, minutes: grant_create(scope, devices, minutes, by="voice"),
     auto_end=lambda scope: end_grants(scope),
