@@ -178,9 +178,12 @@ final class MacCall: ObservableObject {
         let p = key.flatMap { k in PersonaModel.shared.personas.first { $0.id == k || $0.name == k } } ?? PersonaModel.shared.primary
         wakeCall = true
         pendingUtterance = utterance
-        start(panel: true, persona: p)
+        // intent=wake: the voice server is stricter about speech in the first 2 s (room-tone hallucinations).
+        start(panel: true, intent: Self.wakeIntent, persona: p)
         scheduleIdle()
     }
+
+    nonisolated static let wakeIntent = "wake"
 
     /// The listener's recording of what followed the name; sent before the live mic.
     private var pendingUtterance: String?
