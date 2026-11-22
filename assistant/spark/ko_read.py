@@ -92,8 +92,68 @@ def month_day(n, unit):
     return f"{sino(n)} {unit}"
 
 
+# Scripts Qwen sometimes slips into a Korean reply: Han, kana, Cyrillic, Thai, Arabic. Dropped from captions and speech.
+FOREIGN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\u0400-\u04ff\u0e00-\u0e7f\u0600-\u06ff]+")
+FULLWIDTH = str.maketrans({"，": ", ", "。": ". ", "！": "! ", "？": "? ", "：": ": ", "；": "; ", "（": "(", "）": ")"})
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]")
+
+
+def strip_foreign(text):
+    """Stray Chinese/Japanese/Cyrillic/… removed (and fullwidth punctuation made plain): shown and spoken in Korean only."""
+    t = FOREIGN.sub("", text.translate(FULLWIDTH))
+    t = re.sub(r"\(\s*[,;:]?\s*\)", "", t)  # a parenthesis that held only the dropped text
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
+def english_only(text):
+    """A whole English sentence with no Korean in it ("I'll restart its agent gateway."): a model's working note read
+    out loud on a Korean call (live 2026-11-23). Names and acronyms alone ("GPU", "iPhone 15") don't count."""
+    return not re.search(r"[가-힣]", text) and len(re.findall(r"[A-Za-z]{2,}", text)) >= 3
+
+
+LETTERS = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "에이 비 씨 디 이 에프 지 에이치 아이 제이 케이 엘 엠 엔 오 피 큐 알 에스 티 유 브이 더블유 엑스 와이 지".split()))
+WORDS = {  # names the TTS reads badly in English letters
+    "iphone": "아이폰", "ipad": "아이패드", "macbook": "맥북", "macos": "맥오에스", "ios": "아이오에스", "airpods": "에어팟",
+    "apple": "애플", "nvidia": "엔비디아", "google": "구글", "gmail": "지메일", "samsung": "삼성", "tesla": "테슬라",
+    "microsoft": "마이크로소프트", "openai": "오픈에이아이", "anthropic": "앤트로픽", "claude": "클로드", "chatgpt": "챗지피티",
+    "youtube": "유튜브", "netflix": "넷플릭스", "spotify": "스포티파이", "docker": "도커", "github": "깃허브", "git": "깃",
+    "python": "파이썬", "linux": "리눅스", "wifi": "와이파이", "wi-fi": "와이파이", "bluetooth": "블루투스", "siri": "시리",
+    "naver": "네이버", "kakao": "카카오", "notion": "노션", "slack": "슬랙", "zoom": "줌", "planit": "플래닛", "gistra": "기스트라",
+    "nasdaq": "나스닥", "kospi": "코스피", "kosdaq": "코스닥", "etf": "이티에프", "ok": "오케이", "okay": "오케이",
+    "pdf": "피디에프", "ai": "에이아이", "sk": "에스케이", "lg": "엘지", "gist": "지스트", "tv": "티비", "pc": "피씨",
+}
+LATIN = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z\-]*(?![A-Za-z0-9])")
+
+
+def english(text):
+    """English the TTS stumbles on: known names in Hangul, other all-caps acronyms letter by letter ("GPU" → 지피유)."""
+    def one(m):
+        w = m[0]
+        if w.lower() in WORDS:
+            return WORDS[w.lower()]
+        if w.isupper() and 2 <= len(w) <= 6 and w.isalpha():
+            return "".join(LETTERS[c] for c in w)
+        return w
+    return LATIN.sub(one, text)
+
+
+def aside(text):
+    """Parentheses and markup for speech: "엔비디아(NVIDIA)" says the Korean only, "(참고로 …)" becomes a spoken aside."""
+    t = EMOJI.sub("", text)
+    t = re.sub(r"[*_`#>|]+|\[|\]|[{}「」『』]", "", t)
+    def paren(m):
+        inner = m[1].strip()
+        return f", {inner}, " if re.search(r"[가-힣]", inner) and not re.fullmatch(r"[가-힣\s]{0,2}", inner) else m[2]
+    t = re.sub(r"\s*\(([^()]*)\)(\s*)", paren, t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r",(\s*,)+", ",", t)
+    t = re.sub(r",\s*([.!?])", r"\1", t)
+    return re.sub(r"\s{2,}", " ", t).strip(" ,")
+
+
 def speakable(text):
-    """The TTS input for a reply: every digit read out in Korean; anything without digits is returned as is."""
+    """The TTS input for a reply: markup, parentheses and English made speakable, every digit read out in Korean."""
+    text = english(aside(strip_foreign(text)))
     if not re.search(r"\d", text):
         return text
     t = DATE.sub(lambda m: f"{sino(int(m[1]))} 년 {month_day(m[2], '월')} {sino(int(m[3]))} 일", text)
@@ -133,6 +193,11 @@ CASES = [  # (written, spoken): the self-check, run by voice_server --check and 
     ("세 달 말고 3달이요.", "세 달 말고 세 달이요."),
     ("1등, 2층, 3위", "일 등, 이 층, 삼 위"),
     ("숫자 없는 문장이에요.", "숫자 없는 문장이에요."),
+    ("엔비디아(NVIDIA)와 삼성전자(005930)예요.", "엔비디아와 삼성전자예요."),
+    ("오늘은 쉬어요 (참고로 내일은 비가 와요).", "오늘은 쉬어요, 참고로 내일은 비가 와요."),
+    ("GPU 서버가 SK 쪽 API를 불러요.", "지피유 서버가 에스케이 쪽 에이피아이를 불러요."),
+    ("iPhone에서 **Spotify**를 켜요 😊", "아이폰에서 스포티파이를 켜요"),
+    ("네, 알겠어요。好的 그렇게 할게요.", "네, 알겠어요. 그렇게 할게요."),
 ]
 
 

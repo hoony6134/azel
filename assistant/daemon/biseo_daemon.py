@@ -667,6 +667,8 @@ def _blocked(data: dict, text: str) -> list[str] | None:
     if isinstance(denials, list) and denials:  # claude's own list decides; its prose may mention the rm it skipped
         names = sorted({str(x.get("tool_name") or "?")[:40] for x in denials if isinstance(x, dict) and _wanted(x)})
         return names or None
+    if isinstance(denials, list):  # an empty list: nothing was refused, whatever the report's prose says
+        return None  # ("권한이 없는 사용자 목록" in a finished report marked the run blocked and failed)
     return [] if BLOCKED_TEXT.search(text or "") else None
 
 

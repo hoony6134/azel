@@ -3724,6 +3724,11 @@ async def decide(aid: str, body: dict):
     meta = await approval_meta(aid)
     view = approval_view(row, meta)
     if view["status"] != "pending":
+        # a second tap (two devices, a double tap, a retry) with the decision already made is not a failure: the
+        # app showed "승인 실패" for an approval that had gone through
+        same = (view["status"] in ("approved", "used") and decision != "deny") or (view["status"] == "rejected" and decision == "deny")
+        if same:
+            return {"id": aid, "status": view["status"], "decision": meta.get("decision") or decision, "already": True}
         raise HTTPException(409, f"approval is {view['status']}")
     secret = decision == "always" and is_secret((meta.get("requester") or {}).get("session"))
     forced = decision == "always" and (secret or not always_ok(row["command"]))

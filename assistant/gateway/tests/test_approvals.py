@@ -50,6 +50,18 @@ def test_once_and_deny(agw):
     assert c.get("/v1/approvals/rules").json() == []  # once never makes a rule
 
 
+def test_a_repeated_tap_with_the_same_decision_is_not_an_error(agw):
+    g, c, _ = agw
+    a = c.post("/v1/approvals", json=CMD).json()["approval_id"]
+    assert c.post(f"/v1/approvals/{a}", json={"decision": "once"}).status_code == 200
+    again = c.post(f"/v1/approvals/{a}", json={"decision": "once"})  # a double tap, or the second device
+    assert again.status_code == 200 and again.json()["status"] == "approved" and again.json()["already"] is True
+    b = c.post("/v1/approvals", json=CMD).json()["approval_id"]
+    c.post(f"/v1/approvals/{b}", json={"decision": "deny"})
+    assert c.post(f"/v1/approvals/{b}", json={"decision": "deny"}).status_code == 200
+    assert c.post(f"/v1/approvals/{b}", json={"decision": "once"}).status_code == 409  # a changed mind stays refused
+
+
 def test_expiry(agw):
     g, c, _ = agw
     aid = c.post("/v1/approvals", json=CMD).json()["approval_id"]

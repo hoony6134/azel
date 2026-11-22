@@ -1019,6 +1019,10 @@ def test_a_refused_run_is_not_done(cfg, monkeypatch):
     assert st["job_status"] == "failed" and st["needs_input"] is True and st["blocked"] == []  # said only in words
     st, _ = run_delegate(monkeypatch, {"result": "권한 설계 문서를 정리해서 docs/permissions.md에 저장했어요."})
     assert st["job_status"] == "done"  # talking about permissions is not being refused
+    # claude listed no refusal at all: a finished report whose prose says "권한이 없는 …" is done, not blocked
+    st, _ = run_delegate(monkeypatch, {"result": "점검을 마쳤어요. 쓰기 권한이 없는 폴더 두 곳은 따로 정리가 필요해요.",
+                                       "is_error": False, "permission_denials": []})
+    assert st["job_status"] == "done" and st["needs_input"] is False
     # live 2026-11-22: the report was made, then `rm` of old previews (refused on purpose) marked the run blocked
     st, _ = run_delegate(monkeypatch, {"result": "PDF를 만들었어요. 이전 미리보기는 지우는 게 허용되지 않아(wasn't allowed) 남겼어요.",
                                        "is_error": False, "permission_denials": [

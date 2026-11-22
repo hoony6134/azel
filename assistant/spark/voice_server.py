@@ -66,6 +66,9 @@ LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_toke
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
     "한국어로 자연스럽게 말해. 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. "
+    "'친구', '동생' 같은 관계 말만으로는 반말로 바꾸지 마: 성격에 반말이라고 쓰여 있을 때만 반말이야. "
+    "한 번의 답 안에서 첫 문장부터 마지막 문장까지 말투를 똑같이 유지해(해요체면 끝까지 해요체, 반말이면 끝까지 반말). "
+    "한자, 일본어, 중국어, 영어 문장은 섞지 마(제품이나 회사 이름 같은 고유명사만 예외). "
     "'네'나 '알겠습니다'만 하고 끝내지 마. 상장 여부, 주가, 환율, 날씨, 뉴스 같은 지금의 사실은 이번 대화의 도구 결과로만 말하고, "
     "네가 원래 알던 지식으로는 말하지 마(오래됐을 수 있어). 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
@@ -73,8 +76,9 @@ SYSTEM_BODY = (
     "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자는 한글로 풀어 쓰지 말고 아라비아 숫자와 단위로 써(1,333원, 2도, 18.5%, 3시 30분). "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
-    f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
-    f"파일, macbook이나 서버 작업, 코드, 검색, 날씨 같은 최신 정보, 여러 단계 작업) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
+    f"중요: 일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말, 검색, 날씨, 주가, macbook이나 서버 작업은 네가 가진 도구와 "
+    f"참고 메모로 먼저 직접 해(Claude에 넘기지 마). 그 도구로 해 보고도 정말 할 수 없을 때만(코드 짜기, 긴 여러 단계 작업, "
+    f"맞는 도구가 없는 일) 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 간단한 상식, 계산, 방금 대화 내용 정리는 네가 바로 답해. " + AGENCY
 )
 
@@ -370,6 +374,10 @@ _USE = r"\s*(으?로|한테|에게|모델)"
 MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){_USE}", "haiku": rf"(하이쿠|haiku){_USE}",
                "nim": rf"(엔비디아|nvidia|\bnim){_USE}"}  # NVIDIA NIM on a full gateway (gateway/nim.py)
 USE_CLAUDE = re.compile(rf"(클로드|claude){_USE}|(클로드|claude)(가|이)\s*(해|답|풀|찾|봐|알아)", re.I)
+# "클로드는 쓰지마", "클로드 말고 네가 해": this turn stays on the local model, whatever else it says.
+LOCAL_FIRST = os.environ.get("LOCAL_FIRST", "1") != "0"  # see pre_route
+CLAUDE_NO = re.compile(r"(클로드|claude)\s*(는|은|를|도|가|이)?\s*(쓰지|쓰면|부르지|호출하지|빼고|없이|말고|안 ?써|안 ?불러|필요 ?없)"
+                       r"|(로컬|네가|니가|너가)\s*(로|만|혼자)?\s*(해|처리|답)", re.I)
 # Needs live data or a device: straight to Claude without asking Qwen (Qwen would guess).
 NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
                           r"|spark|ruchba|albireo|gienah|deneb|macbook"
@@ -770,8 +778,11 @@ BRAIN_BODY = (
     "search_memory(query) 예전 통화와 메모 검색, add_todo(text) 할 일 메모, done_todo(text) 메모한 할 일 지우기, "
     "device_status() 기기 연결 상태, situation() 최신 상황, scheduled_calls() 예약된 전화 목록. "
     "참고할 상황에 'Cygnus 도구' 목록이 있으면 일정, 과제, 할 일, 서버 상태는 그 도구로 확인해서 답해. "
-    "참고할 상황과 도구로 안 되는 일(일정 정보도 일정 도구도 없을 때, 메일 내용, 일정 등록이나 수정, 웹 검색, 날씨와 뉴스 같은 "
-    f"최신 정보, 서버 재시작 같은 작업, 파일이나 코드 작업, 여러 단계 작업)이면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
+    "일정이나 브리핑을 물으면 '알려 드릴게요' 같은 예고 없이 바로 내용부터 말해. "
+    "일정 브리핑, 일정 확인, 날씨, 주가, 검색, 서버나 기기 작업도 가진 도구(agenda, weather, stock_quote, web_search, 기기 도구)로 "
+    "먼저 직접 해. 이것들은 Claude에 넘기지 마. "
+    f"참고할 상황과 도구로 해 보고도 정말 안 되는 일(일정 정보도 일정 도구도 없을 때, 메일 내용, 일정 등록이나 수정, 코드 짜기, "
+    f"긴 여러 단계 작업)일 때만 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해. "
     "잡담, 인사, 상식, 계산, 방금 대화 정리는 바로 답해. " + AGENCY
 )
 
@@ -1216,7 +1227,7 @@ def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
 
 
-def pre_route(text, settings, local=False, tools=()):
+def pre_route_keywords(text, settings, local=False, tools=()):
     """(straight to Claude?, model) decided by keywords and settings, before any LLM call.
 
     local=True (the brain's context is in Qwen's prompt): personal questions go to Qwen first, which answers from
@@ -1241,6 +1252,22 @@ def pre_route(text, settings, local=False, tools=()):
         task = pick(TASK_WORDS, text)
         keywords = USE_CLAUDE.search(text) or personal or NEEDS_CLAUDE.search(text) or (task and (task != "schedule" or personal))
     return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
+
+
+def pre_route(text, settings, local=False, tools=()):
+    """(straight to Claude?, model) before any LLM call. Local first (user decision 2026-11-23): only a model or Claude
+    the user asked for by name, or a default model set in the settings, goes straight to Claude. Everything else
+    (schedules, weather, prices, servers, devices, files) starts on Qwen with its tools; Qwen hands over with the routing
+    tag when it truly can't, and the claim/promise guards in respond() hand over when it says it did what no tool did.
+    `local` and `tools` are kept for the callers: the answer no longer depends on them."""
+    if not LOCAL_FIRST:  # LOCAL_FIRST=0: the keyword routing from before, no redeploy needed to go back
+        return pre_route_keywords(text, settings, local, tools)
+    forced_model = pick(MODEL_WORDS, text)
+    default = settings.get("default_model", "auto")
+    model = forced_model or (default if default in MODEL_WORDS else None)
+    if CLAUDE_NO.search(text):
+        return bool(forced_model) or default in MODEL_WORDS, model  # "클로드는 쓰지마": never by keyword
+    return bool(forced_model) or default in MODEL_WORDS or bool(USE_CLAUDE.search(text)), model
 
 
 # A reply with no content: acknowledgements and promises only ("네.", "알겠습니다", "네, 확인해 볼게요").
@@ -1350,19 +1377,57 @@ _HOUR_RE = re.compile(r"(\d{1,2})\s*(?:시(?!간)|:\d{2})|(열한|열두|한|두
 # A future promise only: "제가 전화드렸어요" on a placed call (the assistant DID call) is a fact, not a claim.
 ACTION_CLAIM = re.compile(r"전화(를)? ?(드릴게요|드릴께요|걸게요|걸어 ?드릴게요|해 ?드릴게요)|예약(을)? ?(했|해 ?드렸|해 ?둘게요|"
                           r"해 ?드릴게요|할게요|잡았|해 ?놨)|깨워 ?드릴게요|알람(을)? ?(맞췄|맞춰 ?(둘|드릴)게요)|맡겼|맡겨 ?(둘|드릴)게요|"
-                          r"실행했|열었(어요|습니다)|보냈(어요|습니다)|취소했")
+                          r"실행했|열었(어요|습니다)|보냈(어요|습니다)|취소했|"
+                          r"(기억|저장|추가|등록|메모|삭제|재시작|재시동|시동|다시 ?시작|접속|실행)\S*?\s*(했|해 ?(두|놨|드렸)|두었|뒀|놨|드렸|됐)|"
+                          r"(시도|재시작|재시동|시동|접속|실행|처리)\S*?\s*(해\s*)?(볼게요|드릴게요|할게요|하겠습니다|보겠습니다)")
 TOOL_REFUSED = re.compile(r"이미 통화 중|다 걸었어요|없는 도구|쓸 수 없어요|틀렸어요|실패|거절|만료|허용되지 않아|할 수 없어요|없어요\.?$")
 ASK_WHEN = "몇 분 뒤에 걸어 드릴까요?"
-ACTION_TOOLS = {"call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo"}
+ACTION_TOOLS = {"call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo", "remember", "forget"}
 CLAIM_FALLBACK = "그건 제가 직접 처리하지 못했어요. 어떻게 할지 다시 말씀해 주시겠어요?"
 LOOKUP_TOOL = re.compile(r"task_status|schedule_list|overnight_list|list_jobs|job_status$")
 
 
+# a sentence that is not finished: it ends on a connective or a particle ("…엔트로픽이랑", "그리고", "…인데")
+DANGLING = re.compile(r"(그리고|그런데|근데|그러니까|그래서|그러면|또는|아니면|이랑|랑|하고|이고|거나|는데|은데|인데|니까|지만|에서|한테|에게|에다|에는)[\s.,…]*$")
+DANGLING_WAIT_S = 1.3
+# "오늘 일정 브리핑해 드릴게요.", "알려 드릴게요": an announcement with no content in it
+INTRO_ANNOUNCE = re.compile(r"(브리핑|알려|말씀|정리|설명|확인해|읽어)\s*(해\s*)?드릴게요[.!~]*$|(브리핑|알려|정리|설명)\s*(해\s*)?드리겠습니다[.!~]*$")
+ASKS_ENGLISH = re.compile(r"영어|english|번역|translate", re.I)
+
+
+# The request, not the reply's wording: an imperative that is not a question for information ("재시동해줘", "접속해서 켜 줘").
+# When it was made and no action tool ran this turn, a local statement about doing it can only be a made-up claim.
+IMPERATIVE = re.compile(r"(하라|하자|해라|해봐|[가-힣]\s?줘|[가-힣]\s?주세요|[가-힣]\s?줄래|[가-힣]\s?주라|달라|부탁\S*)[\s.!~요]*$")
+INFO_ASK = re.compile(r"알려|설명|말해|얘기|이야기|추천|번역|읽어|찾아|검색|보여|가르쳐|요약|계산|비교|생각|대답|답해|맞혀|"
+                      r"농담|웃겨|노래|확인|조회|점검|체크|열어|알아봐|궁금|도와|정리해|브리핑")
+# what a local model may still say when nothing ran: a question back, a refusal, or "I don't know"
+UNCLAIMED = re.compile(r"\?|못 ?(해|하|했)|할 수 (없|있)|수 없|없어요|없습니다|없네요|모르|어떤|어디|언제|몇|무엇|뭘|누구|어떻게|도구|"
+                       r"할까요|드릴까요|볼까요|줄까요|말씀해|알려 ?주")
+
+
+def requests_action(text):
+    """An explicit do-it request. Not TASK_WORDS (a schedule or code question is answered from a lookup, not an action)."""
+    return bool(SCHED_CALL.search(text) or SCHED_WAKE.search(text) or ASK_CALL.search(text) or ASK_STORE.search(text)
+                or (IMPERATIVE.search(text.strip()) and not INFO_ASK.search(text)))
+
+
+def unconfirmed_claim(sentence, user_text):
+    """A sentence that says an action was or will be done (the wording list, or any plain statement when an action
+    was requested): checked only against `confirmed`, never trusted on its own."""
+    if ACTION_CLAIM.search(sentence):
+        return asks_action(user_text) or requests_action(user_text)
+    st = sentence.strip()
+    return (requests_action(user_text) and len(re.findall(r"[가-힣]", st)) >= 6 and not UNCLAIMED.search(st)
+            and bool(re.search(r"(요|다|죠|네|께)[.!~]*$", st)))
+
+
 def asks_action(text):
     """The user's own words ask for something done (a call, a wake-up, a task): only then is a claim checked."""
-    return bool(SCHED_CALL.search(text) or SCHED_WAKE.search(text) or ASK_CALL.search(text) or pick(TASK_WORDS, text))
+    return bool(SCHED_CALL.search(text) or SCHED_WAKE.search(text) or ASK_CALL.search(text) or ASK_STORE.search(text)
+                or pick(TASK_WORDS, text))
 
 
+ASK_STORE = re.compile(r"(기억|저장|메모|추가|등록|삭제|재시작|재시동|시동|다시 ?시작|접속)\S*?\s*(해|하자|좀|부탁)|재시작|재시동|재부팅|잊지 ?마|지워 ?줘")
 ASK_CALL = re.compile(r"(전화|연락|콜)\s*(좀|부탁|줘|주세요|줄래|줄 ?수)|(예약|알람|맡겨)\s*(좀|줘)")
 
 
@@ -2110,7 +2175,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     local = bool(ctx) or "memory_recall" in gw_names
     to_claude, model = (False, None) if sched or job or auto else pre_route(
         bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
-    offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local"
+    offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local" or bool(CLAUDE_NO.search(bare))
     play = "" if sched or job or auto else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
     if play:  # a game note is terse; the persona's own register and title still hold ("너 차례!" was 반말 for 아젤)
         play += " 말투(존댓말/반말)와 호칭은 평소 네 성격대로 지키고, 사용자를 '당신'이라고 부르지 마."
@@ -2149,6 +2214,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 await on_event(ev)
 
         async def speak(s):  # the action-claim gate, for every model's final text (only when an action was asked)
+            # Claude's own turn: its tool calls are watched, so only the wording is checked (a plain statement of fact
+            # such as "그 작업은 이미 진행 중이에요" is not a claim). The any-statement rule is for the local model.
             if ACTION_CLAIM.search(s) and not acted["ok"] and asks_action(text):
                 timings["unconfirmed"] = s[:80]
                 claimed["n"] += 1
@@ -2229,7 +2296,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if not grounded(s, sources):
                     timings["ungrounded"] = s[:80]
                     raise Recheck("personal", s)
-                if ACTION_CLAIM.search(s) and not confirmed["ok"] and asks_action(bare):
+                if not confirmed["ok"] and unconfirmed_claim(s, bare):
                     timings["unconfirmed"] = s[:80]
                     raise Recheck("action", s)
                 if not looked and live and (FIGURE.search(s) or LISTING.search(s)):
@@ -2385,9 +2452,14 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     uttered: set[str] = set()
 
     def repeat(x):
-        """A sentence this reply already said (a re-asked or restarted model began again: "네, 수능! … 네, 수능!")."""
+        """A sentence this reply already said (a re-asked or restarted model began again: "네, 수능! … 네, 수능!"),
+        or a second announcement ("일정 알려드릴게요" again after a re-ask, live 2026-11-23)."""
         if x is None or x in (FILLER, FILLER_LONG):
             return False
+        if INTRO_ANNOUNCE.search(x):
+            if "\0announce" in uttered:
+                return True
+            uttered.add("\0announce")
         k = re.sub(r"[\W_]+", "", x)
         if len(k) >= 2 and k in uttered:
             return True
@@ -2406,6 +2478,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 s = await sentences.get()
             if s is None or s in (FILLER, FILLER_LONG):
                 return s
+            if not (s := ko_read.strip_foreign(s)) or (ko_read.english_only(s) and not ASKS_ENGLISH.search(text)):
+                return await next_chunk()  # nothing but stray Chinese/Japanese, or a model's English working note
             s = address(s)
         if s is None or s in (FILLER, FILLER_LONG):
             return s
@@ -2416,6 +2490,9 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         while not back and not sentences.empty():
             nxt = sentences.get_nowait()
             if repeat(nxt):
+                continue
+            if nxt not in (None, FILLER, FILLER_LONG) and (
+                    not (nxt := ko_read.strip_foreign(nxt)) or (ko_read.english_only(nxt) and not ASKS_ENGLISH.search(text))):
                 continue
             nxt = nxt if nxt is None or nxt in (FILLER, FILLER_LONG) else address(nxt)
             if nxt is None or nxt in (FILLER, FILLER_LONG) or syllables(s) + syllables(nxt) > room:
@@ -2614,6 +2691,10 @@ class Turn:
 
 FILLER_SOUNDS = re.compile(r"(음+|어+|아+|으+|흠+|에+|그+|저기|그러니까)[\s.,!?~]*")
 STOP_WORDS = re.compile(r"아니|그만|잠깐|취소|됐어|멈춰|스톱|stop|그거 말고", re.I)
+# "잠깐만", "음…", "생각 좀 해볼게": the user asks for time, not an answer. Nothing is said back; the next speech is the turn
+# (claude.ai's voice mode has pause_endpointing for the same thing)
+HOLD = re.compile(r"^(아+[,.\s]*|어+[,.\s]*|음+[,.\s]*)*(잠깐만?(요|만요)?|잠시만?(요|만요)?|기다려\s*(줘|봐|주세요|봐요)|"
+                  r"생각\s*(좀)?\s*(해\s*볼게(요)?|할게(요)?|해\s*보자|해\s*볼까)|음+|어+|그러니까|있잖아|그게|아+)[\s.,!~…]*$")
 QUESTION = re.compile(r"\?|뭐|언제|어디|누구|왜|어떻게|몇|얼마|무슨|어때|알려|해\s*줘|줄래|할까|인가|나요|까요|니\b")
 
 
@@ -2647,11 +2728,16 @@ def is_echo(text, playing_text):
     return bool(heard) and len(heard & _bigrams(playing_text)) >= 0.6 * len(heard)
 
 
+# Whisper turns speaker echo and room noise into a polite greeting; nobody greets in the middle of the assistant's reply
+# (live 2026-11-23: "안녕하세요." the user never said cut the schedule answer and was answered with "안녕하세요, 대표님.")
+GREETING_ONLY = re.compile(r"^\s*(안녕하세요|안녕하십니까|안녕|여보세요|하이|헬로|hello|hi)\s*[.!?~]*\s*$", re.I)
+
+
 def barge_verdict(text, voiced_s, vad_turn, playing_text=""):
     """While the assistant was speaking: 'interrupt' only for long enough speech that is plainly meant for it (a stop
     word, a question, or four syllables beyond fillers) and is not its own echo; else 'resume'. Whisper turns noise
     into short made-up words ("오바자."), and the speaker's sound into the reply's own words."""
-    if not (vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text)):
+    if not (vad_turn.barge and voiced_s >= vad_turn.barge_voiced_s and real_content(text)) or GREETING_ONLY.match(text):
         return "resume"
     if stop := STOP_WORDS.search(text):  # "아니요…" in the reply itself can come back through the speaker
         echoed = stop.group(0).lower() in playing_text.lower() and is_echo(text, playing_text)
@@ -2665,7 +2751,7 @@ def barge_verdict(text, voiced_s, vad_turn, playing_text=""):
 def followup_action(text):
     """While the assistant is thinking: 'ignore' noise, 'replace' the question being worked on (stop words or a
     new question), or 'queue' it to answer afterwards."""
-    if not real_content(text):
+    if not real_content(text) or GREETING_ONLY.match(text):
         return "ignore"
     return "replace" if STOP_WORDS.search(text) or QUESTION.search(text) else "queue"
 
@@ -2693,7 +2779,7 @@ async def gateway_link(ws: WebSocket):
 
 @app.websocket("/v1/call")
 async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str = "", client: str = "",
-               intent: str = "", persona: str = "", mode: str = "", secret: str = "", resume: str = ""):
+               intent: str = "", persona: str = "", mode: str = "", secret: str = "", resume: str = "", duck: str = ""):
     try:
         check_token(call_token(ws.headers, token))  # header preferred; ?token= only for old clients
         if token and not bearer(ws.headers):  # remove ?token= once every shipped app sends the header
@@ -2814,9 +2900,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 if op.get("audio"):
                     op["audio"].cancel()  # cut in or hung up: the rest of the opening is never synthesized
 
+    ducks = duck == "1"  # the app lowers the volume on a tentative barge-in instead of pausing (claude.ai's server_duck)
+
     def cut_at():
-        """Now in phone playback time: playback stands still while paused."""
-        return current["paused_at"] if current["paused_at"] is not None else time.monotonic()
+        """Now in phone playback time: playback stands still while paused (a ducked reply keeps playing)."""
+        return current["paused_at"] if current["paused_at"] is not None and not ducks else time.monotonic()
 
     def queue_audio(sent, s, pcm, sr):
         """Note when this sentence will play on the phone (before it is sent: send() moves play_end)."""
@@ -2838,13 +2926,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     async def pause():
         """First stage of a voice barge-in: the app pauses its playback queue; nothing is cancelled yet."""
         current["paused_at"] = time.monotonic()
-        await send({"type": "pause"})
+        await send({"type": "duck"} if ducks else {"type": "pause"})
 
     async def resume():
         if current["paused_at"] is not None:
-            current["play_end"] += time.monotonic() - current["paused_at"]  # playback stood still meanwhile
+            if not ducks:
+                current["play_end"] += time.monotonic() - current["paused_at"]  # playback stood still meanwhile
             current["paused_at"] = None
-            await send({"type": "resume"})
+            await send({"type": "unduck"} if ducks else {"type": "resume"})
 
     async def barge_check(audio, voiced_s):
         """Second stage: interrupt only for real speech, else let the reply play on. Whatever fails (STT down),
@@ -2873,12 +2962,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
         act = followup_action(text)
         if act == "ignore":
             return
+        asked = current.get("asked")
+        if asked and not asked["spoke"] and not STOP_WORDS.search(text):
+            # nothing said yet: the user was still talking ("…보고서 만들어 줘" + "그러고 끝나고 전화해줘"), so it is one
+            # request, whether or not the second half looks like a new question. Answered apart, the first half got
+            # its own answer and the second another (live 2026-11-23: "…SK하이닉스 주식" / "오늘 알려줘")
+            text = f"{asked['text']} {text}"
+            act = "replace"
         if act == "replace":
-            asked = current.get("asked")
-            if asked and not asked["spoke"] and not STOP_WORDS.search(text):
-                # nothing said yet: the user was still talking ("…보고서 만들어 줘" + "그러고 끝나고 전화해줘"), so it
-                # is one request. Cut off, the first half was dropped and a task of the second half alone ran
-                text = f"{asked['text']} {text}"
             await interrupt()  # cancels the answer being worked on (and anything else speaking)
         else:
             await asyncio.gather(prev, return_exceptions=True) if prev else None
@@ -3028,9 +3119,16 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             timings["stt_ms"] = ms(t0)
             if not text:
                 return
+            if not typed and HOLD.fullmatch(text.strip()):
+                text = ""  # only asked for time: no reply, no turn in the history, back to listening below
+                return
             if not typed:  # the app already shows what the user typed
                 await send({"type": "transcript", "text": text})
             current["asked"] = asked = {"text": text, "spoke": False}  # followup() joins a cut-in to an unanswered turn
+            if not typed and DANGLING.search(text):
+                # "…엔트로픽이랑 그리고": the user paused mid-sentence. Wait a moment: more speech arrives as a follow-up
+                # that cancels this task and joins both halves, instead of two answers (live 2026-11-23)
+                await asyncio.sleep(DANGLING_WAIT_S)
             started = False
             # aclosing: the reply's history turn exists before a cut below rewrites it (no GC-time finally)
             async with contextlib.aclosing(respond(text, session, t0, timings, on_event=on_event, kept=kept,
@@ -3243,6 +3341,27 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
 if __name__ == "__main__":
     # Self-checks without GPU or network (run: python voice_server.py --check).
     if CHECK_ONLY:
+        # live 2026-11-23: a greeting Whisper made up over the reply is noise, and a second announcement is dropped
+        assert all(GREETING_ONLY.match(x) for x in ("안녕하세요.", "안녕하세요", "여보세요?", "Hello"))
+        assert not GREETING_ONLY.match("안녕하세요 오늘 일정 알려줘") and followup_action("안녕하세요.") == "ignore"
+        assert INTRO_ANNOUNCE.search("오늘 일정 브리핑해 드릴게요.") and INTRO_ANNOUNCE.search("알려드릴게요.")
+        assert not INTRO_ANNOUNCE.search("오늘은 수업이 두 개예요.")
+        class _VT:
+            barge, barge_voiced_s = True, 0.3
+        assert barge_verdict("안녕하세요.", 1.0, _VT(), "오늘 일정은 두 건이에요.") == "resume"
+        assert barge_verdict("아니 잠깐만 그거 말고", 1.0, _VT(), "오늘 일정은 두 건이에요.") == "interrupt"
+        assert all(HOLD.fullmatch(x) for x in ("잠깐만", "잠깐만요.", "음…", "아, 잠시만", "생각 좀 해볼게", "기다려 줘", "그러니까"))
+        assert not any(HOLD.fullmatch(x) for x in ("잠깐만 일정 알려줘", "음 그래서 뭐 했지", "기다려 주셔서 감사해요", "아니 그거 말고"))
+        # the checks below exercise the keyword routing (LOCAL_FIRST=0); the local-first rules are checked right here
+        LOCAL_FIRST = True
+        for ask in ("오늘 일정 뭐야?", "광주 날씨 어때?", "삼성전자 주가 알려줘", "서버 괜찮아?", "스파크 재시작해 줘",
+                    "맥북 다운로드 폴더에 파일 넣어 줘", "오늘 해야 될 일정 브리핑 해줘", "내가 가진 주식 오늘 알려줘"):
+            assert pre_route(ask, {}) == (False, None), ask  # local first: Qwen has its tools, and hands over itself
+        assert pre_route("클로드로 해 줘", {})[0] and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")  # asked by name
+        assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")  # a default set in the settings
+        assert not pre_route("스파크 재시동이죠 클로드는 쓰지마", {})[0] and CLAUDE_NO.search("클로드 말고 네가 해")
+        assert not CLAUDE_NO.search("클로드로 해 줘") and not CLAUDE_NO.search("오늘 일정 알려줘")
+        LOCAL_FIRST = False
         def nomode(f):  # state frames carry the call's brain mode and secret flag; most checks don't care
             return {k: v for k, v in f.items() if k not in ("mode", "secret", "auto")} if isinstance(f, dict) else f
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
@@ -3359,6 +3478,24 @@ if __name__ == "__main__":
                            ("내일 날씨는 어때?", "replace"), ("그리고 메일도 확인해 줘", "replace"),
                            ("고마워요", "queue"), ("그리고 회의는 세 시예요", "queue")]:
             assert followup_action(text) == want, (text, followup_action(text))
+        # live 2026-11-23: a half-said sentence waits for its rest; "기억했어요" with no remember tool is a false claim
+        assert all(DANGLING.search(x) for x in ("엔트로픽이랑 그리고", "애플이랑", "주식 갖고 있는데.", "그리고…"))
+        assert not any(DANGLING.search(x) for x in ("주식 오늘 알려줘", "고마워요", "일정 있어?"))
+        assert ACTION_CLAIM.search("네, 엔트로픽도 추가해서 기억했어요.") and ACTION_CLAIM.search("스파크를 재시작했어요.")
+        assert asks_action("애플 주식 기억해줘") and asks_action("스파크 재시작해줘") and not asks_action("오늘 기분 어때")
+        assert action_tool("remember") and not ACTION_CLAIM.search("기억나요")
+        # live 2026-11-23: "재시동을 시도해 볼게요. 잠시만 기다려 주세요." and nothing ran; Claude's English notes were spoken
+        assert ACTION_CLAIM.search("스파크에 접속해서 네모클로즈의 재시동을 시도해 볼게요.") and asks_action("스파크 재시동해줘")
+        # by the request, not the wording: any statement of doing, when an action was asked and nothing ran
+        assert unconfirmed_claim("스파크에 들어가서 바로 처리해 둘게요.", "스파크 네모클로 재시동해줘")
+        assert unconfirmed_claim("네, 그렇게 해 놨습니다.", "저기 서버 껐다 켜 줘")
+        assert not unconfirmed_claim("어느 서버를 재시작할까요?", "스파크 재시동해줘")
+        assert not unconfirmed_claim("그건 제가 직접 처리하지 못해요.", "스파크 재시동해줘")
+        assert not unconfirmed_claim("내일은 비가 올 것 같아요.", "내일 날씨 알려줘")
+        assert not unconfirmed_claim("일정은 두 건이에요 오늘은요.", "오늘 일정 확인해줘")
+        assert not unconfirmed_claim("그건 좋은 생각이에요 정말로요.", "나 오늘 피곤해")
+        assert ko_read.english_only("I'll restart its agent gateway.") and not ko_read.english_only("GPU 서버예요.")
+        assert not ko_read.english_only("iPhone 15") and not ko_read.english_only("네, OK.")
         class FakeWS:
             def __init__(self):
                 self.sent = []
@@ -4879,7 +5016,7 @@ if __name__ == "__main__":
                         w.send_text(json.dumps({"type": "hangup"}))
                         break
             time.sleep(0.1)
-            cut = frames.index({"type": "interrupt"})
+            cut = len(frames) - 1 - frames[::-1].index({"type": "interrupt"})  # the tap's: a joined follow-up interrupts too
             return frames[cut + 1:], frames
         globals()["speech"] = np.zeros(8000, np.int16).tobytes() + (np.ones(16000, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
         for queued in (False, True):
@@ -4888,6 +5025,95 @@ if __name__ == "__main__":
             assert [nomode(x) for x in after] == [{"type": "state", "value": "listening"}], (queued, after)  # one listening, nothing old
             starts = [f for f in frames if isinstance(f, dict) and f.get("type") == "reply_start"]
             assert starts and frames.index(starts[0]) < frames.index("audio"), frames  # reply_start precedes the audio
+        globals().update(tts=real[1], llm_stream=real_llm)
+
+        def hold_check():
+            """"잠깐만" alone: no transcript line, no reply, no model call; the next utterance is answered normally."""
+            said, calls = iter(["잠깐만요", "내일 도시락 뭐 싸지?"]), []
+
+            async def stt(audio):
+                return next(said)
+
+            async def llm(messages, max_tokens=600):
+                calls.append(1)
+                yield "김밥이 좋겠어요. "
+
+            async def fake_tts(sentence):
+                return b"\1\0" * 2400, 24000
+            from fastapi.testclient import TestClient
+            globals().update(tts=fake_tts, llm_stream=llm, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            history.clear()
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            frames = []
+            with tc.websocket_connect("/v1/call?session=hold", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(speech)
+                end = time.monotonic() + 1.5
+                while time.monotonic() < end:
+                    m = w.receive()
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    if nomode(frames[-1]) == {"type": "state", "value": "listening"} and {"type": "state", "value": "thinking"} in map(nomode, [f for f in frames if isinstance(f, dict)]):
+                        break
+                assert not calls and not [f for f in frames if isinstance(f, dict) and f.get("type") in ("transcript", "reply")], frames
+                w.send_bytes(speech)  # a real question next
+                end = time.monotonic() + 4
+                while time.monotonic() < end:
+                    m = w.receive()
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    if isinstance(frames[-1], dict) and frames[-1].get("type") == "turn_done":
+                        break
+                w.send_text(json.dumps({"type": "hangup"}))
+            tr = [f["text"] for f in frames if isinstance(f, dict) and f.get("type") == "transcript"]
+            assert tr == ["내일 도시락 뭐 싸지?"] and calls, (tr, calls, frames)
+            assert [m["content"] for m in history["azel:hold"] if m["role"] == "user"] == ["내일 도시락 뭐 싸지?"]  # no "잠깐만요" turn
+        hold_check()
+        globals().update(tts=real[1], llm_stream=real_llm)
+
+        def duck_check(duck):
+            """A voice over the reply: ducks=1 sends duck (the reply keeps playing, quieter) and later unduck or
+            interrupt; the old apps get pause/resume. Never both kinds."""
+            said = iter(["광합성 설명해 줘", "아 그렇구나"])
+
+            async def stt(audio):
+                return next(said, "음")
+
+            async def llm(messages, max_tokens=600):
+                for i in range(8):
+                    yield f"{i + 1}번째 문장을 천천히 말하고 있어요. "
+                    await asyncio.sleep(0.02)
+
+            async def slow_tts(sentence):
+                await asyncio.sleep(0.05)
+                return b"\1\0" * 24000, 24000  # 1 s of audio per sentence: still playing when the voice comes
+            from fastapi.testclient import TestClient
+            globals().update(tts=slow_tts, llm_stream=llm, transcribe=stt,
+                             SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            history.clear()
+            tc = TestClient(app, client=("100.64.0.8", 1))
+            frames = []
+            with tc.websocket_connect(f"/v1/call?session=duck{duck}{'&duck=1' if duck else ''}",
+                                      headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(speech)
+                got = 0
+                while got < 2:
+                    m = w.receive()
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    got += bool(m.get("bytes"))
+                w.send_bytes(speech)  # the user talks over it
+                end = time.monotonic() + 3
+                while time.monotonic() < end:
+                    m = w.receive()
+                    frames.append("audio" if m.get("bytes") else json.loads(m["text"]))
+                    kinds = {f.get("type") for f in frames if isinstance(f, dict)}
+                    if kinds & {"unduck", "resume", "interrupt"}:
+                        break
+                w.send_text(json.dumps({"type": "hangup"}))
+            kinds = [f.get("type") for f in frames if isinstance(f, dict)]
+            return kinds
+        k = duck_check(True)
+        assert "duck" in k and "pause" not in k, k
+        k = duck_check(False)
+        assert "pause" in k and "duck" not in k, k
         globals().update(tts=real[1], llm_stream=real_llm)
 
         def hangup_check():

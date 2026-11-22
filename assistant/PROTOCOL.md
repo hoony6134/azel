@@ -67,6 +67,9 @@ answering a call the assistant placed; the server then speaks that call's openin
     short "생각이 길어져서 답을 못 정했어요. 한 번만 더 말씀해 주시겠어요?".
   - `{"type":"pause"}` — the user may be talking over the assistant: **pause playback, keep the queue**
   - `{"type":"resume"}` — it was noise or not a real interruption: continue the paused queue where it stopped
+  - `{"type":"duck"}` / `{"type":"unduck"}` — only on a call opened with `?duck=1`, instead of `pause` / `resume`: the user may
+    be talking over the assistant, so **keep playing at about 20 % volume**; `unduck` restores it (noise or echo),
+    `interrupt` (a real cut-in) drops the queue and restores it too. Apps without `duck=1` get `pause` / `resume`.
   - `{"type":"interrupt"}` — the user talked over the assistant: **drop all queued
     playback now** (after a `pause`, or after a tap-to-interrupt). An interrupt while paused is followed by
     `resume`, so the (now empty) queue is never left paused; a barge-in check whose STT fails also resumes.
