@@ -48,6 +48,8 @@ def site():
                 self.end_headers()
             elif self.path == "/file.txt":
                 self.send("파일 내용", "text/plain; charset=utf-8", [("Content-Disposition", 'attachment; filename="a b.txt"')])
+            elif self.path == "/blocked":
+                self.send("<title>제한</title><p>검색 서비스 이용이 제한되었습니다. 비정상적인 트래픽이 감지되었습니다.</p>")
             elif self.path == "/login":
                 self.send("<title>로그인</title><form><input type=password></form>")
             elif self.path.startswith("/found"):
@@ -123,6 +125,12 @@ def test_secret_fields_and_values_are_refused(br, site, selector, value):
     r = d.browser(action="fill", selector=selector, value=value)
     assert r["status"] == "refused" and "never typed" in r["reason"]
     assert ok(d.browser(action="fill", selector="#nm", value="김정훈"))["filled"] == "#nm"
+
+
+def test_a_human_check_page_is_flagged_not_worked_around(br, site):
+    r = ok(d.browser(action="open", url=site.url + "/blocked"))
+    assert r["bot_check"] is True and "login_required" not in r
+    assert "bot_check" not in ok(d.browser(action="open", url=site.url + "/detail"))
 
 
 def test_login_page_is_flagged_not_filled(br, site):
