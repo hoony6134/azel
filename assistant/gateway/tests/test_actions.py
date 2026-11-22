@@ -112,3 +112,22 @@ def test_only_the_app_may_send_an_exact_time(tgw):  # noqa: F811
     for caller in ("api", "qwen", "claude_code", "external"):
         r = asyncio.run(g.bridge.run("schedule_create", {"reason": "x", "when": when}, caller=caller))
         assert r["error"]["code"] == "invalid" and "when_text" in r["spoken"], caller
+
+
+def test_the_installed_apps_create_sheet_body_is_accepted(tgw):  # noqa: F811
+    """Schedule.actionBody (app Shared/Schedule.swift) sends purpose, not reason: "purpose 는 없는 인자예요" live 2026-11-22."""
+    g, c, _ = tgw
+    from datetime import datetime, timedelta
+    at = (datetime.now(g.KST) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    one_off = {"kind": "reminder", "notify": "call", "purpose": "약 먹기", "when": at.isoformat(), "persona_id": "azel"}
+    r = c.post("/v1/schedule", json=one_off, headers=V2).json()
+    assert r["ok"], r
+    rule = {"kind": "reminder", "notify": "push", "purpose": "물 마시기", "repeat_cron": "0 9 * * *",
+            "start_date": at.date().isoformat(), "persona_id": "azel", "confirmed": True}
+    r2 = c.post("/v1/schedule", json=rule, headers=V2).json()
+    assert r2["ok"], r2
+    both = asyncio.run(g.bridge.run("schedule_create", {**one_off, "reason": "약 챙기기"}, caller="app"))
+    assert both["ok"], both
+    items = c.get("/v1/schedule", headers=V2).json()["data"]
+    reasons = {i["purpose"] for i in items}
+    assert {"약 먹기", "물 마시기", "약 챙기기"} <= reasons, reasons  # purpose became the reason; reason wins over purpose

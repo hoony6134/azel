@@ -236,6 +236,9 @@ class Bridge:
         try:
             if caller == "app" and name not in APP_ACTIONS:
                 raise Fail("not_found", f"없는 기능이에요: {str(name)[:40]}")
+            if name in ("call_user", "schedule_create") and "purpose" in args:  # the installed app's create sheet says
+                args = {**{k: v for k, v in args.items() if k != "purpose"},  # purpose (schedule_update's name for it);
+                        "reason": args.get("reason") or args["purpose"]}  # reason wins when both are sent
             if name in OWN_SCHEMAS:
                 check_args(OWN_SCHEMAS[name], args)
             who = self.d.get("who", lambda: "")()
