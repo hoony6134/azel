@@ -281,17 +281,18 @@ sub onContent()
         m.name.text = c.d_name
         m.name.width = inner
         m.name.color = pal("text")
-        show(m.name, 28, 24)
+        ' name, price, change, then the source at the bottom; the 5-day line sits right of the price with a margin
+        show(m.name, 28, 26)
         if c.d_status = "unlisted" or c.d_status = "noprice"
             m.sent.text = c.d_sent
             m.sent.color = pal("text3")
             m.sent.height = 40
-            show(m.sent, 28, 70)
+            show(m.sent, 28, 78)
             return
         end if
         m.big.text = c.d_when
         m.big.color = pal("text")
-        show(m.big, 28, 68)
+        show(m.big, 28, 70)
         m.tail.text = c.d_tail
         ' Korean market colours: up red, down blue; the arrow says it too
         col = pal("text2")
@@ -303,12 +304,12 @@ sub onContent()
             m.tri.blendColor = col
             m.tri.rotation = 0
             if c.d_hl = "down" then m.tri.rotation = 3.14159
-            show(m.tri, 28, 128)
+            show(m.tri, 28, 150)
             tx = 52
         end if
-        show(m.tail, tx, 120)
-        show(m.meta, 28, 150)
-        drawSpark(c.d_series, w - 28 - 120, 78, 120, 56, col)
+        show(m.tail, tx, 142)
+        show(m.meta, 28, ch - 46)
+        drawSpark(c.d_series, w - 36 - 96, 84, 96, 52, col)
     else if t = "count"
         for i = 0 to 1
             n = c.d_n1

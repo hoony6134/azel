@@ -524,7 +524,7 @@ function buildV2(d as Object, now as Integer) as Object
         for each h in d.holdings
             cs.Push(stockCard(h))
         end for
-        sections.Push({title: "내 종목", w: 414, cap: 4, note: "", cards: cs})
+        sections.Push({title: "내 종목", w: 414, h: 232, cap: 4, note: "", cards: cs})  ' taller, like 날씨: room around the price
     end if
 
     ' 과제와 할 일 (남은 항목), then the other GISTRA lists as rows of their own: 7일 안 마감 (what is not already above),
@@ -822,6 +822,7 @@ end function
 
 function stockCard(h as Object) as Object
     c = newCard("stock", 414)
+    c.h = 232
     c.name = sv(h.name)
     c.dtitle = c.name
     unlisted = false

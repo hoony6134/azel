@@ -6,6 +6,7 @@ sub init()
     m.lines = []
     m.focus = 0
     m.offset = 0
+    m.pinned = false
     m.title = mkLabel(m.top, 96, 146, 1000, 56, 44, "sb", pal("text"))
     m.sub = mkLabel(m.top, 824, 166, 1000, 30, 24, "r", pal("text2"))
     m.sub.horizAlign = "right"
@@ -122,6 +123,12 @@ sub render()
     if m.lines.Count() = 0 and m.top.state = "ok" and not m.msg.visible then showMsg("보여 줄 내용이 없어요")
     m.focus = firstFocus()
     m.offset = 0
+    m.pinned = false
+    ' opened from a host card: that host's header is the top line, as if the page scrolled to it
+    if m.top.focusName <> "" and m.focus < m.lines.Count() and m.lines[m.focus].t = "host" and m.lines[m.focus].name = m.top.focusName
+        m.offset = m.focus  ' even near the end: the host on top, the rows under it empty
+        m.pinned = true
+    end if
     draw()
 end sub
 
@@ -215,8 +222,8 @@ sub buildInfra(d as Object)
 end sub
 
 sub makeSlotsFor(kind as String)
-    if kind = "infra" and (m.slots.Count() <> 13) then makeSlots(13, 52)
-    if kind = "tasks" and (m.slots.Count() <> 7) then makeSlots(7, 104)
+    if kind = "infra" and (m.slots.Count() <> 12) then makeSlots(12, 52)  ' ends above the key hint
+    if kind = "tasks" and (m.slots.Count() <> 6) then makeSlots(6, 104)  ' ends above the key hint
     ' no column header on the task page: its list starts right under the summary
     y = 316
     if kind = "tasks" then y = 276
@@ -532,7 +539,7 @@ sub draw()
     if m.focus < m.offset then m.offset = m.focus
     if m.focus > m.offset + n - 1 then m.offset = m.focus - n + 1
     ' scrolling up onto the first line of a group: also show the gap or section title above it
-    if m.offset > 0 and m.focus = m.offset and not m.lines[m.offset - 1].f then m.offset = m.offset - 1
+    if not m.pinned and m.offset > 0 and m.focus = m.offset and not m.lines[m.offset - 1].f then m.offset = m.offset - 1
     if m.msg.visible then return
     for i = 0 to n - 1
         s = m.slots[i]
@@ -560,6 +567,7 @@ sub draw()
 end sub
 
 sub move(d as Integer)
+    m.pinned = false
     i = m.focus + d
     while i >= 0 and i < m.lines.Count()
         if m.lines[i].f
