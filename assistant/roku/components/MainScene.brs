@@ -90,6 +90,9 @@ sub buildSettings()
         m.setItems.push(mkLabel(m.settings, 64, 170 + i * 66, 1100, 48, 26, "0x8FA3B3FF"))
     end for
     hint = mkLabel(m.settings, 64, 430, 1150, 140, 20, "0x6B7A88FF")
+    hint.wrap = true
+    hint.maxLines = 4
+    hint.lineSpacing = 8
     hint.text = "위아래로 고르고 확인(OK)을 누르세요." + Chr(10) + "토큰은 게이트웨이 ~/.config/biseo/tv_token 의 내용이에요(보기 전용)." + Chr(10) + "뒤로 가기로 돌아가요."
     m.setIdx = 0
     refreshSettings()
@@ -284,7 +287,8 @@ sub updateDash()
     m.status.color = "0x8FA3B3FF"
     if m.err <> ""
         m.status.color = "0xF0B35AFF"
-        m.status.text = "연결 끊김 · " + m.err + " · 마지막 " + m.lastOk
+        m.status.text = "연결 끊김 · " + m.err
+        if m.lastOk <> "" then m.status.text = m.status.text + " · 마지막 " + m.lastOk
     else
         a = part("assistant")
         s = ""
