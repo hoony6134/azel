@@ -286,7 +286,8 @@ def test_finish_call_continues_the_conversation(tgw, monkeypatch):
         await asyncio.sleep(0.2)
         await asyncio.gather(*[r for r in g.task_runs.values() if r])
     c.portal.call(go)
-    tid = sent[0]["task_id"]
+    tid = next(m for m in sent if m["type"] == "task_result")["task_id"]
+    assert {"type": "end_call", "session": "azel:iphone-2026-11-22", "reason": "작업 맡김"} in sent  # handed off: hang up
     assert c.get(f"/v1/tasks/{tid}").json()["status"] == "done"
     assert g.fake.db["kv"][f"task-{tid}"]["origin_session"] == "azel:iphone-2026-11-22"
     assert calls == [("task", "azel:iphone-2026-11-22")]

@@ -331,15 +331,23 @@ class StateDown(Exception):
 
 class State:
     def __init__(self, url):
-        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {STATE_TOKEN}"})
+        # ruchba's uvicorn drops idle connections after 5 s, httpx kept them 5 s too: a request on a just-closed one
+        # failed with "Server disconnected without sending a response" (it failed a running task, 2026-11-22)
+        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {STATE_TOKEN}"},
+                                        limits=httpx.Limits(keepalive_expiry=2))
         self.cache: dict = {}
 
     async def call(self, method, path, body=None, **params):
         """JSON result, None on 404, HTTPException on other 4xx, StateDown when unreachable."""
-        try:
-            r = await self.client.request(method, path, json=body, params=params or None)
-        except httpx.HTTPError as e:
-            raise StateDown(type(e).__name__) from e
+        for attempt in (1, 2):
+            try:
+                r = await self.client.request(method, path, json=body, params=params or None)
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                if attempt == 2 or method not in ("GET", "PUT", "DELETE"):  # POST may have run: never sent twice
+                    raise StateDown(type(e).__name__) from e
+            except httpx.HTTPError as e:
+                raise StateDown(type(e).__name__) from e
         if r.status_code >= 500:
             raise StateDown(f"HTTP {r.status_code}")
         if r.status_code == 404:
@@ -727,7 +735,8 @@ def device_prompt(settings, devices):
     order = list(dict.fromkeys(alias[n] for n in [settings["default_device"], *settings["device_fallback"]]
                                if n in alias))
     order += [d["id"] for d in devices if d["id"] not in order]
-    names = ", ".join(f"{i}(mcp__{i})" for i in order)
+    team = {d["id"] for d in devices if d.get("static")}  # their tools come through azel (approvals filed there)
+    names = ", ".join(f"{i}(mcp__azel__{i}__*)" if i in team else f"{i}(mcp__{i})" for i in order)
     first = settings["default_device"]
     note = "" if order[0] == alias.get(first) else f" 기본 기기 {first}는 꺼져 있어. {order[0]}에서 했다고 꼭 말해."
     return (f" 켜져 있는 기기, 우선순위 순: {names}. 사용자가 기기를 말하지 않으면 맨 앞 기기를 써.{note}")
@@ -760,6 +769,8 @@ def tool_info(name):
     """(Korean label, kind) for a tool, from its name alone (never its arguments or result)."""
     if name.startswith("mcp__"):
         server, _, tool = name.removeprefix("mcp__").partition("__")
+        if server == "azel" and "__" in tool:  # a team device served through azel: mcp__azel__spark__run_command
+            server, _, tool = tool.partition("__")
     elif "__" in name:  # the API, NIM and Qwen loops name device tools "<device>__<tool>"
         server, _, tool = name.partition("__")
     else:
@@ -866,6 +877,8 @@ discovery = connectors.Discovery(CLAUDE)
 def run_args(settings, devices, requester=""):
     """(--mcp-config servers, allowed tools, run-scoped --settings, env) for one Claude run: only the connectors and
     custom servers the user switched on, plus the device daemons (told which ask or task the run is for)."""
+    team = [d for d in devices if d.get("static")]  # served through azel's /v1/mcp: their approvals are filed there
+    devices = [d for d in devices if not d.get("static")]
     servers, allowed, run_settings, env = connectors.run_args(settings.get("connectors") or {}, discovery, devices,
                                                               TOKEN, HOME, device_tokens,
                                                               {"X-Azel-Requester": requester} if requester else None,
@@ -873,7 +886,7 @@ def run_args(settings, devices, requester=""):
     # music and home scenes only through azel's music_*/home_scene, which carry the confirm and taint guards
     deny = [f"mcp__{d['id']}__{t}" for d in devices for t in ("music", "home")]
     if requester.startswith("ask:"):  # asks (voice and app) never delegate: multi-step work goes through create_task
-        deny += [f"mcp__{d['id']}__delegate" for d in devices]
+        deny += [f"mcp__{d['id']}__delegate" for d in devices] + [f"mcp__azel__{d['id']}__delegate" for d in team]
     elif requester.startswith("task:"):  # a task never starts another task (no task chains)
         deny += ["mcp__azel__create_task", "mcp__azel__call_user", "mcp__azel__schedule_create",
                  "mcp__azel__schedule_update", "mcp__azel__schedule_cancel", "mcp__claude_ai_Cygnus_MCP__notify_send"]
@@ -970,6 +983,11 @@ async def device_tools(devices):
             tools.append({"name": name, "description": f"[{d['name']}] {t.get('description') or ''}"[:1024],
                           "input_schema": t.get("inputSchema") or {"type": "object"}})
     return tools, where
+
+
+async def team_tools():
+    """The reachable team devices' tools (static entries), for claude -p through /v1/mcp."""
+    return await device_tools([d for d in await fresh_devices() if d.get("static")])
 
 
 async def run_tool(block, where):
@@ -1429,11 +1447,26 @@ CHECKPOINT = "azel-checkpoint"  # the Claude checkpoint's raw note; fallback whe
 CHECKPOINT_PROMPT = (
     "자율 전화 판단용 상황 메모를 써. GISTRA(과제·시험·수업), Planit(할 일), 캘린더, 메일을 확인해서 "
     "앞으로 48시간 안에 마감이거나 사용자의 결정·답장이 필요한 것만, 한 줄에 하나씩 '[긴급도 1-5] 무엇 — 언제까지 — "
-    "왜 사용자가 필요함' 형식으로 10줄 이내로 써. 없으면 '없음'이라고만 써. 인사나 설명은 쓰지 마."
+    "왜 사용자가 필요함' 형식으로 10줄 이내로 써. 이미 제출했거나 완료로 표시된 것(GISTRA 제출 여부, Planit 완료)은 "
+    "쓰지 마. 제출 여부를 확인할 수 없으면 '제출 여부 모름'이라고 써, 미제출이라고 단정하지 마. "
+    "없으면 '없음'이라고만 써. 인사나 설명은 쓰지 마."
 )
 DECIDE_PROMPT = (
-    "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
-    "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
+    "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 전화는 사용자의 하루를 끊는 비싼 수단이야. "
+    "지금 전화하지 않으면 사용자가 실제로 손해를 보는 일일 때만 걸어. 횟수 제한은 없으니 정말 필요하면 몇 번이든 걸되, "
+    "필요 없으면 하루 종일 안 걸어도 돼.\n"
+    "걸 만한 일: 몇 시간 안에 마감인데 끝냈다는 흔적이 없는 일, 사용자 결정 없이는 곧 놓치는 일(곧 만료되는 승인 등), "
+    "서버 여러 대나 핵심 서비스가 통째로 죽어 계속 안 살아나는 장애.\n"
+    "걸지 말 일: 내일 이후 일정이나 마감의 단순 안내, 이미 제출·완료된 일, 지난 일, 사용자가 알아서 할 일. "
+    "서버 경보 하나나 금방 회복된 장애는 사용자가 ntfy 알림으로 이미 받으니 걸지 마.\n"
+    "recent_calls(최근 통화와 사용자가 한 말)를 꼭 봐: 사용자가 이미 받아서 '하겠다', '알고 있다'고 한 일은 그 뒤로 "
+    "충분히 시간을 줘. 예: 14시 통화에서 23시 마감 과제를 하겠다고 했으면 14시 반, 15시에는 다시 걸지 말고, 17시가 "
+    "넘어서도 끝난 흔적이 없고 마감이 다가올 때만 다시 걸어. 안 받은 전화는 아직 전달되지 않은 거야.\n"
+    "calendar_today(오늘 일정)를 봐: 지금 수업·회의·시험·발표 중이면 전화를 받을 수 없어. 그 일정이 끝난 뒤에도 늦지 "
+    "않으면 call=false로 두고, 끝나기를 기다릴 수 없을 만큼 급할 때(대규모 서버 장애, 1시간 안 마감인데 미완료)만 걸어.\n"
+    "상황 메모는 몇 시간 늦을 수 있어. 완료 여부가 불확실하면 미완료로 단정하지 말고 긴급도를 낮춰.\n"
+    "urgency: 5 = 지금 안 걸면 확실히 손해, 4 = 오늘 안에 꼭 알아야 하고 다른 알림으로는 안 닿음, 3 이하 = 전화 말고 "
+    "나중에 말해도 됨.\n"
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
     '"opening": "전화를 받자마자 할 말. 전해야 할 내용을 다 말해: 무엇이, 언제까지인지, 지금 무엇을 하면 되는지까지 '
     '필요한 만큼 길어도 돼. 왜 전화했는지만 짧게 말하고 끝내지 마. 말로 듣기 좋은 문장으로, 목록이나 마크다운 없이, '
@@ -1508,8 +1541,34 @@ async def gather_signals(now):
                 f"{'; '.join(r['open_questions'])[:120]}"
                 for r in rows if r["open_questions"] and r["task_id"] not in (SITUATION, CHECKPOINT)]
 
+    async def recent_calls():
+        """Calls of the last 12 h, oldest first, with what the user said ("내가 할게" at 14:00: no ring at 14:30),
+        and the autonomous calls that rang unanswered."""
+        out, answered = [], set()
+        for r in reversed(await state.call("GET", "/v1/state/history", limit=30) or []):
+            at = r.get("started_at") or 0
+            if now - at > 12 * 3600:
+                continue
+            row = await state.call("GET", f"/v1/state/history/{quote(r['id'], safe='')}") or {}
+            answered.add(row.get("call_id"))
+            said = " / ".join(t.get("user", "") for t in row.get("turns") or [])[:300] or "(말 없음)"
+            who = "비서가 건 전화" if r.get("direction") == "incoming" else "사용자가 건 전화"
+            out.append(f"{datetime.fromtimestamp(at, KST):%H:%M} {who}({r.get('reason') or ''}) — 사용자: {said}")
+        for r in await state.call("GET", "/v1/state/proactive_log", since=now - 12 * 3600, called="true") or []:
+            if r.get("call_id") not in answered:
+                out.append(f"{datetime.fromtimestamp(r['at'], KST):%H:%M} 자율 전화 안 받음: {r.get('reason', '')}")
+        return out
+
+    async def calendar_today():
+        """Today's Google Calendar and Gistra: in class or a meeting = can't take a call."""
+        if MODE != "full":
+            return []
+        day = datetime.fromtimestamp(now, KST).date().isoformat()
+        return (await agenda_text(day, day)).splitlines()[:30]
+
     for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
-                     ("tasks", contexts), ("device_jobs", lambda: device_jobs(now))):
+                     ("tasks", contexts), ("device_jobs", lambda: device_jobs(now)),
+                     ("recent_calls", recent_calls), ("calendar_today", calendar_today)):
         await source(name, fn)
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
@@ -1613,7 +1672,7 @@ async def llm_json(system, user, max_tokens=300):
 
 async def qwen_decide(signals, now):
     """Qwen's verdict, normalized; never trusted beyond its shape (the guardrails decide what happens)."""
-    if not any(signals.values()):
+    if not any(v for k, v in signals.items() if k not in ("recent_calls", "calendar_today")):  # context, not a reason
         return {"call": False, "urgency": 0, "reason": "신호 없음", "opening": ""}
     when = datetime.fromtimestamp(now, KST).strftime("%Y-%m-%d %H:%M (%a)")
     try:
@@ -1637,20 +1696,21 @@ def reason_hash(reason):
     return hashlib.sha256(re.sub(r"[\W_]+", "", reason.lower()).encode()).hexdigest()[:16]
 
 
+DUPLICATE_S = 2 * 3600
+
+
 def guard(decision, now, called_recent, a):
     """Why this decision may not ring (None = ring). `called_recent`: proactive_log rows that called, last 24 h."""
-    hm, today = datetime.fromtimestamp(now, KST).strftime("%H:%M"), datetime.fromtimestamp(now, KST).date()
+    hm = datetime.fromtimestamp(now, KST).strftime("%H:%M")
     if not decision["call"]:
         return "no_call"
     if decision["urgency"] < 4:
         return "urgency"
     if not a["window"][0] <= hm < a["window"][1]:
         return "window"
-    if sum(datetime.fromtimestamp(r["at"], KST).date() == today for r in called_recent) >= a["max_per_day"]:
-        return "max_per_day"
-    if any(now - r["at"] < a["min_gap_minutes"] * 60 for r in called_recent):
-        return "min_gap"
-    if any(r["reason_hash"] == reason_hash(decision["reason"]) for r in called_recent):
+    # no count or gap limit: the judge sees recent_calls and decides; max_per_day/min_gap stay in settings, unused
+    # same words within 2 h = Qwen repeating its last tick; later the same thing may need a second call
+    if any(r["reason_hash"] == reason_hash(decision["reason"]) and now - r["at"] < DUPLICATE_S for r in called_recent):
         return "duplicate"
     return None
 
@@ -3664,6 +3724,16 @@ async def continuation_parent(origin):
     return task_live.get(got[0]) or await state.call("GET", task_key(got[0]))
 
 
+async def hang_up_after_handoff():
+    """Work handed off in a call ends that call (the user's rule): the voice server hangs up once the reply that
+    confirms the task ("끝나면 전화드릴게요") has played."""
+    if origin := origin_ctx.get():
+        try:
+            await link_send({"type": "end_call", "session": origin, "reason": "작업 맡김"})
+        except Exception as e:  # the task stands either way
+            print("hang-up after handoff failed:", type(e).__name__, flush=True)
+
+
 async def task_create(body, source="api"):
     full_only()
     spec = check_task(body)
@@ -3700,6 +3770,7 @@ async def task_create(body, source="api"):
         await kv_list_add("tasks-scheduled", t["id"])
         if spec["when"] == "overnight":
             await kv_list_add("overnight-tasks", t["id"])  # the morning report reads these
+        await hang_up_after_handoff()
         return t
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
@@ -3709,6 +3780,7 @@ async def task_create(body, source="api"):
         task_runs.pop(t["id"], None)
         raise
     start_task(t)
+    await hang_up_after_handoff()
     return t
 
 
@@ -4580,6 +4652,7 @@ bridge = tools_bridge.Bridge(
     task_cancel=lambda tid: task_cancel(tid),
     approval_list=lambda: list_approvals(), approval_get=lambda aid: get_approval(aid),
     approval_create=lambda body: create_approval(body), approval_ran=lambda aid, body: approval_ran(aid, body),
+    team_tools=lambda: team_tools(),
     device_token=lambda url: device_tokens.get(url, TOKEN),
     llm=lambda system, user: llm_json(system, user),
     memory_search=lambda q, n: memory_search(q, n), memory_add=lambda text, meta: memory_add(text, meta),

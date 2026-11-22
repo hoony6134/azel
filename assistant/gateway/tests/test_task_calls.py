@@ -395,3 +395,21 @@ def test_an_instruction_in_a_finish_call_continues_the_same_task(tgw, monkeypatc
     assert 'resume="0f8c2b4e-1111-2222-3333-444455556666"' in prompt and 'cwd="/Users/jh/dev/sandbox"' in prompt
     other = c.portal.call(in_call, {"goal": "새로운 조사 해 줘", "persona": "azel"}, "azel:elsewhere")
     assert not other.get("parent_task")  # another call: a new task
+
+
+def test_a_task_handed_off_in_a_call_ends_that_call(tgw, monkeypatch):
+    g, c, notes = tgw
+    sent = []
+
+    async def link_send(m):
+        sent.append(m)
+    monkeypatch.setattr(g, "link_send", link_send)
+
+    async def create(body, origin):
+        g.origin_ctx.set(origin)
+        return await g.task_create(body, "voice")
+    c.portal.call(create, {"goal": "다운로드 폴더 정리해 줘", "persona": "azel"}, "azel:s1")
+    assert {"type": "end_call", "session": "azel:s1", "reason": "작업 맡김"} in sent
+    sent.clear()
+    c.portal.call(create, {"goal": "다운로드 폴더 정리해 줘", "persona": "azel"}, "")  # the app: no call to end
+    assert not [m for m in sent if m["type"] == "end_call"]

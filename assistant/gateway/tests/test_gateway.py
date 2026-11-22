@@ -713,7 +713,8 @@ def test_call_history_round_trip(gw):
     h = g.fake.db["history"]["L1"]
     assert [t["user"] for t in h["turns"]] == ["오늘 일정 알려줘"] and h["ended"] and h["direction"] == "incoming"
     assert "type" not in h and h["turns"][0]["activity"] == ["캘린더 확인 중"]
-    assert c.get("/v1/history").json() == [{"id": "L1", "title": "오늘 일정 알려줘", "turns": 1}]
+    assert c.get("/v1/history").json() == [{"id": "L1", "title": "오늘 일정 알려줘", "turns": 1, "started_at": 1.0,
+                                            "direction": "incoming", "reason": "morning_briefing"}]
     assert c.get("/v1/history?q=일정").json()[0]["id"] == "L1" and c.get("/v1/history?q=없음").json() == []
     assert c.get("/v1/history/L1").json()["opening"] == "좋은 아침이에요."
     assert c.delete("/v1/history/L1").json() == {"deleted": 1}
@@ -955,12 +956,11 @@ def test_guardrails(gw):
     assert g.guard({**yes, "urgency": 3}, at(10), [], A) == "urgency"
     for h, m in [(2, 0), (7, 59), (23, 0), (23, 30)]:  # Qwen can never ring outside the window
         assert g.guard(yes, at(h, m), [], A) == "window", (h, m)
-    assert g.guard(yes, at(20), [called(at(8)), called(at(11)), called(at(14))], A) == "max_per_day"
-    assert g.guard(yes, at(20), [called(at(8)), called(at(11))], A) is None  # two today: one left
-    assert g.guard(yes, at(20), [called(at(8) - 86400), called(at(11) - 86400), called(at(14) - 86400)], A) is None
-    assert g.guard(yes, at(12), [called(at(11))], A) == "min_gap"  # 60 min < 120
-    assert g.guard(yes, at(13, 1), [called(at(11))], A) is None
-    assert g.guard(yes, at(20), [called(at(9), "서버 다운!")], A) == "duplicate"  # same reason, other punctuation
+    # no count or gap cap: the judge decides from recent_calls
+    assert g.guard(yes, at(20), [called(at(h)) for h in (8, 11, 14, 19)], A) is None
+    assert g.guard(yes, at(11, 30), [called(at(11))], A) is None
+    assert g.guard(yes, at(10), [called(at(9), "서버 다운!")], A) == "duplicate"  # same reason, other punctuation
+    assert g.guard(yes, at(17), [called(at(14), "서버 다운")], A) is None  # 3 h later and still true: ring again
 
 
 def auto_setup(g, monkeypatch, verdict):
@@ -989,7 +989,7 @@ def test_autonomous_tick_calls_logs_and_dedupes(gw, monkeypatch):
     assert placed == [("autonomous", "ruchba 디스크가 꽉 찼어요. 볼까요?")] and entry["called"] and len(entry["call_id"]) == 32
     assert g.fake.db["plog"][-1]["call_id"] == entry["call_id"]  # the row names the call that rang
     assert "NodeDown" in asked[0]  # the signal reached the decision
-    later = now + timedelta(hours=3)  # past the gap, same reason
+    later = now + timedelta(hours=1)  # same reason within 2 h
     g.fake.now = lambda: later.timestamp()
     entry = asyncio.run(g.autonomous_tick(later, A))
     assert entry["blocked_by"] == "duplicate" and len(placed) == 1
@@ -1768,3 +1768,22 @@ def test_moving_an_oauth_connector_forgets_its_grant(gw):
     body["custom"][0]["url"] = "https://other.example.com/mcp"
     assert c.put("/v1/connectors", json=body).status_code == 200 and g.oauth.load(tmp, "notes") is None
     assert c.put("/v1/connectors", json={"claude_ai": [], "custom": [{"name": "spotify", "url": "https://x.example/mcp"}]}).status_code == 400
+
+
+def test_state_retries_an_idempotent_request_once_on_a_dropped_connection(gw):
+    g, _, _ = gw
+    import httpx
+    seen = []
+
+    def handler(req):
+        seen.append(req.method)
+        if len(seen) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, json={"ok": True})
+    st = g.State("http://state")
+    st.client = httpx.AsyncClient(base_url="http://state", transport=httpx.MockTransport(handler))
+    assert asyncio.run(st.call("GET", "/v1/x")) == {"ok": True} and seen == ["GET", "GET"]
+    seen.clear()
+    with pytest.raises(g.StateDown):  # a POST may already have run: it is not sent again
+        asyncio.run(st.call("POST", "/v1/x", {}))
+    assert seen == ["POST"]

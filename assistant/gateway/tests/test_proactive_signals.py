@@ -51,3 +51,24 @@ def test_checkpoint_prompt_is_dated_with_the_night_rule(gw):  # noqa: F811
 def test_the_opening_says_what_needs_saying(gw):  # noqa: F811
     g, _, _ = gw
     assert "다 말해" in g.DECIDE_PROMPT and "마크다운 없이" in g.DECIDE_PROMPT
+
+
+def test_recent_calls_show_what_the_user_said_and_unanswered_rings(gw, monkeypatch):  # noqa: F811
+    g, _, _ = gw
+    now = ts(22, 14, 30)
+
+    async def no_agenda(f, t):
+        return "### 11월 22일 (일)\n- 15:00~16:30 역사학특강 [수업]"
+    monkeypatch.setattr(g, "agenda_text", no_agenda)
+    g.fake.db["history"]["h1"] = {"id": "h1", "call_id": "c1", "started_at": ts(22, 14), "direction": "incoming",
+                                  "reason": "autonomous", "turns": [{"user": "응 지금 할게"}]}
+    g.fake.db["history"]["old"] = {"id": "old", "started_at": ts(21, 9), "turns": [{"user": "어제 얘기"}]}
+    g.fake.now = lambda: ts(22, 14)
+    g.fake.db["plog"] += [{"id": 1, "at": ts(22, 14), "called": True, "call_id": "c1", "reason": "토론지"},
+                          {"id": 2, "at": ts(22, 12), "called": True, "call_id": "c0", "reason": "서버 다운"}]
+    sig = asyncio.run(g.gather_signals(now))
+    assert sig["recent_calls"] == ["14:00 비서가 건 전화(autonomous) — 사용자: 응 지금 할게",
+                                   "12:00 자율 전화 안 받음: 서버 다운"], sig["recent_calls"]
+    assert any("역사학특강" in x for x in sig["calendar_today"])
+    # context alone is no reason to ask the judge
+    assert asyncio.run(g.qwen_decide({"recent_calls": ["x"], "calendar_today": ["y"], "alerts": []}, now))["reason"] == "신호 없음"
