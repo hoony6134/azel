@@ -229,15 +229,15 @@ function pageColumns(p as Integer) as Object
             cols.push({t: "대기", b: "-"})
             cols.push({t: "최근", b: "-"})
         else
-            run = []
+            running = []
             for each r in t.running
-                run.push("• " + r.goal)
+                running.push("• " + r.goal)
             end for
             rec = []
             for each r in t.recent
                 rec.push("• " + r.goal + "  (" + r.status + ")")
             end for
-            cols.push({t: "실행 중", b: joinLines(run, "없음")})
+            cols.push({t: "실행 중", b: joinLines(running, "없음")})
             cols.push({t: "대기", b: "대기 " + t.queued.ToStr() + "건" + Chr(10) + "승인 대기 " + t.approvals.ToStr() + "건 (앱에서 처리)"})
             cols.push({t: "최근 끝난 일", b: joinLines(rec, "없음")})
         end if
