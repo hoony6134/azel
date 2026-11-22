@@ -18,8 +18,33 @@ struct CallEvent: Decodable, Equatable {
     var context: Context?     // `context`: the first frame of a call placed for a task or a reminder
     var caps: [String]?       // what this call's server supports (`hello` frame): text, mode, played…
     var reason: String?       // text_rejected: too_long | too_fast
+    var secret: Bool?         // state frames: this call is secret (incognito)
+    /// A boolean `value` (`{"type":"secret","value":true}`); `value` then stays nil.
+    var flag: Bool?
 
     struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret
+    }
+
+    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil) {
+        self.type = type; self.value = value; self.text = text; self.route = route
+    }
+
+    /// Field by field and tolerant: one odd field never drops the whole frame.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decode(String.self, forKey: .type)
+        if let s = try? c.decodeIfPresent(String.self, forKey: .value) { value = s } else { flag = try? c.decodeIfPresent(Bool.self, forKey: .value) }
+        func str(_ k: CodingKeys) -> String? { try? c.decodeIfPresent(String.self, forKey: k) }
+        text = str(.text); route = str(.route); message = str(.message); phase = str(.phase); label = str(.label)
+        tool = str(.tool); kind = str(.kind); mode = str(.mode); reason = str(.reason)
+        reply_id = try? c.decodeIfPresent(Int.self, forKey: .reply_id)
+        context = try? c.decodeIfPresent(Context.self, forKey: .context)
+        caps = try? c.decodeIfPresent([String].self, forKey: .caps)
+        secret = try? c.decodeIfPresent(Bool.self, forKey: .secret)
+    }
 }
 
 struct AppSettings: Codable, Equatable {

@@ -55,6 +55,7 @@ struct CallScreen: View {
     private var screen: some View {
         ZStack {
             GlazeBackground(state: jarState, tint: tint)
+            if call.secret { Color.black.opacity(0.35).ignoresSafeArea().allowsHitTesting(false) }   // secret: a darker room
             VStack(spacing: Theme.l) {
                 topBar
                 if let c = call.callContext {
@@ -110,7 +111,8 @@ struct CallScreen: View {
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { Circle().fill(p.tint).frame(width: 8, height: 8) }
                     Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
                 }
-                BrainModeControl(current: call.brainMode) { call.chooseBrain($0) }
+                BrainModeControl(current: call.brainMode, pick: { call.chooseBrain($0) },
+                                 secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) })
             }
             Group {
                 if let r = call.log.lastRoute { RouteChip(route: r) }
@@ -196,7 +198,7 @@ struct CallScreen: View {
                     .accessibilityLabel("오디오 출력 선택")
                 Text("출력").font(.footnote).foregroundStyle(Theme.text2)
             }
-            dockButton("녹음", call.recording ? "stop.circle.fill" : "record.circle", on: call.recording, onColor: Theme.danger,
+            dockButton("녹음", call.secret ? "record.circle" : (call.recording ? "stop.circle.fill" : "record.circle"), on: call.recording, onColor: Theme.danger,
                        value: call.recording ? "녹음 중" : "꺼짐") {
                 if call.recording || recordingNoticeShown { call.toggleRecording() } else { askRecord = true }
             }

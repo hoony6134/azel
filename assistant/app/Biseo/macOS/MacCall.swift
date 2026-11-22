@@ -71,6 +71,9 @@ final class MacCall: ObservableObject {
     @Published private(set) var brainMode: String?
     /// The server takes typed turns on this call (`text` in its caps).
     @Published private(set) var canType = false
+    /// Secret (incognito): nothing kept, no recording, no captions on the Lock Screen.
+    @Published private(set) var secret = false
+    @Published private(set) var canSecret = false
     /// The panel's text field is open (it grows to fit).
     @Published var typing = false { didSet { if typing != oldValue { resizePanel() } } }
     @Published var typedDraft = ""
@@ -202,6 +205,11 @@ final class MacCall: ObservableObject {
 
     func hangUp() { end(error: nil, keepPanel: false) }
 
+    func setSecret(_ on: Bool) {
+        guard inCall else { return }
+        client.sendSecret(on)
+    }
+
     func sendTyped(_ text: String, speak: Bool) {
         guard inCall else { return }
         client.sendText(text, speak: speak)
@@ -258,6 +266,7 @@ final class MacCall: ObservableObject {
     func toggleRecording() {
         guard inCall else { return }
         if client.isRecording { client.stopRecording() } else {
+            guard !secret else { self.error = "시크릿 통화는 녹음하지 않아요"; return }
             do { try client.startRecording(session: activeSession) } catch { self.error = "녹음 시작 실패" }
         }
         recording = client.isRecording
@@ -285,7 +294,9 @@ final class MacCall: ObservableObject {
             let mode = BrainModeChoice.shared.takeForCall()
             brainMode = mode
             if pendingUtterance != nil { client.sending = false }   // nothing live goes ahead of the utterance
-            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode)
+            let wantSecret = BrainModeChoice.shared.takeSecretForCall()
+            secret = wantSecret
+            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
             connectedAt = Date()
             AzelFiles.micLive.create()
             if let id = pendingUtterance { pendingUtterance = nil; sendUtterance(id) }
@@ -297,7 +308,15 @@ final class MacCall: ObservableObject {
 
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
-        if let caps = CallClient.caps(event) { canType = caps.contains("text") }
+        if let caps = CallClient.caps(event) {
+            canType = caps.contains("text")
+            canSecret = caps.contains("secret")
+            Task { @MainActor in BrainModeChoice.shared.remember(caps: caps) }
+        }
+        if let s = CallClient.reportedSecret(event), s != secret {
+            secret = s
+            if s && recording { toggleRecording() }   // a secret call keeps no recording
+        }
         if event.type == "text_rejected" {
             let hint = CallLog.rejection(event.reason)
             error = hint
@@ -347,6 +366,8 @@ final class MacCall: ObservableObject {
         AzelFiles.micLive.remove()
         brainMode = nil
         canType = false
+        secret = false
+        canSecret = false
         typing = false
         typedDraft = ""
         fadeTask?.cancel(); idleTask?.cancel()
@@ -445,7 +466,7 @@ struct CallPanelView: View {
                             .keyboardShortcut(call.typing ? nil : KeyboardShortcut(.space, modifiers: []))
                         if call.canType { Button("입력하기") { call.typing = true } }
                         Button(call.held ? "대기 해제" : "대기") { call.toggleHold() }
-                        Button(call.recording ? "녹음 중지" : "녹음") { call.toggleRecording() }
+                        Button(call.recording ? "녹음 중지" : "녹음") { call.toggleRecording() }.disabled(call.secret && !call.recording)
                     } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("통화 제어")
                     Button { call.hangUp() } label: {
@@ -457,7 +478,8 @@ struct CallPanelView: View {
                 HStack(spacing: Theme.xs) {
                     // §17.8: the persona's name before the route chip.
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
-                    BrainModeControl(current: call.brainMode) { call.chooseBrain($0) }
+                    BrainModeControl(current: call.brainMode, pick: { call.chooseBrain($0) },
+                                     secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) })
                     if let r = call.log.lastRoute { RouteChip(route: r) }
                 }
             }
@@ -476,6 +498,7 @@ struct CallPanelView: View {
         .frame(width: 460, height: MacCall.panelHeight(typing: call.typing))
         .background {
             if reduceTransparency { Theme.bgRaised } else { Rectangle().fill(.ultraThinMaterial) }
+            if call.secret { Color.black.opacity(0.3) }
         }
         .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous)

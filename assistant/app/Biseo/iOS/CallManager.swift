@@ -54,6 +54,9 @@ final class CallManager: NSObject, ObservableObject {
     @Published private(set) var brainMode: String?
     /// The server takes typed turns on this call (`text` in its caps).
     @Published private(set) var canType = false
+    /// Secret (incognito): nothing kept, no recording, no captions on the Lock Screen.
+    @Published private(set) var secret = false
+    @Published private(set) var canSecret = false
     private var activeSession: String?
     /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
     @Published private(set) var activePersona: Persona?
@@ -88,6 +91,11 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     // MARK: UI actions
+
+    func setSecret(_ on: Bool) {
+        guard inCall else { return }
+        client.sendSecret(on)
+    }
 
     func sendTyped(_ text: String, speak: Bool) {
         guard inCall else { return }
@@ -159,6 +167,7 @@ final class CallManager: NSObject, ObservableObject {
     func toggleRecording() {
         guard inCall else { return }
         if client.isRecording { client.stopRecording() } else {
+            guard !secret else { self.error = "시크릿 통화는 녹음하지 않아요"; return }
             do { try client.startRecording(session: callID ?? Session.current(sessionPrefix)) } catch { self.error = "녹음 시작 실패" }
         }
         recording = client.isRecording
@@ -198,6 +207,8 @@ final class CallManager: NSObject, ObservableObject {
         error = nil
         brainMode = nil
         canType = false
+        secret = false
+        canSecret = false
         let session = AVAudioSession.sharedInstance()
         // .allowBluetooth: AirPods and other headsets (HFP, mic and speaker) can carry the call;
         // without it the route picker lists them but the route never moves (user bug, 2026-11-22).
@@ -217,7 +228,9 @@ final class CallManager: NSObject, ObservableObject {
         let intent = callID == nil && sessionPrefix == "briefing" ? "briefing" : nil
         let mode = MainActor.assumeIsolated { BrainModeChoice.shared.takeForCall() }
         brainMode = mode
-        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode) } catch {
+        let wantSecret = MainActor.assumeIsolated { BrainModeChoice.shared.takeSecretForCall() }
+        secret = wantSecret
+        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode, secret: wantSecret) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
@@ -232,7 +245,15 @@ final class CallManager: NSObject, ObservableObject {
 
     private func handle(_ event: CallEvent) {
         if let m = CallClient.reportedMode(event) { brainMode = m }
-        if let caps = CallClient.caps(event) { canType = caps.contains("text") }
+        if let caps = CallClient.caps(event) {
+            canType = caps.contains("text")
+            canSecret = caps.contains("secret")
+            Task { @MainActor in BrainModeChoice.shared.remember(caps: caps) }
+        }
+        if let s = CallClient.reportedSecret(event), s != secret {
+            secret = s
+            if s && recording { toggleRecording() }   // a secret call keeps no recording
+        }
         if event.type == "text_rejected" { error = CallLog.rejection(event.reason) }
         if let c = CallContext.from(event: event) { callContext = c; return }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }

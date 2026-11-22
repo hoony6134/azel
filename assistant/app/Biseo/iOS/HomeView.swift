@@ -110,7 +110,8 @@ struct HomeView: View {
                             in: RoundedRectangle(cornerRadius: Theme.callButtonRadius, style: .continuous))
         }
         .buttonStyle(.plain)
-        .brainModeMenu(current: brain.next?.rawValue) { brain.next = $0 }
+        .brainModeMenu(current: brain.next?.rawValue, pick: { brain.next = $0 },
+                       secretCall: { brain.nextSecret = true; call.startCall() })
         .disabled(model.statusError != nil)
         .opacity(model.statusError != nil ? 0.5 : 1)
         .accessibilityHint(model.statusError != nil ? FriendlyError.describe(model.statusError!).title : "통화를 시작합니다")

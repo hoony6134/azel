@@ -44,6 +44,20 @@ final class BrainModeChoice: ObservableObject {
     @Published var supported = false
     /// For the next call only; nil = the setting's default.
     @Published var next: BrainMode?
+    /// The next call starts secret (home's "시크릿으로 걸기").
+    @Published var nextSecret = false
+    /// The caps the last call's server listed, so home can offer what calls support.
+    @Published var lastCaps: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "callCaps") ?? [])
+
+    func remember(caps: [String]) {
+        lastCaps = Set(caps)
+        UserDefaults.standard.set(caps, forKey: "callCaps")
+    }
+
+    func takeSecretForCall() -> Bool {
+        defer { nextSecret = false }
+        return nextSecret
+    }
 
     /// Taken once by the call that starts next.
     func takeForCall() -> String? {
@@ -75,15 +89,24 @@ struct BrainModeMenu: ViewModifier {
     /// The mode in effect, to tick it.
     var current: String?
     var pick: (BrainMode) -> Void
+    /// Home only: "시크릿으로 걸기", when the last call's server supported secret calls.
+    var secretCall: (() -> Void)? = nil
 
     func body(content: Content) -> some View {
-        if choice.supported {
+        let secret = secretCall != nil && choice.lastCaps.contains("secret")
+        if choice.supported || secret {
             content.contextMenu {
-                ForEach(BrainMode.allCases) { m in
-                    Button { pick(m) } label: {
-                        if let h = m.hint { Text(m.label); Text(h) } else { Text(m.label) }
-                        if (current ?? "auto") == m.rawValue { Image(systemName: "checkmark") }
+                if choice.supported {
+                    ForEach(BrainMode.allCases) { m in
+                        Button { pick(m) } label: {
+                            if let h = m.hint { Text(m.label); Text(h) } else { Text(m.label) }
+                            if (current ?? "auto") == m.rawValue { Image(systemName: "checkmark") }
+                        }
                     }
+                }
+                if secret, let secretCall {
+                    Divider()
+                    Button { secretCall() } label: { Label("시크릿으로 걸기", systemImage: "eye.slash") }
                 }
             }
         } else {
@@ -93,8 +116,8 @@ struct BrainModeMenu: ViewModifier {
 }
 
 extension View {
-    func brainModeMenu(current: String?, pick: @escaping (BrainMode) -> Void) -> some View {
-        modifier(BrainModeMenu(current: current, pick: pick))
+    func brainModeMenu(current: String?, pick: @escaping (BrainMode) -> Void, secretCall: (() -> Void)? = nil) -> some View {
+        modifier(BrainModeMenu(current: current, pick: pick, secretCall: secretCall))
     }
 }
 
@@ -104,18 +127,29 @@ struct BrainModeControl: View {
     @ObservedObject private var choice = BrainModeChoice.shared
     var current: String?
     var pick: (BrainMode) -> Void
+    /// This call is secret / the server can make it secret (`secret` in caps).
+    var secret = false
+    var canSecret = false
+    var setSecret: (Bool) -> Void = { _ in }
 
     var body: some View {
-        if choice.supported {
+        if choice.supported || canSecret {
             let m = BrainMode.current(current)
             Menu {
-                Picker("두뇌", selection: Binding(get: { m }, set: { pick($0) })) {
-                    ForEach(BrainMode.allCases) { Text($0.short).tag($0) }
+                if choice.supported {
+                    Picker("두뇌", selection: Binding(get: { m }, set: { pick($0) })) {
+                        ForEach(BrainMode.allCases) { Text($0.short).tag($0) }
+                    }
+                    .pickerStyle(.inline)
                 }
-                .pickerStyle(.inline)
+                if canSecret {
+                    Divider()
+                    Toggle(isOn: Binding(get: { secret }, set: { setSecret($0) })) { Label("시크릿", systemImage: "eye.slash") }
+                }
             } label: {
                 HStack(spacing: 3) {
-                    Text(m.short)
+                    if secret { Image(systemName: "eye.slash").font(.caption2).accessibilityLabel("시크릿") }
+                    Text(choice.supported ? m.short : (secret ? "시크릿" : "옵션"))
                     Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
                 }
                 .font(.footnote)

@@ -51,7 +51,8 @@ final class LiveActivities {
     static func callState(_ c: CallManager) -> CallActivityAttributes.ContentState {
         let last = c.lines.last
         return .init(state: c.held ? "held" : (c.connectedAt == nil ? "connecting" : c.displayState),
-                     caption: last.map { String($0.text.suffix(120)) }, mine: last?.mine ?? false, muted: c.muted)
+                     caption: c.secret ? nil : last.map { String($0.text.suffix(120)) }, mine: last?.mine ?? false, muted: c.muted,
+                     secret: c.secret)
     }
 
     private func syncCall() {

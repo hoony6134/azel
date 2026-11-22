@@ -104,3 +104,33 @@ final class TypedRejectionTests: XCTestCase {
         XCTAssertEqual(CallContext.from(event: ctx)?.chip, "예약: 약 먹기")
     }
 }
+
+@MainActor
+final class SecretCallTests: XCTestCase {
+    func testSecretFramesAndURL() throws {
+        let d = JSONDecoder()
+        XCTAssertEqual(CallClient.reportedSecret(try d.decode(CallEvent.self, from: Data(#"{"type":"secret","value":true}"#.utf8))), true)
+        XCTAssertEqual(CallClient.reportedSecret(try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening","secret":false}"#.utf8))), false)
+        XCTAssertNil(CallClient.reportedSecret(try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening"}"#.utf8))))
+        let req = try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "s", callID: nil, secret: true)
+        XCTAssertTrue(req.url!.absoluteString.contains("secret=1"))
+        XCTAssertFalse(try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "s", callID: nil).url!.absoluteString.contains("secret"))
+    }
+
+    func testOneOddFieldNeverDropsAFrame() throws {
+        // A boolean `value` used to fail the whole decode (value was String-only).
+        let e = try JSONDecoder().decode(CallEvent.self, from: Data(#"{"type":"secret","value":true,"reply_id":"x"}"#.utf8))
+        XCTAssertEqual(e.flag, true)
+        XCTAssertNil(e.value)
+        XCTAssertNil(e.reply_id, "a wrongly typed field is just skipped")
+    }
+
+    func testHomeSecretCallIsTakenOnce() {
+        let c = BrainModeChoice.shared
+        c.nextSecret = true
+        XCTAssertTrue(c.takeSecretForCall())
+        XCTAssertFalse(c.takeSecretForCall())
+        c.remember(caps: ["text", "secret"])
+        XCTAssertTrue(c.lastCaps.contains("secret"))
+    }
+}
