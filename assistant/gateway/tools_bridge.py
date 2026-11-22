@@ -157,7 +157,9 @@ class Bridge:
             dev_defs = [t for t in dev_defs if where[t["name"]][1] != "delegate"]
         cyg_defs, _ = self.d["cygnus"]()
         cyg_defs = [t for t in cyg_defs if t["name"] not in CYGNUS_WRAPPED]  # one name, one tool (the API needs it)
-        own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if await self.mode() == "local" else OWN_TOOLS
+        # local mode: web_search only through the user's own SearXNG, and only while it answers
+        local_no_web = await self.mode() == "local" and not await self.web_ok()
+        own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if local_no_web else OWN_TOOLS
         g_defs, _ = self.d.get("google", lambda: ([], None))()
         s_defs, _ = self.d.get("spotify", lambda: ([], None))()
         return [*dev_defs, *own, *cyg_defs, *g_defs, *s_defs], where
@@ -265,8 +267,8 @@ class Bridge:
         if name in MAC_ACTIONS:
             return await self.mac(name, args, where, caller)
         if name == "web_search":
-            if await self.mode() == "local":  # Haiku-backed: not in local mode (web_fetch stays)
-                raise Fail("unavailable", "로컬 모드에서는 웹 검색을 못 해요.")
+            if await self.mode() == "local" and not await self.web_ok():  # SearXNG down: no paid search in local
+                raise Fail("unavailable", "로컬 모드에서는 지금 웹 검색을 못 해요.")
             q = str(args["query"]).strip()
             if not q:
                 raise Fail("invalid", "무엇을 찾을지 알려 주세요.")
@@ -276,7 +278,8 @@ class Bridge:
             first = re.split(r"(?<=[.!?。])\s+|\n", r["text"].strip())[0] if r["text"] else "찾은 결과가 없어요."
             lead = f"[{site} 기준] " if site else ""  # the citation in front, where a model copies it from
             return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
-                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마.)"
+                f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마. 같은 걸 다시 검색하지 " \
+                "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
@@ -406,6 +409,9 @@ class Bridge:
         await self.d["place_call"]("user_request", f"말씀하신 대로 전화드렸어요. {reason}", pid)
         await self.log_call(reason, None, pid)
         return "지금 전화를 걸게요."
+
+    async def web_ok(self):
+        return await self.d["web_ok"]() if "web_ok" in self.d else False
 
     async def mode(self):
         return await self.d["mode"]() if "mode" in self.d else "auto"

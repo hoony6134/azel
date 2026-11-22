@@ -24,6 +24,7 @@ def start(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("BISEO_LLM_URL", "http://127.0.0.1:9/v1/chat/completions")  # never the real Qwen in tests
+    monkeypatch.setenv("BISEO_SEARXNG_URL", "http://127.0.0.1:9/search")  # nor the real SearXNG
     monkeypatch.setenv("BISEO_WARM_CLAUDE", "0")  # the one-shot fake; test_warm_claude covers the warm path
     for k, v in env.items():
         monkeypatch.setenv(k, v)

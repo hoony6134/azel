@@ -102,3 +102,90 @@ def test_voice_turns_never_delegate_tasks_still_can(tmp_path, monkeypatch):
     task = json.loads(g.run_args({"connectors": {}}, devices, "task:t1")[2])
     assert "mcp__macbook__delegate" in ask["permissions"]["deny"]  # claude -p answering a call or the app
     assert "mcp__macbook__delegate" not in task.get("permissions", {}).get("deny", [])
+
+
+SX = {"results": [
+    {"title": "광주 날씨", "url": "https://weather.example/gwangju", "content": "오늘 광주는 맑고 낮 최고 9도예요. " * 6,
+     "engine": "bing"},
+    {"title": "광주지방기상청", "url": "https://www.kma.example/gj", "content": "예보와 특보를 확인하세요.", "engine": "yandex"},
+    {"title": "nope", "url": "ftp://x/y", "content": "", "engine": "x"}],
+    "answers": [], "infoboxes": [], "unresponsive_engines": [["brave", "Suspended: too many requests"],
+                                                             ["duckduckgo", "CAPTCHA"]]}
+
+
+def sx_client(payload, seen=None):
+    def handler(request):
+        if seen is not None:
+            seen.append(dict(request.url.params))
+        return httpx.Response(200, json=payload)
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def test_searxng_results_in_the_usual_shape():
+    seen = []
+    r = asyncio.run(web.searxng("광주 날씨", 5, client=sx_client(SX, seen)))
+    assert seen[0] == {"q": "광주 날씨", "format": "json", "language": "ko"}
+    assert [s["url"] for s in r["sources"]] == ["https://weather.example/gwangju", "https://www.kma.example/gj"]
+    assert "(weather.example)" in r["text"] and "낮 최고 9도" in r["text"] and r["cost_usd"] == 0
+    assert r["unresponsive"] == ["brave", "duckduckgo"]  # failing engines inside SearXNG are not a failure
+
+
+def test_thin_snippets_read_the_top_pages(monkeypatch):
+    thin = {**SX, "results": [{"title": "광주지방기상청", "url": "https://www.kma.example/gj", "content": "날씨 지도.",
+                               "engine": "bing"}]}
+
+    async def page(url, client=None):
+        return {"url": url, "text": "현재 기온 7도, 오후에 맑음"}
+    monkeypatch.setattr(web, "fetch", page)
+    r = asyncio.run(web.searxng("광주 날씨", 5, client=sx_client(thin)))
+    assert "[kma.example 본문] 현재 기온 7도" in r["text"]
+    assert asyncio.run(web.searxng("x", 5, client=sx_client({"results": []}))) is None  # nothing found
+
+
+def test_searxng_first_haiku_only_as_a_fallback_and_never_in_local(tmp_path, monkeypatch):
+    from test_gateway import start
+    g = start(tmp_path, monkeypatch)
+    calls = []
+
+    async def sx(query, n, url):
+        calls.append("searxng")
+        return None  # found nothing
+
+    async def haiku(key, query, n):
+        calls.append("haiku")
+        return {"text": "맑음", "sources": [], "cost_usd": 0.01, "usage": {}}
+    monkeypatch.setattr(g.web, "searxng", sx)
+    monkeypatch.setattr(g.web, "search", haiku)
+    g.API_KEY = "sk-test"
+    assert asyncio.run(g.web_search("날씨", 5))["text"] == "맑음" and calls == ["searxng", "haiku"]
+    calls.clear()
+
+    async def local():
+        g.mode_ctx.set("local")
+        return await g.web_search("날씨", 5)
+    try:
+        asyncio.run(local())
+        raise AssertionError("no error")
+    except g.HTTPException as e:
+        assert e.status_code == 503 and calls == ["searxng"]  # never the paid search in local mode
+
+
+def test_local_mode_offers_web_search_only_while_searxng_answers():
+    from test_tools_bridge import World
+    b = World().bridge()
+    up = {"ok": True}
+
+    async def mode():
+        return "local"
+
+    async def web_ok():
+        return up["ok"]
+
+    async def found(q, n):
+        return {"text": "맑음", "sources": [{"title": "기상청", "url": "https://kma.example"}], "cost_usd": 0.0}
+    b.d.update(mode=mode, web_ok=web_ok, web_search=found)
+    assert "web_search" in [t["name"] for t in asyncio.run(b.tools("qwen"))[0]]
+    assert asyncio.run(b.run("web_search", {"query": "날씨"}, caller="qwen"))["ok"]
+    up["ok"] = False
+    assert "web_search" not in [t["name"] for t in asyncio.run(b.tools("qwen"))[0]]
+    assert asyncio.run(b.run("web_search", {"query": "날씨"}, caller="qwen"))["error"]["code"] == "unavailable"
