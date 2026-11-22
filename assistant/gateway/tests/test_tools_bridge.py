@@ -663,3 +663,18 @@ def test_a_task_cannot_start_another_web_task_and_browser_reads_taint_the_run():
     assert w.run == [("macbook__browser", {"action": "open", "url": "https://example.com"})]  # no blanket approval for qwen
     r = run(b.call("web_task", {"goal": "다른 일"}))  # after a browser read a task needs the user's yes
     assert "확인할게요" in r["content"] and len(w.tasks) == 0
+
+
+def test_grant_flow_forwards_in_roots_to_the_approval_request(monkeypatch):
+    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
+    w = GrantWorld()
+    orig = w.run_tool
+
+    async def with_roots(block, where):
+        r = await orig(block, where)
+        if not block["input"].get("grant"):
+            r = {"content": json.dumps({**json.loads(r["content"]), "in_roots": True}), "is_error": False}
+        return r
+    w.run_tool = with_roots
+    run(w.bridge().call("spark__run_command", {"command": "pwd"}, where={"spark__run_command": ("http://spark", "run_command")}))
+    assert w.created[0]["in_roots"] is True
