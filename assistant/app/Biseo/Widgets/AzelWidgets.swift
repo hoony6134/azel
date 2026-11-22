@@ -36,7 +36,7 @@ struct CallLiveActivity: Widget {
                 Orb(glaze: a.glaze).frame(width: 44, height: 44)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        Text(a.name).font(.headline)
+                        Text(a.name).font(.headline).lineLimit(1)
                         Text(LiveActivityText.callState(s.state)).font(.subheadline).foregroundStyle(Color(hex: a.glaze))
                         if s.muted { Image(systemName: "mic.slash.fill").font(.caption).foregroundStyle(.secondary).accessibilityLabel("음소거") }
                         Spacer()
@@ -64,7 +64,7 @@ struct CallLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.center) {
                     HStack(spacing: 6) {
-                        Text(a.name).font(.headline)
+                        Text(a.name).font(.headline).lineLimit(1)
                         Text(LiveActivityText.callState(s.state)).font(.subheadline).foregroundStyle(Color(hex: a.glaze))
                     }
                 }

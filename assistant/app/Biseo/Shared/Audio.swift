@@ -151,9 +151,16 @@ final class AudioIO {
         return (pausedAt ?? ProcessInfo.processInfo.systemUptime) < speechEnd
     }
 
+    /// Real audio hardware. Off in the unit-test host: touching the input node asks for the
+    /// microphone, and unsigned test runs flooded the Mac with permission prompts (2026-11-22).
+    /// Tests get an in-memory fake with the same bookkeeping.
+    nonisolated(unsafe) static var hardware = !Config.isTestHost
+    private var fakeRunning = false
+
     /// iOS: call after CallKit activated the audio session.
     func start() throws {
         started = true   // from here on stop() has something to undo, even if start throws
+        guard Self.hardware else { fakeRunning = true; return }
         let input = engine.inputNode
         #if os(macOS)
         // Set before voice processing so the echo canceller pairs the chosen devices.
@@ -215,8 +222,8 @@ final class AudioIO {
     }
 
     func play(_ pcm16: Data) {
-        guard engine.isRunning, let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
-        player.scheduleBuffer(buf)
+        guard isRunning, let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
+        if Self.hardware { player.scheduleBuffer(buf) }
         let now = ProcessInfo.processInfo.systemUptime
         speechLock.lock()
         speechEnd = max(speechEnd, pausedAt ?? now) + Double(buf.frameLength) / buf.format.sampleRate
@@ -257,8 +264,8 @@ final class AudioIO {
     }
 
     /// True while the engine (and so the mic and voice processing) is running.
-    var isRunning: Bool { engine.isRunning }
-    var voiceProcessingOn: Bool { engine.inputNode.isVoiceProcessingEnabled }
+    var isRunning: Bool { Self.hardware ? engine.isRunning : fakeRunning }
+    var voiceProcessingOn: Bool { Self.hardware ? engine.inputNode.isVoiceProcessingEnabled : fakeRunning }
 
     /// Idempotent. Taps and the ducking timer go first, then the players and the engine.
     func stop() {
@@ -272,6 +279,7 @@ final class AudioIO {
         }
         guard started else { return }
         started = false
+        guard Self.hardware else { fakeRunning = false; levels.reset(); return }
         engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
         engine.stop()

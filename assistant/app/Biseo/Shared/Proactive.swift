@@ -21,39 +21,67 @@ enum DeviceID {
     }
 }
 
-/// One entry of `GET /v1/proactive/log`: why the assistant did (or didn't) call.
+/// One entry of `GET /v1/proactive/log`: why the assistant did (or didn't) call. The server sends
+/// {id, at (epoch), call, urgency (number), reason, opening, called, blocked_by, signals, call_id,
+/// persona_id}; older builds sent `ts`.
 struct ProactiveDecision: Decodable, Identifiable, Equatable {
-    var id: String { "\(ts.timeIntervalSince1970)-\(reason)" }
+    var id: String { serverID ?? "\(ts.timeIntervalSince1970)-\(reason)" }
+    let serverID: String?
     let ts: Date
+    /// The model wanted to call.
     let call: Bool
+    /// A call actually went out (`called`); falls back to `call` on older servers.
+    let called: Bool
     let urgency: String?
     let reason: String
+    let opening: String?
+    let blockedBy: String?
 
-    private enum Keys: String, CodingKey { case ts, call, urgency, reason }
+    private enum Keys: String, CodingKey { case id, at, ts, call, called, urgency, reason, opening, blocked_by }
 
-    init(ts: Date, call: Bool, urgency: String?, reason: String) {
-        self.ts = ts; self.call = call; self.urgency = urgency; self.reason = reason
+    init(ts: Date, call: Bool, urgency: String?, reason: String, called: Bool? = nil, opening: String? = nil, blockedBy: String? = nil) {
+        serverID = nil; self.ts = ts; self.call = call; self.called = called ?? call; self.urgency = urgency
+        self.reason = reason; self.opening = opening; self.blockedBy = blockedBy
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
-        if let n = try? c.decode(Double.self, forKey: .ts) { ts = Date(timeIntervalSince1970: n) }
+        if let s = try? c.decode(String.self, forKey: .id) { serverID = s }
+        else if let n = try? c.decode(Int.self, forKey: .id) { serverID = String(n) }
+        else { serverID = nil }
+        let key: Keys = c.contains(.at) ? .at : .ts
+        if let n = try? c.decode(Double.self, forKey: key) { ts = Date(timeIntervalSince1970: n) }
         else {
-            let s = try c.decode(String.self, forKey: .ts)
+            let s = try c.decode(String.self, forKey: key)
             let f = ISO8601DateFormatter()
             f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let g = ISO8601DateFormatter()
             guard let d = f.date(from: s) ?? g.date(from: s) else {
-                throw DecodingError.dataCorruptedError(forKey: .ts, in: c, debugDescription: "unreadable ts \(s)")
+                throw DecodingError.dataCorruptedError(forKey: key, in: c, debugDescription: "unreadable time \(s)")
             }
             ts = d
         }
-        call = try c.decodeIfPresent(Bool.self, forKey: .call) ?? false
+        call = (try? c.decodeIfPresent(Bool.self, forKey: .call)) ?? false
+        called = (try? c.decodeIfPresent(Bool.self, forKey: .called)) ?? call
         // Urgency may be a word or a number; keep it as text.
         if let s = try? c.decode(String.self, forKey: .urgency) { urgency = s }
         else if let n = try? c.decode(Double.self, forKey: .urgency) { urgency = n == n.rounded() ? String(Int(n)) : String(n) }
         else { urgency = nil }
-        reason = try c.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        reason = (try? c.decodeIfPresent(String.self, forKey: .reason)) ?? ""
+        opening = (try? c.decodeIfPresent(String.self, forKey: .opening)).flatMap { $0.isEmpty ? nil : $0 }
+        blockedBy = (try? c.decodeIfPresent(String.self, forKey: .blocked_by)).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Why no call went out, in words; nil when it called.
+    var notCalledBecause: String? {
+        guard !called else { return nil }
+        switch blockedBy {
+        case "min_gap", "gap": return "간격 제한으로 안 걸었어요"
+        case "daily_cap", "max_per_day", "cap": return "하루 횟수 제한으로 안 걸었어요"
+        case "window", "outside_window": return "전화할 수 있는 시간이 아니라서 안 걸었어요"
+        case "no_call", nil: return call ? "걸지 못했어요" : "전화할 필요 없다고 판단했어요"
+        case let other?: return "안 걸었어요 (\(other))"
+        }
     }
 
     static func load() async throws -> [ProactiveDecision] {
@@ -81,13 +109,15 @@ struct ProactiveLogView: View {
                 ForEach(items) { d in
                     Card {
                         HStack(spacing: Theme.s) {
-                            Image(systemName: d.call ? "phone.fill" : "phone.down").foregroundStyle(d.call ? Theme.celadon : Theme.text3)
-                            Text(d.call ? "전화함" : "전화 안 함").font(.headline).foregroundStyle(Theme.text)
+                            Image(systemName: d.called ? "phone.fill" : "phone.down").foregroundStyle(d.called ? Theme.celadon : Theme.text3)
+                            Text(d.called ? "전화함" : "전화 안 함").font(.headline).foregroundStyle(Theme.text)
                             if let u = d.urgency { Text("긴급도 \(u)").font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2) }
                             Spacer()
                             Text(KST.dayAndTime(d.ts)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3)
                         }
-                        Text(d.reason).foregroundStyle(Theme.text2).textSelection(.enabled)
+                        if let why = d.notCalledBecause { Text(why).font(.subheadline.weight(.semibold)).foregroundStyle(Theme.amber) }
+                        if !d.reason.isEmpty { Text(d.reason).foregroundStyle(Theme.text2).textSelection(.enabled) }
+                        if let o = d.opening { Text("첫마디: “\(o)”").font(.footnote).foregroundStyle(Theme.text3).textSelection(.enabled) }
                     }
                     .accessibilityElement(children: .combine)
                 }

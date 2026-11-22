@@ -190,10 +190,11 @@ struct SetupFlow: View {
     }
 
     static func requestMic() async -> Bool {
+        guard AudioIO.hardware else { return false }   // never a permission prompt from the test host
         #if os(iOS)
-        await AVAudioApplication.requestRecordPermission()
+        return await AVAudioApplication.requestRecordPermission()
         #else
-        await AVCaptureDevice.requestAccess(for: .audio)
+        return await AVCaptureDevice.requestAccess(for: .audio)
         #endif
     }
 }
@@ -292,11 +293,13 @@ struct SettingsScreen<Extra: View>: View {
                     }
                 }
                 ApprovalRulesCard()
+                AutoGrantsCard()
                 usageCard
                 statusCard
                 if let s = Binding($settings) {
                     modelCard(s)
                     taskCard(s)
+                    if s.wrappedValue.overnight != nil { overnightCard(s) }
                     budgetCard(s)
                     proactiveCard(s)
                     deviceCard(s)
@@ -607,6 +610,22 @@ struct SettingsScreen<Extra: View>: View {
         }
     }
 
+    /// 밤새: when overnight tasks run, and how the morning report comes.
+    private func overnightCard(_ s: Binding<AppSettings>) -> some View {
+        let o = Binding(get: { s.wrappedValue.overnight ?? .init(window: ["01:00", "06:00"], report_push: true, report_call: false) },
+                        set: { s.wrappedValue.overnight = $0 })
+        let hours = (0..<24).map { String(format: "%02d:00", $0) }
+        return Card("밤새 맡기기") {
+            row("시작") { picker(hours.map { ($0, $0) }, Binding(get: { o.wrappedValue.window.first ?? "01:00" },
+                                                              set: { o.wrappedValue.window = [$0, o.wrappedValue.window.last ?? "06:00"] })) }
+            row("끝") { picker(hours.map { ($0, $0) }, Binding(get: { o.wrappedValue.window.last ?? "06:00" },
+                                                             set: { o.wrappedValue.window = [o.wrappedValue.window.first ?? "01:00", $0] })) }
+            Toggle("아침에 알림으로 알려 주기", isOn: o.report_push).foregroundStyle(Theme.text)
+            Toggle("아침에 전화로 알려 주기", isOn: o.report_call).foregroundStyle(Theme.text)
+            Text("밤새 맡긴 일은 이 시간에 하고, 결과는 아침 브리핑 때 알려 드려요.").font(.footnote).foregroundStyle(Theme.text3)
+        }
+    }
+
     private func budgetCard(_ s: Binding<AppSettings>) -> some View {
         Card("예산") {
             row("월 예산 (USD)") {
@@ -794,6 +813,7 @@ struct SettingsScreen<Extra: View>: View {
             let s = DeviceID.normalize(raw)
             AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)   // before the 호칭 row renders
             BrainModeChoice.shared.supported = BrainModeChoice.reports(data)
+            AppSettings.supportsOvernight = AppSettings.reportsOvernight(data)
             loaded = s
             settings = s
             if let n = s.assistant_name { AssistantName.current = n; nameDraft = AssistantName.current }

@@ -16,8 +16,39 @@ struct CallEvent: Decodable, Equatable {
     var reply_id: Int?        // reply_start
     var mode: String?         // the active brain mode (state / mode events)
     var context: Context?     // `context`: the first frame of a call placed for a task or a reminder
+    var caps: [String]?       // what this call's server supports (`hello` frame): text, mode, played…
+    var reason: String?       // text_rejected: too_long | too_fast
+    var secret: Bool?         // state frames: this call is secret (incognito)
+    var auto: Bool?           // state frames: an auto-approve grant is live for this call
+    var expires_at: Double?   // auto_approve: when the grant ends (epoch)
+    /// A boolean `value` (`{"type":"secret","value":true}`); `value` then stays nil.
+    var flag: Bool?
 
     struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at
+    }
+
+    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil) {
+        self.type = type; self.value = value; self.text = text; self.route = route
+    }
+
+    /// Field by field and tolerant: one odd field never drops the whole frame.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decode(String.self, forKey: .type)
+        if let s = try? c.decodeIfPresent(String.self, forKey: .value) { value = s } else { flag = try? c.decodeIfPresent(Bool.self, forKey: .value) }
+        func str(_ k: CodingKeys) -> String? { try? c.decodeIfPresent(String.self, forKey: k) }
+        text = str(.text); route = str(.route); message = str(.message); phase = str(.phase); label = str(.label)
+        tool = str(.tool); kind = str(.kind); mode = str(.mode); reason = str(.reason)
+        reply_id = try? c.decodeIfPresent(Int.self, forKey: .reply_id)
+        context = try? c.decodeIfPresent(Context.self, forKey: .context)
+        caps = try? c.decodeIfPresent([String].self, forKey: .caps)
+        secret = try? c.decodeIfPresent(Bool.self, forKey: .secret)
+        auto = try? c.decodeIfPresent(Bool.self, forKey: .auto)
+        expires_at = try? c.decodeIfPresent(Double.self, forKey: .expires_at)
+    }
 }
 
 struct AppSettings: Codable, Equatable {
@@ -103,6 +134,12 @@ struct AppSettings: Codable, Equatable {
     /// Whether the gateway knows `user_title` (its GET included the key). Today's gateway doesn't, and
     /// rejects unknown keys on PUT, so the 호칭 rows stay hidden and the field is never sent until it does.
     @MainActor static var supportsUserTitle = false
+    /// The gateway takes `when` on tasks (its settings include `overnight`).
+    @MainActor static var supportsOvernight = false
+
+    static func reportsOvernight(_ data: Data) -> Bool {
+        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["overnight"] != nil
+    }
 
     /// The GET /v1/settings JSON has a `user_title` key (any value, "" or null included).
     static func reportsUserTitle(_ data: Data) -> Bool {
@@ -113,6 +150,8 @@ struct AppSettings: Codable, Equatable {
     var task_backend: String?
     /// auto | local | claude_api | claude_code: the default brain for calls. nil on older gateways.
     var brain_mode: String?
+    /// The overnight work queue (nil on older gateways: the 밤새 choices stay hidden).
+    var overnight: OvernightSettings?
     /// Extra model providers; `providers.nim` is NVIDIA NIM. Optional for older gateways.
     var providers: Providers?
 

@@ -39,6 +39,7 @@ final class AppModel: ObservableObject {
             if let name = s.assistant_name { AssistantName.current = name }
             AppSettings.supportsUserTitle = AppSettings.reportsUserTitle(data)
             BrainModeChoice.shared.supported = BrainModeChoice.reports(data)
+            AppSettings.supportsOvernight = AppSettings.reportsOvernight(data)
         }
         switch await approvalsResult {
         case .success(let data):

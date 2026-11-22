@@ -78,13 +78,14 @@ final class CallClient {
     /// The token goes in the Authorization header, never the query: query strings end up in proxy logs.
     /// `intent`: e.g. "briefing" for 오늘 브리핑 / the Siri briefing, so the server opens with it.
     static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil,
-                        persona: String? = nil, mode: String? = nil) throws -> URLRequest {
+                        persona: String? = nil, mode: String? = nil, secret: Bool = false) throws -> URLRequest {
         guard var url = URLComponents(string: voiceURL + "/v1/call") else { throw StartError.notConfigured }
         url.queryItems = [URLQueryItem(name: "session", value: session)]
         if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
         if let intent { url.queryItems?.append(URLQueryItem(name: "intent", value: intent)) }
         if let persona { url.queryItems?.append(URLQueryItem(name: "persona", value: persona)) }
         if let mode { url.queryItems?.append(URLQueryItem(name: "mode", value: mode)) }
+        if secret { url.queryItems?.append(URLQueryItem(name: "secret", value: "1")) }
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -92,10 +93,10 @@ final class CallClient {
     }
 
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
-    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil) throws {
+    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil, secret: Bool = false) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
-                                                                         session: session, callID: callID, intent: intent, persona: persona, mode: mode))
+                                                                         session: session, callID: callID, intent: intent, persona: persona, mode: mode, secret: secret))
         socket = task
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
@@ -396,6 +397,41 @@ final class CallClient {
         }
         statsLock.lock(); sentBytes += pcm16.count; sentPeak = max(sentPeak, Self.peak(pcm16)); statsLock.unlock()
     }
+
+    /// A typed user turn (`{"type":"text","text":…,"speak":…}`): answered like speech, with
+    /// audio when `speak`, as text only otherwise.
+    func sendText(_ text: String, speak: Bool) {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["type": "text", "text": text, "speak": speak]),
+              let s = String(data: data, encoding: .utf8) else { return }
+        socket?.send(.string(s)) { _ in }
+    }
+
+    /// The server's capabilities when a frame lists them (`hello`).
+    static func caps(_ e: CallEvent) -> [String]? { e.caps }
+
+    /// Auto-approve for this call (`{"type":"auto_approve","value",…}`); the server answers with the
+    /// grant's `expires_at`, and state frames carry `auto`.
+    func sendAutoApprove(_ on: Bool, minutes: Int? = nil, devices: [String]? = nil) {
+        var b: [String: Any] = ["type": "auto_approve", "value": on]
+        if on, let minutes { b["minutes"] = minutes }
+        if on, let devices, !devices.isEmpty { b["devices"] = devices }
+        guard let d = try? JSONSerialization.data(withJSONObject: b), let s = String(data: d, encoding: .utf8) else { return }
+        socket?.send(.string(s)) { _ in }
+    }
+
+    /// (on, expires) when a frame reports the call's auto-approve state.
+    static func reportedAuto(_ e: CallEvent) -> (on: Bool, expires: Date?)? {
+        if e.type == "auto_approve", let on = e.flag ?? e.auto { return (on, e.expires_at.map { Date(timeIntervalSince1970: $0) }) }
+        return e.auto.map { ($0, nil) }
+    }
+
+    /// Secret (incognito) on or off mid-call; the server confirms with a secret frame.
+    func sendSecret(_ on: Bool) {
+        socket?.send(.string(#"{"type":"secret","value":\#(on)}"#)) { _ in }
+    }
+
+    /// Whether the call is secret, when a frame says so (`{"type":"secret","value":…}` or a state's `secret`).
+    static func reportedSecret(_ e: CallEvent) -> Bool? { e.type == "secret" ? (e.flag ?? e.secret) : e.secret }
 
     /// Mid-call brain switch (`{"type":"mode","value":…}`); the server confirms with a mode event.
     func switchMode(_ mode: String) {

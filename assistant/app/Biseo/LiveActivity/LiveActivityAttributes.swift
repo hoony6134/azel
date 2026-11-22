@@ -11,6 +11,8 @@ struct CallActivityAttributes: ActivityAttributes {
         var caption: String?
         var mine: Bool
         var muted: Bool
+        /// Secret call: the Lock Screen and Dynamic Island show no captions.
+        var secret: Bool = false
     }
 
     var name: String

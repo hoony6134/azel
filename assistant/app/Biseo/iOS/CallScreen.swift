@@ -9,6 +9,9 @@ struct CallScreen: View {
     @State private var showTranscript = false
     @State private var banner: String?
     @State private var askRecord = false
+    @State private var typing = false
+    @State private var draft = ""
+    @FocusState private var typingFocus: Bool
     @AppStorage("recordingNoticeShown") private var recordingNoticeShown = false
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @AppStorage("noiseMode") private var noiseMode = "normal"
@@ -52,20 +55,9 @@ struct CallScreen: View {
     private var screen: some View {
         ZStack {
             GlazeBackground(state: jarState, tint: tint)
+            if call.secret { Color.black.opacity(0.35).ignoresSafeArea().allowsHitTesting(false) }   // secret: a darker room
             VStack(spacing: Theme.l) {
                 topBar
-                if let m = BrainMode.chip(call.brainMode) {
-                    // In 로컬만 the assistant may say it needs Claude: a tap switches this call back to 자동.
-                    Button { if call.brainMode == BrainMode.local.rawValue { call.chooseBrain(.auto) } } label: {
-                        Label(call.brainMode == BrainMode.local.rawValue ? "\(m) · 탭하면 자동" : m, systemImage: "cpu")
-                            .font(.footnote.weight(.semibold)).foregroundStyle(Theme.indigo)
-                            .padding(.horizontal, Theme.m).padding(.vertical, 4)
-                            .background(.ultraThinMaterial, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("두뇌: \(m)")
-                    .accessibilityHint(call.brainMode == BrainMode.local.rawValue ? "두 번 탭하면 자동으로 바꿔요" : "")
-                }
                 if let c = call.callContext {
                     Label(c.chip, systemImage: c.kind == "task" ? "checklist" : "bell").font(.footnote.weight(.semibold))
                         .foregroundStyle(Theme.text).lineLimit(1)
@@ -78,8 +70,12 @@ struct CallScreen: View {
                         .background(.ultraThinMaterial, in: Capsule())
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
-                    .contentTransition(.opacity).animation(Theme.state, value: jarState)
+                // One Text (icon inline) so the crossfade swaps a single label; a Label with
+                // contentTransition left the old state drawn under the new one (user bug, 2026-11-22).
+                Text("\(Image(systemName: jarState.symbol)) \(jarState.spokenLabel)").font(.headline).foregroundStyle(jarState.color)
+                    .contentTransition(.opacity)
+                    .animation(reduceMotion ? nil : Theme.quick, value: jarState)
+                    .accessibilityLabel(jarState.spokenLabel)
                 GeometryReader { geo in
                     MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt, tint: tint).frame(width: geo.size.width, height: geo.size.height)
                         .contentShape(Rectangle())
@@ -94,6 +90,7 @@ struct CallScreen: View {
                     Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
                 }
                 captions
+                typingRow
                 dock
                 hangUp
             }
@@ -113,9 +110,15 @@ struct CallScreen: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            HStack(spacing: 6) {
-                if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { Circle().fill(p.tint).frame(width: 8, height: 8) }
-                Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+            VStack(spacing: 2) {
+                HStack(spacing: 6) {
+                    if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { Circle().fill(p.tint).frame(width: 8, height: 8) }
+                    Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
+                }
+                BrainModeControl(current: call.brainMode, pick: { call.chooseBrain($0) },
+                                 secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) },
+                                 auto: call.autoOn, autoExpires: call.autoExpires, canAuto: call.canAuto,
+                                 setAuto: { call.setAuto($0, minutes: $1, devices: $2) })
             }
             Group {
                 if let r = call.log.lastRoute { RouteChip(route: r) }
@@ -143,6 +146,8 @@ struct CallScreen: View {
                                         Text(line.text + (line.interrupted ? " …" : ""))
                                     }
                                 }
+                            } else if line.typed == true {
+                                Text("\(Image(systemName: "keyboard")) \(line.text)").accessibilityLabel("입력: \(line.text)")
                             } else {
                                 Text(line.text + (line.interrupted ? " …" : ""))
                             }
@@ -171,6 +176,24 @@ struct CallScreen: View {
         }
     }
 
+    /// Typing during the call (the server lists `text` in its caps); the mic stays as it is.
+    @ViewBuilder private var typingRow: some View {
+        if call.canType {
+            if typing {
+                CallTypingField(text: $draft, focus: $typingFocus, send: { call.sendTyped($0, speak: $1) },
+                                close: { typing = false; typingFocus = false })
+                    .padding(.horizontal, Theme.m).padding(.vertical, Theme.s)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: Theme.rowRadius, style: .continuous))
+            } else {
+                Button { typing = true; typingFocus = true } label: {
+                    Label("입력하기", systemImage: "keyboard").font(.footnote).foregroundStyle(Theme.text2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("키보드로 말을 입력해요")
+            }
+        }
+    }
+
     private var dock: some View {
         let buttons = Group {
             dockButton("음소거", call.muted ? "mic.slash.fill" : "mic.fill", on: call.muted, onColor: Theme.amber) { call.toggleMute() }
@@ -181,7 +204,7 @@ struct CallScreen: View {
                     .accessibilityLabel("오디오 출력 선택")
                 Text("출력").font(.footnote).foregroundStyle(Theme.text2)
             }
-            dockButton("녹음", call.recording ? "stop.circle.fill" : "record.circle", on: call.recording, onColor: Theme.danger,
+            dockButton("녹음", call.secret ? "record.circle" : (call.recording ? "stop.circle.fill" : "record.circle"), on: call.recording, onColor: Theme.danger,
                        value: call.recording ? "녹음 중" : "꺼짐") {
                 if call.recording || recordingNoticeShown { call.toggleRecording() } else { askRecord = true }
             }

@@ -112,6 +112,7 @@ final class WakeClipRecorder {
 
     /// Calls `done` on the main queue with the clip.
     func record(done: @escaping ([Float]) -> Void) throws {
+        guard AudioIO.hardware else { throw AVError(.unknown) }   // no mic in the test host
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard let mono = AVAudioFormat(standardFormatWithSampleRate: format.sampleRate, channels: 1),
