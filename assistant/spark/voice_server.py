@@ -63,7 +63,7 @@ LENGTH_STYLE = {
 LENGTH_TOKENS = {"brief": 250, "normal": 600, "detailed": 1000}  # Qwen max_tokens per reply_length
 SYSTEM_BODY = (
     "지금은 음성 통화 중이라 답이 그대로 소리로 읽혀. "
-    "한국어로 자연스럽게 말해. 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. 첫 마디는 열 글자 안팎으로 짧게 하되 내용으로 시작해. "
+    "한국어로 자연스럽게 말해. 말투(존댓말/반말)는 비서 성격을 따르고, 성격에 정해져 있지 않으면 존댓말로 말해. "
     "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
     "없으니, 도구가 없으면 할 수 없다고 하고 다시 물어봐. "
@@ -288,7 +288,7 @@ def activity_note(said):
 def local_prompt(text):
     """Qwen's prompt in local mode: no hand-over tag to emit (there is no Claude to hand over to)."""
     text = re.sub(r"[^.。]*" + re.escape(ROUTE_TAG) + r"[^.。]*[.。]\s*", "", text)
-    return text + " 할 수 없거나 모르는 건 짧게 모른다고 말하고, 지어내지 마."
+    return text + " 사용자의 일정이나 개인 정보, 최신 정보처럼 확인할 수 없는 사실은 모른다고 말해. 잡담과 네 이야기는 성격대로 편하게 해."
 
 
 def system_prompt(name, length="normal", context="", persona="", title=""):
@@ -1097,9 +1097,28 @@ ACK_WORDS = re.compile(r"네네|넵|네|예|응|알겠습니다|알겠어요|알
                        r"(확인|찾아|알아|검색)(해\s*)?(볼게요|드릴게요)|잠시만요|기다려\s*주세요")
 TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|예|그래|그래요|알겠어|알았어|좋아|오케이|ok|여보세요|여보|"
                      r"잘\s*자|수고\S*|아니\S*|맞아\S*|됐어|괜찮아\S*|오키)[\s.!~?,]*", re.I)
-SMALL_TALK = ("이건 도구가 필요한 질문이 아니야. 도구나 확인 없이 네 성격대로 바로 답해. 같이 뭘 하자는 말(게임, 퀴즈, "
-              "이야기, 연습)이면 따라 말하지 말고 지금 바로 시작해서 네 첫 수를 둬. 그냥 하는 말이면 맞장구만 치지 말고 질문이나 "
-              "생각, 가벼운 농담을 하나 덧붙여. 일정이나 할 일 내용은 지어내지 마.")
+RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일을 한 도구가 없었어. 하지 않은 일을 했다고 하지 말고, 그 말은 빼고 "
+                      "이어서 자연스럽게 다시 말해. 이미 한 말은 반복하지 마.",
+           "personal": "방금 '{s}'라고 했는데, 사용자의 일정이나 개인 정보는 확인된 게 없어. 지어내지 말고 그 말은 빼고 이어서 "
+                        "자연스럽게 다시 말해. 이미 한 말은 반복하지 마."}
+STUB_NOTE = "방금 답이 너무 짧아서 아무 내용이 없었어. 이미 한 말은 반복하지 말고, 질문에 네 성격대로 내용을 담아 이어서 답해."
+INTERJECTION = re.compile(r"아+|어+|오+|음+|응+|네+|예|그거|그게|뭐+|헐|와+|우와|아이고|진짜|정말|그러니까|있잖아|맞다|글쎄")
+
+
+class Recheck(Exception):
+    def __init__(self, kind, sentence):
+        super().__init__(sentence)
+        self.kind, self.sentence = kind, sentence
+
+
+def stub(reply, title=""):
+    """True when a reply is only an interjection ("아, 그거!", "오빠, 아, 그거!"): nothing else but one syllable at most.
+    A short real answer ("세 개야.") is not one."""
+    words = [w for w in re.findall(r"[가-힣A-Za-z0-9]+", reply.replace(title, " ") if title else reply)
+             if not INTERJECTION.fullmatch(w)]
+    return len("".join(words)) < 2
+
+
 NUDGE = ("방금 대답에 내용이 없었어. 질문에 실제 내용으로 바로 답해. "
          f"직접 답할 수 없으면 다른 말 없이 정확히 {ROUTE_TAG} 만 출력해.")
 
@@ -1151,12 +1170,24 @@ def hours_in(text):
     return {(int(n) if n else KO_HOURS[w]) % 12 for n, w in _HOUR_RE.findall(text)}
 
 
+# Not a statement of the user's plans: a question, a conditional or a suggestion ("일정이 빡빡하면 일찍 주무세요"), or the
+# persona talking about itself ("나 내일 수업 있어").
+NOT_A_CLAIM = re.compile(r"\?|면\s|면서|거든요?\s|(세요|시죠|자|봐|볼까|어때|할래|하세요|드세요)[.!~]*$|^\s*(나|내가|난|저|제가|전)\s")
+
+
+ASSERTS_PLAN = re.compile(r"있(어|어요|습니다|고|네)|\d+\s*건|[한두세네]\s*(건|개)|잡혀|예정")
+NEGATED = re.compile(r"안\s|않|없|못\s|모르")
+
+
 def grounded(sentence, sources):
     """False for a claim about the user's plans that no source backs (see SCHED_NOUN above)."""
-    if not SCHED_NOUN.search(sentence):
+    if not SCHED_NOUN.search(sentence) or NOT_A_CLAIM.search(sentence.strip()):
         return True
     said, known = hours_in(sentence), hours_in(sources)
-    return said <= known if said else bool(known)
+    if said:
+        return said <= known
+    # no hour: only "plans exist" counts as a claim ("내일 일정은 두 건이에요"), never a negation ("확인이 안 돼요")
+    return bool(known) or not ASSERTS_PLAN.search(sentence) or bool(NEGATED.search(sentence))
 
 
 def content_free(reply):
@@ -1746,45 +1777,25 @@ def recent_context(hist, n=6):
     return ("최근 통화 내용:\n" + "\n".join(lines) + ("\n" + CUT_NOTE if cut else "") + "\n\n") if lines else ""
 
 
-TITLE_EVERY = 3  # replies without the title before it comes back
-HONORIFICS = ("아저씨", "아줌마", "오빠", "오라버니", "형님", "형", "언니", "누나", "자기야", "자기", "사장님", "선생님", "이모",
-              "삼촌", "주인님", "고객님")
-_VOCATIVE = "|".join(sorted(map(re.escape, HONORIFICS), key=len, reverse=True))
-INVENTED = re.compile(rf"^\s*(?:{_VOCATIVE})\s*[,!~]\s*|\s*,\s*(?:{_VOCATIVE})(?=\s*[.!?~]*\s*$)")
 title_gap: dict[str, int] = {}  # history key -> replies since the user's title was last said
 
 
 class Address:
-    """The user's title (호칭) in a call's replies, deterministic rather than left to the model: the first reply
-    starts with it, later replies bring it back after TITLE_EVERY without it, and a reply never says it twice."""
+    """The user's title (호칭): the call's first reply starts with it when the model left it out. Nothing else is
+    rewritten: the model's own vocatives stay as it said them (user decision 2026-11-22, fewer filters)."""
 
     def __init__(self, title, hkey, first_reply):
-        self.title, self.hkey, self.named, self.started = title, hkey, False, False
-        gap = title_gap.get(hkey, 0)
-        self.due = bool(title) and (first_reply or gap >= TITLE_EVERY)
+        self.title, self.hkey, self.started = title, hkey, False
+        self.due = bool(title) and first_reply
 
     def __call__(self, s):
-        # a form of address the user never set ("아저씨", "오빠"): dropped as a vocative, the sentence kept
-        s = re.sub(INVENTED, lambda m: m.group(0) if self.title and self.title in m.group(0) else "", s).strip() or s
-        if not self.title:
-            return s
-        t = re.escape(self.title)
         first, self.started = not self.started, True
-        if self.title in s:
-            # the model's own vocative counts when it is due or the reply asks the user something back;
-            # otherwise (and always the second time in a reply) it is dropped and the sentence kept
-            if self.named or not (self.due or s.rstrip().endswith("?")):
-                s = re.sub(rf"^\s*{t}\s*[,!.]?\s*|\s*,\s*{t}(?=[,.!?\s]|$)", "", s, count=1).strip() or s
-            if self.title in s:
-                self.named = True
-            return s
-        if first and self.due:
-            self.named = True
+        if first and self.due and self.title not in s:
             return f"{self.title}, {s}"
         return s
 
     def done(self):
-        title_gap[self.hkey] = 0 if self.named else title_gap.get(self.hkey, 0) + 1
+        pass
 
 
 async def respond(text, session, t0, timings, on_event=None, kept=None, speak=True):
@@ -1893,101 +1904,95 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 + gateway_tools_text(gw_defs) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
                 + play
             messages = [{"role": "system", "content": system}, *prior, {"role": "user", "content": text}]
-            guard = needs_answer(bare)  # a question or request must not end with a bare "네"
-            ack_held, flushed, nudged, chatted, dropped = [], False, False, False, False
+            # No-tool turns pass through as the model said them (user decision 2026-11-22: "툴콜을 안 할 때의 안전장치는
+            # 최대한 덜어내고 할루시네이션만 잡는 쪽으로"). Two checks remain, and each first re-asks Qwen once:
+            # an action claimed with no action tool, and the user's own plans stated with no source.
+            asked = needs_answer(bare)  # a real question (not "여보세요?", "응"): a bare interjection is asked again once
+            rechecked, stubbed, notes = False, False, set()  # notes: our own re-ask texts, never a source
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
 
             async def say(s):
-                nonlocal flushed, dropped
-                sources = ctx + "\n".join(m["content"] for m in messages if m["role"] == "user")
+                sources = ctx + "\n".join(m["content"] for m in messages if m["role"] == "user" and m["content"] not in notes)
                 if not grounded(s, sources):
                     timings["ungrounded"] = s[:80]
-                    if not guard:  # small talk: leave the unsourced sentence out instead of handing the turn over
-                        dropped = True
-                        return
-                    raise Ungrounded
+                    raise Recheck("personal", s)
                 if ACTION_CLAIM.search(s) and not confirmed["ok"] and asks_action(bare):
                     timings["unconfirmed"] = s[:80]
-                    raise Unconfirmed
-                if guard and not flushed and content_free(" ".join(ack_held + [s])):
-                    ack_held.append(s)  # "네," alone: keep it back until real content follows
-                    return
-                for x in ack_held + [s]:
-                    await sentences.put(x)
-                ack_held.clear()
-                flushed = True
+                    raise Recheck("action", s)
+                await sentences.put(s)
 
             try:
-                for rounds in range(4):  # at most two tool calls and one nudge, then an answer
+                for rounds in range(4):  # at most two tool calls and one re-ask, then an answer
                     buf, state, said_round = "", "maybe", []
                     thinking.append(Unthink())
-                    async for delta in unthink(llm_stream(messages, LENGTH_TOKENS[length]), thinking[-1]):
-                        timings.setdefault("llm_first_token_ms", ms(t0))
-                        buf += delta
-                        if state not in ("tool", "no"):
-                            state = tag_state(buf.lstrip())
-                        if state in ("maybe", "tool"):
-                            continue  # might be a tag; a tool call is collected whole
-                        if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
-                            answered = said_round or re.search(r"[가-힣]", buf.split(ROUTE_TAG)[0])
-                            if state != "tag" and answered and not guard:  # small talk already answered: keep it
-                                buf = buf.split(ROUTE_TAG)[0]
-                                break
-                            if state == "tag" and not guard and not chatted:  # small talk handed over: ask Qwen once more
-                                break
+                    try:
+                        async for delta in unthink(llm_stream(messages, LENGTH_TOKENS[length]), thinking[-1]):
+                            timings.setdefault("llm_first_token_ms", ms(t0))
+                            buf += delta
+                            if state not in ("tool", "no"):
+                                state = tag_state(buf.lstrip())
+                            if state in ("maybe", "tool"):
+                                continue  # might be a tag; a tool call is collected whole
+                            if state == "tag" or ROUTE_TAG in buf:  # also "수요일이요. [CLAUDE]": hand over, never say it
+                                if state != "tag" and (said_round or re.search(r"[가-힣]", buf.split(ROUTE_TAG)[0])):
+                                    # already answered: keep what was said, drop the late tag
+                                    buf = buf.split(ROUTE_TAG)[0]
+                                    break
+                                return await via_claude()
+                            if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
+                                before, _, after = buf.partition(TOOL_TAG)
+                                for x in split_ready(before, final=True)[0]:
+                                    said_round.append(x)
+                                    await say(x)
+                                buf, state = TOOL_TAG + after, "tool"
+                                continue
+                            speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
+                            done, rest = split_ready(speak, final=False)
+                            buf = rest + held
+                            for x in done:
+                                timings.setdefault("first_sentence_ms", ms(t0))
+                                said_round.append(x)
+                                await say(x)
+                        if state == "tag":
                             return await via_claude()
-                        if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
-                            before, _, after = buf.partition(TOOL_TAG)
-                            for s in split_ready(before, final=True)[0]:
-                                said_round.append(s)
-                                await say(s)
-                            buf, state = TOOL_TAG + after, "tool"
-                            continue
-                        speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
-                        done, rest = split_ready(speak, final=False)
-                        buf = rest + held
-                        for s in done:
-                            timings.setdefault("first_sentence_ms", ms(t0))
-                            said_round.append(s)
-                            await say(s)
-                    if state == "tag" and not guard and not chatted:
-                        chatted = True
-                        messages += [{"role": "assistant", "content": ROUTE_TAG}, {"role": "user", "content": SMALL_TALK}]
-                        continue
-                    if state == "tool" and (ctx or gw_defs) and rounds < 2:
-                        t_tool = time.perf_counter()
+                        if state == "tool" and (ctx or gw_defs) and rounds < 2:
+                            t_tool = time.perf_counter()
 
-                        async def tool_say(text):  # "앱에서 허용해 주세요" while an approval is pending
-                            said_round.append(text)
-                            await sentences.put(text)
-                        line = buf.strip().split("\n")[0]
-                        result = await run_tool(line, session, tool_say)
-                        tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
-                        if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
-                            confirmed["ok"] = True
-                        timings.setdefault("tools", []).append(ms(t_tool))
-                        messages += [{"role": "assistant", "content": buf.strip()},
-                                     {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
+                            async def tool_say(text):  # "앱에서 허용해 주세요" while an approval is pending
+                                said_round.append(text)
+                                await sentences.put(text)
+                            line = buf.strip().split("\n")[0]
+                            result = await run_tool(line, session, tool_say)
+                            tool_name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
+                            if action_tool(tool_name) and not TOOL_REFUSED.search(result.strip()):  # side effects only
+                                confirmed["ok"] = True
+                            timings.setdefault("tools", []).append(ms(t_tool))
+                            messages += [{"role": "assistant", "content": buf.strip()},
+                                         {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
+                            continue
+                        if state == "tool" or ROUTE_TAG in buf:
+                            return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
+                        for x in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
+                            said_round.append(x)
+                            await say(x)
+                    except Recheck as e:  # one re-ask with a short correction; never cut the reply down to a filler
+                        if rechecked:
+                            raise Ungrounded if e.kind == "personal" else Unconfirmed
+                        rechecked = True
+                        said = " ".join(said_round[:-1])
+                        note = RECHECK[e.kind].format(s=e.sentence[:80])
+                        notes.add(note)
+                        messages += [{"role": "assistant", "content": said or "…"}, {"role": "user", "content": note}]
                         continue
-                    if state == "tool" or ROUTE_TAG in buf:
-                        return await via_claude()  # tools looping, or no brain, or a late tag: let Claude take it
-                    for s in split_ready(hold_tag_prefix(buf)[0], final=True)[0]:
-                        said_round.append(s)
-                        await say(s)
-                    if not guard and not flushed and dropped:  # small talk whose only sentence was left out
-                        await sentences.put("네.")
-                        break
-                    if guard and not flushed:  # the whole reply was "네" / "확인해 볼게요": no answer at all
-                        ack_held.clear()
-                        if nudged:
-                            return await via_claude()
-                        nudged = True
-                        messages += [{"role": "assistant", "content": " ".join(said_round) or "네"},
-                                     {"role": "user", "content": local_prompt(NUDGE) if offline else NUDGE}]
+                    if asked and not stubbed and stub(" ".join(said_round), user_title(settings, persona)):
+                        stubbed = True  # "아, 그거!" to a question: ask for the rest, once (live 2026-11-22, 서아)
+                        timings["stub"] = " ".join(said_round)[:40]
+                        messages += [{"role": "assistant", "content": " ".join(said_round) or "…"},
+                                     {"role": "user", "content": STUB_NOTE}]
                         continue
                     break
             except Ungrounded:
-                return await via_claude()  # never speak made-up plans
+                return await via_claude()  # twice unsourced: Claude checks the real data (local: says it can't)
             except Unconfirmed:  # never say an action happened when nothing did it
                 if SCHED_CALL.search(bare) or SCHED_WAKE.search(bare):
                     pending_schedule[session] = (time.time(), {"kind": "wake" if SCHED_WAKE.search(bare) else "reminder"})
@@ -3131,20 +3136,17 @@ if __name__ == "__main__":
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
-        assert Address("대표님", "h1", False)("아저씨, 오늘은 쉬세요.") == "오늘은 쉬세요."
-        assert Address("", "h2", True)("네, 오빠!") == "네!"  # no title set: an invented one goes
-        assert Address("", "h3", True)("좋아요, 누나.") == "좋아요."
-        assert Address("오빠", "h4", False)("오빠, 밥 먹었어?") == "오빠, 밥 먹었어?"  # the title the user chose
-        assert Address("대표님", "h5", False)("형 회사 이야기 해 볼까요?") == "형 회사 이야기 해 볼까요?"  # not a vocative
-        title_gap.clear()
+        # the title: the call's first reply only, and only when the model left it out; nothing else is rewritten
+        assert Address("대표님", "h1", False)("아저씨, 오늘은 쉬세요.") == "아저씨, 오늘은 쉬세요."
+        assert Address("오빠", "h4", False)("오빠, 밥 먹었어?") == "오빠, 밥 먹었어?"
         replies = []
-        for i, said in enumerate([["네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["대표님, 좋아요."],
-                                  ["그럼요."], ["오늘은 쉬세요."], ["대표님, 더 필요한 거 있으세요?"]]):
+        for i, said in enumerate([["네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["그럼요."], ["오늘은 쉬세요."]]):
             a = Address("대표님", "t", i == 0)
             replies.append([a(x) for x in said])
             a.done()
-        assert replies == [["대표님, 네, 확인했어요.", "그리고요."], ["맑아요."], ["좋아요."], ["그럼요."],
-                           ["대표님, 오늘은 쉬세요."], ["대표님, 더 필요한 거 있으세요?"]], replies
+        assert replies == [["대표님, 네, 확인했어요.", "대표님, 그리고요."], ["대표님, 맑아요."], ["그럼요."], ["오늘은 쉬세요."]], replies
+        assert stub("아, 그거!") and stub("오빠, 아, 그거!", "오빠") and stub("네.") and not stub("오, 좋아! 카레 먹자.")
+        assert not stub("세 개야.") and not stub("아, 카페 로고 의뢰야.")
         for ask in ("오늘 광주 날씨 어때?", "비트코인 시세 알려줘"):  # with the gateway's web_search: Qwen answers
             assert not pre_route(ask, {}, local=True, tools=("web_search",))[0] and pre_route(ask, {}, local=True)[0], ask
         assert korean_only("기상청 기준으로 맑아요 (https://www.weather.go.kr/w/index.do).") == "기상청 기준으로 맑아요."
@@ -3218,11 +3220,11 @@ if __name__ == "__main__":
             said = [s async for s, *_ in respond(user, "ack", time.perf_counter(), {})]
             return said, calls
         said, calls = asyncio.run(ack_check(["네.", "물은 100도에서 끓어요."]))
-        assert said == ["물은 100도에서 끓어요."] and calls[1][-1]["content"] == NUDGE, said  # nudged once, "네" unsaid
+        assert said == ["네.", "물은 100도에서 끓어요."] and STUB_NOTE in [m["content"] for m in calls[1]], said  # asked once more
         said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."]))
-        assert said == ["클로드가 답해요."] and len(calls) == 2, said  # empty twice: Claude takes the turn
+        assert said == ["네.", "네, 확인해 볼게요."] and len(calls) == 2, said  # once only, then the reply stands
         said, _ = asyncio.run(ack_check(["네, 100도예요."]))
-        assert said == ["네, 100도예요."], said  # an acknowledgement goes out with the content after it
+        assert said == ["네, 100도예요."], said
         said, calls = asyncio.run(ack_check(["네."], user="고마워"))
         assert said == ["네."] and len(calls) == 1  # thanks: a bare "네" is the right answer
         # Live regression: greetings, acknowledgements and small talk went to Claude. On every persona they stay on Qwen.
@@ -3231,21 +3233,20 @@ if __name__ == "__main__":
                         {"id": "spica", "name": "스피카", "primary": True, "voice": "sohee", "personality": "결론부터, 냉철한 조언자"}):
             links.settings = {"personas": [persona]}
             for user, reply in [("네, 알겠습니다.", "네, 알겠습니다."), ("여보세요?", "네."), ("할 일이 많아.", "네."),
-                                ("가보세요.", "네, 들어가세요."), ("자기야 안녕", "안녕, 반가워요. [CLAUDE]"), ("응", "네.")]:
+                                ("가보세요.", "네, 들어가세요."), ("자기야 안녕", "안녕, 반가워요. [CLAUDE]"), ("응", "네."),
+                                ("오늘 좀 피곤하다", "내일 일정이 빡빡하시면 일찍 주무세요.")]:
                 said, calls = asyncio.run(ack_check([reply], user=user))
                 assert len(calls) == 1 and "클로드가 답해요." not in said and not any("CLAUDE" in x for x in said), \
                     (persona["id"], user, said, len(calls))
             links.settings = {}
-        for persona_reply in (["[CLAUDE]", "할 일이 많으시군요. 하나씩 해 봐요."],  # small talk handed over: asked once more
-                              ["내일 일정이 빡빡하시면 일찍 주무세요."]):  # an unsourced plan in small talk: left out
-            said, calls = asyncio.run(ack_check(persona_reply, user="오늘 좀 피곤하다"))
-            assert "클로드가 답해요." not in said, (persona_reply, said)
-        said, calls = asyncio.run(ack_check(["[CLAUDE]", "[CLAUDE]"], user="오늘 좀 피곤하다"))
-        assert said == ["클로드가 답해요."] and len(calls) == 2  # Qwen insists twice: Claude it is
-        assert pre_route("할 일이 많아.", {}) == (False, None) and pre_route("오늘 할 일 알려 줘", {})[0]
-        assert pre_route("내일 해야 될 일 정리해 줘", {})[0]  # plan questions still go to Claude
-        said, calls = asyncio.run(ack_check(["네.", "네, 확인해 볼게요."], user="내 과제 마감 언제야?"))
-        assert said == ["클로드가 답해요."]  # a real question with an empty reply still escalates
+        # the two hallucination checks: re-asked once with a note, then the old handling
+        said, calls = asyncio.run(ack_check(["오전 열 시에 팀 회의가 있어요.", "회의는 지금 확인이 안 돼요."], user="오늘 좀 피곤하다"))
+        assert said == ["회의는 지금 확인이 안 돼요."] and "확인된 게 없어" in calls[1][-1]["content"], said
+        said, calls = asyncio.run(ack_check(["오전 열 시에 팀 회의가 있어요."], user="오늘 좀 피곤하다"))
+        assert said == ["클로드가 답해요."] and len(calls) == 2, said  # twice: Claude checks the real data
+        said, calls = asyncio.run(ack_check(["네, 지금 전화 드릴게요.", "지금은 제가 직접 걸 수가 없어요. 어떻게 할까요?"],
+                                            user="나중에 전화해 줄 수 있어?"))
+        assert said == ["지금은 제가 직접 걸 수가 없어요.", "어떻게 할까요?"] and "도구가 없었어" in calls[1][-1]["content"], said
         async def title_turns():  # same session all day: a new title must not be fought by the old turns
             seen = []
 
@@ -3287,6 +3288,10 @@ if __name__ == "__main__":
         assert not grounded("오전 열 시에 팀 회의가 있어요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
         assert not grounded("내일 일정은 두 건이에요.", "") and grounded("물은 백 도에서 끓어요.", "")
         assert grounded("지금은 오후 열한 시예요.", "")  # the clock is not a plan
+        for chat in ("내일 일정이 빡빡하시면 일찍 주무세요.", "오늘 수업 어땠어?", "나 내일 수업 있어.", "과제 같이 할래?",
+                     "시험 끝나면 놀러 가자."):
+            assert grounded(chat, ""), chat  # chatter, not a claim about the user's plans
+        assert grounded("회의는 지금 확인이 안 돼요.", "") and not grounded("오늘 수업이 세 개 있어요.", "")
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
 
         async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
@@ -4704,9 +4709,13 @@ if __name__ == "__main__":
             return [x async for x, *_ in gen]
         # 2026-11-22 transcripts: nothing was scheduled, the assistant said it would call
         # (the fast path now parses "오분 있다가 …전화해줘" itself; with no time it is Qwen's, and Qwen must not lie)
-        assert unconfirmed_check("이따가 호출어 확인이라고 전화해줘", ["오 분 뒤에 호출어 확인이라고 전화드릴게요."]) == [ASK_WHEN]
+        lie = "오 분 뒤에 호출어 확인이라고 전화드릴게요."
+        assert unconfirmed_check("이따가 호출어 확인이라고 전화해줘", [lie, lie]) == [ASK_WHEN]  # re-asked, still claimed
+        pending_schedule.pop("unc", None)
+        assert unconfirmed_check("이따가 호출어 확인이라고 전화해줘", [lie, "몇 분 뒤에 걸까요?"]) == ["몇 분 뒤에 걸까요?"]
+        assert unconfirmed_check("이따가 호출어 확인이라고 전화해줘", [lie, lie]) == [ASK_WHEN]
         assert "unc" in pending_schedule  # the answer ("5분 뒤") completes the schedule
-        assert unconfirmed_check("끝나면 전화해줄 수 있어", ["맥북 작업이 끝나면 바로 전화드릴게요."]) == ["클로드가 답해요."] \
+        assert unconfirmed_check("끝나면 전화해줄 수 있어", ["맥북 작업이 끝나면 바로 전화드릴게요."] * 2) == ["클로드가 답해요."] \
             or task_intent("끝나면 전화해줄 수 있어")  # or the task route takes it
         assert unconfirmed_check("물은 몇 도에서 끓어?", ["물은 100도에서 끓어요."]) == ["물은 100도에서 끓어요."]
         # A placed or reminder call: "여보세요" → "네, 제가 전화드렸어요." is the truth, never the claim fallback
