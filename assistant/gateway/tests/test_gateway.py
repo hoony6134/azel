@@ -37,6 +37,10 @@ def start(tmp_path, monkeypatch, **env):
         return None
     g.voice_link = no_link
 
+    async def no_scheduler():  # tests drive scheduler_tick / fire_scheduled by hand, at fixed times; a background
+        return None             # loop on the real clock would mark those items late ("missed") behind their back
+    g.scheduler = no_scheduler
+
     async def discovered():  # what `claude mcp list` / `claude plugin list` would report
         g.discovery.connectors = [{"name": "Cygnus MCP", "url": "https://mcp.example/cygnus", "status": "connected"},
                                   {"name": "Gmail", "url": "https://gmail.example/mcp", "status": "connected"},
@@ -1075,7 +1079,8 @@ def test_signals_and_checkpoint(gw, monkeypatch):
     monkeypatch.setattr(g, "ask_text", fake_ask)
     asyncio.run(g.run_checkpoint())
     sig = asyncio.run(g.gather_signals(now))
-    assert sig["approvals"] == ["macbook: git push (60분째 승인 대기)"]
+    assert sig["approvals"] == []  # an hour past its 5-minute expiry: expired, not "waiting"
+    assert g.fake.db["approvals"]["a1"]["status"] == "expired"
     assert len(sig["missed_calls"]) == 1 and sig["missed_calls"][0].endswith("기상 전화 못 받음")
     assert sig["tasks"] == ["t1: 치과 예약 / 열린 질문: 몇 시?"]
     assert sig["device_jobs"] == ["macbook: 빌드 → failed"]
