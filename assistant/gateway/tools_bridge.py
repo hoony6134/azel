@@ -112,7 +112,7 @@ SCHEDULE_UPDATE = {
             "덧붙이거나 계산하지 마: 게이트웨이가 정하고, 애매하면 물어볼 말을 돌려줘")},
         "when": {"type": "string", "description": (
             "정확한 ISO 시각을 이미 알 때만(앱 등). 반복 전체면 이 시각의 시·분이 새 규칙의 시각. cron은 repeat_cron에")},
-        "purpose": {"type": "string", "maxLength": 60},
+        "purpose": {"type": "string", "maxLength": 200},  # as create's reason: the editor pre-fills it from the note
         "notify": {"type": "string", "enum": ["call", "push"], "description": (
             "사용자가 받는 방식을 바꾸라고 할 때만('전화 말고 알림으로' → push). '10시 알림'의 '알림'은 예약을 가리키는 말일 뿐, "
             "그때는 notify를 넣지 마")},

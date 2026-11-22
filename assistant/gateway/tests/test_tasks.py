@@ -106,7 +106,7 @@ def test_cancel(tgw):
     g, c, notes = tgw
     tid = c.post("/v1/tasks", json={"goal": "TASK-SLOW 취소할 작업", "notify": "call"}).json()["id"]
     wait_for(c, tid, ("running",))
-    assert c.post(f"/v1/tasks/{tid}/cancel").json()["status"] == "cancelled"
+    assert c.post(f"/v1/tasks/{tid}/cancel").json()["data"]["status"] == "cancelled"
     assert c.post(f"/v1/tasks/{tid}/cancel").status_code == 409
     assert notes == []  # a cancelled task does not call
 

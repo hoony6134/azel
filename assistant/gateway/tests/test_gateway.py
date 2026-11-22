@@ -780,8 +780,8 @@ def test_schedule_api_validates_and_confirms(gw):
                                           "note": "회의"}).json()
     assert weekly["repeat"] == f"weekly:{dow}" and weekly["created_by"] == "app"
     assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"], item["id"]]  # soonest first
-    gone = c.delete(f"/v1/schedule/{item['id']}").json()
-    assert gone == {**item, "status": "cancelled"}
+    gone = c.delete(f"/v1/schedule/{item['id']}").json()  # the whole result: the app never reads it, errors show text
+    assert gone["ok"] and gone["data"] == {**item, "status": "cancelled"}
     assert c.delete(f"/v1/schedule/{item['id']}").status_code == 404
     assert [i["id"] for i in c.get("/v1/schedule").json()] == [weekly["id"]]  # default: pending and fired
     assert {i["id"] for i in c.get("/v1/schedule?include=all").json()} == {weekly["id"], item["id"]}

@@ -2367,7 +2367,8 @@ async def put_settings(body: dict):
     if "brain_mode" in body and body["brain_mode"] not in BRAIN_MODES:
         raise HTTPException(400, f"brain_mode: one of {list(BRAIN_MODES)}")
     if "overnight" in body:
-        o = {**DEFAULTS["overnight"], **(body["overnight"] if isinstance(body["overnight"], dict) else {})}
+        o = {**DEFAULTS["overnight"], **((await load_settings()).get("overnight") or {}),  # the stored value: a save
+             **(body["overnight"] if isinstance(body["overnight"], dict) else {})}  # leaving a key out keeps it
         w = o.get("window")
         if not (isinstance(w, list) and len(w) == 2 and all(isinstance(x, str) and HM_RE.fullmatch(x) for x in w)
                 and w[0] != w[1] and all(isinstance(o[k], bool) for k in ("report_push", "report_call"))
@@ -2775,8 +2776,9 @@ def connectors_out(conn):
 
 def connectors_in(body, old=None):
     """The app shape → the stored setting: claude_ai as {name: enabled}; a custom server's secret file is its name.
-    A server sent without `allowed_tools` (an app that predates it) keeps the one already stored under its name."""
+    A server sent without `allowed_tools` or `oauth` (the app's model has neither) keeps the stored one under its name."""
     kept = {c["name"]: c["allowed_tools"] for c in (old or {}).get("custom", []) if c.get("allowed_tools")}
+    signs_in = {c["name"] for c in (old or {}).get("custom", []) if c.get("oauth")}
     ai, custom = body.get("claude_ai", []), body.get("custom", [])
     if not isinstance(ai, list) or not all(isinstance(c, dict) and set(c) <= {"name", "enabled", "status"} for c in ai) \
             or not isinstance(custom, list) or set(body) - {"claude_ai", "custom"}:
@@ -2786,7 +2788,8 @@ def connectors_in(body, old=None):
                                  "custom": [{**{k: v for k, v in c.items() if k != "has_secret"},
                                              "auth_ref": c.get("name"),
                                              **({"allowed_tools": kept[c["name"]]}
-                                                if "allowed_tools" not in c and c.get("name") in kept else {})}
+                                                if "allowed_tools" not in c and c.get("name") in kept else {}),
+                                             **({"oauth": True} if "oauth" not in c and c.get("name") in signs_in else {})}
                                             if isinstance(c, dict) else c for c in custom]})
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -2926,7 +2929,7 @@ async def memories_post(request: Request, body: dict):
 
 @app.delete("/v1/memories/{mid}")
 async def memories_delete(request: Request, mid: str):
-    return await act("forget", {"id": mid, "confirmed": True}, request=request)  # the app asked before deleting
+    return await act("forget", {"id": mid, "confirmed": True}, request=request, v2=True)  # asked first; body unread
 
 
 @app.post("/v1/memories/recall")
@@ -2943,14 +2946,15 @@ async def memories_people(request: Request, body: dict):
 RESULT_V2 = "x-azel-result"  # "2": the whole {ok, spoken, data, needs, error}; else the pre-batch-5 bodies
 
 
-async def act(name, args, created=False, request=None, full=True):
-    """Run an action for the app. With `X-Azel-Result: 2` the answer is the whole result (needs on 200). Without it
-    (app builds before batch 5) the same result is shaped as before: the resource on success, an HTTP error with
-    `detail` otherwise (needs as 409 with the question). Same action, same checks either way."""
+async def act(name, args, created=False, request=None, full=True, v2=False):
+    """Run an action for the app. With `X-Azel-Result: 2` (or `v2`: a route whose app code reads the whole result)
+    the answer is the whole result (needs on 200). Without it (app builds before batch 5) the same result is shaped as
+    before: the resource on success, an HTTP error with `detail` otherwise (needs as 409 with the question). Same
+    action, same checks either way."""
     if full:
         full_only()
     r = await bridge.run(name, args, args.get("persona_id"), caller="app", surface="rest")
-    if request is not None and request.headers.get(RESULT_V2) == "2":
+    if v2 or request is not None and request.headers.get(RESULT_V2) == "2":
         status = (201 if created else 200) if r["ok"] or r["needs"] else tools_bridge.HTTP_OF[r["error"]["code"]]
         return JSONResponse(tools_bridge.public(r) | ({"detail": r["error"]["message"]} if r["error"] else {}),
                             status if r["ok"] or not r["needs"] else 200)
@@ -2970,25 +2974,30 @@ async def schedule_get(request: Request, include: str = "", persona: str | None 
 
 @app.post("/v1/schedule")
 async def schedule_post(request: Request, body: dict):
+    # The installed app never sends X-Azel-Result but reads this answer as an ActionResult (ok/spoken/needs), so a
+    # confirm (every rule with a start_date) must come back as needs on 200, not 409. Only its pre-batch-5 create
+    # (`at`, decoded as the item) keeps the old shape.
+    legacy = "at" in body and "when" not in body
     if "at" in body and "when" not in body:  # the field's name before batch 5
         body = {**{k: v for k, v in body.items() if k != "at"}, "when": body["at"]}
     if "reason" not in body:
         body = {**body, "reason": body.get("purpose") or body.get("note") or "예약 전화"}
-    return await act("schedule_create", {k: v for k, v in body.items() if k != "note"}, created=True, request=request)
+    return await act("schedule_create", {k: v for k, v in body.items() if k != "note"}, created=True, request=request,
+                     v2=not legacy)
 
 
 @app.put("/v1/schedule/{sid}")
 async def schedule_put(request: Request, sid: str, body: dict, occurrence: str | None = None):
     scope = "occurrence" if occurrence else body.get("scope") or "rule"
     return await act("schedule_update", {**body, "id": sid, "scope": scope, **({"at": occurrence} if occurrence else {})},
-                     request=request)
+                     request=request, v2=True)  # the app reads an ActionResult here too
 
 
 @app.delete("/v1/schedule/{sid}")
 async def schedule_delete(request: Request, sid: str, occurrence: str | None = None):
     # the app deletes the item it shows: the whole rule unless one occurrence is named
     return await act("schedule_cancel", {"id": sid, **({"scope": "occurrence", "at": occurrence} if occurrence else
-                                                       {"scope": "rule"})}, request=request)
+                                                       {"scope": "rule"})}, request=request, v2=True)  # body unread
 
 
 @app.get("/v1/history")
@@ -3191,8 +3200,12 @@ def approval_view(row, meta, now=None):
         status = "expired"
     elif status == "approved" and row.get("decided") and now >= row["decided"] + APPROVED_RUN_S:
         status = "expired"  # approved but never run in time: no longer usable
+    req = meta.get("requester") or {}
+    secret = is_secret(req.get("session"))  # the same rule as the push and the decision: no 항상 허용 to offer then
+    forced = secret or not always_ok(row.get("command") or "")
     return {**row, "status": status, "expires_at": expires, "decision": meta.get("decision"),
-            "requester": meta.get("requester"), "rule_id": meta.get("rule_id")}
+            "requester": meta.get("requester"), "rule_id": meta.get("rule_id"), "persona": req.get("persona"),
+            **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
 
 
 @app.post("/v1/approvals")
@@ -4411,7 +4424,7 @@ async def tasks_patch(tid: str, body: dict):
 
 @app.post("/v1/tasks/{tid}/cancel")
 async def tasks_cancel(request: Request, tid: str):
-    return await act("task_cancel", {"id": tid}, request=request)
+    return await act("task_cancel", {"id": tid}, request=request, v2=True)  # the app reads only the status
 
 
 async def task_cancel(tid):
