@@ -188,3 +188,33 @@ def test_every_calendar_is_read_in_parallel_within_the_budget(tmp_path, monkeypa
     assert sorted(missed) == ["고장", "느린 것"]  # the 랩미팅 on 공유 is the primary's again: kept once, unlabeled
     assert "- 11/23(Mon) 13:00~13:50 ICPC 예선 (대회 일정)" in text and "- 11/23(Mon) 10:00~10:50 랩미팅\n" in text
     assert text.endswith("못 읽은 캘린더: 고장, 느린 것")
+
+
+def test_events_that_began_before_the_range_are_listed_only_on_the_days_they_cover(tmp_path):
+    """Live 2026-11-23: from=11/23 to=11/24 showed a "### 11/22(일)" section of GIST LMS all-day items."""
+    setup(tmp_path)
+
+    def fake(request):
+        url = str(request.url)
+        if url.startswith("https://oauth2.example/token"):
+            return httpx.Response(200, json={"access_token": "AT", "expires_in": 3600})
+        if "/calendarList" in url:
+            return httpx.Response(200, json={"items": [{"id": "primary", "primary": True}]})
+        day = lambda title, a, b: {"summary": title, "start": {"date": a}, "end": {"date": b}}  # noqa: E731  b exclusive
+        return httpx.Response(200, json={"items": [
+            day("12주차 토론지 제출", "2026-11-22", "2026-11-24"),  # 22 and 23: only 23 is in range
+            day("학회", "2026-11-21", "2026-11-28"),  # covers the whole range: 23 and 24
+            day("어제 끝난 것", "2026-11-22", "2026-11-23"),  # 22 only: Google may still send it, never listed
+            {"summary": "밤샘 실험", "start": {"dateTime": "2026-11-22T23:00:00+09:00"},
+             "end": {"dateTime": "2026-11-23T01:00:00+09:00"}},
+            {"summary": "랩미팅", "start": {"dateTime": "2026-11-24T10:00:00+09:00"},
+             "end": {"dateTime": "2026-11-24T11:00:00+09:00"}}]})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fake)) as c:
+            return await GT.events(tmp_path, "2026-11-23", "2026-11-24", client=c)
+    rows, missed = asyncio.run(go())
+    got = [(r["day"].isoformat(), r["start"], r["title"]) for r in rows]
+    assert got == [("2026-11-23", "", "12주차 토론지 제출"), ("2026-11-23", "", "학회"), ("2026-11-23", "", "밤샘 실험"),
+                   ("2026-11-24", "", "학회"), ("2026-11-24", "10:00", "랩미팅")], got
+    assert all("2026-11-23" <= r["day"].isoformat() <= "2026-11-24" for r in rows) and missed == []

@@ -290,18 +290,31 @@ async def _event_rows(http, h, a):
                 continue
             s, en = e.get("start", {}), e.get("end", {})
             title, loc = e.get("summary", "(제목 없음)")[:80], (e.get("location") or "")[:40]
-            key = s.get("dateTime") or s.get("date") or ""
-            if (key, title) in seen:
-                continue
-            seen.add((key, title))
             if "dateTime" in s:
                 st, et = datetime.fromisoformat(s["dateTime"]).astimezone(KST), datetime.fromisoformat(en["dateTime"]).astimezone(KST)
-                row = {"day": st.date(), "start": f"{st:%H:%M}", "end": f"{et:%H:%M}",
-                       "when": f"{st:%m/%d(%a) %H:%M}~{et:%H:%M}"}
-            else:
-                row = {"day": Date.fromisoformat(s["date"]) if s.get("date") else a["from"], "start": "", "end": "",
-                       "when": f"{s.get('date', '')} 종일"}
-            rows.append({**row, "key": key, "title": title, "where": loc, "cal": _cal_name(c)})
+                if st.date() > a["to"] or et.date() < a["from"]:
+                    continue
+                if st.date() < a["from"]:  # began before the range (overnight): on its first day, from its start
+                    found = [({"day": a["from"], "start": "", "end": f"{et:%H:%M}",
+                               "when": f"{st:%m/%d %H:%M}부터 {et:%m/%d(%a) %H:%M}까지"}, a["from"].isoformat())]
+                else:
+                    found = [({"day": st.date(), "start": f"{st:%H:%M}", "end": f"{et:%H:%M}",
+                               "when": f"{st:%m/%d(%a) %H:%M}~{et:%H:%M}"}, s["dateTime"])]
+            else:  # all-day: under each day it covers inside the range (Google's end date is exclusive)
+                try:
+                    sd = Date.fromisoformat(s["date"])
+                    ed = Date.fromisoformat(en["date"]) if en.get("date") else sd + timedelta(days=1)
+                except (KeyError, ValueError):
+                    continue
+                first, last = max(sd, a["from"]), min(ed - timedelta(days=1), a["to"])
+                found = [({"day": first + timedelta(days=i), "start": "", "end": "",
+                           "when": f"{first + timedelta(days=i)} 종일"}, (first + timedelta(days=i)).isoformat())
+                         for i in range((last - first).days + 1)]
+            for row, key in found:
+                if (key, title) in seen:  # the same event in two calendars: once
+                    continue
+                seen.add((key, title))
+                rows.append({**row, "key": key, "title": title, "where": loc, "cal": _cal_name(c)})
     return sorted(rows, key=lambda r: r["key"]), missed
 
 
