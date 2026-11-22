@@ -6,7 +6,7 @@ function newCard(t as String, w as Integer) as Object
         t: t, w: w, head: "", hl: "", sent: "", meta: "", when: "", tail: "", soon: false, now: false, name: ""
         title: "", v: [-1, -1, -1, -1], down: "", n1: "", l1: "", m1: "", n2: "", l2: "", m2: ""
         status: "", load: "", upt: "", note: "", ts: 0, dtitle: "", dsub: "", dsoon: false, facts: []
-        series: [], labels: [], unit: "", icons: [], icon: ""
+        series: [], labels: [], unit: "", icons: [], icon: "", h: 200
     }
 end function
 
@@ -758,6 +758,7 @@ end function
 
 function weatherSection(w as Object) as Object
     c = newCard("wx", 560)
+    c.h = 232
     c.when = deg(w["now"])
     c.tail = sv(w.sky)
     c.icon = sv(w.icon)
@@ -778,16 +779,24 @@ function weatherSection(w as Object) as Object
     if hrs.Count() >= 3
         t = newCard("chart", 560)
         p = newCard("chart", 560)
+        t.h = 232
+        p.h = 232
         t.title = "기온 °C"
         p.title = "비 올 확률 %"
+        ' one bar every 2 hours across the same 12 hours: six bars with room for an icon and a value each.
+        ' The weather row is taller than the others (232, not 200), so icon, value, bar and hour each get a line.
+        idx = -1
         for each h in hrs
-            t.series.Push(h.t)
-            pv = h.pop
-            if pv = invalid then pv = 0
-            p.series.Push(pv)
-            t.labels.Push(sv(h.h))
-            p.labels.Push(sv(h.h))
-            t.icons.Push(sv(h.icon))
+            idx = idx + 1
+            if idx mod 2 = 0 and t.series.Count() < 6
+                t.series.Push(h.t)
+                pv = h.pop
+                if pv = invalid then pv = 0
+                p.series.Push(pv)
+                t.labels.Push(sv(h.h))
+                p.labels.Push(sv(h.h))
+                t.icons.Push(sv(h.icon))
+            end if
         end for
         lo = 1000.0
         hi = -1000.0
@@ -808,7 +817,7 @@ function weatherSection(w as Object) as Object
         cards.Push(t)
         cards.Push(p)
     end if
-    return {title: "날씨", w: 560, cap: 3, note: "", cards: cards}
+    return {title: "날씨", w: 560, h: 232, cap: 3, note: "", cards: cards}
 end function
 
 function stockCard(h as Object) as Object
@@ -899,7 +908,7 @@ function makeContent(sections as Object) as Object
                 d_tail: c.tail, d_soon: c.soon, d_now: c.now, d_name: c.name, d_v1: c.v[0], d_v2: c.v[1]
                 d_v3: c.v[2], d_v4: c.v[3], d_down: c.down, d_n1: c.n1, d_l1: c.l1, d_m1: c.m1, d_n2: c.n2
                 d_l2: c.l2, d_m2: c.m2, d_status: c.status, d_load: c.load, d_upt: c.upt, d_title: c.title
-                d_series: c.series, d_labels: c.labels, d_unit: c.unit, d_icons: c.icons, d_icon: c.icon
+                d_series: c.series, d_labels: c.labels, d_unit: c.unit, d_icons: c.icons, d_icon: c.icon, d_h: c.h
             })
         end for
     end for
