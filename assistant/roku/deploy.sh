@@ -8,9 +8,9 @@ PW="${BISEO_HOME:-$HOME/.config/biseo}/roku_dev_password"
 [ -r "$PW" ] || { echo "no $PW" >&2; exit 1; }
 SRC="$(cd "$(dirname "$0")" && pwd)"
 TMP=$(mktemp -d)
-cp -R "$SRC/manifest" "$SRC/source" "$SRC/components" "$SRC/fonts" "$TMP/"
+cp -R "$SRC/manifest" "$SRC/source" "$SRC/components" "$SRC/fonts" "$SRC/images" "$TMP/"
 sed -i.bak "s/^build_version=.*/build_version=$(($(date +%s) / 60 % 100000))/" "$TMP/manifest" && rm "$TMP/manifest.bak"
-(cd "$TMP" && zip -qr "$TMP/azel-tv.zip" manifest source components fonts)
+(cd "$TMP" && zip -qr "$TMP/azel-tv.zip" manifest source components fonts images)
 unzip -l "$TMP/azel-tv.zip" | grep -q ' manifest$' || { echo "manifest is not at the zip root" >&2; exit 1; }
 /usr/bin/curl --noproxy '*' -sS -m 120 --digest -u "rokudev:$(tr -d '\n' < "$PW")" \
   -F mysubmit=Install -F "archive=@$TMP/azel-tv.zip" "http://$ROKU/plugin_install" | grep -o 'Install Success\|Identical to previous[^<"]*\|Install Failure[^<]*\|Install timeout[^<"]*' | head -2
