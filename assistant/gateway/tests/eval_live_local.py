@@ -32,7 +32,7 @@ HOME = {"name": "광주", "lat": 35.2285, "lon": 126.8434}
 NUM = r"(\d[\d,.]*|[일이삼사오육칠팔구십백천만억]{2,})"  # Qwen says figures in digits or in words
 CASES = [  # (said, the tool it must use, what the answer must hold)
     ("광주 날씨 알려줄래?", "weather", rf"{NUM} ?도"),
-    ("내일 서울 날씨 어때?", "weather", rf"{NUM} ?도|비|맑|흐"),
+    ("내일 서울 날씨 어때?", "weather", rf"(?=.*내일)(?!.*오늘 서울)(?=.*({NUM} ?도|비|맑|흐))"),  # tomorrow's, not today's
     # a dated ANT price from the quote source (Anthropic listed on Nasdaq; "비상장" from memory was stale)
     ("그러면 클로드 그 엔트로픽 있잖아 엔트로픽의 주가 지금 알려줘", "stock_quote",
      rf"(?=.*{NUM} ?달러)(?=.*(\d+월 ?\d+일|기준))(?!.*비상장)"),
@@ -45,6 +45,13 @@ SLEEP_ASK = "일주일 동안 내가 얼마나 잤는지 수면시간 확인해�
 SLEEP_FAILED = [(SLEEP_ASK, "네, 일주일간 수면 기록을 불러올게요."), ("일로 와.", "네, 바로 불러올게요.")]
 SLEEP_PUSH = "아니 말로만 하지 말고 진짜 하라고"
 SLEEP_WANT = rf"{NUM} ?시간|{NUM} ?분"
+# live 2026-11-23 03:13 (로컬): "서버 확인해 볼게요. 잠시만요." and nothing after it; now the lookup runs first
+INFRA_TOOLS = [{'name': 'infra_health', 'description': '서버·인프라·노드·홈서버·내부 시스템 상태: 서버별 켜짐, CPU, 메모리(RAM), 디스크, 온도, 컨테이너', 'input_schema': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}, {'name': 'infra_status', 'description': '서비스·컨테이너 모니터 중 지금 문제 있는 것(내부 시스템이 괜찮은지)', 'input_schema': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}, {'name': 'infra_alerts', 'description': '지금 울리고 있는 서버·인프라 경보', 'input_schema': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}]
+INFRA_RESULT = ("서버 6대 중 5대 정상. gienah: 응답 없음(10분 전부터). deneb CPU 12%, 메모리 41%, 디스크 63%. "
+                "울리는 경보 1건: gienah node down.")
+INFRA_CASES = ["야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "서버 괜찮아?", "인프라 상태 어때"]
+INFRA_WANT = r"gienah|기에나|지에나|응답|꺼|다운|죽|문제|다섯|5대|경보"
+PROMISE = re.compile(r"(확인|찾아|알아|살펴|점검)\s*(해\s*)?(볼게요|보겠습니다|드릴게요|할게요|하겠습니다)|잠시만요")
 ANNOUNCE_ONLY = re.compile(r"^[^.?!]*(찾아|알아|확인해)\s*볼게요\.?$")
 
 
@@ -87,6 +94,8 @@ async def main():
 
     async def gateway_tool(name, args, on_say=None):  # the link to the gateway, as the bridge answers it
         used.append((name, args))
+        if name.startswith("infra_"):
+            return INFRA_RESULT
         if name in phone_data.KIND:  # the gateway's phone tools: the synced days, the call has no live phone here
             try:
                 return (await phone_data.run(name, args, phone_store, no_phone, now))[0]
@@ -100,7 +109,7 @@ async def main():
     async def no_claude(*a, **k):
         claude.append(a[0] if a else "")
         yield "클로드가 답해요."
-    defs = [t for t in (await b.tools("qwen"))[0] if "__" not in t["name"]] + list(phone_data.TOOLS)
+    defs = [t for t in (await b.tools("qwen"))[0] if "__" not in t["name"]] + list(phone_data.TOOLS) + INFRA_TOOLS
     V.gw_tools.update(at=time.time() + 3600, defs=defs)
     V.gateway_tool, V.tts, V.claude_stream = gateway_tool, no_tts, no_claude
     V.links.settings = {**(V.links.settings or {}), "brain_mode": "local"}
@@ -115,6 +124,16 @@ async def main():
         reply = " ".join(out)
         checks = {"used " + tool: tool in [n for n, _ in used], "answered": bool(re.search(want, reply)),
                   "not only a promise": not ANNOUNCE_ONLY.match(reply.strip()), "no URL": "http" not in reply}
+        rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
+    for i, said in enumerate(INFRA_CASES):  # the server check: looked up before Qwen says a word, no promise spoken
+        used.clear()
+        timings = {}
+        t0 = time.perf_counter()
+        out = [s async for s, *_ in V.respond(said, f"infra-{i}", t0, timings)]
+        reply = " ".join(out)
+        checks = {"used infra_*": any(n.startswith("infra_") for n, _ in used), "answered": bool(re.search(INFRA_WANT, reply)),
+                  "no promise said": not any(PROMISE.search(x) for x in out), "no lookup failed": V.LOOKUP_FAILED not in reply,
+                  "tool first": bool(timings.get("tool_first"))}
         rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
     # the sleep exchange: the request itself, then the push after two unkept promises (as the call went live)
     for label, session, prior, said in (("수면 요청", "sleep-1", [], SLEEP_ASK),
