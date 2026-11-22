@@ -129,6 +129,17 @@ function demoData(inCall as Boolean) as Object
         calendar: [{start: hm(now - 1800), end: hm(now + 2700), what: "자료구조", cal: "MyTT", where: "대학 A동 212호"}, {start: hm(now + 7200), end: hm(now + 10800), what: "프로그래밍 언어 및 컴파일러 중간고사 대비 스터디 모임", cal: "MyTT", where: "도서관 3층 세미나실"}]
         calls: [{at: hm(now + 5400), what: "약 먹기"}]
         next_deadline: {title: "과제 4: 해시 테이블 구현", due: iso(now + 10800), course: "자료구조", source: "gistra"}
+        weather: {source: "기상청", place: "광주", now: -0.4, sky: "맑음", high: 15.0, low: -0.4, pop: 60, hourly: [
+            {h: "03", t: 1.0, pop: 0}, {h: "04", t: 2.0, pop: 0}, {h: "05", t: 2.0, pop: 0}, {h: "06", t: 3.0, pop: 30}
+            {h: "07", t: 4.0, pop: 30}, {h: "08", t: 5.0, pop: 20}, {h: "09", t: 7.0, pop: 0}, {h: "10", t: 10.0, pop: 0}
+            {h: "11", t: 12.0, pop: 10}, {h: "12", t: 14.0, pop: 60}, {h: "13", t: 15.0, pop: 70}, {h: "14", t: 14.0, pop: 40}]}
+        holdings: [
+            {name: "애플", ticker: "AAPL", listed: true, price: 342.56, currency: "USD", pct: -1.9, spark: [352.78, 351.91, 352.45, 349.21, 342.56], source: "야후 파이낸스"}
+            {name: "토스", listed: false}
+            {name: "엔비디아", ticker: "NVDA", listed: true, price: 125.53, currency: "USD", pct: 2.31, spark: [118.2, 120.5, 119.9, 122.7, 125.53], source: "야후 파이낸스"}
+            {name: "삼성전자", ticker: "005930", listed: true, price: 180900, currency: "KRW", pct: -8.13, spark: [196800, 190300, 194700, 196900, 183100], source: "네이버 증권"}
+            {name: "SK하이닉스", ticker: "000660", listed: true, price: 1100000, currency: "KRW", pct: -7.02, spark: [1120000, 1098000, 1144000, 1183000, 1113000], source: "네이버 증권"}
+        ]
     }
 end function
 
@@ -150,8 +161,8 @@ function demoDetail(path as String) as Object
     end if
     return {
         asof: "03:15"
-        hosts: [{name: "deneb", status: "ok", up: true, cpu: 37, mem: 66, disk: 19, temp: invalid, uptime: "160d", role: "Public Edge · Identity", services: 3, services_down: 0}
-            {name: "vd-spark", status: "ok", up: true, cpu: 7, mem: 76, disk: 19, temp: 62, uptime: "1d", role: "Vuja De GPU", services: 2, services_down: 1}]
+        hosts: [{name: "deneb", status: "ok", up: true, cpu: 37, mem: 66, disk: 19, temp: invalid, uptime: "160d", role: "Public Edge · Identity", services: 3, services_down: 0, cpu_24h: [16, 8, 13, 11, 8, 10, 10, 37], mem_24h: [71, 70, 69, 68, 67, 66, 66, 66]}
+            {name: "vd-spark", status: "ok", up: true, cpu: 7, mem: 76, disk: 19, temp: 62, uptime: "1d", role: "Vuja De GPU", services: 2, services_down: 1, cpu_24h: [1, 1, 1, 2, 1, 1, 5, 7], mem_24h: [74, 75, 75, 76, 76, 76, 77, 76]}]
         groups: [{node: "deneb", role: "Public Edge · Identity", services: [{name: "Nginx Proxy Manager", type: "http", state: "up", uptime: 100.0, ms: 15, last_down: invalid}
                 {name: "Restic Backup", type: "push", state: "up", uptime: 100.0, ms: invalid, last_down: "2026-10-31 05:00"}
                 {name: "Grafana", type: "http", state: "up", uptime: 99.86, ms: 110, last_down: invalid}]}

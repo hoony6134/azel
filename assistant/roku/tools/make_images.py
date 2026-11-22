@@ -135,8 +135,21 @@ def channel_art():
     make(1920, 1080, 450, "splash_fhd.png")
 
 
+def tri_image(w=16, h=14):
+    """The stock card's up arrow (white, alpha; the card blends the colour and rotates it 180° for down): the subset
+    Pretendard has no ▲/▼ glyph."""
+    W, H = w * SS, h * SS
+    y, x = np.mgrid[0:H, 0:W]
+    x, y = (x + 0.5) / SS, (y + 0.5) / SS
+    inside = (y <= h) & (np.abs(x - w / 2) <= (y / h) * (w / 2))
+    alpha = inside.reshape(h, SS, w, SS).mean(axis=(1, 3))
+    img = np.dstack([np.full((h, w, 3), 255.0), alpha * 255])
+    Image.fromarray(np.round(img).astype(np.uint8), "RGBA").save(OUT / "tri.png", optimize=True)
+
+
 def main():
     OUT.mkdir(exist_ok=True)
+    tri_image()
     nine("card.9.png", rrect_mask(24, 24, 8), (8, 16, 8, 16))
     nine("focus.9.png", rrect_mask(24, 24, 8, ring=4), (8, 16, 8, 16))
     Image.fromarray(np.full((2, 2, 4), 255, dtype=np.uint8), "RGBA").save(OUT / "rule.png")
