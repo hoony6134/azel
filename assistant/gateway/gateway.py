@@ -4039,6 +4039,8 @@ async def overnight_morning(settings, briefing_on):
             t = await state.call("GET", task_key(i["id"]))
             if t:
                 t["reported"] = True
+                if t["status"] != "waiting_approval":  # told in the morning report: a restart won't tell it again
+                    t["notified_at"] = t.get("notified_at") or time.time()
                 await task_save(t)
                 if t["status"] != "waiting_approval":
                     await kv_list_remove("overnight-tasks", t["id"])
