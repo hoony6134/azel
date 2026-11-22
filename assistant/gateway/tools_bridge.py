@@ -316,7 +316,7 @@ class Bridge:
                 raise Fail("not_found", str(e))
             except Exception as e:  # noqa: BLE001  Open-Meteo down or slow
                 raise Fail("unavailable", f"지금은 날씨를 가져오지 못했어요({type(e).__name__}).")
-            return r["spoken"], r, r["spoken"] + " (Open-Meteo 기준. 이 문장대로 답해.)"
+            return r["spoken"], r, r["spoken"] + f" ({r.get('source', 'Open-Meteo')} 기준. 이 문장대로 짧게 답해.)"
         if name == "stock_quote":
             try:
                 r = await self.d["stock_quote"](str(args["query"]).strip())
@@ -959,16 +959,15 @@ MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것
                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
 WEATHER = {
     "name": "weather",
-    "description": ("날씨(기온, 최고·최저, 비 올 확률, 하늘). 날씨를 물으면 웹 검색 말고 이걸 불러. place는 사용자가 말한 "
-                    "지명 그대로(없으면 비워: 사용자가 사는 곳), when은 now(기본)|today|tomorrow|day_after. 결과 문장대로 답해."),
+    "description": ("날씨(기온, 최고·최저, 비 올 확률, 하늘). 날씨는 웹 검색 말고 이걸 불러. place는 말한 지명 그대로(없으면 비움, "
+                    "'지금 여기'면 '여기'), when은 now|today|tomorrow|day_after."),
     "input_schema": {"type": "object", "additionalProperties": False, "properties": {
         "place": {"type": "string", "maxLength": 40},
         "when": {"type": "string", "enum": ["now", "today", "tomorrow", "day_after"]}}}}
 STOCK_QUOTE = {
     "name": "stock_quote",
-    "description": ("주가와 환율(현재가 또는 마지막 종가, 전날 대비). 주가나 환율을 물으면 웹 검색 말고 이걸 불러. query는 "
-                    "회사 영어 이름이나 티커, 종목 코드(예: Samsung Electronics, Anthropic, AAPL, 005930), 환율이면 "
-                    "'달러 환율', '엔화 환율'. 결과 문장대로 답하고, 못 찾으면 그렇다고만 말해(비상장일 수 있어)."),
+    "description": ("주가와 환율(마지막 가격, 날짜, 전날 대비). 웹 검색 말고 이걸 불러. query는 회사 영어 이름·티커·종목 코드"
+                    "(Anthropic, AAPL, 005930), 환율이면 '달러 환율'. 결과 문장대로 답해."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
         "query": {"type": "string", "minLength": 1, "maxLength": 60}}}}
 WEB_SEARCH = {

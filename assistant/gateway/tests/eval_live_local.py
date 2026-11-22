@@ -50,8 +50,11 @@ async def main():
     async def up():
         return True
 
+    kma = Path.home() / ".config/biseo/kma_key"  # 기상청 when the Mac has the key (never printed), else Open-Meteo
+    key = kma.read_text().strip() if kma.exists() else None
+
     async def wx(place, when):
-        return await weather.forecast(place, when, HOME)
+        return await weather.forecast(place, when, HOME, kma_key=key)
 
     async def sx(q, n):
         r = await web.searxng(q, n, os.environ.get("BISEO_SEARXNG_URL", web.SEARXNG_URL))

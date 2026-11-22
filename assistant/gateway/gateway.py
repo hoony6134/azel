@@ -4037,8 +4037,23 @@ async def quote_now(q):
     return await stock_quotes.quote(q, search=lambda s: web.searxng(s, 6, url, fetch_pages=False))
 
 
+KMA_KEY_PATH = HOME / "kma_key"  # data.go.kr 기상청 key (Decoding), 0600, on the Mac's gateway only
+
+
+def kma_key():
+    """The 기상청 key, re-read on each use (rotating the file needs no restart); never on a limited or team gateway,
+    never if others can read it."""
+    if MODE != "full" or not KMA_KEY_PATH.exists() or KMA_KEY_PATH.stat().st_mode & 0o077:
+        return None
+    return KMA_KEY_PATH.read_text().strip() or None
+
+
+here_location = None  # async () -> {"lat", "lon"} | {"name"} | None: the phone's location, wired where phone data exists
+
+
 async def weather_now(place, when):
-    return await weather.forecast(place, when, (await load_settings())["weather_home"])
+    return await weather.forecast(place, when, (await load_settings())["weather_home"], kma_key=kma_key(),
+                                  here=here_location)
 
 
 async def persona_shares(pid):
