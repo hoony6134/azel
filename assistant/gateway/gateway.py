@@ -3561,7 +3561,8 @@ def check_task(body):
         raise HTTPException(400, "auto_approve: true or false")
     return {"goal": goal.strip(), "notify": notify, "budget_usd": float(budget), "max_minutes": float(minutes),
             "device": device, "persona": persona, "backend": backend, "when": when,
-            "auto_approve": bool(body.get("auto_approve", False))}
+            "auto_approve": bool(body.get("auto_approve", False)),
+            **({"brief": str(body["brief"])[:4000]} if body.get("brief") else {})}  # the run's instructions, not shown
 
 
 NOTIFY_ASK = re.compile(r"(끝나면|끝나고|다\s*되면|완료되면|마치면|끝나는\s*대로)\s*(나한테|저한테|제게|내게)?\s*(전화|연락|알림|알려|푸시)")
@@ -3665,7 +3666,7 @@ def task_prompt(t, devices):
     asked = datetime.fromtimestamp(t.get("created") or time.time(), KST)  # "내일 아침까지" said at 01:00 = this morning
     night = late_night.prompt_rule(asked)
     return f"{where}{note}" + (f"\n이 일은 {asked:%-m월 %-d일 %H:%M}에 맡겨졌어.{night}" if night else "") + \
-        f"\n\n목표: {t['goal']}"
+        (f"\n\n{t['brief']}" if t.get("brief") else "") + f"\n\n목표: {t['goal']}"  # brief: how to run it, never shown
 
 
 async def task_round(t, prompt, resume, deadline):

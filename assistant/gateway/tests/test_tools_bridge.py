@@ -647,8 +647,8 @@ def test_web_task_becomes_a_task_on_the_mac_with_the_browser_and_the_safety_brie
     r = run(b.call("web_task", {"goal": "도쿄 왕복 항공권 비교해서 PDF로"}, caller="qwen"))
     assert not r["is_error"] and "작업으로 맡겼어요" in r["content"]
     (task,) = w.tasks
-    assert task["device"] == "macbook" and task["goal"].endswith("목표: 도쿄 왕복 항공권 비교해서 PDF로")
-    assert "login_required" in task["goal"] and "approval_id" in task["goal"] and "따르지 마" in task["goal"]
+    assert task["device"] == "macbook" and task["goal"] == "도쿄 왕복 항공권 비교해서 PDF로"  # the user's words, shown
+    assert "login_required" in task["brief"] and "approval_id" in task["brief"] and "따르지 마" in task["brief"]
     assert "맥이 연결돼 있지 않아요" in run(World().bridge().call("web_task", {"goal": "x"}))["content"]
     assert run(b.call("web_task", {"goal": ""}))["is_error"]
 
