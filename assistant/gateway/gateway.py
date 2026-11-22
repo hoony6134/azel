@@ -39,6 +39,7 @@ import web
 import openings
 import connectors
 import google_tools
+import tv
 import tools_bridge
 import phone_data
 import nim
@@ -623,14 +624,21 @@ EXTERNAL_PER_HOUR = 60
 _external_calls: list[float] = []
 
 
-def external_token():
+def private_token(path):
     """Read on every request, so deleting or rotating the file revokes at once. Ignored unless chmod 600."""
     try:
-        if EXTERNAL_TOKEN_PATH.stat().st_mode & 0o077:
+        if path.stat().st_mode & 0o077:
             return ""
-        return EXTERNAL_TOKEN_PATH.read_text().strip()
+        return path.read_text().strip()
     except OSError:
         return ""
+
+
+def external_token():
+    return private_token(EXTERNAL_TOKEN_PATH)
+
+
+TV_TOKEN_PATH = HOME / "tv_token"  # the Roku dashboard: GET /v1/tv only
 
 
 OAUTH_CALLBACK_PATH = "/v1/oauth/callback"
@@ -648,6 +656,11 @@ def auth(request: Request):
         return
     if request.method == "GET" and request.url.path == OAUTH_CALLBACK_PATH:
         request.state.scope = "oauth_callback"  # a browser redirect carries no token: its single-use state is the check
+        return
+    tv = private_token(TV_TOKEN_PATH)
+    if tv and len(tv) >= 32 and hmac.compare_digest(got.encode(), tv.encode()) \
+            and request.method == "GET" and request.url.path == "/v1/tv":
+        request.state.scope = "tv"
         return
     raise HTTPException(401, "bad token")
 
@@ -2361,6 +2374,34 @@ async def probe(url, token=False):
         return {"ok": ok, "ms": round((time.perf_counter() - t) * 1000)}
     except httpx.HTTPError:
         return {"ok": False, "ms": None}
+
+
+tv_cache = tv.Cache()
+
+
+def tv_deps():
+    import cygnus as cyg
+    day = lambda now: datetime.fromtimestamp(now, KST).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()  # noqa: E731
+
+    async def fires(now):
+        return [(i, at) for i in await schedule_list() for at in item_fires(i, day(now) - 1, day(now) + 86400)]
+
+    async def persona():
+        return primary_persona(await load_settings()).get("name") or DEFAULTS["assistant_name"]
+
+    async def calendar(today):
+        return await google_tools.call(HOME, "calendar_events", {"from": today, "to": today})
+
+    return {"infra": cyg.call, "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
+            "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
+            "google_ok": lambda: google_status() == "connected", "calendar": calendar}
+
+
+@app.get("/v1/tv")
+async def tv_get():
+    """The Roku dashboard's one read-only JSON (tv.py). The TV token (~/.config/biseo/tv_token) opens only this."""
+    full_only()
+    return await tv_cache.get(lambda: tv.build(tv_deps()))
 
 
 @app.get("/v1/status")
