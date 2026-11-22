@@ -54,8 +54,10 @@ sub init()
         m.bars.Push(mkRect(m.top, 0, 0, 30, 10, pal("text3")))
     end for
     m.xl = []
-    for i = 0 to 3
-        m.xl.Push(mkLabel(m.top, 0, 164, 80, 30, 24, "r", pal("text3")))
+    for i = 0 to 11
+        l = mkLabel(m.top, 0, 196, 80, 30, 24, "r", pal("text3"))
+        l.horizAlign = "center"
+        m.xl.Push(l)
     end for
     ' over each bar: its value, and on the temperature chart the hour's weather icon
     m.bv = []
@@ -64,7 +66,7 @@ sub init()
         l = mkLabel(m.top, 0, 82, 42, 26, 24, "r", pal("text2"))
         l.horizAlign = "center"
         m.bv.Push(l)
-        m.bi.Push(mkPoster(m.top, "pkg:/images/wx_clear.png", 0, 54, 24, 24, pal("text2")))
+        m.bi.Push(mkPoster(m.top, "pkg:/images/wx_clear.png", 0, 64, 32, 32, pal("text2")))
     end for
     m.wxIcon = mkPoster(m.top, "pkg:/images/wx_clear.png", 28, 24, 48, 48, pal("text"))
     m.seg = []
@@ -154,6 +156,9 @@ sub onContent()
     w = c.d_w
     if w < 100 then w = 414
     m.fill.width = w
+    ch = c.d_h
+    if ch = invalid or ch < 100 then ch = 200
+    m.fill.height = ch
     inner = w - 56
     t = c.d_t
     m.meta.width = inner
@@ -250,19 +255,19 @@ sub onContent()
         x = 28
         if c.d_icon <> ""
             m.wxIcon.uri = "pkg:/images/wx_" + c.d_icon + ".png"
-            show(m.wxIcon, 28, 24)
-            x = 28 + 48 + 14
+            show(m.wxIcon, 28, 28)
+            x = 28 + 48 + 16
         end if
         m.big.text = c.d_when
         m.big.color = pal("text")
-        show(m.big, x, 24)
+        show(m.big, x, 28)
         m.tail.text = c.d_tail
-        show(m.tail, x + m.big.boundingRect().width + 14, 38)
+        show(m.tail, x + m.big.boundingRect().width + 14, 42)
         m.sent.text = c.d_sent
         if c.d_soon then m.sent.color = pal("amber") else m.sent.color = pal("text")
         m.sent.height = 40
-        show(m.sent, 28, 86)
-        show(m.meta, 28, 146)
+        show(m.sent, 28, 102)
+        show(m.meta, 28, ch - 54)
     else if t = "chart"
         m.kind.text = c.d_title
         m.kind.color = pal("text2")
@@ -346,9 +351,11 @@ sub drawBars(series as Object, labels as Object, unit as String, inner as Intege
     n = series.Count()
     if n = 0 then return
     if n > 12 then n = 12
+    ' a column per value: icon (y 60), value (y 98), bar (128-178), hour (y 188), each centred in its column
     stp = Int(inner / n)
-    bw = stp - 12
-    top = 110
+    bw = 36
+    if bw > stp - 16 then bw = stp - 16
+    top = 128
     h = 50
     lo = 1000.0
     hi = -1000.0
@@ -373,7 +380,8 @@ sub drawBars(series as Object, labels as Object, unit as String, inner as Intege
         b = m.bars[i]
         b.width = bw
         b.height = bh
-        b.translation = [28 + i * stp, top + h - bh]
+        cx = 28 + i * stp + Int(stp / 2)
+        b.translation = [cx - Int(bw / 2), top + h - bh]
         b.color = pal("text3")
         if unit = "%" and v >= 60 then b.color = pal("amber")
         if unit <> "%" and i = 0 then b.color = pal("text2")
@@ -382,20 +390,21 @@ sub drawBars(series as Object, labels as Object, unit as String, inner as Intege
         vl = m.bv[i]
         if unit = "%" then vl.text = Int(v).ToStr() else vl.text = degShort(v)
         vl.width = stp
-        vl.translation = [28 + i * stp - 6, 82]
+        vl.translation = [28 + i * stp, 98]
         vl.color = pal("text2")
         if unit = "%" and v >= 60 then vl.color = pal("amber")
         vl.visible = true
         if i < icons.Count() and icons[i] <> ""
             ic = m.bi[i]
             ic.uri = "pkg:/images/wx_" + icons[i] + ".png"
-            ic.translation = [28 + i * stp + Int((bw - 24) / 2), 54]
+            ic.translation = [cx - 16, 60]
             ic.visible = true
         end if
-        if i mod 3 = 0 and li < 4 and i < labels.Count()
+        if i < labels.Count()
             l = m.xl[li]
             l.text = labels[i] + "시"
-            l.translation = [28 + i * stp, 164]
+            l.width = stp
+            l.translation = [28 + i * stp, 188]
             l.visible = true
             li = li + 1
         end if

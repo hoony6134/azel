@@ -112,7 +112,24 @@ sub buildRows()
     m.counterOn = []
 end sub
 
+' the rows' clip: two whole sections and the next one's title, whatever their heights (the weather row is taller)
+sub updateClip()
+    f = m.rows.rowItemFocused
+    if f = invalid or f.Count() <> 2 or m.model = invalid then return
+    n = m.model.sections.Count()
+    if n = 0 or f[0] >= n then return
+    h = 58
+    for k = 0 to 1
+        s = m.model.sections[(f[0] + k) mod n]
+        sh = 200
+        if s.h <> invalid then sh = s.h
+        h = h + sh + 112
+    end for
+    m.rowsClip.clippingRect = [0, 0, 1920, h]
+end sub
+
 sub updateCounter()
+    updateClip()
     f = m.rows.rowItemFocused
     m.counter.visible = false
     if f = invalid or f.Count() <> 2 or m.model = invalid then return
@@ -457,12 +474,17 @@ sub setRows(model as Object)
     titles = []
     sizes = []
     gaps = []
+    heights = []
     for each s in model.sections
         titles.Push(s.title)
-        sizes.Push([s.w, 200])
+        h = 200
+        if s.h <> invalid then h = s.h  ' the weather row is taller (its charts need the room)
+        sizes.Push([s.w, h])
+        heights.Push(h + 64)
         gaps.Push([24, 0])
     end for
     m.sectionTitles = titles
+    m.rows.rowHeights = heights
     m.rows.rowItemSize = sizes
     m.rows.rowItemSpacing = gaps
     m.rows.content = makeContent(model.sections)
