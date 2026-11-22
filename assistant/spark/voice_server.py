@@ -2890,6 +2890,36 @@ class Turn:
                 yield ("end", audio) if self.last_voiced_s >= self.min_voiced_s else ("drop", None)
 
 
+class TurnDiag:
+    """Per turn, from speech onset to its end: inbound audio seconds, wall seconds, the longest gap between inbound audio
+    messages (and when it began, seconds into the call) and what ended it. A turn that closes late with little
+    audio and one long gap means the client stopped sending (live 2026-11-23: Mac turns closed ~17 s late)."""
+
+    def __init__(self, t0=None):
+        self.t0, self.last, self.started = t0 if t0 is not None else time.monotonic(), None, None
+
+    def start(self, now):
+        self.started, self.audio_s, self.gap_s, self.gap_at = now, 0.0, 0.0, None
+
+    def frame(self, now, nbytes):
+        """Every inbound audio message (16 kHz PCM16), after the VAD saw it."""
+        if self.started is not None:
+            if self.last is not None and now - self.last > self.gap_s and self.last >= self.started:
+                self.gap_s, self.gap_at = now - self.last, self.last - self.t0
+            self.audio_s += nbytes / 32000
+        self.last = now
+
+    def done(self, now, by, voiced_s=None):
+        """The turn's numbers (None when no speech was under way), and the turn closes."""
+        if self.started is None:
+            return None
+        d = {"by": by, "audio_s": round(self.audio_s, 2), "wall_s": round(now - self.started, 2),
+             "max_gap_s": round(self.gap_s, 2), "gap_at_s": None if self.gap_at is None else round(self.gap_at, 2),
+             **({"voiced_s": round(voiced_s, 2)} if voiced_s is not None else {})}
+        self.started = None
+        return d
+
+
 FILLER_SOUNDS = re.compile(r"(음+|어+|아+|으+|흠+|에+|그+|저기|그러니까)[\s.,!?~]*")
 STOP_WORDS = re.compile(r"아니|그만|잠깐|취소|됐어|멈춰|스톱|stop|그거 말고", re.I)
 # "잠깐만", "음…", "생각 좀 해볼게": the user asks for time, not an answer. Nothing is said back; the next speech is the turn
@@ -3001,6 +3031,14 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
     start_log = {"event": "start", "log_id": log_id}
     vad_turn = Turn(SileroVoiceActivityDetector(), mode=links.settings.get("noise_mode", "normal"))
+    diag = TurnDiag()
+
+    def diag_done(by, voiced_s=None):
+        d = diag.done(time.monotonic(), by, voiced_s)
+        if d:  # numbers only: nothing said is printed, and a secret call is not named
+            print(f"turn-end {'secret' if current.get('secret') else log_id[:8]} " + " ".join(f"{k}={v}" for k, v in d.items()),
+                  flush=True)
+        return d
     # a wake-started call opens on room tone and the wake word's tail: its first WAKE_GUARD_S hear only louder,
     # longer speech (the noisy-mode thresholds), so Whisper is not handed silence to hallucinate on
     wake_guard_until = time.monotonic() + WAKE_GUARD_S if intent == "wake" else 0.0
@@ -3442,6 +3480,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                 if kind == "hangup":
                     break
                 if kind == "interrupt":  # tap-to-interrupt: same as a barge-in, after a protected first sentence
+                    diag_done("interrupt")
                     side(tap_interrupt())
                 if kind == "played":  # the phone finished reply N: playback really ends now, not at the estimate
                     current["reports"] = True
@@ -3474,8 +3513,13 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     await send({"type": "mode", "value": v})
                 continue
             vad_turn.set_mode("noisy" if time.monotonic() < wake_guard_until else links.settings.get("noise_mode", "normal"))
+            diag.frame(time.monotonic(), len(msg.get("bytes") or b""))  # before the VAD: a stall then the closing frames
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
                 now = time.monotonic()
+                if kind == "start":
+                    diag.start(now)
+                    diag.audio_s += len(msg.get("bytes") or b"") / 32000  # the message speech began in (a one-shot send: all of it)
+                d = diag_done("quiet" if kind == "end" else "drop", vad_turn.last_voiced_s) if kind in ("end", "drop") else None
                 task = current["task"]
                 busy = task and not task.done()
                 # The tail guard: speech then still gets the barge-in check (echo, noise), never a free new turn
@@ -3500,10 +3544,11 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     elif busy:  # thinking: never cancel on raw voice, decide on the transcript
                         current["task"] = spawn(followup(audio, task))
                     else:
-                        current["task"] = spawn(answer(audio))
+                        current["task"] = spawn(answer(audio, timings={"turn": d} if d else None))
     except WebSocketDisconnect:
         pass
     finally:  # hung up: stop everything this call started (a Claude run gets a link cancel as its task unwinds)
+        diag_done("hangup")  # speech still under way when the call ended
         async def cleanup():
             phones[:] = [p for p in phones if p["send"] is not send]
             left = [t for t in {*current["replies"], *current["side"], current["task"]} if t and not t.done()]
@@ -3652,6 +3697,15 @@ if __name__ == "__main__":
         list(t.feed(silence))
         cough = tone(0.2, 8000, 5)
         assert [k for k, _ in t.feed(cough + silence)] == ["start", "drop"]  # a 200 ms cough: never a turn
+        dg = TurnDiag(t0=100.0)
+        dg.frame(100.5, 3200)  # before any speech: not counted
+        dg.start(101.0)
+        for at in (101.1, 101.2, 101.3):
+            dg.frame(at, 3200)  # 0.1 s chunks arriving in time
+        dg.frame(118.3, 3200)  # then a 17 s stall before the closing frames
+        got = dg.done(118.6, "quiet", 1.4)
+        assert got == {"by": "quiet", "audio_s": 0.4, "wall_s": 17.6, "max_gap_s": 17.0, "gap_at_s": 1.3, "voiced_s": 1.4}, got
+        assert dg.done(119.0, "hangup") is None  # nothing under way: nothing to say
         bursts = b"".join(tone(0.1, 9000, 6 + i) + silence[:9600] for i in range(5))  # door slams, clatter
         kinds = [k for k, _ in t.feed(bursts + silence)]
         # bursts 300 ms apart merge into one utterance (end-of-speech needs 500 ms of quiet); it reaches STT, and
