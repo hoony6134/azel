@@ -79,7 +79,18 @@ final class MacCall: ObservableObject {
     @Published var typedDraft = ""
     private var pttCall = false
     /// Started by the wake word: the mic is live from the start and the call ends after 30 s of quiet.
-    private var wakeCall = false
+    @Published private var wakeCall = false
+
+    /// The panel's listening glow: while the push-to-talk key is held, and in a wake-started call
+    /// whenever the mic is live and the assistant is listening (so it visibly hears the user).
+    var hearing: Bool {
+        Self.hears(talking: talking, wake: wakeCall, inCall: inCall, muted: muted, held: held, state: state)
+    }
+
+    nonisolated static func hears(talking: Bool, wake: Bool, inCall: Bool, muted: Bool, held: Bool, state: String) -> Bool {
+        if talking { return true }
+        return wake && inCall && !muted && !held && (state == "listening" || state.isEmpty)
+    }
     private var fadeTask: Task<Void, Never>?
     private var idleTask: Task<Void, Never>?
 
@@ -421,6 +432,7 @@ final class CallPanel: NSPanel {
 /// DESIGN §8.2: jar · captions · route chip and close, on material, radius 30.
 struct CallPanelView: View {
     @ObservedObject var call: MacCall
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var typingFocus: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -502,7 +514,16 @@ struct CallPanelView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous)
-            .strokeBorder(call.talking ? Theme.celadon : Theme.stroke, lineWidth: call.talking ? 1.5 : 1))
+            .strokeBorder(call.hearing ? Theme.celadon : Theme.stroke, lineWidth: call.hearing ? 1.5 : 1))
+        .overlay {
+            // The listening glow, shared by push-to-talk and wake: a soft celadon rim inside the edge.
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .strokeBorder(Theme.celadon, lineWidth: 6).blur(radius: 6)
+                .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+                .opacity(call.hearing ? 0.55 : 0)
+                .allowsHitTesting(false)
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: call.hearing)
         .environment(\.colorScheme, .dark)
     }
 }
