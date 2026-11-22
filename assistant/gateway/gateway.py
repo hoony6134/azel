@@ -3951,6 +3951,7 @@ def task_prompt(t, devices):
     if t["device"] and t["device"] in limited:
         note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
     note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
+    note += " 사용자가 다운로드 폴더를 말하면 결과 파일은 그 기기의 ~/Downloads에 저장해(위임할 때도 그렇게 전해)."
     if t.get("parent_task"):
         note += f" 이 작업은 앞서 맡긴 작업({t['parent_task']})을 이어서 하는 거야: 같은 기기와 폴더에서 그 결과에 이어서 해."
         if (r := t.get("resume")) and r.get("session_id"):

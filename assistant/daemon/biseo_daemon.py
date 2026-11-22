@@ -733,7 +733,10 @@ def delegate(task: str, cwd: str, harness: str = "claude_code", model: str | Non
     env = _claude_env()
     allowed = CFG.get("delegate_allowed_tools", DEFAULTS["delegate_allowed_tools"])
     job_id = uuid.uuid4().hex[:12]
+    # "다운로드 폴더에 받아줘": a report ran in ~/dev and stayed there (2026-11-22); the run may also write Downloads
+    extra_dirs = [str(p) for p in (Path.home() / "Downloads",) if p.is_dir()]
     argv = [CFG["claude_bin"], "-p", task, *resume_args, "--permission-mode", "acceptEdits",
+            *(["--add-dir", *extra_dirs] if extra_dirs else []),
             *(["--allowedTools", *allowed] if allowed else []),
             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
             *prompt_tool_args(job_id, wd),

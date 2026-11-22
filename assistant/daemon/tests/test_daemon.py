@@ -164,7 +164,8 @@ def test_delegate_mocked(cfg, monkeypatch):
     st = d.job_status(job_id=job_id)
     assert st["job_status"] == "done" and st["summary"] == "did it"
     conf = seen["argv"][seen["argv"].index("--mcp-config") + 1]  # the run's own prompt-server config
-    assert seen["argv"] == ["claude", "-p", "fix bug", "--permission-mode", "acceptEdits",
+    dl = [str(p) for p in (Path.home() / "Downloads",) if p.is_dir()]
+    assert seen["argv"] == ["claude", "-p", "fix bug", "--permission-mode", "acceptEdits", *(["--add-dir", *dl] if dl else []),
                             "--allowedTools", *d.DEFAULTS["delegate_allowed_tools"],
                             "--disallowedTools", "Bash(git push:*)", "Bash(rm:*)", "Bash(sudo:*)",
                             "--mcp-config", conf, "--permission-prompt-tool", "mcp__azel_prompt__approve",
