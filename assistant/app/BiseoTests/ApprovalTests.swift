@@ -281,3 +281,32 @@ final class AutoApproveTests: XCTestCase {
         client.sendAutoApprove(true, minutes: 30, devices: ["macbook"])   // no socket: nothing sent, no crash
     }
 }
+
+final class ApprovalButtonsTests: XCTestCase {
+    func testNotificationButtonsSendRealBooleans() throws {
+        let info: [AnyHashable: Any] = ["type": "approval", "approval_id": "ap5"]
+        let deny = try XCTUnwrap(PushAction.request(action: "DENY", userInfo: info))
+        XCTAssertEqual(deny.path, "/v1/approvals/ap5")
+        XCTAssertEqual(deny.body?["decision"], "deny")
+        XCTAssertEqual(deny.body?["approve"], false as AnyHashable, "a JSON false: Python's bool(\"false\") would approve")
+        let sent = try JSONSerialization.data(withJSONObject: deny.body!)
+        XCTAssertTrue(String(decoding: sent, as: UTF8.self).contains(#""approve":false"#))
+        XCTAssertEqual(PushAction.request(action: "APPROVE_ALWAYS", userInfo: info)?.body?["decision"], "always")
+        XCTAssertNil(PushAction.request(action: "APPROVE_ONCE", userInfo: ["type": "task"]))
+        XCTAssertTrue(PushAction.categories.map(\.identifier).contains("APPROVAL_ONCE"))
+    }
+
+    #if os(macOS)
+    @MainActor func testPanelGrowsForTheApprovalRow() {
+        XCTAssertEqual(MacCall.panelHeight(typing: false), 112)
+        XCTAssertEqual(MacCall.panelHeight(typing: false, approval: true), 142)
+    }
+    #endif
+}
+
+final class ForcedPushNoteTests: XCTestCase {
+    func testAnAlwaysHeldToOnceIsExplained() {
+        let body = Data(#"{"decision":"once","forced_once":true,"forced_reason":"파일을 바꾸는 명령이라 이번 한 번만 허용했어요."}"#.utf8)
+        XCTAssertEqual(ApprovalAPI.forcedNote(body), "파일을 바꾸는 명령이라 이번 한 번만 허용했어요.")
+    }
+}

@@ -28,6 +28,33 @@ private struct Orb: View {
     }
 }
 
+/// 허용 / 거부 / 항상 허용 for a waiting device command; the app's intent sends the decision.
+private struct ApprovalButtons: View {
+    let approval: PendingApproval
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Image(systemName: "hand.raised.fill").font(.caption).foregroundStyle(tint)
+                Text(approval.shortCommand.map { "\(approval.device) · \($0)" } ?? "승인 필요")
+                    .font(.caption.monospaced()).lineLimit(1)
+            }
+            HStack(spacing: 6) {
+                Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "once")) { Text("허용").frame(maxWidth: .infinity) }
+                    .tint(tint)
+                Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "deny")) { Text("거부").frame(maxWidth: .infinity) }
+                    .tint(.red)
+                Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "always")) { Text("항상 허용").frame(maxWidth: .infinity) }
+                    .tint(.gray)
+                    .disabled(approval.forcedOnce)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+        }
+    }
+}
+
 struct CallLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: CallActivityAttributes.self) { ctx in
@@ -46,6 +73,7 @@ struct CallLiveActivity: Widget {
                     if let c = s.caption {
                         Text(c).font(.subheadline).foregroundStyle(s.mine ? .secondary : .primary).lineLimit(2)
                     }
+                    if let ap = s.approval { ApprovalButtons(approval: ap, tint: Color(hex: a.glaze)).padding(.top, 4) }
                 }
             }
             .padding(16)
@@ -69,7 +97,9 @@ struct CallLiveActivity: Widget {
                     }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    if let c = s.caption {
+                    if let ap = s.approval {
+                        ApprovalButtons(approval: ap, tint: Color(hex: a.glaze))
+                    } else if let c = s.caption {
                         Text(c).font(.subheadline).foregroundStyle(s.mine ? .secondary : .primary).lineLimit(2)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -102,6 +132,7 @@ struct TaskLiveActivity: Widget {
                     }
                     if let step = s.step { Text(step).font(.subheadline).foregroundStyle(.secondary).lineLimit(2) }
                     if s.steps > 0 { Text("\(s.steps)단계").font(.caption).foregroundStyle(.secondary) }
+                    if let ap = s.approval { ApprovalButtons(approval: ap, tint: Color(hex: a.glaze)).padding(.top, 4) }
                 }
             }
             .padding(16)
@@ -119,7 +150,8 @@ struct TaskLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.center) { Text(a.goal).font(.headline).lineLimit(1) }
                 DynamicIslandExpandedRegion(.bottom) {
-                    if let step = s.step { Text(step).font(.subheadline).foregroundStyle(.secondary).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading) }
+                    if let ap = s.approval { ApprovalButtons(approval: ap, tint: Color(hex: a.glaze)) }
+                    else if let step = s.step { Text(step).font(.subheadline).foregroundStyle(.secondary).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading) }
                 }
             } compactLeading: {
                 Image(systemName: icon(s.status)).foregroundStyle(Color(hex: a.glaze))

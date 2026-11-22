@@ -24,6 +24,11 @@ final class LiveActivities {
             .receive(on: RunLoop.main)
             .sink { [weak self] in self?.syncTasks($0) }
             .store(in: &bag)
+        // A pending approval shows its buttons on the call's (or a waiting task's) activity.
+        ApprovalCenter.shared.$all
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.syncNow() } }
+            .store(in: &bag)
         // Activities left over from a previous run (the app was killed mid-call).
         for a in ActivityKit.Activity<CallActivityAttributes>.activities { Task { await a.end(nil, dismissalPolicy: .immediate) } }
         for a in ActivityKit.Activity<TaskActivityAttributes>.activities { tasks[a.attributes.taskID] = a }
@@ -48,17 +53,31 @@ final class LiveActivities {
 
     static func glaze(_ p: Persona?) -> UInt32 { p.map { $0.customHex ?? $0.tintKey.glazeHex } ?? PersonaTint.celadon.glazeHex }
 
-    static func callState(_ c: CallManager) -> CallActivityAttributes.ContentState {
+    static func callState(_ c: CallManager, approval: PendingApproval? = nil) -> CallActivityAttributes.ContentState {
         let last = c.lines.last
         return .init(state: c.held ? "held" : (c.connectedAt == nil ? "connecting" : c.displayState),
                      caption: c.secret ? nil : last.map { String($0.text.suffix(120)) }, mine: last?.mine ?? false, muted: c.muted,
-                     secret: c.secret)
+                     secret: c.secret, approval: approval)
+    }
+
+    /// The oldest pending approval as the Lock Screen shows it; no command text in a secret call.
+    static func pendingApproval(_ pending: [ApprovalRequest], secret: Bool) -> PendingApproval? {
+        guard let a = pending.min(by: { ($0.created ?? .distantPast) < ($1.created ?? .distantPast) }) else { return nil }
+        return PendingApproval(id: a.id, device: a.device, command: secret ? nil : a.command, forcedOnce: a.forcedOnce)
+    }
+
+    /// Re-applies everything (after a decision from the Lock Screen, or a new approval).
+    func syncNow() {
+        lastCall = nil
+        syncCall()
+        syncTasks(TaskModel.shared.tasks)
     }
 
     private func syncCall() {
         let c = CallManager.shared
         if c.inCall {
-            let s = Self.callState(c)
+            ApprovalCenter.shared.start()   // approvals keep coming in while the phone is locked in a call
+            let s = Self.callState(c, approval: Self.pendingApproval(ApprovalCenter.shared.pending, secret: c.secret))
             if let call {
                 guard s != lastCall else { return }
                 lastCall = s
@@ -78,8 +97,12 @@ final class LiveActivities {
     }
 
     private func syncTasks(_ list: [AgentTask]) {
+        // Outside a call, a task waiting for approval carries the buttons.
+        let waiting = call == nil ? list.first { $0.status == "waiting_approval" && tasks[$0.id] != nil }?.id : nil
+        let approval = Self.pendingApproval(ApprovalCenter.shared.pending, secret: false)
         for t in list {
-            let s = TaskActivityAttributes.ContentState(status: t.status, step: t.steps.last?.label, steps: t.steps.count)
+            let s = TaskActivityAttributes.ContentState(status: t.status, step: t.steps.last?.label, steps: t.steps.count,
+                                                        approval: t.id == waiting ? approval : nil)
             if let a = tasks[t.id] {
                 if t.isActive {
                     if a.content.state != s { Task { await a.update(.init(state: s, staleDate: nil)) } }
@@ -103,7 +126,8 @@ final class LiveActivities {
         let p = PersonaModel.shared.selected
         _ = try? ActivityKit.Activity.request(
             attributes: CallActivityAttributes(name: p?.name ?? "아젤", glaze: Self.glaze(p), startedAt: Date().addingTimeInterval(-83)),
-            content: .init(state: .init(state: "speaking", caption: "내일 오전 10시에 팀 회의가 있고, 오후 3시까지 과제 마감이에요.", mine: false, muted: false), staleDate: nil))
+            content: .init(state: .init(state: "speaking", caption: "내일 오전 10시에 팀 회의가 있고, 오후 3시까지 과제 마감이에요.", mine: false, muted: false,
+                                        approval: PendingApproval(id: "demo", device: "deneb", command: "docker compose restart web", forcedOnce: false)), staleDate: nil))
         _ = try? ActivityKit.Activity.request(
             attributes: TaskActivityAttributes(taskID: "demo", goal: "이번 주 과제 마감 정리해서 노션에 올리기", glaze: PersonaTint.indigo.glazeHex),
             content: .init(state: .init(status: "running", step: "노션 페이지 만드는 중", steps: 3), staleDate: nil))

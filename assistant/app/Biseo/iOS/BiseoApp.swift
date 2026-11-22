@@ -48,7 +48,9 @@ struct BiseoApp: App {
                 if scenePhase == .active {
                     ApprovalCenter.shared.start()
                     Task { await ApprovalCenter.shared.refresh() }   // stale sheets never survive a return
-                } else { ApprovalCenter.shared.stop() }
+                } else if !CallManager.shared.inCall {
+                    ApprovalCenter.shared.stop()   // during a call the app keeps running, and so does the check
+                }
             }
         }
     }

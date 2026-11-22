@@ -13,12 +13,26 @@ struct CallActivityAttributes: ActivityAttributes {
         var muted: Bool
         /// Secret call: the Lock Screen and Dynamic Island show no captions.
         var secret: Bool = false
+        /// A device command waiting for the user, with 허용 / 거부 / 항상 허용 buttons.
+        var approval: PendingApproval? = nil
     }
 
     var name: String
     /// Persona glaze, 0xRRGGBB.
     var glaze: UInt32
     var startedAt: Date
+}
+
+/// The approval a Live Activity shows. `command` is nil in a secret call ("승인 필요" only).
+struct PendingApproval: Codable, Hashable {
+    var id: String
+    var device: String
+    var command: String?
+    /// "항상 허용" isn't allowed for this one.
+    var forcedOnce: Bool
+
+    /// The command cut for the Lock Screen.
+    var shortCommand: String? { command.map { $0.count <= 40 ? $0 : String($0.prefix(39)) + "…" } }
 }
 
 /// A background task (`/v1/tasks`) while it runs.
@@ -28,6 +42,7 @@ struct TaskActivityAttributes: ActivityAttributes {
         var status: String
         var step: String?
         var steps: Int
+        var approval: PendingApproval? = nil
     }
 
     var taskID: String

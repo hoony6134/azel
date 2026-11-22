@@ -42,6 +42,12 @@ targets:
       properties:
         CFBundleDisplayName: Azel
         CFBundleName: Azel # macOS menu/app name; PRODUCT_NAME stays Biseo (module name, test host)
+        # Siri needs the app's name in a phrase; these let "아젤 불러줘" and "비서 불러줘" work too.
+        INAlternativeAppNames:
+          - INAlternativeAppName: 아젤
+            INAlternativeAppNamePronunciationHint: 아젤
+          - INAlternativeAppName: 비서
+            INAlternativeAppNamePronunciationHint: 비서
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         NSMicrophoneUsageDescription: Azel로 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.
@@ -74,6 +80,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.scian.biseo.widgets
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: NO
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) WIDGET # ApprovalIntent: the app-only perform body
     info:
       path: Biseo/Widgets/Info.plist
       properties:
