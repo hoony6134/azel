@@ -119,6 +119,6 @@ final class PushActionTests: XCTestCase {
         XCTAssertEqual(PushAction.request(action: "SKIP", userInfo: info)?.method, "DELETE")
         XCTAssertEqual(PushAction.request(action: "STOP", userInfo: ["task_id": "t9"]), .init(method: "POST", path: "/v1/tasks/t9/cancel"))
         XCTAssertNil(PushAction.request(action: "SKIP", userInfo: ["schedule_id": "a1"]), "no occurrence: do nothing")
-        XCTAssertEqual(Set(PushAction.categories.map(\.identifier)), ["SCHEDULE", "TASK"])
+        XCTAssertEqual(Set(PushAction.categories.map(\.identifier)), ["SCHEDULE", "TASK", "APPROVAL", "APPROVAL_ONCE"])
     }
 }

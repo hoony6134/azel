@@ -94,3 +94,13 @@ final class ListeningGlowTests: XCTestCase {
     }
 }
 #endif
+
+#if os(macOS)
+final class WakeIntentTests: XCTestCase {
+    func testWakeCallsSayIntentWake() throws {
+        let req = try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "mac-1", callID: nil, intent: MacCall.wakeIntent, persona: "azel")
+        let items = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(items.first { $0.name == "intent" }?.value, "wake")
+    }
+}
+#endif

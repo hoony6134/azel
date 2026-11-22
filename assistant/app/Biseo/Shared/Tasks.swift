@@ -184,7 +184,8 @@ enum TaskAPI {
         case .overnight: b["when"] = "overnight"
         case .at(let d): b["when"] = KST.iso(d)
         }
-        if when != .now && autoApprove { b["auto_approve"] = true }   // read-only commands only, server side
+        // The task's own auto-approve grant (brain aeb70e6: the batch 8 grant, ends with the task).
+        if autoApprove { b["auto_approve"] = true }
         if let device { b["device"] = device }
         if let persona { b["persona"] = persona }
         return b

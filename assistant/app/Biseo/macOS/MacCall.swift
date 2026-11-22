@@ -1,3 +1,4 @@
+import Combine
 import AVFoundation
 import AppKit
 import SwiftUI
@@ -178,9 +179,12 @@ final class MacCall: ObservableObject {
         let p = key.flatMap { k in PersonaModel.shared.personas.first { $0.id == k || $0.name == k } } ?? PersonaModel.shared.primary
         wakeCall = true
         pendingUtterance = utterance
-        start(panel: true, persona: p)
+        // intent=wake: the voice server is stricter about speech in the first 2 s (room-tone hallucinations).
+        start(panel: true, intent: Self.wakeIntent, persona: p)
         scheduleIdle()
     }
+
+    nonisolated static let wakeIntent = "wake"
 
     /// The listener's recording of what followed the name; sent before the live mic.
     private var pendingUtterance: String?
@@ -221,6 +225,25 @@ final class MacCall: ObservableObject {
 
     func hangUp() { end(error: nil, keepPanel: false) }
 
+    private func closePanelSoon() {
+        fadeTask?.cancel()
+        fadeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(CallOverlay.linger * 1e9))
+            guard let self, !Task.isCancelled, !self.inCall, let p = self.panel else { return }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 }) { p.orderOut(nil) }
+        }
+    }
+
+    /// The call panel's approval row: decide right there (the floating approval window closes too).
+    func decideApproval(_ a: ApprovalRequest, _ d: ApprovalDecision) {
+        Task {
+            do { _ = try await ApprovalCenter.shared.decide(a, d) }
+            catch let e where ApprovalCenter.alreadyDecided(e) { await ApprovalCenter.shared.refresh() }
+            catch { self.error = "보내지 못했어요: " + FriendlyError.describe(error).title }
+            if ApprovalCenter.shared.presented?.id == a.id { ApprovalWindow.close() }
+        }
+    }
+
     func setAuto(_ on: Bool, minutes: Int, devices: [String]?) {
         guard inCall else { return }
         client.sendAutoApprove(on, minutes: minutes, devices: devices)
@@ -249,12 +272,15 @@ final class MacCall: ObservableObject {
         return true
     }
 
-    static func panelHeight(typing: Bool) -> CGFloat { typing ? 176 : 112 }
+    static func panelHeight(typing: Bool, approval: Bool = false) -> CGFloat { (typing ? 176 : 112) + (approval ? 30 : 0) }
+
+    private var approvalWatch: Any?
+    private var panelHasApproval: Bool { inCall && !ApprovalCenter.shared.pending.isEmpty }
 
     private func resizePanel() {
         guard let p = panel else { return }
         var f = p.frame
-        f.size.height = Self.panelHeight(typing: typing)   // grows upward from the bottom edge
+        f.size.height = Self.panelHeight(typing: typing, approval: panelHasApproval)   // grows upward from the bottom edge
         p.setFrame(f, display: true, animate: false)
         if typing { p.makeKey() }
     }
@@ -367,7 +393,10 @@ final class MacCall: ObservableObject {
         case "activity" where event.phase == "tool_end":
             pulseAt = Date()
         case "hangup", "end":
-            end(error: nil, keepPanel: false)
+            // The server ended the call: same cleanup as the user's hang-up (audio flushed, mic and
+            // markers released), then the panel lingers briefly so the last words stay readable.
+            end(error: nil, keepPanel: true)
+            closePanelSoon()
             return
         case "error": error = event.message
         case "interrupt": log.apply(event); interruptedAt = Date()
@@ -377,6 +406,7 @@ final class MacCall: ObservableObject {
 
     /// keepPanel: leave the transcript / error on screen after the server hung up or something failed.
     private func end(error message: String?, keepPanel: Bool) {
+        if inCall && !secret { StartAzelCallIntent.donate(persona: activePersona) }   // Siri suggestions
         if inCall { NotificationCenter.default.post(name: callEndedNotification, object: nil) }
         client.stop()
         if let message { error = message }
@@ -402,6 +432,7 @@ final class MacCall: ObservableObject {
         typedDraft = ""
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
+        resizePanel()
     }
 
     // MARK: Panel
@@ -423,6 +454,9 @@ final class MacCall: ObservableObject {
             p.setAccessibilityLabel("\(AssistantName.current) 말하기 패널")
             p.contentView = NSHostingView(rootView: CallPanelView(call: self))
             panel = p
+            approvalWatch = ApprovalCenter.shared.$all.receive(on: RunLoop.main).sink { [weak self] _ in
+                DispatchQueue.main.async { self?.resizePanel() }
+            }
         }
         if let p = panel, let screen = NSScreen.main {
             // Bottom-centre, 80 pt above the Dock (visibleFrame already excludes it).
@@ -451,6 +485,7 @@ final class CallPanel: NSPanel {
 /// DESIGN §8.2: jar · captions · route chip and close, on material, radius 30.
 struct CallPanelView: View {
     @ObservedObject var call: MacCall
+    @ObservedObject private var approvals = ApprovalCenter.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var typingFocus: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -486,6 +521,7 @@ struct CallPanelView: View {
                     Text(u.typed == true ? "\(Image(systemName: "keyboard")) \(u.text)" : u.text).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
                 }
                 if let reply { PanelReply(call: call, reply: reply) }
+                if let a = approvals.pending.first { PanelApprovalRow(request: a, secret: call.secret) { call.decideApproval(a, $0) } }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .animation(Theme.caption, value: call.lines)
@@ -518,7 +554,7 @@ struct CallPanelView: View {
             }
         }
         .padding(.horizontal, Theme.l)
-        .frame(width: 460, height: 112)
+        .frame(width: 460, height: 112 + (call.inCall && !approvals.pending.isEmpty ? 30 : 0))
         .frame(maxHeight: .infinity, alignment: .top)
         .overlay(alignment: .bottom) {
             if call.typing {
@@ -528,7 +564,7 @@ struct CallPanelView: View {
                     .onAppear { typingFocus = true }
             }
         }
-        .frame(width: 460, height: MacCall.panelHeight(typing: call.typing))
+        .frame(width: 460, height: MacCall.panelHeight(typing: call.typing, approval: call.inCall && !approvals.pending.isEmpty))
         .background {
             if reduceTransparency { Theme.bgRaised } else { Rectangle().fill(.ultraThinMaterial) }
             if call.secret { Color.black.opacity(0.3) }
@@ -636,5 +672,28 @@ enum WakeURL {
         // The id becomes part of a file name: only [A-Za-z0-9_-], at most 64.
         let u = value("utterance").flatMap { $0.range(of: #"^[A-Za-z0-9_-]{1,64}$"#, options: .regularExpression) != nil ? $0 : nil }
         return Request(persona: value("persona"), utterance: u)
+    }
+}
+
+/// One pending approval inside the call panel: device and a short command, 허용 / 거부 / 항상 허용.
+struct PanelApprovalRow: View {
+    let request: ApprovalRequest
+    var secret = false
+    var decide: (ApprovalDecision) -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.xs) {
+            Image(systemName: "hand.raised.fill").font(.caption).foregroundStyle(Theme.amber)
+            Text(secret ? "승인 필요" : "\(request.device) · \(request.command)").font(.caption.monospaced()).foregroundStyle(Theme.text)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 2)
+            Button("허용") { decide(.once) }
+            Button("거부") { decide(.deny) }
+            Button("항상") { decide(.always) }.disabled(request.forcedOnce).help(request.forcedNote ?? "")
+        }
+        .font(.caption)
+        .buttonStyle(.borderless)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("승인 필요: \(secret ? "" : request.command)")
     }
 }

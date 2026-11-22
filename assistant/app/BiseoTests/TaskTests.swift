@@ -184,8 +184,9 @@ final class OvernightTaskTests: XCTestCase {
         XCTAssertEqual(night["auto_approve"] as? Bool, true)
         let at = ISO8601DateFormatter().date(from: "2026-11-23T14:00:00Z")!
         XCTAssertEqual(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, when: .at(at))["when"] as? String, "2026-11-23T23:00:00+09:00")
-        XCTAssertNil(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, autoApprove: true)["auto_approve"],
-                     "a now task's auto-approve is a grant, not this field")
+        XCTAssertEqual(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push, autoApprove: true)["auto_approve"] as? Bool, true,
+                       "any task: the field opens the task's grant (brain aeb70e6)")
+        XCTAssertNil(TaskAPI.body(goal: "x", device: nil, persona: nil, notify: .push)["auto_approve"])
     }
 
     func testScheduledTaskAndPush() throws {
@@ -199,3 +200,20 @@ final class OvernightTaskTests: XCTestCase {
         XCTAssertFalse(AppSettings.reportsOvernight(Data(#"{"default_model":"auto"}"#.utf8)))
     }
 }
+
+#if os(iOS)
+@MainActor
+final class LiveActivityApprovalTests: XCTestCase {
+    func testOldestPendingAndNoCommandInSecret() {
+        let a = ApprovalRequest(["id": "new", "device": "macbook", "command": "ls", "created_at": "2026-11-22T10:05:00Z"])
+        let b = ApprovalRequest(["id": "old", "device": "deneb", "command": "docker restart web", "created_at": "2026-11-22T10:00:00Z", "forced_once": true])
+        let p = LiveActivities.pendingApproval([a, b], secret: false)
+        XCTAssertEqual(p?.id, "old")
+        XCTAssertEqual(p?.command, "docker restart web")
+        XCTAssertEqual(p?.forcedOnce, true, "항상 greyed out")
+        XCTAssertNil(LiveActivities.pendingApproval([a], secret: true)?.command, "secret: only 승인 필요")
+        XCTAssertNil(LiveActivities.pendingApproval([], secret: false))
+        XCTAssertEqual(PendingApproval(id: "x", device: "m", command: String(repeating: "a", count: 60), forcedOnce: false).shortCommand?.count, 40)
+    }
+}
+#endif

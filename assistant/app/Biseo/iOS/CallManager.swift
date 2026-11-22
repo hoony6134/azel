@@ -301,6 +301,7 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     private func teardown() {
+        if activeSession != nil && !secret { StartAzelCallIntent.donate(persona: activePersona) }   // Siri suggestions
         client.stop()
         if activeSession != nil { NotificationCenter.default.post(name: callEndedNotification, object: nil) }
         activeSession = nil

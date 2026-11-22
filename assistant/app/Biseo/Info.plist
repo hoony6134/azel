@@ -35,6 +35,21 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>INAlternativeAppNames</key>
+	<array>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>아젤</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>아젤</string>
+		</dict>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>비서</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>비서</string>
+		</dict>
+	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>LSUIElement</key>

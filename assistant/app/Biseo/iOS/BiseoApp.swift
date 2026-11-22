@@ -50,7 +50,9 @@ struct BiseoApp: App {
                     ApprovalCenter.shared.start()
                     Task { await ApprovalCenter.shared.refresh() }   // stale sheets never survive a return
                     Task { await PhoneDataSync.upload(force: false) }
-                } else { ApprovalCenter.shared.stop() }
+                } else if !CallManager.shared.inCall {
+                    ApprovalCenter.shared.stop()   // during a call the app keeps running, and so does the check
+                }
             }
         }
     }
