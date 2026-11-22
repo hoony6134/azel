@@ -98,6 +98,7 @@ struct WatchHome: View {
 /// The iPhone call screen, shrunk: state glaze, the jar reacting to the voice, one caption, two buttons.
 struct WatchCallScreen: View {
     @ObservedObject private var call = WatchCall.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
 
     private var tint: Color { call.persona?.tint ?? Theme.glazeCeladon }
@@ -115,12 +116,21 @@ struct WatchCallScreen: View {
                     .frame(width: 64, height: 64)
                     .padding(.vertical, Theme.xs)
                 if let line = call.log.lines.last {
-                    Text(line.text)
+                    // The reply brightens as it is heard, like the iPhone's captions.
+                    TimelineView(.animation(minimumInterval: 1 / 10, paused: line.mine || !call.playing)) { _ in
+                        let k = call.karaoke(stepped: reduceMotion)
+                        Group {
+                            if !line.mine, k.texts.joined(separator: " ") == line.text {
+                                KaraokeText(text: line.text, heard: k.spoken)
+                            } else {
+                                Text(line.text).foregroundStyle(line.mine ? Theme.text2 : Theme.text)
+                            }
+                        }
                         .font(.caption2)
-                        .foregroundStyle(line.mine ? Theme.text2 : Theme.text)
-                        .lineLimit(2)
+                        .lineLimit(3)
                         .multilineTextAlignment(.center)
-                        .animation(Theme.caption, value: line.text)
+                    }
+                    .animation(Theme.caption, value: line.text)
                 }
                 Spacer(minLength: 0)
                 HStack(spacing: Theme.l) {
