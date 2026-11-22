@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -22,9 +23,11 @@ sys.argv = [sys.argv[0], "--check"]  # import the voice server without its speec
 import voice_server as V  # noqa: E402
 import quote  # noqa: E402
 import weather  # noqa: E402
+import phone_data  # noqa: E402
 import web  # noqa: E402
 from test_tools_bridge import World  # noqa: E402
 
+KST = timezone(timedelta(hours=9))
 HOME = {"name": "광주", "lat": 35.2285, "lon": 126.8434}
 NUM = r"(\d[\d,.]*|[일이삼사오육칠팔구십백천만억]{2,})"  # Qwen says figures in digits or in words
 CASES = [  # (said, the tool it must use, what the answer must hold)
@@ -37,6 +40,11 @@ CASES = [  # (said, the tool it must use, what the answer must hold)
     ("엔비디아 주식 얼마야?", "stock_quote", rf"{NUM} ?달러"),
     ("지금 1달러 환율 얼마야?", "stock_quote", rf"{NUM} ?원"),
 ]
+# live 2026-11-22 (로컬): asked for a week of sleep, Azel said "불러올게요" three times and called nothing
+SLEEP_ASK = "일주일 동안 내가 얼마나 잤는지 수면시간 확인해줘."
+SLEEP_FAILED = [(SLEEP_ASK, "네, 일주일간 수면 기록을 불러올게요."), ("일로 와.", "네, 바로 불러올게요.")]
+SLEEP_PUSH = "아니 말로만 하지 말고 진짜 하라고"
+SLEEP_WANT = rf"{NUM} ?시간|{NUM} ?분"
 ANNOUNCE_ONLY = re.compile(r"^[^.?!]*(찾아|알아|확인해)\s*볼게요\.?$")
 
 
@@ -66,8 +74,24 @@ async def main():
                                                                fetch_pages=False))
     b.d.update(weather=wx, stock_quote=sq, web_search=sx, web_fetch=web.fetch, cygnus=lambda: ([], None), mode=local, web_ok=up)
 
+    now = datetime.now(KST)
+    nights = {(now.date() - timedelta(days=i)).isoformat(): {"date": (now.date() - timedelta(days=i)).isoformat(),
+                                                             "sleep": {"asleep_min": m}}
+              for i, m in enumerate([400, 380, 420, 350, 460, 390, 410])}  # GET /v1/phone/days: 7 synced nights
+
+    async def phone_store(method, path, body=None, **kw):
+        return {"days": nights, "updated": now.timestamp() - 1800}
+
+    async def no_phone(kind, q, timeout):
+        return {"ok": False, "error": "offline"}
+
     async def gateway_tool(name, args, on_say=None):  # the link to the gateway, as the bridge answers it
-        used.append(name)
+        used.append((name, args))
+        if name in phone_data.KIND:  # the gateway's phone tools: the synced days, the call has no live phone here
+            try:
+                return (await phone_data.run(name, args, phone_store, no_phone, now))[0]
+            except phone_data.Unavailable as e:
+                return str(e)
         return (await b.call(name, args, caller="qwen"))["content"][:2000]
 
     async def no_tts(sentence, *a, **k):
@@ -76,7 +100,7 @@ async def main():
     async def no_claude(*a, **k):
         claude.append(a[0] if a else "")
         yield "클로드가 답해요."
-    defs = [t for t in (await b.tools("qwen"))[0] if "__" not in t["name"]]
+    defs = [t for t in (await b.tools("qwen"))[0] if "__" not in t["name"]] + list(phone_data.TOOLS)
     V.gw_tools.update(at=time.time() + 3600, defs=defs)
     V.gateway_tool, V.tts, V.claude_stream = gateway_tool, no_tts, no_claude
     V.links.settings = {**(V.links.settings or {}), "brain_mode": "local"}
@@ -89,9 +113,26 @@ async def main():
         t0 = time.perf_counter()
         out = [s async for s, *_ in V.respond(said, f"live-{i}", t0, timings)]
         reply = " ".join(out)
-        checks = {"used " + tool: tool in used, "answered": bool(re.search(want, reply)),
+        checks = {"used " + tool: tool in [n for n, _ in used], "answered": bool(re.search(want, reply)),
                   "not only a promise": not ANNOUNCE_ONLY.match(reply.strip()), "no URL": "http" not in reply}
-        rows.append((said, checks, reply, used[:], timings, time.perf_counter() - t0))
+        rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
+    # the sleep exchange: the request itself, then the push after two unkept promises (as the call went live)
+    for label, session, prior, said in (("수면 요청", "sleep-1", [], SLEEP_ASK),
+                                        ("수면 재촉", "sleep-2", SLEEP_FAILED, SLEEP_PUSH)):
+        used.clear()
+        timings = {}
+        V.history.pop(f"azel:{session}", None)
+        for u, a in prior:
+            V.history[f"azel:{session}"] += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
+        if prior:
+            V.pending_lookup[f"azel:{session}"] = (time.time(), SLEEP_ASK)
+        t0 = time.perf_counter()
+        reply = " ".join([s async for s, *_ in V.respond(said, session, t0, timings)])
+        sleep_calls = [a for n, a in used if n == "phone_sleep"]
+        checks = {"used phone_sleep": bool(sleep_calls),
+                  "a week": any(a.get("range") in ("last_7_days", "this_week") for a in sleep_calls),
+                  "answered": bool(re.search(SLEEP_WANT, reply)), "no lookup failed": V.LOOKUP_FAILED not in reply}
+        rows.append((f"{label}: {said}", checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
     for said, checks, reply, tools, timings, s in rows:
         ok = all(checks.values())
         print(f"{'PASS' if ok else 'FAIL'} {said[:30]:30} {s:4.1f}s tools={tools} "
