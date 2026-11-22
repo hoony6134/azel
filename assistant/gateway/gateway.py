@@ -3984,7 +3984,10 @@ async def task_notify(t, approval=False):
 
 async def fail_orphan_tasks(startup=True):
     """This gateway's unfinished tasks with no runner here: queued ones (never started) are picked up again; ones that
-    were running when the gateway stopped cannot resume and fail. At start and then every TASK_WATCH_S."""
+    were running when the gateway stopped cannot resume and fail. At start and then every TASK_WATCH_S. At start,
+    finishes the previous run never delivered are told again (retell)."""
+    since = await retell_since() if startup else None
+    retell = []
     for tid in await state.call("GET", "/v1/state/kv/tasks-index") or []:
         if tid in task_runs:
             continue
@@ -3994,15 +3997,53 @@ async def fail_orphan_tasks(startup=True):
         if t["status"] == "queued" and not t.get("cancel_requested"):
             print("picking up queued task:", tid, flush=True)
             start_task(t)
-        elif startup and t["status"] in ("done", "failed") and t.get("notify") in ("call", "push") \
-                and not t.get("notified_at") and time.time() - (t.get("finished") or 0) < NOTIFY_RETRY_S \
-                and tid not in notify_retried:
-            notify_retried.add(tid)  # once per process, however often the watcher looks
-            print("task notify: telling again after a restart:", tid, flush=True)  # its finish was never delivered
-            asyncio.create_task(task_notify(t))
+        elif startup and t["status"] in ("done", "failed") and not t.get("notified_at"):
+            if (t.get("finished") or 0) < since or t.get("notify") not in ("call", "push"):
+                t["notified_at"] = t.get("finished") or time.time()  # from before notified_at existed: counts as told
+                await task_save(t)
+            elif tid not in notify_retried and time.time() - t["finished"] < NOTIFY_RETRY_S:
+                notify_retried.add(tid)  # once per process, however often the watcher looks
+                retell.append(t)
         elif startup and t["status"] in ("running", "waiting_approval"):
             t.update(status="failed", finished=time.time(), error="게이트웨이가 다시 시작돼서 멈췄어요.")
             await task_save(t)
+    if retell:
+        asyncio.create_task(retell_finishes(retell))
+
+
+async def retell_since():
+    """Startup re-tells cover only tasks that finished after this gateway's previous start, and after the first start
+    that knew notified_at (kv gateway-start-<device>); the first start with this code re-tells nothing."""
+    key, now = f"/v1/state/kv/gateway-start-{DEVICE}", time.time()
+    prev = await state.call("GET", key) or {}
+    await state.call("PUT", key, {"started": now, "since": prev.get("since") or now})
+    return max(prev.get("since") or now, prev.get("started") or now)
+
+
+async def retell_finishes(tasks):
+    """At most one call per startup: one task's own finish call, or one call naming several; push tasks get pushes."""
+    calls = [t for t in tasks if t.get("notify") == "call"]
+    for t in tasks:
+        if t.get("notify") == "push":
+            print("task notify: telling again after a restart (push):", t["id"], flush=True)
+            await task_notify(t)
+    if len(calls) == 1:
+        print("task notify: telling again after a restart:", calls[0]["id"], flush=True)
+        await task_notify(calls[0])
+    elif calls:
+        settings = await load_settings()
+        title = user_title(settings, primary_persona(settings))
+        names = [openings.purpose_rule(t["goal"]) or t["goal"][:20] for t in calls]
+        more = f" 외 {len(names) - 3}개" if len(names) > 3 else ""
+        opening = (f"{title + ', ' if title else ''}완료된 작업이 {len(calls)}개 있어요: {', '.join(names[:3])}{more}. "
+                   "어느 것부터 알려 드릴까요? 앱에서도 결과를 보실 수 있어요.")
+        try:
+            r = await place_call("task", opening=opening, context={"kind": "task", "label": f"작업 완료 {len(calls)}개"})
+            print("task notify: told again in one call:", [t["id"] for t in calls], r.get("call_id"), flush=True)
+            for t in calls:
+                await mark_notified(t)
+        except Exception as e:
+            print("task notify: the combined re-tell call failed:", type(e).__name__, flush=True)
 
 
 NOTIFY_RETRY_S = 6 * 3600  # finishes this recent that were never delivered are told again at startup

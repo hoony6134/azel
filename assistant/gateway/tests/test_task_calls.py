@@ -143,17 +143,59 @@ def test_an_undelivered_finish_is_told_again_after_a_restart(tgw, monkeypatch):
     async def notify(t, approval=False):
         told.append(t["id"])
     monkeypatch.setattr(g, "task_notify", notify)
-    base = {"goal": "조사", "notify": "call", "owner": g.DEVICE, "finished": time.time() - 60, "result": "끝"}
+    now = time.time()
+    g.fake.db["kv"][f"gateway-start-{g.DEVICE}"] = {"started": now - 600, "since": now - 3600}  # the previous run
+    base = {"goal": "조사", "notify": "call", "owner": g.DEVICE, "finished": now - 60, "result": "끝"}
     g.fake.db["kv"]["task-aaaaaaaaaaaa"] = {**base, "id": "aaaaaaaaaaaa", "status": "done"}
-    g.fake.db["kv"]["task-bbbbbbbbbbbb"] = {**base, "id": "bbbbbbbbbbbb", "status": "done", "notified_at": time.time()}
-    g.fake.db["kv"]["task-cccccccccccc"] = {**base, "id": "cccccccccccc", "status": "done", "finished": time.time() - 99999}
+    g.fake.db["kv"]["task-bbbbbbbbbbbb"] = {**base, "id": "bbbbbbbbbbbb", "status": "done", "notified_at": now}
+    g.fake.db["kv"]["task-cccccccccccc"] = {**base, "id": "cccccccccccc", "status": "done", "finished": now - 1800}
     g.fake.db["kv"]["tasks-index"] = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
 
     async def go():
         await g.fail_orphan_tasks(startup=True)
         await asyncio.sleep(0.05)
     asyncio.run(go())
-    assert told == ["aaaaaaaaaaaa"]  # never told, recent: again; told, or too old: no
+    assert told == ["aaaaaaaaaaaa"]  # finished during the previous run, never told: again
+    assert g.fake.db["kv"]["task-cccccccccccc"]["notified_at"]  # finished before that run started: backfilled, silent
+
+
+def test_the_first_start_with_notified_at_retells_nothing_and_backfills(tgw, monkeypatch):
+    g, c, notes = tgw
+    told = []
+
+    async def notify(t, approval=False):
+        told.append(t["id"])
+    monkeypatch.setattr(g, "task_notify", notify)
+    g.fake.db["kv"].pop(f"gateway-start-{g.DEVICE}", None)
+    for tid in ("dddddddddddd", "eeeeeeeeeeee"):  # finished an hour ago, before this code: the live case
+        g.fake.db["kv"][f"task-{tid}"] = {"id": tid, "goal": "조사", "notify": "call", "owner": g.DEVICE,
+                                          "status": "done", "finished": time.time() - 3600, "result": "끝"}
+    g.fake.db["kv"]["tasks-index"] = ["dddddddddddd", "eeeeeeeeeeee"]
+
+    async def go():
+        await g.fail_orphan_tasks(startup=True)
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert told == [] and all(g.fake.db["kv"][f"task-{t}"].get("notified_at") for t in ("dddddddddddd", "eeeeeeeeeeee"))
+    assert g.fake.db["kv"][f"gateway-start-{g.DEVICE}"]["since"] > time.time() - 5
+
+
+def test_several_undelivered_finishes_become_one_call(tgw, monkeypatch):
+    g, c, notes = tgw
+    now = time.time()
+    g.fake.db["kv"][f"gateway-start-{g.DEVICE}"] = {"started": now - 600, "since": now - 3600}
+    ids = ["111111111111", "222222222222", "333333333333"]
+    for i, tid in enumerate(ids):
+        g.fake.db["kv"][f"task-{tid}"] = {"id": tid, "goal": f"조사 {i}", "notify": "call", "owner": g.DEVICE,
+                                          "status": "done", "finished": now - 60, "result": "끝"}
+    g.fake.db["kv"]["tasks-index"] = ids
+
+    async def go():
+        await g.fail_orphan_tasks(startup=True)
+        await asyncio.sleep(0.1)
+    asyncio.run(go())
+    assert len(notes) == 1 and notes[0][:2] == ("call", "task") and "완료된 작업이 3개" in notes[0][2], notes
+    assert all(g.fake.db["kv"][f"task-{t}"].get("notified_at") for t in ids)
 
 
 def test_finish_opening_is_a_short_briefing_with_the_title_once(tgw, monkeypatch):
