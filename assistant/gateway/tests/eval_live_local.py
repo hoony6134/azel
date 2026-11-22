@@ -47,10 +47,14 @@ SLEEP_PUSH = "아니 말로만 하지 말고 진짜 하라고"
 SLEEP_WANT = rf"{NUM} ?시간|{NUM} ?분"
 # live 2026-11-23 03:13 (로컬): "서버 확인해 볼게요. 잠시만요." and nothing after it; now the lookup runs first
 INFRA_TOOLS = [{'name': 'infra_health', 'description': '서버·인프라·노드·홈서버·내부 시스템 상태: 서버별 켜짐, CPU, 메모리(RAM), 디스크, 온도, 컨테이너', 'input_schema': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}, {'name': 'infra_status', 'description': '서비스·컨테이너 모니터 중 지금 문제 있는 것(내부 시스템이 괜찮은지)', 'input_schema': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}, {'name': 'infra_alerts', 'description': '지금 울리고 있는 서버·인프라 경보', 'input_schema': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}]
-INFRA_RESULT = ("서버 6대 중 5대 정상. gienah: 응답 없음(10분 전부터). deneb CPU 12%, 메모리 41%, 디스크 63%. "
-                "울리는 경보 1건: gienah node down.")
-INFRA_CASES = ["야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "서버 괜찮아?", "인프라 상태 어때"]
-INFRA_WANT = r"gienah|기에나|지에나|응답|꺼|다운|죽|문제|다섯|5대|경보"
+# as at 03:14: hosts fine, no alert firing, but one service down, which only infra_status shows
+INFRA_RESULT = {"infra_health": "서버 6대 모두 켜짐. deneb CPU 12%, 메모리 41%, 디스크 63%. vd-spark CPU 30%, 메모리 70%.",
+                "infra_status": "문제 있는 서비스 1개: Vuja De claw (NemoClaw) http, vd-spark, 멈춤(03:02부터, 24시간 가동률 97.8%).",
+                "infra_alerts": "경보 없음."}
+INFRA_CASES = ["야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "서버 괜찮아?", "인프라 상태 어때",
+               "서버 상태 확인해줘. 지금 서버 중에 뭐 하나 터진 것 같다.", "방금 전에 그 크리티컬 알림 떴거든 네모클로 응답하지 않는다고"]
+INFRA_WANT = r"NemoClaw|네모클로|네모 클로|Vuja|뷰자|부자데|claw|클로"
+ALL_FINE = re.compile(r"모두\s*정상|다\s*정상|문제\s*없")
 PROMISE = re.compile(r"(확인|찾아|알아|살펴|점검)\s*(해\s*)?(볼게요|보겠습니다|드릴게요|할게요|하겠습니다)|잠시만요")
 ANNOUNCE_ONLY = re.compile(r"^[^.?!]*(찾아|알아|확인해)\s*볼게요\.?$")
 
@@ -95,7 +99,7 @@ async def main():
     async def gateway_tool(name, args, on_say=None):  # the link to the gateway, as the bridge answers it
         used.append((name, args))
         if name.startswith("infra_"):
-            return INFRA_RESULT
+            return INFRA_RESULT[name]
         if name in phone_data.KIND:  # the gateway's phone tools: the synced days, the call has no live phone here
             try:
                 return (await phone_data.run(name, args, phone_store, no_phone, now))[0]
@@ -131,10 +135,31 @@ async def main():
         t0 = time.perf_counter()
         out = [s async for s, *_ in V.respond(said, f"infra-{i}", t0, timings)]
         reply = " ".join(out)
-        checks = {"used infra_*": any(n.startswith("infra_") for n, _ in used), "answered": bool(re.search(INFRA_WANT, reply)),
+        checks = {"read all three": {n for n, _ in used} >= set(INFRA_RESULT), "names the down service":
+                  bool(re.search(INFRA_WANT, reply)) and not ALL_FINE.match(reply.strip()),
                   "no promise said": not any(PROMISE.search(x) for x in out), "no lookup failed": V.LOOKUP_FAILED not in reply,
                   "tool first": bool(timings.get("tool_first"))}
         rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
+    # live 2026-11-23 (4b69826f): small talk after stock quotes got a tool promise and "네, 대표님" four times
+    azel = {"id": "azel", "name": "아젤", "primary": True, "voice": "sohee", "user_title": "대표님",
+            "personality": "전문적이고 귀여운 비서"}
+    V.CALL_PERSONA.set(azel)
+    for label, session, prior, said in (
+            ("잡담", "sad", [("삼성전자랑 엔비디아 주가 알려줘", "삼성전자는 180,900원으로 8.13% 내렸고, 엔비디아는 125.53달러로 "
+                                                       "14.01% 내렸어요."), ], "슬프다 그래서"),
+            ("소고 생일", "sogo", [], "소고 생일")):
+        used.clear()
+        timings = {}
+        V.history.pop(f"azel:{session}", None)
+        for u, a in prior:
+            V.history[f"azel:{session}"] += [{"role": "user", "content": u}, {"role": "assistant", "content": a}]
+        t0 = time.perf_counter()
+        out = [s async for s, *_ in V.respond(said, session, t0, timings)]
+        reply = " ".join(out)
+        checks = {"no promise said": not any(PROMISE.search(x) or V.future(x) and V.LOOKUP_VERB.search(x) for x in out),
+                  "no tool talk": "도구" not in reply, "대표님 at most once": reply.count("대표님") <= 1, "said something": bool(out)}
+        rows.append((f"{label}: {said}", checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
+    V.CALL_PERSONA.set(None)
     # the sleep exchange: the request itself, then the push after two unkept promises (as the call went live)
     for label, session, prior, said in (("수면 요청", "sleep-1", [], SLEEP_ASK),
                                         ("수면 재촉", "sleep-2", SLEEP_FAILED, SLEEP_PUSH)):
