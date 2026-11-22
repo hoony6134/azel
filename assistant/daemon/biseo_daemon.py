@@ -147,6 +147,22 @@ def check_args(tokens: list[str], wd: Path) -> None:
 # compared case-insensitively (APFS: SUDO is sudo), and every argv position counts, so wrappers (env, xargs,
 # find -exec, nice, nohup, time, timeout, caffeinate, command) cannot hide a command.
 ESCALATE = {"sudo", "su", "doas", "pkexec", "runas"}
+# The one exception (the user's decision, 2026-11-23): `sudo <command>` as the whole command, run as `sudo -n` (we never
+# type or keep a password: it works only where the user set NOPASSWD), approved by a tap every time, never automatically.
+SUDO_NO_PASSWORD = "이 기기는 sudo에 비밀번호가 필요해서 실행하지 못했어요. 그 명령에 NOPASSWD를 직접 설정해 둔 경우에만 sudo가 돼요."
+
+
+def as_sudo(tokens: list[str]) -> list[str] | None:
+    """`sudo [-n] cmd …` as ["sudo", "-n", cmd, …]; None when it is not a sudo command. Other sudo options are refused
+    (-u, -s, -i, -E, -e … change who runs what, or open a shell)."""
+    if not tokens or os.path.basename(tokens[0]).lower() != "sudo":
+        return None
+    rest = tokens[1:]
+    while rest and rest[0] == "-n":
+        rest = rest[1:]
+    if not rest or rest[0].startswith("-"):
+        raise Refused("sudo takes only a command (no options): sudo <command>")
+    return ["sudo", "-n", *rest]
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
 INLINE = {"perl": "eE", "ruby": "e", "node": "ep", "nodejs": "ep", "php": "r", "lua": "e"}  # + python* : c
 INLINE_LONG = {"--eval", "--print", "--command"}
@@ -215,9 +231,11 @@ def _path_values(t: str) -> list[str]:
     return vals
 
 
-def hard_deny(tokens: list[str], wd: Path) -> None:
+def hard_deny(tokens: list[str], wd: Path, under_sudo: bool = False) -> None:
     """Refuse (before any approval exists, and for approved runs) what no approval may unlock."""
     tokens = _expand(tokens)
+    if not under_sudo and as_sudo(tokens) is not None:  # the command under it meets every rule, a second sudo too
+        return hard_deny(as_sudo(tokens)[2:], wd, under_sudo=True)
     names = [os.path.basename(t).lower() for t in tokens]
     home = Path.home().resolve()
     secrets = [Path(d).expanduser().resolve() for d in SECRET_DIRS]
@@ -530,8 +548,11 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
     tokens = shlex.split(command)
     if not tokens:
         raise Refused("empty command")
-    listed = any(_has_seq(tokens, pat, anywhere=False) for pat in CFG["allowed_commands"])
-    risky = any(_has_seq(tokens, pat, anywhere=True) for pat in CFG["approval_required"])
+    sudo = as_sudo(tokens)
+    if sudo:  # the approval, the grant and the run all carry the exact form that runs
+        tokens, command = sudo, shlex.join(sudo)
+    listed = not sudo and any(_has_seq(tokens, pat, anywhere=False) for pat in CFG["allowed_commands"])
+    risky = bool(sudo) or any(_has_seq(tokens, pat, anywhere=True) for pat in CFG["approval_required"])
     unlisted = not listed and not risky
     if unlisted and not CFG["approve_unlisted"]:  # an approval id cannot unlock it here either
         raise Refused("command not in allowed_commands")
@@ -548,10 +569,10 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
         approval_id = None  # the gateway already spent the approval and audits the run
     elif not approval_id and via_grant and (risky or unlisted):  # nobody is contacted: the gateway proxy files it
         return {"status": "needs_approval", "command": command, "cwd": str(wd), "device": CFG["id"],
-                "in_roots": in_roots(wd), "nonce": _issue_nonce()}
+                "in_roots": in_roots(wd), "nonce": _issue_nonce(), **({"sudo": True} if sudo else {})}
     if not grant and not approval_id and (risky or unlisted):
         r = gateway("POST", "/v1/approvals", {"device": CFG["id"], "tool": "run_command", "command": command,
-                                              "cwd": str(wd), "in_roots": in_roots(wd),
+                                              "cwd": str(wd), "in_roots": in_roots(wd), **({"sudo": True} if sudo else {}),
                                               **({"requester": REQUESTER.get()} if REQUESTER.get() else {})})
         if r.get("status") != "approved":  # an "always" rule approves it on the spot
             return {"status": "pending_approval", "approval_id": r["approval_id"]}
@@ -581,6 +602,8 @@ def run_command(command: str, cwd: str | None = None, approval_id: str | None = 
         res = {"status": "timeout", "timeout_s": CFG["command_timeout"]}
     else:
         res = {"status": "ok", "exit_code": out.returncode, "stdout": _cap(out.stdout), "stderr": _cap(out.stderr)}
+        if sudo and out.returncode and b"password is required" in out.stderr:
+            res["error"] = SUDO_NO_PASSWORD
     if approval_id:  # audit: what ran under an approval (never its output)
         try:
             gateway("POST", f"/v1/approvals/{approval_id}/ran", {"exit_code": res.get("exit_code"), "status": res["status"]})
@@ -816,7 +839,10 @@ def decide_prompt(tool_name: str, tool_input: dict, cwd: str, requester: str = "
     command = prompt_command(tool_name, tool_input)
     if tool_name == "Bash":
         try:
-            hard_deny(shlex.split(command), wd)  # what no approval may unlock stays refused here too
+            toks = shlex.split(command)
+            if ESCALATE & {os.path.basename(t).lower() for t in _expand(toks)}:  # sudo is run_command's alone, by a tap
+                raise Refused("privilege escalation is never allowed in a delegated run")
+            hard_deny(toks, wd)  # what no approval may unlock stays refused here too
         except (Refused, ValueError) as e:
             return {"behavior": "deny", "message": f"이 명령은 승인으로도 실행할 수 없어요: {e}"}
     try:

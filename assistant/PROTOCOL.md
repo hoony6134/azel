@@ -139,6 +139,23 @@ answering a call the assistant placed; the server then speaks that call's openin
   answered from the result, as before. A task that delegates waits for the job (`job_status`) before it counts as done.
 - **Approval pushes** carry `aps.category = "APPROVAL"` (허용 / 거부 / 항상 허용 buttons) with `approval_id`, and
   `forced_once: true` when "always" can't hold (a command that writes, or a secret call): hide that button.
+- **Administrator (sudo) approvals** (user decision 2026-11-23): a `run_command` whose whole command is `sudo <command>`
+  can run, but only after the user taps 허용 on that one request, every time. The daemon runs it as `sudo -n …` (it never
+  types or stores a password: it works only where the user set NOPASSWD for that command; otherwise the result carries
+  `error`: "이 기기는 sudo에 비밀번호가 필요해서 …"). Other sudo options (`-u`, `-s`, `-i`, `-E` …), sudo inside another
+  command (`env sudo`, `xargs sudo`, `sudo sudo`), su/doas/pkexec, and what the command under sudo would be refused for
+  (shells with `-c`, secret paths, `rm -rf ~` …) stay refused before any approval. A delegated `claude -p` never gets sudo.
+  - Never approved without the tap: not by `approval_mode: "auto"`, the classifier, an auto-approve grant (call or task)
+    or a stored "always" rule. Always once: "항상 허용" becomes once with `forced_reason` "관리자 권한(sudo) 명령은 …".
+  - Push: title "관리자 권한(sudo) 승인 요청", `aps.category = "APPROVAL_RISKY"`, with `type: "approval"`,
+    `approval_id`, `sudo: true`, `tier: "sudo"`, `forced_once: true`.
+  - `GET /v1/approvals` and `GET /v1/approvals/{id}` items carry `tier: "sudo"`, `sudo: true`, `forced_once: true` and
+    that `forced_reason`. The daemon's `needs_approval` (team devices) carries `sudo: true`; the spoken line is
+    "관리자 권한(sudo) 명령이에요. 앱에서 명령을 확인하고 직접 허용해 주세요."
+  - **App (next install):** register `APPROVAL_RISKY` with two actions, 허용 (`.authenticationRequired`,
+    `.destructive`) and 거부, and no 항상 허용. Show a sudo item highlighted on iPhone, Mac, the Live Activity and
+    the watch notification: warning colour, a "관리자 권한" label, the full command in monospace, no 항상 허용. Use
+    `tier == "sudo"` (or `sudo == true`); older gateways never send it.
 - Team devices (vd-spark, vd-core) may be handed a `delegate` (their own Claude Code); only `sadr` never is.
 - **Auto-approve** (like Claude Code's auto mode, only when the user grants it): while a grant is live, a device
   command whose run (this call, or a task started in it, or a task granted directly) asks for approval runs at once

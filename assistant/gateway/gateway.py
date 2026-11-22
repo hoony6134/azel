@@ -3462,6 +3462,18 @@ def parse_requester(v):
     return {"task_id": key} if kind == "task" else {"session": key, "persona": key.split(":", 1)[0] if ":" in key else None}
 
 
+SUDO_ONCE = "관리자 권한(sudo) 명령은 항상 허용할 수 없어서 이번 한 번만 허용했어요."
+
+
+def is_sudo(command):
+    """A command the daemon runs as `sudo -n …`: never auto-approved, never "always", and the push says so (PM 2026-11-23)."""
+    try:
+        t = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(t) and os.path.basename(t[0]).lower() == "sudo"
+
+
 def always_ok(command):
     """True when an approval of `command` may become an "always" rule."""
     try:
@@ -3511,10 +3523,13 @@ def approval_view(row, meta, now=None):
         status = "expired"  # approved but never run in time: no longer usable
     req = meta.get("requester") or {}
     secret = is_secret(req.get("session"))  # the same rule as the push and the decision: no 항상 허용 to offer then
-    forced = secret or not always_ok(row.get("command") or "")
+    sudo = is_sudo(row.get("command") or "")
+    forced = secret or sudo or not always_ok(row.get("command") or "")
     return {**row, "status": status, "expires_at": expires, "decision": meta.get("decision"),
             "requester": meta.get("requester"), "rule_id": meta.get("rule_id"), "persona": req.get("persona"),
-            **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
+            **({"tier": "sudo", "sudo": True} if sudo else {}),
+            **({"forced_once": True, "forced_reason": SUDO_ONCE if sudo else SECRET_ALWAYS if secret else ALWAYS_NO}
+               if forced else {})}
 
 
 @app.post("/v1/approvals")
@@ -3530,17 +3545,19 @@ async def create_approval(body: dict):
     requester = parse_requester(body.get("requester"))  # the ask or task whose run asked (daemon header)
     if requester and requester.get("task_id"):
         task_approvals.setdefault(requester["task_id"], set()).add(aid)
+    sudo = is_sudo(row["command"])  # from the command itself, whatever the caller says: only a tap approves it
     rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-    rule = None if requester and requester.get("task_id") else next(  # a task's commands always need a tap
+    rule = None if requester and requester.get("task_id") or sudo else next(  # a task's commands always need a tap
         (r for r in rules if (r["device"], r["command"], r.get("cwd")) == (row["device"], row["command"], row["cwd"])), None)
     meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None,
-            **({"in_roots": body["in_roots"]} if isinstance(body.get("in_roots"), bool) else {})}  # daemon's say (resolved paths)
+            **({"in_roots": body["in_roots"]} if isinstance(body.get("in_roots"), bool) else {}),  # daemon's say (resolved paths)
+            **({"sudo": True} if sudo else {})}
     if rule:  # an "always" rule: approved on the spot, still audited when it runs
         await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
-    if (await load_settings()).get("approval_mode") == "auto" and row["tool"] not in NEVER_AUTO:
+    if not sudo and (await load_settings()).get("approval_mode") == "auto" and row["tool"] not in NEVER_AUTO:
         # the default (the user's rule): regex, then a model for what it flags; only the truly dangerous asks
         tier, stage = await risk.lenient_classify(row["command"], row["cwd"], str(body.get("script") or "")[:20000],
                                                   row["device"], qwen=qwen_classify,
@@ -3551,7 +3568,7 @@ async def create_approval(body: dict):
             meta.update(decision="auto", stage=f"policy:{stage}")
             await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
             return {"approval_id": aid, "status": "approved", "auto": True}
-    if row["tool"] not in NEVER_AUTO and body.get("in_roots") is True and deep_enough(row["cwd"]) \
+    if not sudo and row["tool"] not in NEVER_AUTO and body.get("in_roots") is True and deep_enough(row["cwd"]) \
             and (grant := await grant_for(requester, row["device"])) is not None:  # "알아서 해", inside the daemon's roots
         tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,
                                           haiku=None if await brain_mode() == "local" else haiku_classify)
@@ -3570,10 +3587,15 @@ async def create_approval(body: dict):
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     try:  # the app shows it; the command text only (never output), shortened
         # "항상 허용" is offered only where it could hold: a read-only command, not from a secret call
-        once = not always_ok(row["command"]) or is_secret((requester or {}).get("session"))
-        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", category="APPROVAL_ONCE" if once else "APPROVAL",
-                              type="approval", approval_id=aid,
-                              **({"forced_once": True} if once else {}))  # the command only in the app, never here
+        once = sudo or not always_ok(row["command"]) or is_secret((requester or {}).get("session"))
+        if sudo:  # emphasised, and APPROVAL_RISKY asks for the device's unlock before the tap counts
+            await send_alert_push("관리자 권한(sudo) 승인 요청", f"{row['device']}에서 관리자 권한(sudo) 명령을 실행하려고 해요. "
+                                  "앱에서 명령을 확인하고 허용해 주세요.", category="APPROVAL_RISKY", type="approval",
+                                  approval_id=aid, forced_once=True, sudo=True, tier="sudo")
+        else:
+            await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", category="APPROVAL_ONCE" if once else "APPROVAL",
+                                  type="approval", approval_id=aid,
+                                  **({"forced_once": True} if once else {}))  # the command only in the app, never here
     except Exception as e:
         print("approval push failed:", type(e).__name__, flush=True)
     if requester and requester.get("task_id"):
@@ -3816,7 +3838,8 @@ async def decide(aid: str, body: dict):
             return {"id": aid, "status": view["status"], "decision": meta.get("decision") or decision, "already": True}
         raise HTTPException(409, f"approval is {view['status']}")
     secret = decision == "always" and is_secret((meta.get("requester") or {}).get("session"))
-    forced = decision == "always" and (secret or not always_ok(row["command"]))
+    sudo = is_sudo(row.get("command") or "")
+    forced = decision == "always" and (secret or sudo or not always_ok(row["command"]))
     if forced:
         decision = "once"  # only read-only commands become standing rules, and never from a secret call
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
@@ -3834,7 +3857,7 @@ async def decide(aid: str, body: dict):
             print("task release failed:", type(e).__name__, flush=True)
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
-            **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
+            **({"forced_once": True, "forced_reason": SUDO_ONCE if sudo else SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
 
 
 @app.post("/v1/approvals/{aid}/use")

@@ -30,6 +30,11 @@ APPROVAL_WAIT_S = 300
 APPROVAL_POLL_S = 2
 CALL_CAP = 20  # user-requested calls a day, apart from the autonomous-call limits
 ASK_APPROVAL = "앱에서 허용해 주세요."
+ASK_SUDO = "관리자 권한(sudo) 명령이에요. 앱에서 명령을 확인하고 직접 허용해 주세요."
+
+
+def ask_text(command):
+    return ASK_SUDO if re.match(r"\s*(\S*/)?sudo(\s|$)", str(command or ""), re.I) else ASK_APPROVAL
 PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
 GRANT_S = 300  # a signed grant is valid this long (the daemon refuses more than 10 minutes)
 
@@ -501,7 +506,7 @@ class Bridge:
     async def after_approval(self, name, args, aid, where, on_progress):
         """Wait for the app's decision on `aid`, then run the same call with the approval id."""
         if on_progress:
-            await on_progress(ASK_APPROVAL)
+            await on_progress(ask_text(args.get("command")))
         t0 = time.monotonic()
         while time.monotonic() - t0 < APPROVAL_WAIT_S:
             a = await self.d["state"]("GET", f"/v1/state/approvals/{aid}") or {}
@@ -541,7 +546,7 @@ class Bridge:
                                                 "cwd": na["cwd"], "requester": self.d.get("who", lambda: "")(),
                                                 **({"in_roots": na["in_roots"]} if isinstance(na.get("in_roots"), bool) else {})}))["approval_id"]
         if on_progress:
-            await on_progress(ASK_APPROVAL)
+            await on_progress(ask_text(na["command"]))
         t0 = time.monotonic()
         while time.monotonic() - t0 < APPROVAL_WAIT_S:
             a = await self.d["state"]("GET", f"/v1/state/approvals/{aid}") or {}
