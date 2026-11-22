@@ -602,13 +602,23 @@ function noneLine(s as String) as Boolean
     return Instr(1, s, "없음") > 0 or Instr(1, s, "No firing") > 0 or Instr(1, s, "정상") > 0
 end function
 
+' v1 lines of Cygnus text: markdown headers, the snapshot/"As of" stamps and "없음" are not items
+function plainLine(l as String) as String
+    t = l.Trim()
+    if Left(t, 1) = "#" or Left(t, 4) = "스냅샷" or Left(t, 5) = "As of" or t = "없음" then return ""
+    if Left(t, 2) = "- " then t = Mid(t, 3)
+    return t
+end function
+
 function textCards(lines as Dynamic, w as Integer) as Object
     out = []
     for each l in arr(lines)
+      if plainLine(sv(l)) <> "" then
         c = newCard("todo", w)
-        c.sent = clean(sv(l))
+        c.sent = clean(plainLine(sv(l)))
         c.dtitle = c.sent
         out.Push(c)
+      end if
     end for
     return out
 end function
@@ -625,15 +635,15 @@ function buildV1(d as Object, now as Integer) as Object
     queued = 0
     if infra <> invalid
         for each l in arr(infra.alerts)
-            if not noneLine(sv(l))
+            if not noneLine(sv(l)) and plainLine(sv(l)) <> ""
                 broken = broken + 1
-                urgent.Push(urgentCard("crit", "경고", sv(l), "인프라"))
+                urgent.Push(urgentCard("crit", "경고", plainLine(sv(l)), "인프라"))
             end if
         end for
         for each l in arr(infra.problems)
-            if not noneLine(sv(l))
+            if not noneLine(sv(l)) and plainLine(sv(l)) <> ""
                 broken = broken + 1
-                urgent.Push(urgentCard("crit", "경고", sv(l), "인프라"))
+                urgent.Push(urgentCard("crit", "경고", plainLine(sv(l)), "인프라"))
             end if
         end for
     end if
