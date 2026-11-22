@@ -30,6 +30,8 @@ sub run()
         if data = invalid
             m.top.result = {ok: false, code: 200, error: "응답을 읽을 수 없어요"}
         else
+            ' a gateway that predates v=2 ignores the parameter and answers with the v1 shape: go by what came back
+            if data.DoesExist("gistra") then v = 2 else v = 1
             m.top.result = {ok: true, v: v, data: data}
         end if
     end if

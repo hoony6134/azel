@@ -531,7 +531,16 @@ function buildV1(d as Object, now as Integer) as Object
     for each e in arr(d.calls)
         addSlot(cs, sv(e.at), "", sv(e.what), "예약 통화 · Azel이 전화해요", nowHM)
     end for
-    appendAll(cs, textCards(d.calendar, 560))
+    for each l in arr(d.calendar)
+        t = sv(l)
+        if Left(t, 2) = "- " then t = Mid(t, 3)
+        if Left(t, 4) <> "캘린더 " and t <> "일정 없음" then
+            c = newCard("todo", 560)
+            c.sent = clean(t)
+            c.dtitle = c.sent
+            cs.Push(c)
+        end if
+    end for
     if cs.Count() = 0 then cs.Push(emptyCard(560, "오늘 남은 일정이 없어요"))
     sections.Push({title: "오늘", w: 560, cap: 3, cards: cs})
     if infra = invalid
