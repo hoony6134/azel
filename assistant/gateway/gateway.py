@@ -3363,14 +3363,17 @@ async def create_approval(body: dict):
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
-    if (await load_settings()).get("approval_mode") == "auto" and row["tool"] not in NEVER_AUTO \
-            and risk.lenient(row["command"], row["cwd"], str(body.get("script") or "")[:20000]) == risk.SAFE:
-        # the default (the user's rule): everything but deleting, deploying and the like runs without a tap
-        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
-        meta.update(decision="auto", stage="policy")
-        await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
-        print(f"auto-approve: policy on {row['device']}: {row['command'][:80]!r}", flush=True)
-        return {"approval_id": aid, "status": "approved", "auto": True}
+    if (await load_settings()).get("approval_mode") == "auto" and row["tool"] not in NEVER_AUTO:
+        # the default (the user's rule): regex, then a model for what it flags; only the truly dangerous asks
+        tier, stage = await risk.lenient_classify(row["command"], row["cwd"], str(body.get("script") or "")[:20000],
+                                                  row["device"], qwen=qwen_classify,
+                                                  haiku=None if await brain_mode() == "local" else haiku_classify)
+        print(f"approval policy: {tier} by {stage} on {row['device']}: {row['command'][:80]!r}", flush=True)
+        if tier == risk.SAFE:
+            await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+            meta.update(decision="auto", stage=f"policy:{stage}")
+            await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
+            return {"approval_id": aid, "status": "approved", "auto": True}
     if row["tool"] not in NEVER_AUTO and body.get("in_roots") is True and deep_enough(row["cwd"]) \
             and (grant := await grant_for(requester, row["device"])) is not None:  # "알아서 해", inside the daemon's roots
         tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,

@@ -32,3 +32,27 @@ def test_auto_mode_approves_everything_but_the_dangerous(gw):  # noqa: F811
     assert c.post("/v1/approvals", json={"device": "macbook", "tool": "run_command", "command": "pip3 install rich",
                                          "cwd": "/Users/jh/dev/x"}).json()["status"] == "pending"
     assert c.put("/v1/settings", json={"approval_mode": "never"}).status_code == 400
+
+
+def test_a_model_clears_what_the_regex_flags_except_the_few_that_always_ask(gw, monkeypatch):  # noqa: F811
+    g, c, _ = gw
+    c.put("/v1/settings", json={"approval_mode": "auto"})
+    asked = []
+
+    async def says_safe(system, user):
+        asked.append(user)
+        return {"tier": "safe", "confidence": 0.95}
+    monkeypatch.setattr(g, "qwen_classify", says_safe)
+    monkeypatch.setattr(g, "haiku_classify", says_safe)
+    post = lambda cmd, **kw: c.post("/v1/approvals", json={"device": "macbook", "tool": "run_command",  # noqa: E731
+                                                           "command": cmd, "cwd": "/Users/jh/dev/x", **kw}).json()
+    assert post("rm -rf build")["status"] == "approved" and asked  # flagged by the regex, cleared by the models
+    asked.clear()
+    assert post("pip3 install rich")["status"] == "approved" and not asked  # the regex alone: no model call
+    for cmd in ("sudo reboot", "rm -rf ~/", "git push --force origin main", "cat ~/.ssh/id_rsa"):
+        assert post(cmd)["status"] == "pending", cmd  # always asks, whatever a model says
+
+    async def says_risky(system, user):
+        return {"tier": "risky", "confidence": 0.9}
+    monkeypatch.setattr(g, "haiku_classify", says_risky)
+    assert post("rm -rf src")["status"] == "pending"  # one judge says risky: asked
