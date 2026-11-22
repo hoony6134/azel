@@ -1887,6 +1887,43 @@ def task_intent(text):
     return "call" if DEVICE_JOB.search(text) else None
 
 
+# "알아서 해": the user's own words turn on auto-approve, read back once (user decision 2026-11-22). Handled here, not
+# by Qwen: Qwen skipped the read-back and told the user to check the app, so the grant never started. The grant goes
+# the way the app's toggle does (auto_grant), so a device output read a moment ago cannot block the user's own words.
+AUTO_ON = re.compile(r"알아서\s*(해|하|진행|처리|실행|돌려)|묻지\s*말고|물어보지\s*말고|자동\s*(으로\s*)?(승인|실행|허용)")
+AUTO_OFF = re.compile(r"자동\s*(으로\s*)?(승인|실행|허용)\s*(꺼|끄|그만|멈|중지|해제)|이제\s*(하나하나|매번)\s*물어")
+AUTO_Q = "이번 통화 동안 위험하지 않은 명령은 묻지 않고 바로 실행할게요. 지우기나 설치 같은 건 여전히 여쭤볼게요. 맞죠?"
+AUTO_MAX_CHARS = 30  # longer utterances carry a request of their own ("재시작하고 알아서 해"): the model answers those
+pending_auto: dict[str, float] = {}  # call key -> when the read-back was asked
+
+
+def auto_intent(text, key):
+    """"on" / "off" / "answer" (to the read-back) / None."""
+    asked = pending_auto.get(key)
+    if asked and time.time() - asked < 90 and (YES.search(text) or NO.search(text)):
+        return "answer"
+    if len(text) > AUTO_MAX_CHARS:
+        return None
+    return "off" if AUTO_OFF.search(text) else "on" if AUTO_ON.search(text) else None
+
+
+async def auto_reply(text, action, key):
+    if action == "on":
+        pending_auto[key] = time.time()
+        return AUTO_Q
+    pending_auto.pop(key, None)
+    if action == "answer" and NO.search(text):
+        return "알겠어요, 명령마다 승인을 받을게요."
+    try:
+        links.pick(personal=True, need_claude=False)
+    except RuntimeError:
+        return "지금은 자동 실행을 바꿀 수 없어요."
+    await links.notify({"type": "auto_grant", "session": key, "value": action == "answer"})
+    if action == "off":
+        return "자동 실행을 껐어요. 이제 명령마다 승인을 받을게요."
+    return "네, 이번 통화 동안 위험하지 않은 명령은 바로 실행할게요. 이미 앱에 올라간 요청은 직접 눌러 주세요."
+
+
 async def task_reply(text, notify):
     dev = next((v for k, v in _DEV.items() if re.search(k, text, re.I)), None)
     msg = {"type": "task", "goal": text, "notify": notify, "persona": (CALL_PERSONA.get() or {}).get("id"),
@@ -2034,23 +2071,24 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     history_sig[hkey] = sig
     prior = list(hist)  # earlier turns only: this utterance is added to history below and sent once, as the last turn
     bare = strip_vocative(text, name)
-    sched = schedule_intent(bare, session)
-    job = None if sched else task_intent(bare)
+    auto = auto_intent(bare, hkey)
+    sched = None if auto else schedule_intent(bare, session)
+    job = None if sched or auto else task_intent(bare)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
     gw_names = tuple(t["name"] for t in gw_tools["defs"])
     # The gateway's memory and people tools answer personal questions too: Qwen looks first, Claude only after
     local = bool(ctx) or "memory_recall" in gw_names
-    to_claude, model = (False, None) if sched or job else pre_route(
+    to_claude, model = (False, None) if sched or job or auto else pre_route(
         bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
     offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local"
-    play = "" if sched or job else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
+    play = "" if sched or job or auto else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
     if play:  # a game note is terse; the persona's own register and title still hold ("너 차례!" was 반말 for 아젤)
         play += " 말투(존댓말/반말)와 호칭은 평소 네 성격대로 지키고, 사용자를 '당신'이라고 부르지 마."
     if offline or play:
         to_claude = False  # local mode: Qwen answers what it can and says plainly what it can't
     sentences: asyncio.Queue = asyncio.Queue()
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
-    route = {"value": "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
+    route = {"value": "auto" if auto else "schedule" if sched else "task" if job else "claude" if to_claude else "qwen"}
     address = Address(user_title(settings, persona), hkey, not any(m["role"] == "assistant" for m in hist))
     fetched = {"agenda": ""}  # agenda_prefetch's block, read by both model paths
 
@@ -2111,6 +2149,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
         try:
             if sched:  # handled here and by a full gateway; neither Qwen's answer nor Claude
                 for s in split_ready(await schedule_reply(bare, sched, session), final=True)[0]:
+                    await sentences.put(s)
+                return
+            if auto:  # "알아서 해": read back once, then the same grant as the app's toggle
+                for s in split_ready(await auto_reply(bare, auto, hkey), final=True)[0]:
                     await sentences.put(s)
                 return
             if job:  # a background task: confirm it and let the caller go
@@ -3108,6 +3150,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     await links.notify({"type": "announced", "id": q.get_nowait().get("id"), "ok": False})
                 call_hooks.pop(k, None)
                 end_hooks.pop(k, None)
+                pending_auto.pop(k, None)  # a read-back never carries into the next call
                 if current.get("auto"):  # its grant ends with the call (a secret call has no call log to end it)
                     await links.notify({"type": "auto_grant", "session": k, "value": False})
             for k in [k for k in games if k.endswith(f":{session}")]:  # a game left running never carries into the next call
@@ -5288,4 +5331,31 @@ if __name__ == "__main__":
         assert got == [{"id": "q1", "type": "phone_result", "ok": False, "error": "offline"},
                        {"id": "q2", "ok": True, "data": {"days": []}, "type": "phone_result"}], got
         assert to_phone == [{"type": "phone_query", "id": "q2", "kind": "health", "args": {"from": "2026-11-22"}}]
+        # "알아서 해": read back by the server, then the app toggle's grant; never Qwen's paraphrase
+        pending_auto.clear()
+        assert auto_intent("알아서 해줘", "azel:a") == "on" and auto_intent("이제 묻지 말고 해", "azel:a") == "on"
+        assert auto_intent("자동 승인 꺼 줘", "azel:a") == "off" and auto_intent("응", "azel:a") is None  # nothing asked
+        assert auto_intent("스파크 들어가서 네모클로 재시작하고 나머지는 알아서 해줘", "azel:a") is None  # a request of its own
+        assert auto_intent("오늘 날씨 알려줘", "azel:a") is None
+        notified = []
+
+        async def auto_flow():
+            pick, notify = links.pick, links.notify
+            links.pick = lambda **kw: None
+
+            async def fake_notify(m):
+                notified.append(m)
+            links.notify = fake_notify
+            try:
+                said = [await auto_reply("알아서 해줘", "on", "azel:a")]
+                said.append(await auto_reply("응", auto_intent("응", "azel:a"), "azel:a"))
+                said.append(await auto_reply("알아서 해", "on", "azel:b"))
+                said.append(await auto_reply("아니", auto_intent("아니", "azel:b"), "azel:b"))
+                return said
+            finally:
+                links.pick, links.notify = pick, notify
+        said = asyncio.run(auto_flow())
+        assert said[0] == AUTO_Q and said[1].startswith("네, 이번 통화 동안") and said[3].startswith("알겠어요")
+        assert notified == [{"type": "auto_grant", "session": "azel:a", "value": True}]  # "아니" grants nothing
+        assert not pending_auto
         print("voice_server checks ok")
