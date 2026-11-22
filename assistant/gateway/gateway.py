@@ -78,6 +78,18 @@ WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no")
 COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
 warm_pool = Pool()
 call_warm_keys: dict[str, str] = {}  # call_log id -> its warm process key, closed when the call ends
+call_started: dict[str, float] = {}  # call_log id -> when it started (a call whose end never came expires)
+CALL_TTL_S = 2 * 3600
+
+
+def live_calls():
+    """The calls in progress, as "<persona>:<session>" keys. A call whose end never arrived (the voice link dropped,
+    the voice server restarted) stops counting after CALL_TTL_S, so it can't hold finish calls back forever."""
+    now = time.time()
+    for lid in [lid for lid, at in call_started.items() if now - at > CALL_TTL_S]:
+        call_started.pop(lid, None)
+        call_warm_keys.pop(lid, None)
+    return set(call_warm_keys.values())
 assert MODE in ("full", "limited"), "BISEO_MODE must be full or limited"
 
 MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"}
@@ -1260,7 +1272,10 @@ async def place_held_call(kw):
     await asyncio.sleep(3)  # the phone needs a moment after hanging up before it rings again
     try:
         r = await place_call(**kw)
-        print("task notify: called after the other call:", (kw.get("context") or {}).get("id"), r.get("call_id"), flush=True)
+        tid = (kw.get("context") or {}).get("id")
+        print("task notify: called after the other call:", tid, r.get("call_id"), flush=True)
+        if tid:
+            await mark_notified({"id": tid})
     except Exception as e:
         print("task notify: held call failed:", (kw.get("context") or {}).get("id"), type(e).__name__, flush=True)
 
@@ -2024,13 +2039,14 @@ async def handle_link(ws):
                 warm_key = f"{pid}:{m['session']}"  # what the voice server's asks use as the session
                 if isinstance(m.get("log_id"), str):
                     call_warm_keys[m["log_id"]] = warm_key
+                    call_started[m["log_id"]] = time.time()
                 asyncio.create_task(prewarm(warm_key, pid))
             elif m.get("event") == "end" and (warm_key := call_warm_keys.pop(m.get("log_id"), None)):
+                call_started.pop(m.get("log_id"), None)
                 asyncio.create_task(warm_pool.close(warm_key))  # the call is over: so is its warm Claude
                 asyncio.create_task(post_call_facts(m["log_id"], warm_key.split(":", 1)[0]))
-                if not call_warm_keys:  # the line is free: the finish calls that waited for it ring now
-                    while pending_finish:
-                        asyncio.create_task(place_held_call(pending_finish.pop(0)))
+                if not live_calls():  # the line is free: the finish calls that waited for it ring now
+                    line_free.set()
             await record_call_log(m)  # in order, so a call's turns follow its start
         elif m.get("type") == "schedule" and isinstance(m.get("id"), str):
             tasks[m["id"]] = served(serve_schedule(m), m)
@@ -2041,6 +2057,8 @@ async def handle_link(ws):
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_briefing_context(m))
         elif m.get("type") == "announce_result" and (f := announce_waits.get(m.get("id"))) and not f.done():
+            f.set_result(m)
+        elif m.get("type") == "announced" and (f := announced_waits.get(m.get("id"))) and not f.done():
             f.set_result(m)
         elif m.get("type") == "call_answered":
             try:
@@ -2072,6 +2090,9 @@ async def voice_link():
             print("voice link down:", type(e).__name__, e, flush=True)
         finally:
             link["ws"] = None
+            call_warm_keys.clear()  # no voice server, no calls: their ends will never arrive
+            call_started.clear()
+            line_free.set()
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
@@ -3199,14 +3220,13 @@ def notify_request(goal):
 
 
 async def recent_open_task(origin, persona):
-    """The task a follow-up means: the newest unfinished one from this call, else this persona's within 10 minutes."""
-    now, seen = time.time(), {}
+    """The task a follow-up means: the newest unfinished one from this same call (never another call's)."""
+    seen = {}
     for t in [*(await bridge_recent_tasks(10)), *task_live.values()]:  # the runners' own dicts win
         seen[t["id"]] = t
     open_ = sorted((t for t in seen.values() if t["status"] in ("queued", "running", "waiting_approval")),
                    key=lambda t: t.get("created") or 0, reverse=True)
-    return next((t for t in open_ if origin and t.get("origin_session") == origin), None) or \
-        next((t for t in open_ if persona and t.get("persona") == persona and now - (t.get("created") or 0) < 600), None)
+    return next((t for t in open_ if origin and t.get("origin_session") == origin), None)  # this call's own only
 
 
 async def task_create(body, source="api"):
@@ -3215,7 +3235,7 @@ async def task_create(body, source="api"):
     if want := notify_request(spec["goal"]):  # "그 작업 끝나면 전화해 줘": the running task, not a new one
         t = await recent_open_task(origin_ctx.get(), spec["persona"])
         if not t:
-            raise HTTPException(409, "알림을 바꿀 진행 중인 작업이 없어요. 어떤 일을 맡길지 말씀해 주세요.")
+            raise HTTPException(409, "어떤 작업 말씀이세요? 이 통화에서 맡기신 진행 중인 작업이 없어요.")
         return {**t, **await task_set_notify(t["id"], want), "notify_updated": True}
     settings = await load_settings()
     spec["backend"], spec["fallback_reason"] = await task_backend_for(spec, settings)
@@ -3512,23 +3532,69 @@ async def task_briefing(t, title):
     return (f"{title}, {say}" if title else say)[:900]
 
 
-announce_waits: dict[str, asyncio.Future] = {}  # announce id -> the voice server's answer
+announce_waits: dict[str, asyncio.Future] = {}  # announce id -> the voice server's answer (taken)
+announced_waits: dict[str, asyncio.Future] = {}  # announce id -> whether it was actually spoken
 pending_finish: list[dict] = []  # finish calls held while the user is on another call
+line_free = asyncio.Event()  # set when the last call ends (or the voice link drops)
+HOLD_MAX_S = 180  # a held finish call rings after this even if the line still looks busy
+STAGGER_S = 20  # after ringing one held call, give it time to connect before the next
+ANNOUNCE_SPOKEN_S = 600  # an announcement not spoken by then (call stayed busy, ended): ring instead
 
 
 async def announce_in_call(session, opening, detail, context):
-    """Say a task's result inside the call the user is on now (the voice server speaks it as a turn). True when the
-    voice server took it."""
+    """Say a task's result inside the call the user is on now (the voice server speaks it as a turn). True only once
+    the voice server reports it actually spoken; taken-but-never-spoken (the call ended first) is False: ring."""
     rid = uuid.uuid4().hex
-    announce_waits[rid] = asyncio.get_running_loop().create_future()
+    loop = asyncio.get_running_loop()
+    announce_waits[rid], announced_waits[rid] = loop.create_future(), loop.create_future()
     try:
         await link_send({"type": "announce", "id": rid, "session": session, "opening": opening, "detail": detail,
                          "context": context})
-        return (await asyncio.wait_for(announce_waits[rid], 5)).get("ok") is True
+        if (await asyncio.wait_for(announce_waits[rid], 5)).get("ok") is not True:
+            return False
+        return (await asyncio.wait_for(announced_waits[rid], ANNOUNCE_SPOKEN_S)).get("ok") is True
     except (asyncio.TimeoutError, OSError, RuntimeError):
         return False
     finally:
         announce_waits.pop(rid, None)
+        announced_waits.pop(rid, None)
+
+
+def hold_finish(kw):
+    pending_finish.append({**kw, "_held_at": time.time()})
+    if not any(not t.done() for t in finish_worker):
+        finish_worker[:] = [asyncio.get_running_loop().create_task(ring_held_calls())]
+
+
+finish_worker: list[asyncio.Task] = []
+
+
+async def ring_held_calls():
+    """Ring the held finish calls one at a time: when the line is free, or when the oldest has waited HOLD_MAX_S
+    (a call that looks busy may be a stale one), then give the call it placed STAGGER_S to connect."""
+    while pending_finish:
+        wait = max(0.0, HOLD_MAX_S - (time.time() - pending_finish[0]["_held_at"]))
+        if live_calls() and wait > 0:
+            line_free.clear()
+            try:
+                await asyncio.wait_for(line_free.wait(), min(wait, 30))
+            except asyncio.TimeoutError:
+                pass
+            continue
+        kw = {k: v for k, v in pending_finish.pop(0).items() if k != "_held_at"}
+        await place_held_call(kw)
+        if pending_finish:
+            await asyncio.sleep(STAGGER_S)
+
+
+async def mark_notified(t):
+    """The user was told (in a call, by a call, or by a push): a gateway restart won't tell them again."""
+    try:
+        cur = task_live.get(t["id"]) or await state.call("GET", task_key(t["id"])) or t
+        cur["notified_at"] = time.time()
+        await task_save(cur)
+    except Exception as e:
+        print("task notify: notified_at not saved:", t["id"], type(e).__name__, flush=True)
 
 
 async def task_notify(t, approval=False):
@@ -3544,24 +3610,27 @@ async def task_notify(t, approval=False):
             origin = t.get("origin_session")
             context = {"kind": "task", "id": t["id"], "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]}
             detail = f"목표: {t['goal'][:300]}\n결과: {(t.get('result') or t.get('error') or '')[:3000]}"
-            if origin and origin in call_warm_keys.values():
+            if origin and origin in live_calls():
                 if await announce_in_call(origin, opening, detail, context):
                     print("task notify: told in the current call:", t["id"], flush=True)
+                    await mark_notified(t) if not approval else None  # an approval call isn't the finish
                     return
                 print("task notify: the current call did not take it, calling:", t["id"], flush=True)
             kw = {"reason": "task_approval" if approval else "task", "opening": opening, "persona_id": t["persona"],
                   "context": context, "detail": detail, **({"origin_session": origin} if origin else {})}
-            if call_warm_keys and not (origin and origin in call_warm_keys.values()):
-                pending_finish.append(kw)  # the line is busy with another call: ring once it ends
+            if live_calls() and not (origin and origin in live_calls()):
+                hold_finish(kw)  # the line is busy with another call: ring once it ends (or after HOLD_MAX_S)
                 print("task notify: on another call, calling after it ends:", t["id"], flush=True)
                 return
             r = await place_call(**kw)
             print("task notify: called:", t["id"], r.get("call_id"), "push sent:", r.get("sent"), flush=True)
+            await mark_notified(t) if not approval else None  # an approval call isn't the finish
         elif t["notify"] == "push":
             title = "승인 필요" if approval else "작업 완료" if t["status"] == "done" else "작업 실패"
             what = ("승인이 필요해요" if approval else "작업이 끝났어요" if t["status"] == "done" else "작업이 실패했어요")
             goal = t["goal"] if len(t["goal"]) <= 40 else t["goal"][:39] + "…"
             await send_alert_push(title, spoken_text(f"{what}: {goal}"), type="task", task_id=t["id"])  # no model output
+            await mark_notified(t) if not approval else None  # an approval call isn't the finish
     except Exception as e:
         print("task notify failed:", t["id"], type(e).__name__, flush=True)
 
@@ -3578,15 +3647,25 @@ async def fail_orphan_tasks(startup=True):
         if t["status"] == "queued" and not t.get("cancel_requested"):
             print("picking up queued task:", tid, flush=True)
             start_task(t)
+        elif startup and t["status"] in ("done", "failed") and t.get("notify") in ("call", "push") \
+                and not t.get("notified_at") and time.time() - (t.get("finished") or 0) < NOTIFY_RETRY_S \
+                and tid not in notify_retried:
+            notify_retried.add(tid)  # once per process, however often the watcher looks
+            print("task notify: telling again after a restart:", tid, flush=True)  # its finish was never delivered
+            asyncio.create_task(task_notify(t))
         elif startup and t["status"] in ("running", "waiting_approval"):
             t.update(status="failed", finished=time.time(), error="게이트웨이가 다시 시작돼서 멈췄어요.")
             await task_save(t)
 
 
+NOTIFY_RETRY_S = 6 * 3600  # finishes this recent that were never delivered are told again at startup
+notify_retried: set[str] = set()
+
+
 def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
             "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
-            "origin_session")
+            "origin_session", "notified_at")
     return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
 
 
@@ -3728,7 +3807,7 @@ bridge = tools_bridge.Bridge(
     place_call=lambda reason, opening, pid: place_call(reason, opening=opening, persona_id=pid),
     schedule_create=lambda body, by: schedule_create(body, by), task_create=lambda body, src: task_create(body, src),
     state=lambda method, path, body=None, **kw: state.call(method, path, body, **kw),
-    in_call=lambda: bool(call_warm_keys), cygnus=lambda: claude_api.cygnus_bridge(HOME),
+    in_call=lambda: bool(live_calls()), cygnus=lambda: claude_api.cygnus_bridge(HOME),
     schedule_list_text=lambda: bridge_schedule_text(), schedule_items=lambda **kw: bridge_schedule_items(**kw),
     schedule_cancel=lambda sid, at, occurrence=None: schedule_cancel(sid=sid, at=at, occurrence=occurrence),
     schedule_update=lambda sid, changes, occ: schedule_update(sid, changes, occ),
