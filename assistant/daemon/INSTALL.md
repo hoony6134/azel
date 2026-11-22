@@ -1,4 +1,4 @@
-# Biseo agent daemon: install
+# Azel agent daemon: install
 
 1. `mkdir -p ~/.config/biseo && cp daemon.example.toml ~/.config/biseo/daemon.toml && chmod 600 ~/.config/biseo/*`
    and edit `id`, `name`, `host` (this host's Tailscale IP), `allowed_roots`. The token file must already exist.

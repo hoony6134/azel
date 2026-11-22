@@ -1,4 +1,4 @@
-"""Biseo agent daemon: an MCP server (streamable HTTP at /mcp) exposing guarded tools.
+"""Azel agent daemon: an MCP server (streamable HTTP at /mcp) exposing guarded tools.
 
 See ../PROTOCOL.md section 4. Run: `uv run python biseo_daemon.py [--config PATH]`.
 """
@@ -31,7 +31,7 @@ import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
-log = logging.getLogger("biseo-daemon")
+log = logging.getLogger("azel-daemon")
 
 DEFAULTS = {
     "id": "macbook",
@@ -1580,7 +1580,7 @@ class BearerAuth:
 def build_app(cfg: dict):
     CFG.clear()
     CFG.update(cfg)
-    server = MCPServer(name=f"biseo-daemon-{cfg['id']}")
+    server = MCPServer(name=f"azel-daemon-{cfg['id']}")
     for t in [*TOOLS, *(BROWSER_TOOLS if cfg["browser_enabled"] else []), *(MAC_TOOLS if sys.platform == "darwin" else [])]:
         server.tool()(t)
     # Host-header check (DNS rebinding) for our bind address; the bearer token is the real gate.

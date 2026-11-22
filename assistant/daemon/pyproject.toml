@@ -1,7 +1,7 @@
 [project]
 name = "biseo-daemon"
 version = "0.1.0"
-description = "Biseo agent daemon: MCP server exposing guarded file, command and delegate tools"
+description = "Azel agent daemon: MCP server exposing guarded file, command and delegate tools"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",

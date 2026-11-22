@@ -193,7 +193,7 @@ async def lifespan(app):
     pool.close()
 
 
-app = FastAPI(title="biseo-memory", lifespan=lifespan)
+app = FastAPI(title="azel-memory", lifespan=lifespan)
 v1 = Depends(auth)
 lim = Depends(token_only)  # also open to limited hosts
 
