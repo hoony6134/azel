@@ -39,6 +39,9 @@ home_shortcuts = []   # e.g. ["azel-lights-off", "azel-movie"]
 # (naver|google), read, click, fill, screenshot, pdf, print, close. Headless unless show=true. Needs
 # `uv run playwright install chromium`. Clicks that submit/buy/pay/book/apply and the first print to each printer wait
 # for your approval in the app; passwords, card numbers and IDs are never typed; files stay in browser_downloads.
+# Every click or fill on an order/payment/checkout page, and every print job, asks first. Only pdf, csv, txt, json,
+# png, jpg, xlsx and docx downloads are kept. The profile is never for logins: cookies are cleared each time the browser
+# starts, and nothing here types credentials. Log in to nothing with show=true either.
 browser_enabled = false
 browser_profile = "~/.config/biseo/browser-profile"   # 0700
 browser_downloads = "~/Downloads/azel"

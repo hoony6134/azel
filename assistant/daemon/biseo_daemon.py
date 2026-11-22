@@ -812,11 +812,16 @@ BROWSER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_
 _B: dict = {"downloads": [], "blocked": []}
 BROWSER_ACTIONS = ("open", "search", "read", "click", "fill", "screenshot", "pdf", "print", "close")
 SEARCH_URLS = {"naver": "https://search.naver.com/search.naver?query={}", "google": "https://www.google.com/search?q={}"}
-COMMIT_RE = re.compile(r"결제|구매|주문|예약|신청|제출|가입|송금|이체|입금|동의하고|"
+COMMIT_RE = re.compile(r"결제|구매|주문|예약|신청|제출|가입|송금|이체|입금|동의하고|보내기|전송|등록|삭제|확인|"
                        r"\b(submit|buy|purchase|pay|payment|checkout|order|book|booking|reserve|register|subscribe|"
-                       r"donate|transfer|confirm)\b", re.I)
-SECRET_FIELD_RE = re.compile(r"passw|pwd|비밀번호|card|cvc|cvv|cvn|카드|ssn|주민|resident|social.?security|otp|"
-                             r"\bpin\b|계좌|account.?num|security.?code", re.I)
+                       r"donate|transfer|confirm|send|delete|post)\b", re.I)
+# a page whose address says order, payment or checkout: every click and fill on it needs an approval
+COMMIT_URL_RE = re.compile(r"checkout|/orders?\b|order[-_]?(form|confirm)|payment|/pay\b|purchase|billing|/cart\b|결제|주문",
+                           re.I)
+# the field's own words (name, id, label text, placeholder...); `pw` also as a camelCase tail (userPw, pwConfirm)
+SECRET_FIELD_RE = re.compile(r"passw|pwd|비밀번호|암호|card|cvc|cvv|cvn|카드|ssn|주민|resident|social.?security|otp|"
+                             r"\bpin\b|계좌|account.?num|security.?code|(?:^|[^a-z])pw|pw(?:[^a-z]|$)|passwd", re.I)
+DOWNLOAD_OK = {".pdf", ".csv", ".txt", ".json", ".png", ".jpg", ".jpeg", ".xlsx", ".docx"}
 BOT_CHECK_RE = re.compile(r"비정상적인 (트래픽|검색)|이용이 제한|로봇이 아니|자동화된 (요청|트래픽)|unusual traffic|are you a robot|"
                           r"verify you are human|captcha", re.I)
 PRINTER_RE = re.compile(r"[A-Za-z0-9_.-]{1,60}")
@@ -833,6 +838,11 @@ def secret_value(v: str) -> bool:
     """A card number or a Korean resident number: never typed into a page."""
     digits = re.sub(r"[\s-]", "", v or "")
     return bool(re.fullmatch(r"\d{13,19}", digits) and _luhn(digits)) or bool(re.fullmatch(r"\d{6}[1-4]\d{6}", digits))
+
+
+def on_commit_page(url: str) -> bool:
+    u = urlsplit(url)
+    return bool(COMMIT_URL_RE.search(u.path + "?" + u.query))
 
 
 def is_commit(desc: dict, selector: str = "") -> bool:
@@ -876,6 +886,7 @@ def _guard(route):
         loc = resp.headers.get("location")
         if 300 <= resp.status < 400 and loc:
             check_url(urljoin(req.url, loc))
+        check_url(req.url)  # DNS rebinding: the name must still resolve to a public address after the fetch
     except Refused as e:
         _B["blocked"].append(str(e))
         return route.abort("blockedbyclient")
@@ -884,8 +895,24 @@ def _guard(route):
     route.fulfill(response=resp)
 
 
+def _guard_ws(ws):
+    """WebSockets get the same host check as requests (ws -> http, wss -> https), then connect through."""
+    try:
+        check_url(re.sub(r"^ws", "http", ws.url, count=1))
+    except Refused as e:
+        _B["blocked"].append(str(e))
+        return ws.close()
+    ws.connect_to_server()
+
+
 def _on_download(dl):
-    dest = _out_path(dl.suggested_filename, Path(dl.suggested_filename).suffix[:10] or ".bin")
+    name = dl.suggested_filename or ""
+    ext = Path(name).suffix.lower()
+    if ext not in DOWNLOAD_OK:
+        dl.cancel()
+        _B.setdefault("refused_downloads", []).append(name[:80])
+        return
+    dest = _out_path(name, ext)
     dl.save_as(dest)
     _B["downloads"].append(str(dest))
 
@@ -920,6 +947,8 @@ def _page(show: bool):
         raise RuntimeError("chromium unavailable (run `uv run playwright install chromium`): "
                            + str(e).strip().splitlines()[0])
     ctx.route("**/*", _guard)
+    ctx.route_web_socket("**/*", _guard_ws)
+    ctx.clear_cookies()  # the profile always starts logged out: it is never for logins, whatever an earlier run left
     ctx.on("page", _watch)  # a popup or target=_blank tab becomes the page we drive
     _B.update(ctx=ctx, show=show)
     _watch(ctx.pages[0] if ctx.pages else ctx.new_page())
@@ -959,8 +988,12 @@ def _snapshot(page, max_chars: int, text: bool = True) -> dict:
         out |= {"text": t[:max_chars], "truncated": len(t) > max_chars}
         if BOT_CHECK_RE.search(t[:3000]):  # never worked around: the user can open it with show=true and pass it himself
             out["bot_check"] = True
+    if COMMIT_URL_RE.search(urlsplit(page.url).path + "?" + urlsplit(page.url).query):
+        out["commit_page"] = "this looks like an order or payment page: every further click or fill needs the user's approval"
     if _B["downloads"]:
         out["downloads"], _B["downloads"] = list(_B["downloads"]), []
+    if _B.get("refused_downloads"):
+        out["refused_downloads"], _B["refused_downloads"] = _B["refused_downloads"], []
     return out
 
 
@@ -977,12 +1010,17 @@ def _locate(page, text: str | None, selector: str | None):
     return loc.first
 
 
-DESCRIBE_JS = """el => { const f = el.closest('form'); const g = a => (el.getAttribute(a) || '');
-  return {tag: el.tagName.toLowerCase(), type: g('type').toLowerCase(),
-          text: (el.innerText || el.value || g('aria-label') || g('title')).trim().slice(0, 80),
+DESCRIBE_JS = """el => { const orig = el;
+  el = el.control || (el.closest && el.closest('label') && el.closest('label').control) || el;  // a label stands for its input
+  const f = el.closest('form'); const g = a => (el.getAttribute(a) || '');
+  const labels = Array.from(el.labels || []).map(l => l.innerText || '').join(' ');
+  const masked = (getComputedStyle(el).webkitTextSecurity || 'none') !== 'none';
+  return {tag: el.tagName.toLowerCase(), type: masked ? 'password' : g('type').toLowerCase(),
+          text: (orig.innerText || orig.value || orig.getAttribute('aria-label') || orig.getAttribute('title') || '').trim().slice(0, 80),
+          editable: el.matches('input, textarea, [contenteditable=""], [contenteditable="true"]'),
           form: !!f, method: f ? (f.getAttribute('method') || 'get').toLowerCase() : '',
           autocomplete: g('autocomplete').toLowerCase(), hint: [g('name'), el.id, g('placeholder'),
-          g('aria-label'), g('autocomplete')].join(' '), href: el.href || ''} }"""
+          g('aria-label'), g('autocomplete'), g('title'), labels, g('class')].join(' '), href: el.href || ''} }"""
 
 
 def _report_html(rep: dict) -> str:
@@ -1046,10 +1084,6 @@ def _gate(command: str, cwd: str, approval_id: str | None) -> dict | None:
     return None
 
 
-def _printers_file() -> Path:
-    return CFG["log_path"].with_name("printers_ok.txt")
-
-
 def _print(path: str | None, printer: str | None, approval_id: str | None) -> dict:
     name = Path(path or "").name
     f = (_downloads_dir() / name).resolve()
@@ -1062,13 +1096,8 @@ def _print(path: str | None, printer: str | None, approval_id: str | None) -> di
         if printer not in known:
             raise Refused(f"unknown printer; available: {', '.join(known) or 'none'}")
     key = printer or "default"
-    known_ok = _printers_file().read_text().split() if _printers_file().exists() else []
-    if key not in known_ok:  # the first print to a printer is the user's tap
-        if pend := _gate(f"인쇄 {name} → {key}", "print", approval_id):
-            return pend
-        fd = os.open(_printers_file(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a") as fh:
-            fh.write(key + "\n")
+    if pend := _gate(f"인쇄 {name} → {key}", "print", approval_id):  # every job is the user's tap: paper and ink cost
+        return pend
     r = subprocess.run([LP, *(["-d", printer] if printer else []), str(f)], capture_output=True, text=True, timeout=30)
     if r.returncode:
         raise RuntimeError((r.stderr.strip() or f"lp exit {r.returncode}")[:300])
@@ -1148,22 +1177,26 @@ def browser(action: str, url: str | None = None, engine: str | None = None, quer
                 raise Refused("click needs text or selector")
             el = _locate(pg, text, selector)
             desc = el.evaluate(DESCRIBE_JS)
-            if is_commit(desc, selector or ""):
+            if is_commit(desc, selector or "") or on_commit_page(pg.url):
                 label = (desc["text"] or text or selector)[:60]
                 if pend := _gate(f"브라우저 클릭 '{label}' ({pg.url[:150]})", "browser", approval_id):
                     return pend
             el.click()
             _settle(pg)
             pg.wait_for_timeout(600)  # a download starts and is saved just after the click
-            return _snapshot(pg, cap)
+            return _snapshot(_B["page"], cap)  # a click may have opened a new tab: that one is ours now
         if action == "fill":
             if not selector or value is None:
                 raise Refused("fill needs selector and value")
             el = _locate(pg, None, selector)
-            d = el.evaluate(DESCRIBE_JS)
+            d = el.evaluate(DESCRIBE_JS)  # of the input a label points to, not the label
+            if not d["editable"]:
+                raise Refused("fill only types into inputs, textareas and editable text")
             if d["type"] in ("password", "file") or d["autocomplete"].startswith("cc-") \
                     or d["autocomplete"] == "one-time-code" or SECRET_FIELD_RE.search(d["hint"]) or secret_value(value):
                 raise Refused("passwords, card numbers, one-time codes and IDs are never typed here: ask the user to do it")
+            if on_commit_page(pg.url) and (pend := _gate(f"브라우저 입력 '{selector[:60]}' ({pg.url[:150]})", "browser", approval_id)):
+                return pend
             el.fill(value)
             return {"status": "ok", "filled": selector}
         if action == "screenshot":
