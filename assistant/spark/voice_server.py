@@ -1591,18 +1591,24 @@ DEVICE_JOB = re.compile(r"(" + "|".join(_DEV) + r")\S*\s.{0,30}(정리|설치|�
                         r"\S*\s*(해\s*)?(줘|주세요|줄래)", re.I)
 
 
+# "자기 전에 이거 해 둬", "밤새 ○○ 조사해 놔": work for the overnight queue (runs at night, told in the morning)
+OVERNIGHT = re.compile(r"(자기 ?전에|밤새|밤사이|자는 ?동안|내일 ?아침까지).{0,40}(해 ?둬|해 ?놔|해 ?놓|해 ?줘|조사|정리|찾아|알아봐|만들어)")
+
+
 def task_intent(text):
     """None, or how to report back ("call" / "push") when the request is a background task: an explicit
     "끝나면 알려 줘", or a job on a named device (several steps; the caller should not wait on the line)."""
     if TASK_NOTIFY.search(text):
         return "push" if re.search(r"푸시|알림|메시지|문자", text) else "call"
+    if OVERNIGHT.search(text):
+        return "push"  # told in the morning report; nobody is woken
     return "call" if DEVICE_JOB.search(text) else None
 
 
 async def task_reply(text, notify):
     dev = next((v for k, v in _DEV.items() if re.search(k, text, re.I)), None)
     msg = {"type": "task", "goal": text, "notify": notify, "persona": (CALL_PERSONA.get() or {}).get("id"),
-           **({"device": dev} if dev else {})}
+           **({"device": dev} if dev else {}), **({"when": "overnight"} if OVERNIGHT.search(text) else {})}
     try:
         reply = await links.request(msg, need_claude=True)
     except (RuntimeError, asyncio.TimeoutError):
@@ -3082,6 +3088,8 @@ if __name__ == "__main__":
         assert task_intent("맥북 다운로드 폴더 정리해 줘") == "call" and task_intent("논문 찾아서 요약하고 끝나면 알려 줘") == "call"
         assert task_intent("빌드 돌리고 다 되면 알림으로 알려 줘") == "push" and task_intent("맥북 켜져 있어?") is None
         assert task_intent("내일 10시에 전화해 줘") is None and task_intent("오늘 날씨 알려 줘") is None
+        assert task_intent("자기 전에 이거 해 둬: 다운로드 폴더 정리") == "push" and OVERNIGHT.search("밤새 오픈 자비스 조사해 놔")
+        assert task_intent("내일 아침까지 논문 세 편 찾아서 정리해 놔") == "push" and not OVERNIGHT.search("밤새 잘 잤어?")
         assert pre_route("엔비디아로 답해 줘", {}) == (True, "nim") and pre_route("선생님으로 불러 줘", {})[1] is None
         assert pre_route("하이쿠가 뭐야?", {})[0] is False and pre_route("일정한 속도로 걸어", {})[0] is False
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")
