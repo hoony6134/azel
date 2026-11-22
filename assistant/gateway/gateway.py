@@ -414,7 +414,8 @@ local_devices: dict[str, dict] = {}  # daemons that registered here, so this dev
 STATIC_PATH = HOME / "static_devices.json"
 static_devices: dict[str, dict] = {}
 device_tokens: dict[str, str] = {}  # daemon url -> its bearer token, when not the shared one
-limited_urls: set[str] = set()  # daemons that may never be handed a `delegate`
+limited_urls: set[str] = set()  # team devices' daemons (static entries)
+NO_DELEGATE = {"sadr"}  # devices that are never handed a `delegate` (team devices may delegate since batch 8)
 STATIC_PROBE_S = 60
 
 
@@ -952,8 +953,8 @@ async def device_tools(devices):
             print("tools/list failed:", d["id"], type(e).__name__, flush=True)
             continue
         for t in listed:
-            if t["name"] == "delegate" and d.get("limited"):
-                continue  # a team device only reads and diagnoses: never hand it work
+            if t["name"] == "delegate" and d["id"] in NO_DELEGATE:
+                continue
             name = f"{d['id']}__{t['name']}"[:64]
             where[name] = (d["url"], t["name"])
             tools.append({"name": name, "description": f"[{d['name']}] {t.get('description') or ''}"[:1024],
@@ -964,8 +965,8 @@ async def device_tools(devices):
 async def run_tool(block, where):
     try:
         url, name = where[block["name"]]
-        if name == "delegate" and url in limited_urls:
-            raise RuntimeError("delegate is not allowed on a limited device")
+        if name == "delegate" and block["name"].split("__")[0] in NO_DELEGATE:
+            raise RuntimeError("delegate is not allowed on this device")
         res = await mcp(url, "tools/call", {"name": name, "arguments": block["input"]})
         text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
         if name == "delegate" and (req := requester_ctx.get()).startswith("task:"):
@@ -1177,10 +1178,12 @@ async def send_voip_push(payload):
     return await apns_send(payload, "voip")
 
 
-async def send_alert_push(title, body, **extra):
+async def send_alert_push(title, body, category=None, **extra):
     """An ordinary notification (e.g. a missed scheduled call); needs the app's alert token. `extra` rides at the
-    payload's top level next to `aps` (a task push: `type: "task"`, `task_id`, so the app opens azel://task/<id>)."""
-    return await apns_send({"aps": {"alert": {"title": title, "body": body}, "sound": "default"}, **extra}, "alert")
+    payload's top level next to `aps` (a task push: `type: "task"`, `task_id`, so the app opens azel://task/<id>);
+    `category` picks the app's notification buttons (APPROVAL: 허용 / 거부 / 항상 허용)."""
+    aps = {"alert": {"title": title, "body": body}, "sound": "default", **({"category": category} if category else {})}
+    return await apns_send({"aps": aps, **extra}, "alert")
 
 
 async def apns_send(payload, kind):
@@ -3213,8 +3216,11 @@ async def create_approval(body: dict):
         return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     try:  # the app shows it; the command text only (never output), shortened
-        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", type="approval",
-                              approval_id=aid)  # the command itself only in the app, never on the lock screen
+        # "항상 허용" is offered only where it could hold: a read-only command, not from a secret call
+        once = not always_ok(row["command"]) or is_secret((requester or {}).get("session"))
+        await send_alert_push("승인 요청", f"{row['device']}에서 명령 실행 승인이 필요해요", category="APPROVAL",
+                              type="approval", approval_id=aid,
+                              **({"forced_once": True} if once else {}))  # the command only in the app, never here
     except Exception as e:
         print("approval push failed:", type(e).__name__, flush=True)
     return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
@@ -3500,7 +3506,7 @@ TASK_MAX_ROUNDS = 4  # one approval wait per round
 TASK_STATUSES = ("scheduled", "queued", "running", "waiting_approval", "done", "failed", "cancelled")
 TASK_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로"
               " 요약해. 도구가 pending_approval을 돌려주면 그 명령을 다시 시도하지 말고 'APPROVAL_PENDING <approval_id>'"
-              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
+              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. sadr에선 delegate를 쓰지 마.")
 PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
 task_slots = asyncio.Semaphore(TASK_SLOTS)
 task_runs: dict[str, asyncio.Task] = {}  # tasks this gateway is running
@@ -3655,14 +3661,14 @@ def task_prompt(t, devices):
     where = (f"작업 기기: {t['device']}." if t["device"] else
              "작업 기기는 기본 순서대로 고르되, 파일 저장·수정·설치처럼 쓰는 일은 전체 권한 기기(맥북)를 우선해.")
     limited = [d["id"] for d in devices if d.get("limited")]
-    note = f" 한도 기기(팀 기기: 바꾸는 명령은 승인을 받아야 하고 delegate는 안 됨): {', '.join(limited)}." if limited else ""
+    note = f" 한도 기기(팀 기기: 바꾸는 명령은 승인을 받아야 함): {', '.join(limited)}." if limited else ""
     if t["device"] and t["device"] in limited:
         note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
     note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
     note += (" 간단하고 짧은 일은 기기 도구(read_file, list_dir, run_command, browser)로 직접 해. 여러 파일을 고치는 코딩이나"
              " 파일을 써 가며 하는 깊은 조사처럼 그 기기에서 오래, 여러 단계가 필요한 일은 그 기기의 delegate로 그 기기의"
              " Claude Code에 맡겨. 맡겼으면 기다리지 말고 job_id를 남기고 끝내: 시스템이 그 작업이 끝날 때까지 기다렸다가 그"
-             " 결과로 마무리해. 한도 기기(팀 기기)와 sadr에는 delegate를 쓰지 마.")
+             " 결과로 마무리해. sadr에는 delegate를 쓰지 마.")
     asked = datetime.fromtimestamp(t.get("created") or time.time(), KST)  # "내일 아침까지" said at 01:00 = this morning
     night = late_night.prompt_rule(asked)
     return f"{where}{note}" + (f"\n이 일은 {asked:%-m월 %-d일 %H:%M}에 맡겨졌어.{night}" if night else "") + \
@@ -4464,7 +4470,7 @@ GOOGLE_STYLE = ("메일과 캘린더는 calendar_events, gmail_search, gmail_rea
                 "말하지 마.")
 TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로 요약해. "
                   "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
-                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
+                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. sadr에선 delegate를 쓰지 마.")
 bridge = tools_bridge.Bridge(
     who=lambda: requester_ctx.get(),  # the run (ask:<session> | task:<id>): the prompt-injection guard's key
     fresh_devices=lambda: fresh_devices(), device_tools=lambda d: device_tools(d), run_tool=lambda b, w: run_tool(b, w),

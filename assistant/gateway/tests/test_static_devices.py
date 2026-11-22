@@ -62,7 +62,7 @@ def test_daemon_calls_use_the_device_token(sgw, monkeypatch):
     assert seen == ["Bearer spark-daemon-tok", "Bearer t0k"]
 
 
-def test_never_delegate_to_a_limited_device(sgw, monkeypatch):
+def test_team_devices_may_delegate_and_sadr_never(sgw, monkeypatch):
     g, _ = sgw
     g.static_devices["spark"]["last_seen"] = 9e12
     calls = []
@@ -75,13 +75,16 @@ def test_never_delegate_to_a_limited_device(sgw, monkeypatch):
     monkeypatch.setattr(g, "mcp", mcp)
     devs = asyncio.run(g.fresh_devices())
     tools, where = asyncio.run(g.device_tools(devs))
-    assert [t["name"] for t in tools] == ["spark__run_command"]
-    where["spark__delegate"] = (SPARK["url"], "delegate")  # even if a model names it anyway
-    res = asyncio.run(g.run_tool({"id": "1", "name": "spark__delegate", "input": {"task": "x"}}, where))
-    assert res["is_error"] and not any(m == "tools/call" for _, m, _ in calls)
+    assert [t["name"] for t in tools] == ["spark__run_command", "spark__delegate"]  # a team device may delegate now
+    where["sadr__delegate"] = ("http://100.64.0.99:8765/mcp", "delegate")  # even if a model names it anyway
+    res = asyncio.run(g.run_tool({"id": "1", "name": "sadr__delegate", "input": {"task": "x"}}, where))
+    assert res["is_error"] and not any(m == "tools/call" and u.startswith("http://100.64.0.99") for u, m, _ in calls)
     servers, allowed, run_settings, _ = g.run_args(asyncio.run(g.load_settings()), devs)
     assert servers["spark"]["headers"]["Authorization"] == "Bearer spark-daemon-tok"
-    assert json.loads(run_settings)["permissions"]["deny"] == ["mcp__spark__delegate", "mcp__spark__home", "mcp__spark__music"]
+    assert "mcp__spark__delegate" not in json.loads(run_settings)["permissions"]["deny"]
+    sadr = [{"id": "sadr", "url": "http://100.64.0.99:8765/mcp"}]
+    _, _, rs, _ = g.run_args(asyncio.run(g.load_settings()), sadr)
+    assert "mcp__sadr__delegate" in json.loads(rs)["permissions"]["deny"]
 
 
 def test_static_entry_must_be_limited(tmp_path, monkeypatch):

@@ -29,7 +29,8 @@ def test_pending_push_and_requester(agw):
     g, c, pushes = agw
     r = c.post("/v1/approvals", json={**CMD, "requester": "ask:azel:call-1"}).json()  # the daemon passes it on
     assert r["status"] == "pending" and r["expires_at"] - time.time() == pytest.approx(300, abs=5)
-    assert pushes == [("승인 요청", "macbook에서 명령 실행 승인이 필요해요", {"type": "approval", "approval_id": r["approval_id"]})]
+    assert pushes == [("승인 요청", "macbook에서 명령 실행 승인이 필요해요",
+                       {"category": "APPROVAL", "type": "approval", "approval_id": r["approval_id"]})]  # 허용/거부/항상 허용
     a = c.get(f"/v1/approvals/{r['approval_id']}").json()
     assert a["status"] == "pending" and a["requester"] == {"session": "azel:call-1", "persona": "azel"}
     assert [x["id"] for x in c.get("/v1/approvals").json()] == [r["approval_id"]]
@@ -250,3 +251,10 @@ def test_kv_keys_fit_the_memory_service(agw, key, ok):
     assert accepted is ok, key
     if not ok:
         assert code == 422, (key, code)
+
+
+
+def test_a_write_approval_push_says_always_is_not_offered(agw):
+    g, c, pushes = agw
+    c.post("/v1/approvals", json={**CMD, "command": "rm -rf build"})
+    assert pushes[-1][2]["category"] == "APPROVAL" and pushes[-1][2]["forced_once"] is True  # no 항상 허용 button
