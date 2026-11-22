@@ -192,15 +192,16 @@ def tools(shared=True):
     return tool_defs([n for n in TOOLS if shared or n not in SHARED_ONLY]) if available() else []
 
 
-async def call(name, args, raw=False):
-    """Run one Cygnus tool for a model; always a short string, never an exception."""
+async def call(name, args, raw=False, extra=None):
+    """Run one Cygnus tool for a model; always a short string, never an exception. `extra`: arguments set by the gateway's
+    own code (the TV's full status page asks infra_status for every monitor), never by a model."""
     global _shared_client
     if name not in TOOLS:
         return f"모르는 도구예요: {str(name)[:40]}"
     if not available():
         return "이 기기에는 Cygnus 토큰이 없어요."
     try:
-        checked = check_args(name, args)
+        checked = {**check_args(name, args), **(extra or {})}
     except ValueError as e:
         return f"도구 인자가 틀렸어요: {e}"
     if _shared_client is None:

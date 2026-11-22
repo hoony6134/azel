@@ -2615,6 +2615,7 @@ async def probe(url, token=False):
 
 
 tv_cache, tv_cache2 = tv.Cache(), tv.Cache()
+tv_detail_cache = {"infra": tv.Cache(), "tasks": tv.Cache()}
 
 
 def tv_deps():
@@ -2649,15 +2650,20 @@ def tv_deps():
     return {"infra": lambda name: cyg.call(name, {}), "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
             "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
             "google_ok": lambda: google_status() == "connected", "calendar": calendar,
-            "infra_raw": lambda n, a=None: cyg.call(n, a or {}, raw=True), "persona2": persona2, "overnight": overnight,
+            "infra_raw": lambda n, extra=None: cyg.call(n, {}, raw=True, extra=extra), "persona2": persona2, "overnight": overnight,
             "calendar_rows": calendar_rows}
 
 
 @app.get("/v1/tv")
-async def tv_get(v: int = 1):
-    """The Roku dashboard's one read-only JSON (tv.py): v1 by default, `?v=2` the structured shape. The TV token
-    (~/.config/biseo/tv_token) opens only this."""
+async def tv_get(v: int = 1, detail: str | None = None):
+    """The Roku dashboard's one read-only JSON (tv.py): v1 by default, `?v=2` the structured shape, `?detail=infra|tasks`
+    a detail screen's data. The TV token (~/.config/biseo/tv_token) opens only this path."""
     full_only()
+    if detail is not None:
+        if detail not in tv_detail_cache:
+            raise HTTPException(400, "detail: infra or tasks")
+        make = tv.build_infra_detail if detail == "infra" else tv.build_tasks_detail
+        return await tv_detail_cache[detail].get(lambda: make(tv_deps()))
     if v == 1:
         return await tv_cache.get(lambda: tv.build(tv_deps()))
     if v == 2:

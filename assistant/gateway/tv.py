@@ -7,12 +7,21 @@ count. The answer is cached for TTL_S seconds, so a TV polling every 30 s never 
 import asyncio
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 TTL_S = 30
 SECTION_TIMEOUT_S = 8
 LINES, WIDTH = 10, 90
+
+
+def plain(text):
+    """Display text without pictographs (🔁, ⬜, ✅…): the TV's Hangul-subset font has no glyph for them and draws a blank
+    gap instead, which pushed the first word of a card out of line. Letters, digits, punctuation and ·, ~, ° stay."""
+    out = "".join(c for c in str(text or "") if c in "°℃" or not (unicodedata.category(c) in ("So", "Cs", "Co")
+                                                   or c in "\uFE0F\u200D" or ord(c) > 0xFFFF))
+    return " ".join(out.split())
 
 
 def lines(text, limit=LINES):
@@ -84,6 +93,7 @@ DUE = re.compile(r"(\d{1,2})월 (\d{1,2})일 \([월화수목금토일]\) (\d{1,2
 DATE_LEAD = re.compile(r"^(\d{1,2})월 (\d{1,2})일(?: \([월화수목금토일]\))?(?: (\d{1,2}):(\d{2}))?")
 CAL = re.compile(r"^- (?:(\d{2}/\d{2})\([A-Za-z]{3}\) (\d{2}:\d{2})~(\d{2}:\d{2})|\d{4}-\d{2}-\d{2} 종일) (.+)$")
 CLASS_TIME = re.compile(r"(\d{1,2}:\d{2})\s*[~–-]\s*(\d{1,2}:\d{2})")
+TIME_LEAD = re.compile(r"^(\d{1,2}:\d{2})\s*[~–-]\s*(\d{1,2}:\d{2})\s*")
 CRIT = re.compile(r"crit|심각|\bP1\b|치명", re.I)
 SERVICE = re.compile(r"^(?P<name>.+?)(?: \((?P<type>[A-Za-z]{2,6})\))?\s+(?P<state>멈춤|DOWN|꺼짐|느려짐|degraded|slow)(?:\s*·\s*(?P<note>.+))?$", re.I)
 STATUS_WORDS = ("새로 배움", "익히는 중", "복습 중", "익힘")
@@ -183,7 +193,7 @@ def parse_alerts(text):
             continue
         if re.match(r"(no firing alerts|지금 울리는 경보 없음)", line, re.I):
             continue
-        out.append({"text": line.lstrip("-*• ")[:WIDTH], "head": alert_head(line),
+        out.append({"text": plain(line.lstrip("-*• "))[:WIDTH], "head": alert_head(line),
                     "level": "crit" if CRIT.search(line) else "warn", "at": None, "group": group})
     return out[:LINES]
 
@@ -207,11 +217,17 @@ def parse_item(line, now):
       `⬜ 11월 23일 (월) 23:59 · 하우스 문서 — 문서 부착 공지 [할 일]`   date · kind — title [tag]
       `⬜ 마감 없음 · 대외부 — 인수인계 기록지 작성 [할 일]`             no date
       `11월 22일 (일) 현대 예술의 이해[01] · 강의 개요 — 새 토론글이 …`  date only, course · topic — note
-      `프로그래밍 언어 · Lexical Analysis (익히는 중) — 예정 11월 1일 (일)`  no date, course · topic (status) — note"""
-    body = re.sub(r"^[-*]\s*", "", line.strip())
-    body = re.sub(r"^(?:[⬜✅☑✔☐]\uFE0F?)\s*", "", body)
+      `프로그래밍 언어 · Lexical Analysis (익히는 중) — 예정 11월 1일 (일)`  no date, course · topic (status) — note
+      `🔁 20:00~22:00 지온나래 · 지온나래 정기회의 (정기 회의) · 구관 토론실`   time range club · title · place"""
+    body = plain(re.sub(r"^[-*]\s*", "", line.strip()))
     when = due = date = None
-    m = DATE_LEAD.match(body)
+    m, t = DATE_LEAD.match(body), TIME_LEAD.match(body)
+    if t:  # an activity: `20:00~22:00 club · title · place`, the club up to the first ` · `
+        when, body = f"{t.group(1)}~{t.group(2)}", body[t.end():]
+        club, _, rest = body.partition(" · ")
+        title, _, place = rest.rpartition(" · ") if rest.count(" · ") else (rest, "", "")
+        return {"when": when, "due": None, "date": None, "kind": club.strip()[:40], "title": (title or rest).strip()[:WIDTH],
+                "note": place.strip()[:WIDTH], "tag": None}
     if m:
         mo, d, h, mi = m.groups()
         when = f"{int(mo)}/{int(d)}" + (f" {int(h):02d}:{mi}" if h else "")
@@ -270,7 +286,7 @@ def parse_sections(text, now):
                 cur = {"title": "", "items": []}
                 sections.append(cur)
             item = parse_item(line, now) if line.startswith(("-", "*")) else \
-                {"when": None, "due": None, "kind": "", "title": line[:WIDTH], "note": "", "tag": None}
+                {"when": None, "due": None, "kind": "", "title": plain(line)[:WIDTH], "note": "", "tag": None}
             cur["items"].append(item)
     for sec in sections:
         sec["items"] = sec["items"][:LINES]
@@ -313,7 +329,7 @@ def parse_calendar(text):
     for line in (text or "").splitlines():
         m = CAL.match(line.strip())
         if m:
-            what = re.sub(r"\s+@ .*$", "", m.group(4))[:WIDTH]
+            what = plain(re.sub(r"\s+@ .*$", "", m.group(4)))[:WIDTH]
             out.append({"start": m.group(2) or "종일", "end": m.group(3), "what": what})
     return out[:LINES]
 
@@ -332,8 +348,8 @@ def calendar_events(rows):
         if not r.get("start") or cal.startswith("http") or (r["start"], r["title"]) in seen:
             continue
         seen.add((r["start"], r["title"]))
-        out.append({"start": r["start"], "end": r.get("end") or None, "what": r["title"][:WIDTH],
-                    "cal": cal or "캘린더", "where": (r.get("where") or "")[:WIDTH]})
+        out.append({"start": r["start"], "end": r.get("end") or None, "what": plain(r["title"])[:WIDTH],
+                    "cal": cal or "캘린더", "where": plain(r.get("where"))[:WIDTH]})
     return out[:LINES]
 
 
@@ -390,12 +406,12 @@ async def build2(d, now=None):
         rows, apps, night = await asyncio.gather(d["tasks"](20), d["approvals"](), d["overnight"]())
         queued = [t for t in rows if t.get("status") in ("queued", "waiting_approval")]
         created = [a.get("created") for a in apps if a.get("created")]
-        return {"running": [{"goal": str(t.get("goal", ""))[:WIDTH], "since": iso(t.get("started"))}
+        return {"running": [{"goal": plain(t.get("goal"))[:WIDTH], "since": iso(t.get("started"))}
                             for t in rows if t.get("status") == "running"][:5],
-                "queued": {"count": len(queued), "next": str(queued[0].get("goal", ""))[:WIDTH] if queued else None},
+                "queued": {"count": len(queued), "next": plain(queued[0].get("goal"))[:WIDTH] if queued else None},
                 "approvals": {"count": len(apps), "oldest": iso(min(created)) if created else None},
                 "overnight": night,
-                "recent": [{"goal": str(t.get("goal", ""))[:WIDTH], "status": t["status"], "at": iso(t.get("finished"))}
+                "recent": [{"goal": plain(t.get("goal"))[:WIDTH], "status": t["status"], "at": iso(t.get("finished"))}
                            for t in rows if t.get("status") in ("done", "failed")][:3]}
 
     async def gistra():
@@ -429,6 +445,97 @@ async def build2(d, now=None):
     vals = await asyncio.gather(*(section(f) for f in (infra, tasks, gistra, calls, calendar, assistant)))
     out = dict(zip(names, vals))
     return {"at": iso(now), **out, "next_deadline": next_deadline(out["gistra"], out["calendar"], now, today)}
+
+
+# ---------- ?detail=infra|tasks: what the TV's detail screens show (a status page per host and service, the task queue) ----------
+MONITOR = re.compile(r"^(?P<mark>[✓✗⚠!])\s+(?P<name>.+?) \((?P<type>[a-z-]{2,12})\) (?P<state>up|down|pending|maintenance|degraded)"
+                     r"(?:\s*·\s*24h (?P<pct>[\d.]+)%)?(?:\s*·\s*(?P<ms>\d+)ms)?(?:\s*·\s*last down (?P<last>[\d-]+ [\d:]+))?", re.I)
+
+
+def parse_monitors(text):
+    """infra_status (all monitors): `## deneb · Public Edge · Identity` opens a node group, then
+    `  ✓ Nginx Proxy Manager (http) up · 24h 100.00% · 15ms` or `✗ Vuja De claw (NemoClaw) (http) DOWN · 24h 2.85%`.
+    → [{node, role, services: [{name, type, state, uptime, ms, last_down}]}]. A service line it can't read is kept with
+    its text as the name and state `unknown`, never dropped."""
+    groups, cur = [], None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            node, _, role = (x.strip() for x in line[3:].partition(" · "))
+            cur = {"node": node, "role": role, "services": []}
+            groups.append(cur)
+        elif not line or line.startswith("#") or cur is None:
+            continue
+        else:
+            m = MONITOR.match(line)
+            if m:
+                st = m.group("state").lower()
+                cur["services"].append({
+                    "name": plain(m.group("name"))[:60], "type": m.group("type").lower(),
+                    "state": "up" if st == "up" else "degraded" if st in ("pending", "degraded") else
+                    "maintenance" if st == "maintenance" else "down",
+                    "uptime": float(m.group("pct")) if m.group("pct") else None,
+                    "ms": int(m.group("ms")) if m.group("ms") else None, "last_down": m.group("last")})
+            else:
+                cur["services"].append({"name": plain(line.lstrip("✓✗⚠! "))[:60], "type": None, "state": "unknown",
+                                        "uptime": None, "ms": None, "last_down": None})
+    return groups
+
+
+async def build_infra_detail(d, now=None):
+    """GET /v1/tv?detail=infra: every host (health) and every monitored service by node (status), like the Cygnus
+    status page. None parts when Cygnus is unreachable; `checked` is when the gateway read it."""
+    now = now or time.time()
+    if not d["infra_ok"]():
+        return {"at": iso(now), "hosts": None, "groups": None, "alerts": None}
+    h, s, a = await asyncio.gather(d["infra_raw"]("infra_health"), d["infra_raw"]("infra_status", {"problems_only": False}),
+                                   d["infra_raw"]("infra_alerts"))
+    hosts, asof = parse_hosts(h, now)
+    groups = parse_monitors(s)
+    roles = {g["node"]: g["role"] for g in groups}
+    for host in hosts:
+        svc = next((g["services"] for g in groups if g["node"] == host["name"]), [])
+        host.update(role=roles.get(host["name"], ""), services=len(svc),
+                    services_down=sum(x["state"] in ("down", "unknown") for x in svc))
+    return {"at": iso(now), "asof": asof, "hosts": hosts, "groups": groups, "alerts": parse_alerts(a)}
+
+
+def first_line(text, limit=100):
+    """A task result's first real line, without markdown marks: the summary the detail screen shows."""
+    for line in str(text or "").splitlines():
+        line = plain(re.sub(r"[*`#>]+", "", line)).strip(" -")
+        if line:
+            return line[:limit]
+    return ""
+
+
+ENGINES = {"claude_api": "Claude", "claude_code": "Claude Code", "codex": "Codex", "qwen": "Qwen", "nim": "NIM"}
+
+
+def task_row(t):
+    steps = [s for s in t.get("steps") or [] if s.get("label")]
+    return {"goal": plain(t.get("goal"))[:WIDTH], "status": t.get("status"), "device": t.get("device") or None,
+            "engine": ENGINES.get(t.get("backend"), t.get("backend")) if t.get("backend") else None,
+            "started": iso(t.get("started")), "finished": iso(t.get("finished")),
+            "step": plain(steps[-1]["label"])[:60] if steps else None, "steps": len(t.get("steps") or []),
+            "note": plain(t.get("note"))[:WIDTH] or None}
+
+
+async def build_tasks_detail(d, now=None):
+    """GET /v1/tv?detail=tasks: the running, queued and waiting tasks (goal, device, engine, start, current step) and the
+    last 10 finished with a one-line result. Approvals stay a count; no command, brief or full result is included."""
+    now = now or time.time()
+    rows, apps = await asyncio.gather(d["tasks"](40), d["approvals"]())
+    active = [task_row(t) for t in rows if t.get("status") in ("running", "waiting_approval", "queued", "scheduled")]
+    done = []
+    for t in rows:
+        if t.get("status") in ("done", "failed", "cancelled"):
+            r = task_row(t)
+            r["result"] = first_line(t.get("error") if t.get("status") != "done" and t.get("error") else t.get("result"))
+            done.append(r)
+    order = {"running": 0, "waiting_approval": 1, "queued": 2, "scheduled": 3}
+    return {"at": iso(now), "active": sorted(active, key=lambda r: order[r["status"]])[:LINES],
+            "recent": done[:10], "approvals": len(apps)}
 
 
 class Cache:

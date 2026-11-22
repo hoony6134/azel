@@ -319,3 +319,109 @@ def test_build2_gives_hosts_sections_and_next_deadline():
     g = out["gistra"]
     assert g["asof"] == "15:41" and [s["title"] for s in g["sections"]] == ["7일 안 마감", "복습할 단원", "LMS 알림 (최근 7일)", "남은 항목"]
     assert out["next_deadline"]["title"] and out["next_deadline"]["due"].startswith("2026-11-2")
+
+
+# ---------- real captured text (tests/fixtures/tv_*), 2026-11-23 ----------
+FIX = Path(__file__).resolve().parent / "fixtures"
+
+
+def test_activity_line_loses_its_emoji_and_keeps_the_time_as_when():
+    # captured gistra_today `### 활동 일정`: the 🔁 has no glyph in the TV font and showed as an indent
+    line = "- 🔁 20:00~22:00 지온나래 · 지온나래 정기회의 (정기 회의) · 구관 토론실"
+    it = tv.parse_item(line, NOW)
+    assert it["when"] == "20:00~22:00" and it["kind"] == "지온나래"
+    assert it["title"] == "지온나래 정기회의 (정기 회의)" and it["note"] == "구관 토론실"
+    snap, secs = tv.parse_sections("### 활동 일정\n" + line + "\n", NOW)
+    assert secs[0]["items"][0]["kind"] == "지온나래"
+
+
+def test_no_display_field_starts_with_a_symbol():
+    lines_ = ["- ⬜ 11월 23일 (월) 23:59 · 하우스 문서 — 문서 부착 공지 [할 일]", "- ✅ 마감 없음 · 대외부 — 인수인계 기록지 작성 [할 일]",
+              "- 🔁 20:00~22:00 지온나래 · 지온나래 정기회의 (정기 회의) · 구관 토론실"]
+    for line in lines_:
+        it = tv.parse_item(line, NOW)
+        for k in ("when", "kind", "title", "note"):
+            assert it[k] is None or (it[k] == it[k].strip() and not it[k].startswith(("⬜", "✅", "🔁", "\uFE0F"))), (k, it[k])
+    assert tv.plain(" 🔁  정기 회의 ") == "정기 회의" and tv.plain("69°C · 20:00~22:00") == "69°C · 20:00~22:00"
+    assert tv.calendar_events([{"start": "09:00", "title": "🎉 생일", "cal": "MyTT"}])[0]["what"] == "생일"
+
+
+def test_monitors_parse_the_whole_status_page():
+    groups = tv.parse_monitors((FIX / "tv_infra_status.txt").read_text())
+    assert [g["node"] for g in groups][:3] == ["deneb", "sadr", "albireo"] and groups[-1]["node"] == "external"
+    deneb = groups[0]
+    assert deneb["role"] == "Public Edge · Identity" and len(deneb["services"]) == 9
+    assert deneb["services"][0] == {"name": "Nginx Proxy Manager", "type": "http", "state": "up", "uptime": 100.0,
+                                    "ms": 15, "last_down": None}
+    restic = deneb["services"][1]
+    assert restic["type"] == "push" and restic["ms"] is None and restic["last_down"] == "2026-10-31 05:00"
+    assert deneb["services"][8]["name"] == "ntfy-relay · deneb (Kuma 알림 경로)"  # a name with its own ` · ` and parens
+    claw = next(s for g in groups for s in g["services"] if s["name"].startswith("Vuja De claw"))
+    assert claw == {"name": "Vuja De claw (NemoClaw)", "type": "http", "state": "down", "uptime": 2.85, "ms": None,
+                    "last_down": None}
+    assert all(s["state"] != "unknown" for g in groups for s in g["services"])  # every real line understood
+    assert sum(len(g["services"]) for g in groups) == 51  # every ✓/✗ line of the capture
+
+
+def test_infra_detail_joins_hosts_and_their_services():
+    health, status = (FIX / "tv_infra_health.txt").read_text(), (FIX / "tv_infra_status.txt").read_text()
+    asked = []
+
+    async def raw(n, extra=None):
+        asked.append((n, extra))
+        return {"infra_health": health, "infra_status": status, "infra_alerts": "No firing alerts."}[n]
+
+    out = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: True, "infra_raw": raw}, NOW))
+    assert ("infra_status", {"problems_only": False}) in asked  # the full page, not only problems
+    spark = next(h for h in out["hosts"] if h["name"] == "vd-spark")
+    assert spark["role"] == "Vuja De GPU" and spark["services"] == 4 and spark["services_down"] == 1
+    assert spark["temp"] == 62 and spark["status"] == "ok" and out["asof"] == "03:15" and out["alerts"] == []
+    assert len(out["hosts"]) == 8 and len(out["groups"]) == 9  # 8 nodes + external sites
+    off = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: False}, NOW))
+    assert off["hosts"] is None and off["groups"] is None
+
+
+def test_tasks_detail_from_real_rows():
+    import json
+    rows = json.loads((FIX / "tv_tasks.json").read_text())
+    running = {"goal": "🔁 스파크 로그 정리", "status": "running", "device": "spark", "backend": "claude_api",
+               "started": NOW - 60, "steps": [{"at": NOW - 5, "kind": "tool", "tool": "spark__run_command",
+                                                "label": "spark에서 명령 실행 중"}], "brief": "SECRET-BRIEF"}
+
+    async def tasks(n):
+        return [running, *rows]
+
+    async def approvals():
+        return [{"id": "x", "command": "rm -rf /secret"}]
+
+    out = asyncio.run(tv.build_tasks_detail({"tasks": tasks, "approvals": approvals}, NOW))
+    a = out["active"][0]
+    assert a["goal"] == "스파크 로그 정리" and a["engine"] == "Claude" and a["device"] == "spark"
+    assert a["step"] == "spark에서 명령 실행 중" and a["started"].endswith("+09:00")
+    assert len(out["recent"]) == 10 and out["approvals"] == 1
+    first = out["recent"][0]
+    assert first["status"] == "done" and first["result"] == "대표님, 스파크에서 네모클로 서비스 재시작을 마쳤고 정상으로 확인했습니다."
+    cancelled = next(r for r in out["recent"] if r["status"] == "cancelled")
+    assert cancelled["result"] == "취소됐어요."  # a failure shows its error, not the half-written result
+    failed = next(r for r in out["recent"] if r["status"] == "failed")
+    assert failed["result"].startswith("기기 작업이 권한 때문에 막혀서")
+    text = str(out)
+    assert "rm -rf" not in text and "SECRET-BRIEF" not in text and "`" not in text and "**" not in text
+
+
+def test_detail_query_is_open_to_the_tv_token(gw, monkeypatch):
+    g, c, tmp = gw
+
+    async def fake(d, now=None):
+        return {"ok": "tasks"}
+
+    monkeypatch.setattr(g.tv, "build_tasks_detail", fake)
+    g.tv_detail_cache["tasks"] = g.tv.Cache()
+    path = tmp / "tv_token"
+    path.write_text("t" * 40)
+    path.chmod(0o600)
+    tvh = {"Authorization": "Bearer " + "t" * 40}
+    r = c.get("/v1/tv?detail=tasks", headers=tvh)
+    assert r.status_code == 200 and r.json() == {"ok": "tasks"}
+    assert c.get("/v1/tv?detail=secrets", headers=tvh).status_code == 400
+    assert c.get("/v1/tasks", headers=tvh).status_code == 401  # still only the TV path
