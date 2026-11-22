@@ -1237,6 +1237,10 @@ async def scheduler_tick(now, fired):
         except StateDown:
             pass  # tomorrow, then
     p = s["proactive"]
+    try:
+        await expire_approvals(now.timestamp())
+    except StateDown:
+        pass
     try:  # scheduled calls: only the scheduler lease holder fires (renewed every tick, lowest priority wins)
         if await take_lease("scheduler", 150, SCHED_PRIORITY):
             await fire_scheduled(now.timestamp())
@@ -1281,13 +1285,21 @@ DECIDE_PROMPT = (
     "너는 개인 비서가 사용자에게 먼저 전화할지 정하는 판단기야. 아래 신호와 상황 메모를 보고, 지금 전화하지 않으면 "
     "사용자가 손해를 보는 일일 때만 전화해. 단순 정보, 이미 지난 일, 사용자가 알아서 할 일은 전화하지 마. "
     'JSON 하나만 출력해: {"call": true|false, "urgency": 1-5, "reason": "한 줄 이유", '
-    '"opening": "전화 첫마디, 이유를 한두 문장으로, 비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
+    '"opening": "전화 첫마디. 왜 지금 거는지를 짧은 한 구절로 먼저(예: \'토론지 마감이 오늘 자정이라 전화드렸어요\'), '
+    '이어서 필요한 것을 한 문장. 비서 성격의 말투(정해져 있지 않으면 존댓말)"}'
 )
+
+
+def checkpoint_prompt(now=None):
+    """The checkpoint's prompt with the date: without it Claude wrote "현재 날짜를 모르니…" into the situation."""
+    now = now or datetime.now(KST)
+    return (CHECKPOINT_PROMPT + f" 지금은 {now:%Y년 %-m월 %-d일} {'월화수목금토일'[now.weekday()]}요일 {now:%H:%M}"
+            "(한국 시간)이야. 날짜는 이 기준으로 '오늘', '내일', '11월 24일'처럼 써." + late_night.prompt_rule(now))
 
 
 async def run_checkpoint():
     """One `claude -p` that reads GISTRA/Planit/Calendar/Gmail and leaves a compact situation note in memory."""
-    text = await ask_text(CHECKPOINT_PROMPT, session=f"checkpoint-{uuid.uuid4().hex[:8]}", model="sonnet",
+    text = await ask_text(checkpoint_prompt(), session=f"checkpoint-{uuid.uuid4().hex[:8]}", model="sonnet",
                           task="schedule")
     if text:
         await state.call("PUT", f"/v1/context/{CHECKPOINT}", {"summary": text[:4000], "open_questions": []})
@@ -1326,9 +1338,13 @@ async def gather_signals(now):
         return [f"{r['names']} ({round((now - r['at']) / 60)}분 전)" for r in rows if now - r["at"] < 86400]
 
     async def approvals():
-        rows = await state.call("GET", "/v1/state/approvals") or []
-        return [f"{r['device']}: {r['command'][:60]} ({round((now - r['created']) / 60)}분째 승인 대기)"
-                for r in rows if now - r["created"] > 1800]
+        await expire_approvals(now)  # an expired request is not "waiting": it can never run any more
+        out = []
+        for r in await state.call("GET", "/v1/state/approvals") or []:
+            v = approval_view(r, await approval_meta(r["id"]), now)
+            if v["status"] == "pending" and now - r["created"] > 120:
+                out.append(f"{r['device']}: {r['command'][:60]} ({round((v['expires_at'] - now) / 60)}분 안에 만료)")
+        return out
 
     async def missed():
         rows = await state.call("GET", "/v1/state/schedule", status="missed") or []
@@ -1337,7 +1353,8 @@ async def gather_signals(now):
 
     async def contexts():
         rows = await state.call("GET", "/v1/context", recent=20) or []
-        return [f"{r['task_id']}: {r['summary'][:80]} / 열린 질문: {'; '.join(r['open_questions'])[:120]}"
+        return [f"{r['task_id']}: {relabel_day(r['summary'], r.get('updated'), now)[:80]} / 열린 질문: "
+                f"{'; '.join(r['open_questions'])[:120]}"
                 for r in rows if r["open_questions"] and r["task_id"] not in (SITUATION, CHECKPOINT)]
 
     for name, fn in (("alerts", alerts_recent), ("approvals", approvals), ("missed_calls", missed),
@@ -1346,6 +1363,39 @@ async def gather_signals(now):
     note = await situation_note(now)
     sig["situation"] = [note] if note else []
     return sig
+
+
+DAY_WORD = re.compile(r"(오늘|어제|그저께) (\d{1,2}:\d{2})")
+
+
+def relabel_day(text, updated, now):
+    """'오늘 19:48 통화', written when that note was saved, said again relative to `now` ('어제 19:48 통화')."""
+    try:
+        saved = datetime.fromisoformat(str(updated)).astimezone(KST).date()
+    except (TypeError, ValueError):
+        return text
+    today = datetime.fromtimestamp(now, KST).date()
+
+    def again(m):
+        day = saved - timedelta(days={"오늘": 0, "어제": 1, "그저께": 2}[m.group(1)])
+        label = {0: "오늘", 1: "어제", 2: "그저께"}.get((today - day).days) or f"{day.month}월 {day.day}일"
+        return f"{label} {m.group(2)}"
+    return DAY_WORD.sub(again, text)
+
+
+async def expire_approvals(now=None):
+    """Pending requests past their expiry become "expired" in state (approval_view only computed it, so the row
+    stayed "pending" and the judge saw "338분째 승인 대기")."""
+    now = now or time.time()
+    if MODE != "full":
+        return
+    for r in await state.call("GET", "/v1/state/approvals") or []:
+        if approval_view(r, await approval_meta(r["id"]), now)["status"] == "expired" and r["status"] == "pending":
+            try:
+                await state.call("POST", f"/v1/state/approvals/{quote(r['id'], safe='')}",
+                                 {"approve": False, "expire": True})
+            except HTTPException:
+                pass  # decided meanwhile, or another gateway got there first
 
 
 async def situation_note(now):
