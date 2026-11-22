@@ -71,6 +71,8 @@ final class CallManager: NSObject, ObservableObject {
         config.supportsVideo = false
         config.maximumCallsPerCallGroup = 1
         config.supportedHandleTypes = [.generic]
+        // The orb on CarPlay's and the system's call screens (a template image: tinted by the system).
+        config.iconTemplateImageData = UIImage(named: "MenuBarTemplate")?.pngData()
         provider = CXProvider(configuration: config)
         super.init()
         provider.setDelegate(self, queue: nil)

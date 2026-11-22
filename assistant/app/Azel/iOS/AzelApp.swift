@@ -53,8 +53,9 @@ struct AzelApp: App {
             // "아젤한테 전화해줘" through Siri's calling intent: the documented way to start an
             // outgoing CallKit call while the app is in the background or the phone is locked.
             .onContinueUserActivity(NSStringFromClass(INStartCallIntent.self)) { activity in
-                let name = (activity.interaction?.intent as? INStartCallIntent)?.contacts?.first?.displayName
-                CallManager.shared.startCall(persona: StartCallIntentHandler.persona(named: name), ringbackOnFailure: true)
+                let who = (activity.interaction?.intent as? INStartCallIntent)?.contacts?.first
+                CallManager.shared.startCall(persona: StartCallIntentHandler.persona(handle: who?.personHandle?.value, named: who?.displayName),
+                                             ringbackOnFailure: true)
             }
             .onChange(of: scenePhase, initial: true) {
                 if scenePhase == .active { WatchSync.shared.push(); Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh(); WatchSync.shared.push() } }
@@ -170,8 +171,10 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate {
 /// "아젤한테 전화해줘": any contact Siri hears is taken as the assistant (or a persona by name);
 /// the call itself starts in the app (continueInApp → onContinueUserActivity).
 final class StartCallIntentHandler: NSObject, INStartCallIntentHandling {
-    @MainActor static func persona(named name: String?) -> Persona? {
-        PersonaModel.shared.match(name: name) ?? PersonaModel.shared.primary
+    /// CarPlay's and the Phone app's recents call back with the handle the call was made with (the
+    /// persona id); Siri gives a spoken name.
+    @MainActor static func persona(handle: String? = nil, named name: String?) -> Persona? {
+        PersonaModel.shared.persona(id: handle) ?? PersonaModel.shared.match(name: name) ?? PersonaModel.shared.primary
     }
 
     func resolveContacts(for intent: INStartCallIntent, with completion: @escaping ([INStartCallContactResolutionResult]) -> Void) {
