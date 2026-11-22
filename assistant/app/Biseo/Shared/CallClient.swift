@@ -82,7 +82,8 @@ final class CallClient {
     /// The token goes in the Authorization header, never the query: query strings end up in proxy logs.
     /// `intent`: e.g. "briefing" for 오늘 브리핑 / the Siri briefing, so the server opens with it.
     static func request(voiceURL: String, token: String, session: String, callID: String?, intent: String? = nil,
-                        persona: String? = nil, mode: String? = nil, secret: Bool = false, locked: Bool = false) throws -> URLRequest {
+                        persona: String? = nil, mode: String? = nil, secret: Bool = false, locked: Bool = false,
+                        resume: String? = nil) throws -> URLRequest {
         guard var url = URLComponents(string: voiceURL + "/v1/call") else { throw StartError.notConfigured }
         url.queryItems = [URLQueryItem(name: "session", value: session)]
         if let callID { url.queryItems?.append(URLQueryItem(name: "call_id", value: callID)) }
@@ -93,6 +94,8 @@ final class CallClient {
         // The phone was locked when the call started: the brain can say "잠금 해제가 필요해요" for
         // an approval that needs authentication instead of failing silently.
         if locked { url.queryItems?.append(URLQueryItem(name: "locked", value: "1")) }
+        // "이어서 통화" from the call list: the server seeds this call with that call's turns
+        if let resume, !secret { url.queryItems?.append(URLQueryItem(name: "resume", value: resume)) }
         guard let wsURL = url.url, ["ws", "wss"].contains(wsURL.scheme) else { throw StartError.badURL }
         var req = URLRequest(url: wsURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -100,10 +103,12 @@ final class CallClient {
     }
 
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
-    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil, secret: Bool = false, locked: Bool = false) throws {
+    func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil, secret: Bool = false, locked: Bool = false,
+               resume: String? = nil) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
-                                                                         session: session, callID: callID, intent: intent, persona: persona, mode: mode, secret: secret, locked: locked))
+                                                                         session: session, callID: callID, intent: intent, persona: persona, mode: mode, secret: secret, locked: locked,
+                                                                         resume: resume))
         socket = task
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()

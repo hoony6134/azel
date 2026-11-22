@@ -121,8 +121,27 @@ def test_submitted_assignments_never_reach_the_judge(gw, monkeypatch):  # noqa: 
         "[5] 12주차 토론지 LMS 업로드 — 오늘 23:00까지 — 제출 여부 모름\n[4] 컴파일러 프로젝트 과제 — 11월 23일 23:59\n"
         "[4] 과기사관 공결 확인서 전송 메일 — 11월 23일 23:59"}
     sig = asyncio.run(g.gather_signals(time.time()))
-    assert "토론지" not in sig["situation"][0] and "컴파일러" in sig["situation"][0] and "공결" in sig["situation"][0]
-    assert not any("토론지" in x for x in sig["calendar_today"]) and any("지온나래" in x for x in sig["calendar_today"])
+    lines = sig["situation"][0].splitlines()  # kept, but marked strongly: the judge still decides
+    assert any("토론지" in x and x.endswith(g.SUBMITTED_MARK) for x in lines)
+    assert any("컴파일러" in x and not x.endswith(g.SUBMITTED_MARK) for x in lines)
+    assert all(x.endswith(g.SUBMITTED_MARK) for x in sig["calendar_today"] if "토론지" in x)
+    assert any("지온나래" in x and not x.endswith(g.SUBMITTED_MARK) for x in sig["calendar_today"])
     open_list = "스냅샷: 11월 22일 (일) 20:30\n\n남은 과제/할 일이 없습니다."
     sig = asyncio.run(g.gather_signals(time.time()))
-    assert sig["gistra_due"] == ["남은 과제·할 일 없음(모두 제출함)"] and "컴파일러" not in sig["situation"][0]
+    assert sig["gistra_due"] == ["남은 과제·할 일 없음(모두 제출함)"]
+    assert all(x.endswith(g.SUBMITTED_MARK) for x in sig["situation"][0].splitlines() if "컴파일러" in x)
+
+
+def test_a_past_call_can_be_continued(gw, monkeypatch):  # noqa: F811
+    g, _, _ = gw
+    sent = []
+
+    async def link_send(m):
+        sent.append(m)
+    monkeypatch.setattr(g, "link_send", link_send)
+    cid = "c" * 32
+    g.fake.db["history"][cid] = {"id": cid, "turns": [{"user": "기획서 맡겨줘", "assistant": ["맥북에 맡겼어요."]}]}
+    asyncio.run(g.serve_history_turns({"id": "r1", "type": "history_turns", "call": cid}))
+    asyncio.run(g.serve_history_turns({"id": "r2", "type": "history_turns", "call": "../x"}))
+    assert sent == [{"id": "r1", "type": "history_turns", "turns": [{"user": "기획서 맡겨줘", "assistant": "맥북에 맡겼어요."}]},
+                    {"id": "r2", "type": "history_turns", "turns": []}]
