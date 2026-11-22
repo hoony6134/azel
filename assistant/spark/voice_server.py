@@ -828,10 +828,20 @@ def gateway_tools_text(defs):
             + "\n'찾아볼게요'라고만 하고 끝내지 마: 찾을 거면 바로 도구를 불러.")
 
 
+TOOL_TEXT_MAX = 2000
+TOOL_TEXT_MAX_OF = {"agenda": 6000}  # a month of days: cut at 2000, the late days read as "no events"
+
+
+def clip_tool(text, name=""):
+    """A tool result as a model reads it: whole lines only, and a cut is said, never silent."""
+    cap = TOOL_TEXT_MAX_OF.get(name, TOOL_TEXT_MAX)
+    return text if len(text) <= cap else text[:cap].rsplit("\n", 1)[0] + "\n(이후 생략)"
+
+
 async def gateway_tool(name, args, on_say=None):
     """One gateway tool over the link, as the text a model reads."""
     msg = await gateway_tool_msg(name, args, on_say)
-    return str(msg.get("result") or msg.get("message") or "")[:2000]
+    return clip_tool(str(msg.get("result") or msg.get("message") or ""), name)
 
 
 async def gateway_tool_msg(name, args, on_say=None):
@@ -875,7 +885,7 @@ async def run_tool(raw, session, on_say=None):
     try:
         reply = await links.brain_request({"type": "tool", "name": name, "args": args,
                                            "persona": (CALL_PERSONA.get() or {}).get("id")}, TOOL_WAIT_S)
-        return str(reply.get("result", ""))[:2000]
+        return clip_tool(str(reply.get("result", "")), name)
     except (RuntimeError, asyncio.TimeoutError):
         return "지금은 그 도구를 쓸 수 없어요."
 
@@ -1154,6 +1164,16 @@ TRIVIAL = re.compile(r"(안녕\S*|고마워\S*|고맙\S*|감사\S*|응|어|네|�
 ANNOUNCE = re.compile(r"(찾아|알아|확인해|검색해|살펴|조회해|점검해)\s*(볼게요|보겠습니다|드릴게요)"
                       r"|(확인|검색|조회|점검|파악)\s*(할게요|하겠습니다|해\s*드릴게요)|알려\s*드릴게요"
                       r"|^(잠시만|잠깐만)\s*(기다려\s*주세요|기다려\s*줘|요)?[.!~]*$|기다려\s*주세요[.!~]*$")
+# "잠깐만요." alone in small talk is not a promise: only a lookup verb with what is looked up, or any of these words
+# when the user's turn asked for current info or their schedule (user decision: minimal guards on no-tool chat).
+LOOKUP_VERB = re.compile(r"확인|찾아|알아보|알아봐|검색|조회|점검|살펴")
+LOOKUP_OBJ = re.compile(r"일정|캘린더|스케줄|수업|마감|과제|할\s*일|날씨|기온|주가|주식|환율|시세|가격|뉴스|브리핑|상태")
+
+
+def is_promise(s, wants_lookup):
+    return bool(ANNOUNCE.search(s)) and (wants_lookup or bool(LOOKUP_VERB.search(s) and LOOKUP_OBJ.search(s)))
+
+
 # a promise that never got its tool call (after a nudge and, where one fits, a direct lookup): said, not dropped
 LOOKUP_FAILED = "죄송해요, 지금은 그걸 찾아보지 못했어요."
 WEATHER_Q = re.compile(r"날씨|기온|몇\s*도|비\s*(와|올|오)|눈\s*(와|올|오)|우산|추워|더워|미세먼지")
@@ -2013,6 +2033,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             rechecked, stubbed, notes = False, False, set()  # notes: our own re-ask texts, never a source
             announced, guessed, looked, tool_nudged = [], [], [], False  # "찾아볼게요" / a figure before any lookup
             live = asked and bool(LIVE_Q.search(bare)) and any(t["name"] in ("web_search", "weather") for t in gw_defs)
+            wants_lookup = bool(LIVE_Q.search(bare) or WEB_LIVE.search(bare) or agenda_range(bare, datetime.now(KST)))
             confirmed = {"ok": False}  # an action tool (call, schedule, task, device) succeeded in this turn
             promised = set()
 
@@ -2032,7 +2053,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 if not looked and live and (FIGURE.search(s) or LISTING.search(s)):
                     guessed.append(s)  # today's figure or a listing claim before any lookup: from memory, never said
                     return
-                if not looked and (ctx or gw_defs) and ANNOUNCE.search(s):
+                if not looked and (ctx or gw_defs) and is_promise(s, wants_lookup):
                     announced.append(s)  # a promise to look: said only once the tool actually runs
                     return
                 await sentences.put(s)
@@ -3325,6 +3346,10 @@ if __name__ == "__main__":
         assert agenda_range("이번 주 일정 뭐 있어?", now) == (late_night.day_for(0, now), mon + timedelta(days=6))
         assert agenda_range("다음 주 일정", now) == (mon + timedelta(days=7), mon + timedelta(days=13))
         assert agenda_range("일정 알려줘", now) == (late_night.day_for(0, now),) * 2 and agenda_range("일정한 속도", now) is None
+        month = "\n".join([f"- 11/{d} 09:00 수업 {d} 오룡관 강의실" for d in range(1, 31)] * 12)
+        assert clip_tool(month, "agenda").endswith("(이후 생략)") and len(clip_tool(month, "agenda")) > 5000
+        assert clip_tool(month, "web_search").endswith("(이후 생략)") and len(clip_tool(month, "web_search")) <= 2010
+        assert clip_tool("짧은 결과", "agenda") == "짧은 결과"
         for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
             assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
         assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
@@ -4936,6 +4961,12 @@ if __name__ == "__main__":
             said = asyncio.run(local_run(ask))
             assert ran == [{"name": "agenda", "args": {}}] and TOOL_NUDGE not in [m["content"] for m in ann[-1]], ann
             assert said == ["확인할게요.", "내일은 수업이 하나 있어요."], said
+            ann.clear(), ran.clear()  # small talk: "잠깐만요." is just words, never a nudge or a forced lookup
+            globals()["llm_stream"] = announcer(["잠깐만요. 따뜻한 차 한 잔 하고 쉬어요."])
+            said = asyncio.run(local_run("나 오늘 좀 피곤하다"))
+            assert " ".join(said) == "잠깐만요. 따뜻한 차 한 잔 하고 쉬어요." and ran == [] and len(ann) == 1, (said, ann)
+            assert not is_promise("잠시만 기다려 주세요.", False) and is_promise("잠시만 기다려 주세요.", True)
+            assert is_promise("내일 일정 확인해 볼게요.", False) and not is_promise("확인해 볼게요.", False)
             globals()["gateway_tool"] = saved_gw_tool
             gw_tools.clear(), gw_tools.update(saved_tools)
             globals()["run_tool"] = saved_run

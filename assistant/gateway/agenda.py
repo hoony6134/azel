@@ -11,6 +11,7 @@ from datetime import date as Date
 
 MAX_DAYS = 31  # Gistra's own cap
 SOURCE_TIMEOUT_S = 12
+MAX_CHARS = 5400  # under the voice server's agenda cap (6000), notes included
 WEEKDAY = "월화수목금토일"
 GISTRA_DAY = re.compile(r"^#{2,4}\s*(\d{1,2})월\s*(\d{1,2})일")
 GISTRA_ROW = re.compile(r"^-\s+(?:(\d{1,2}:\d{2})(?:~(\d{1,2}:\d{2}))?\s+)?(.+?)(?:\s*\[[\w.-]+\])?\s*$")
@@ -76,6 +77,15 @@ def render(rows, f, t, notes=()):
         out.append(f"- {when} {r['text']}")
     if not rows:
         out.append("이 기간에 일정 없음" if len(notes) < 2 else "")
+    if sum(len(x) + 1 for x in out) > MAX_CHARS:  # a long month: whole days up to the cap, and the cut is named
+        n = size = 0
+        while n < len(out) and size + len(out[n]) + 1 <= MAX_CHARS:
+            size += len(out[n]) + 1
+            n += 1
+        while n > 1 and not out[n].startswith("### "):  # never half a day: back to the last whole one
+            n -= 1
+        days = [x[4:] for x in out[:n] if x.startswith("### ")]
+        out = out[:n] + [f"(이후 생략: {days[-1]}까지만 보여요. 그 뒤 일정은 기간을 줄여 다시 물어봐.)" if days else "(이후 생략)"]
     out += list(notes)
     return "\n".join(x for x in out if x).strip()
 
