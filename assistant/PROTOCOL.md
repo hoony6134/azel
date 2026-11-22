@@ -609,6 +609,17 @@ then checks `GET /v1/approvals/{id}` → `{"status":"approved","device","command
 and an exact command/cwd match, spends it with `POST /v1/approvals/{id}/use` (central, atomic, once, within 10 min of
 the tap; also kept in the local used-ids file), runs it, and reports `POST /v1/approvals/{id}/ran`
 `{"exit_code","status"}` (no output).
+Grant flow (`approval_via = "gateway-grant"`, vd-spark and vd-core, whose daemons cannot reach the gateway): the daemon
+contacts nobody and answers `{"status":"needs_approval","command","cwd","device","nonce"}` (the nonce is remembered in
+memory for 15 min). The gateway's device-tool path files the approval itself (`create_approval`: push, expiry, rules,
+requester), waits for the tap, spends it (`/use`), and calls `run_command` again with
+`grant = {approval_id, device, command, cwd, nonce, exp, mac}`: `mac` is HMAC-SHA256 (hex) of
+`"azel-grant-v1\n" + json([approval_id, device, command, cwd, nonce, exp])` (compact, UTF-8) keyed by the daemon's
+bearer token; `exp` is at most 10 minutes away (the gateway uses 5). The daemon runs `hard_deny` first, then checks the
+signature, exact device/command/cwd, expiry, and that the nonce is one it issued and has not used (persisted in
+`used_nonces.txt`, 0600), and runs. A grant never bypasses `hard_deny`; an approval id is refused in this mode. The
+gateway records the audit row (`/ran`). `claude -p` runs reach daemons directly, not through the gateway's device-tool
+path, so they receive the `needs_approval` answer and cannot continue it.
 Approved runs may use any existing directory under `$HOME` as cwd, except one that is, is inside, or contains a
 protected path (so never `~` itself); allowlisted runs without approval stay inside `allowed_roots` with `check_args`.
 `approve_unlisted`: true on jh-only devices (macbook, albireo, gienah, deneb, ruchba, fawaris), false on vd-spark,

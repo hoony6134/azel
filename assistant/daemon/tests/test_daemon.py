@@ -838,3 +838,7 @@ def test_default_mode_is_unchanged_and_never_returns_needs_approval(cfg, gw):
     assert d.CFG["approval_via"] == "gateway"
     d.CFG["approve_unlisted"] = True
     assert d.run_command(command="pwd")["status"] == "pending_approval"
+
+
+def test_grant_mac_matches_the_gateways_golden_value():
+    assert d.grant_mac("tok", "ap-1", "vd-spark", "ls -la", "/home/u/x", "n0nce", 1700000000) == "78a6c4f27e365ff9965f2d61eb1bfeec26de56c0587bd4ab0a6013c5eea7f0f7"
