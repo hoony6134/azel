@@ -139,6 +139,7 @@ function demoData(inCall as Boolean) as Object
             {name: "엔비디아", ticker: "NVDA", listed: true, price: 125.53, currency: "USD", pct: 2.31, spark: [118.2, 120.5, 119.9, 122.7, 125.53], source: "야후 파이낸스"}
             {name: "삼성전자", ticker: "005930", listed: true, price: 180900, currency: "KRW", pct: -8.13, spark: [196800, 190300, 194700, 196900, 183100], source: "네이버 증권"}
             {name: "SK하이닉스", ticker: "000660", listed: true, price: 1100000, currency: "KRW", pct: -7.02, spark: [1120000, 1098000, 1144000, 1183000, 1113000], source: "네이버 증권"}
+            {name: "S&P500", ticker: "^GSPC", listed: true, price: 6910.39, currency: "index", pct: -3.7, spark: [7120.5, 7088.1, 7050.2, 7176.0, 6910.39], source: "야후 파이낸스"}
         ]
     }
 end function
