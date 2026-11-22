@@ -121,7 +121,8 @@ answering a call the assistant placed; the server then speaks that call's openin
   stays live: speech during a typed turn is handled as usual.
 - **Auto-approve** (like Claude Code's auto mode, only when the user grants it): while a grant is live, a device
   command whose run (this call, or a task started in it, or a task granted directly) asks for approval runs at once
-  when it classifies **safe**; **risky** ones still need a tap, and the daemons' hard_deny is unchanged.
+  when it classifies **safe**; **risky** ones still need a tap, and the daemons' hard_deny is unchanged. Browser-tool
+  approvals (`tool: "browser"`: a committing click, a first print) are never auto-approved.
   - Grant from the call: client → `{"type":"auto_approve","value":true|false,"minutes"?,"devices"?}`; the server answers
     `{"type":"auto_approve","value","expires_at"}` when the gateway confirms, and every `state` frame carries
     `"auto": true|false`. `hello.caps` lists `"auto_approve"`. The grant ends at hangup, after `minutes` (≤ 120), or on
@@ -133,7 +134,7 @@ answering a call the assistant placed; the server then speaks that call's openin
     device, command, at, stage, also after it ended); `DELETE /v1/auto-approve/{id}` → 204. A task's grant ends with
     the task.
   - Tiers (`gateway/risk.py`): deterministic rules first (reads, status, a single named service or container restart,
-    files inside the working directory, `open -a` → safe; recursive or mass delete, service stop/disable/reboot,
+    files inside the working directory, `open -a` → safe; any delete (rm, rmdir, unlink, trash), recursive or mass delete, service stop/disable/reboot,
     installs, users and permissions, sending data off-host, secrets-adjacent paths, git push/force, docker rm/prune/
     volume rm, kill -9, osascript and the like → risky), then the local Qwen, then Haiku (never in local brain mode),
     then risky. Cached per command+cwd+device; the gateway log says which stage decided.

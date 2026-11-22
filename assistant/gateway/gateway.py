@@ -3045,7 +3045,7 @@ async def create_approval(body: dict):
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
-    if (grant := await grant_for(requester, row["device"])) is not None:  # the user said "알아서 해" for this run
+    if row["tool"] not in NEVER_AUTO and (grant := await grant_for(requester, row["device"])) is not None:  # "알아서 해"
         tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,
                                           haiku=None if await brain_mode() == "local" else haiku_classify)
         print(f"auto-approve: {tier} by {stage} on {row['device']} (grant {grant['id']})", flush=True)
@@ -3066,6 +3066,7 @@ async def create_approval(body: dict):
 
 # ---------- auto-approve: the user lets ordinary commands run without a tap for one call or task ----------
 AUTO_MAX_S = 7200
+NEVER_AUTO = {"browser"}  # a click that commits (buy, send, submit) or a first print: always the user's tap
 AUTO_KEY = "/v1/state/kv/auto-grants"
 secret_grants: dict[str, dict] = {}  # secret calls' grants: memory only, nothing persists
 

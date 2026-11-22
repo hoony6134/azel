@@ -78,10 +78,8 @@ def _one(part, cwd):
         return RISKY
     if INSTALL.search(" ".join(t)):
         return RISKY
-    if name == "rm":  # one file in the working directory, no flags: fine; recursive, forced or mass: never
-        files = [a for a in args if not a.startswith("-")]
-        return SAFE if len(files) == 1 and not any(a.startswith("-") for a in args) and "*" not in files[0] \
-            and _inside(files[0], cwd) else RISKY
+    if name in ("rm", "rmdir", "unlink", "trash", "shred", "srm"):  # deleting always asks (the user's rule)
+        return RISKY
     if name == "kill":
         return RISKY if any(a in ("-9", "-KILL", "-SIGKILL") for a in args) else None
     if name == "rsync":

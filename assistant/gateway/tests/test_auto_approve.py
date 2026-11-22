@@ -16,7 +16,7 @@ CWD = "/Users/jh/dev/proj"
 T = [
  ("ls -la", "safe"), ("cat README.md", "safe"), ("git status", "safe"), ("git diff HEAD~1", "safe"),
  ("git add -A && git commit -m 'wip'", "safe"), ("git push origin main", "risky"), ("git push --force", "risky"),
- ("git reset --hard HEAD~3", "risky"), ("rm notes.txt", "safe"), ("rm -rf build", "risky"), ("rm *.log", "risky"),
+ ("git reset --hard HEAD~3", "risky"), ("rm notes.txt", "risky"), ("unlink a.txt", "risky"), ("rmdir out", "risky"), ("rm -rf build", "risky"), ("rm *.log", "risky"),
  ("rm a.txt b.txt", "risky"), ("mkdir -p out/logs", "safe"), ("touch out/a.md", "safe"), ("cp a.txt b.txt", "safe"),
  ("cp ~/.ssh/id_rsa .", "risky"), ("mv /etc/hosts x", "risky"), ("echo hi > notes.txt", "safe"),
  ("echo hi > /etc/motd", "risky"), ("docker ps", "safe"), ("docker logs web --tail 50", "safe"),
@@ -155,3 +155,12 @@ def test_secret_grants_stay_in_memory_and_send_no_summary(agw):
     pushes.clear()
     asyncio.run(g.end_grants({"session": "azel:secret-0123456789ab"}))
     assert not pushes and not g.secret_grants
+
+
+
+def test_browser_commits_are_never_auto_approved(agw):
+    g, c, _ = agw
+    grant(g)
+    r = c.post("/v1/approvals", json={"device": "macbook", "tool": "browser", "cwd": "browser",
+                                      "command": "클릭: 결제하기 (https://shop.example/checkout)", "requester": "ask:azel:s1"}).json()
+    assert r["status"] == "pending" and not r.get("auto")
