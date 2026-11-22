@@ -329,15 +329,23 @@ class StateDown(Exception):
 
 class State:
     def __init__(self, url):
-        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {STATE_TOKEN}"})
+        # ruchba's uvicorn drops idle connections after 5 s, httpx kept them 5 s too: a request on a just-closed one
+        # failed with "Server disconnected without sending a response" (it failed a running task, 2026-11-22)
+        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {STATE_TOKEN}"},
+                                        limits=httpx.Limits(keepalive_expiry=2))
         self.cache: dict = {}
 
     async def call(self, method, path, body=None, **params):
         """JSON result, None on 404, HTTPException on other 4xx, StateDown when unreachable."""
-        try:
-            r = await self.client.request(method, path, json=body, params=params or None)
-        except httpx.HTTPError as e:
-            raise StateDown(type(e).__name__) from e
+        for attempt in (1, 2):
+            try:
+                r = await self.client.request(method, path, json=body, params=params or None)
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                if attempt == 2 or method not in ("GET", "PUT", "DELETE"):  # POST may have run: never sent twice
+                    raise StateDown(type(e).__name__) from e
+            except httpx.HTTPError as e:
+                raise StateDown(type(e).__name__) from e
         if r.status_code >= 500:
             raise StateDown(f"HTTP {r.status_code}")
         if r.status_code == 404:
