@@ -7,6 +7,7 @@ struct AzelWidgets: WidgetBundle {
     var body: some Widget {
         CallLiveActivity()
         TaskLiveActivity()
+        CallWidget()
     }
 }
 

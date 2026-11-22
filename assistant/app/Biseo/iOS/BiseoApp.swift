@@ -14,6 +14,7 @@ struct BiseoApp: App {
         _ = CallManager.shared // PushKit must be registered on every launch, including background VoIP launches
         Recordings.cleanup()
         Config.migrateAddresses()
+        WatchSync.shared.start()
         UNUserNotificationCenter.current().delegate = TaskNotificationHandler.shared
         UNUserNotificationCenter.current().setNotificationCategories(PushAction.categories)
         LiveActivities.shared.start()
@@ -44,7 +45,11 @@ struct BiseoApp: App {
             }
             .preferredColorScheme(nil)
             .tint(Theme.celadon)
-            .onOpenURL { url in if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } } }
+            .onOpenURL { url in
+                if let id = TaskModel.taskID(from: url) { Task { await TaskModel.shared.openTask(id: id) } }
+                // the Azel 부르기 widget; during a call the Live Activity's azel://call just opens the app
+                if url.host == "call", model.configured { CallManager.shared.startCall() }
+            }
             // "아젤한테 전화해줘" through Siri's calling intent: the documented way to start an
             // outgoing CallKit call while the app is in the background or the phone is locked.
             .onContinueUserActivity(NSStringFromClass(INStartCallIntent.self)) { activity in
@@ -52,7 +57,7 @@ struct BiseoApp: App {
                 CallManager.shared.startCall(persona: StartCallIntentHandler.persona(named: name), ringbackOnFailure: true)
             }
             .onChange(of: scenePhase, initial: true) {
-                if scenePhase == .active { Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh() } }
+                if scenePhase == .active { WatchSync.shared.push(); Task { await model.refresh(); await history.refresh(); await PersonaModel.shared.refresh(); WatchSync.shared.push() } }
                 if scenePhase == .active {
                     ApprovalCenter.shared.start()
                     Task { await ApprovalCenter.shared.refresh() }   // stale sheets never survive a return

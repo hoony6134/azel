@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Azel</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>xyz.scian.biseo</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>azel</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>INAlternativeAppNames</key>
+	<array>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>아젤</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>아젤</string>
+		</dict>
+		<dict>
+			<key>INAlternativeAppName</key>
+			<string>비서</string>
+			<key>INAlternativeAppNamePronunciationHint</key>
+			<string>비서</string>
+		</dict>
+	</array>
+	<key>INIntentsSupported</key>
+	<array>
+		<string>INStartCallIntent</string>
+	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Azel로 통화할 때 목소리를 서버로 보내기 위해 마이크를 사용합니다.</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INStartCallIntent</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>voip</string>
+		<string>audio</string>
+	</array>
+	<key>WKApplication</key>
+	<true/>
+	<key>WKCompanionAppBundleIdentifier</key>
+	<string>xyz.scian.biseo</string>
+</dict>
+</plist>
