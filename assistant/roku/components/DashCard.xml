@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<component name="DashCard" extends="Group">
+    <interface>
+        <field id="itemContent" type="node" onChange="onContent" />
+        <field id="focusPercent" type="float" onChange="onFocus" />
+        <field id="rowListHasFocus" type="boolean" />
+        <field id="rowHasFocus" type="boolean" />
+        <field id="width" type="float" />
+        <field id="height" type="float" />
+    </interface>
+    <script type="text/brightscript" uri="pkg:/components/Common.brs" />
+    <script type="text/brightscript" uri="pkg:/components/DashCard.brs" />
+</component>

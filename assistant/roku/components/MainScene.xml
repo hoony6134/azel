@@ -1,16 +1,29 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <component name="MainScene" extends="Scene">
+    <script type="text/brightscript" uri="pkg:/components/Common.brs" />
+    <script type="text/brightscript" uri="pkg:/components/Model.brs" />
     <script type="text/brightscript" uri="pkg:/components/MainScene.brs" />
     <children>
-        <Rectangle id="bg" width="1920" height="1080" color="0x0B0F14FF" />
-        <Group id="dash" />
-        <Group id="ambient" visible="false" />
+        <Rectangle id="bg" width="1920" height="1080" color="0x0D1113FF" />
+        <Group id="header" translation="[92,54]" />
+        <Group id="strip" translation="[96,150]" />
+        <Group id="rowsClip" translation="[0,318]" clippingRect="[0,0,1920,682]">
+            <RowList id="rows" itemComponentName="DashCard" itemSize="[1920,264]" itemSpacing="[0,48]" numRows="3"
+                rowItemSize="[[414,200]]" rowItemSpacing="[[24,0]]" focusXOffset="[96]" rowLabelOffset="[[96,16]]"
+                showRowLabel="[true]" showRowCounter="[false]"
+                rowFocusAnimationStyle="floatingFocus" vertFocusAnimationStyle="fixedFocusWrap"
+                wrapDividerBitmapUri="pkg:/images/rule_wrap.png" wrapDividerHeight="2" wrapDividerWidth="1920"
+                drawFocusFeedback="true" focusBitmapUri="pkg:/images/focus.9.png" focusBitmapBlendColor="0xECF0ECFF" />
+        </Group>
+        <Group id="detail" visible="false" translation="[972,318]" />
+        <Group id="ambientG" visible="false">
+            <Rectangle id="ambientBg" width="1920" height="1080" color="0x080B0CFF" />
+            <Group id="ambBase" translation="[240,320]" />
+        </Group>
+        <Group id="errorG" visible="false" />
         <Group id="settings" visible="false" />
         <Timer id="poll" duration="60" repeat="true" />
         <Timer id="idle" duration="300" repeat="false" />
-        <Animation id="fade" duration="10" repeat="true" easeFunction="inOutQuad">
-            <FloatFieldInterpolator id="fadeI" fieldToInterp="ambient.opacity" key="[0.0, 0.5, 1.0]" keyValue="[1.0, 0.4, 1.0]" />
-        </Animation>
         <Timer id="tick" duration="60" repeat="true" />
     </children>
 </component>

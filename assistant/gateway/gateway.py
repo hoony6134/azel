@@ -2423,7 +2423,7 @@ async def probe(url, token=False):
         return {"ok": False, "ms": None}
 
 
-tv_cache = tv.Cache()
+tv_cache, tv_cache2 = tv.Cache(), tv.Cache()
 
 
 def tv_deps():
@@ -2439,16 +2439,39 @@ def tv_deps():
     async def calendar(today):
         return await google_tools.call(HOME, "calendar_events", {"from": today, "to": today})
 
+    async def calendar_rows(today):
+        rows, _ = await google_tools.events(HOME, today, today)
+        return rows
+
+    async def persona2():
+        s = await load_settings()
+        p = primary_persona(s)
+        return {"name": p.get("name") or DEFAULTS["assistant_name"], "tint": p.get("color") or "celadon"}
+
+    async def overnight():
+        """Tasks waiting for the night window (`when: overnight`, status scheduled) and when the window opens."""
+        ids = await state.call("GET", "/v1/state/kv/tasks-scheduled") or []
+        rows = [await state.call("GET", task_key(i)) for i in ids[:50]]
+        n = sum(1 for t in rows if t and t.get("when") == "overnight" and t.get("status") == "scheduled")
+        return {"count": n, "starts": (await load_settings())["overnight"]["window"][0]}
+
     return {"infra": lambda name: cyg.call(name, {}), "infra_ok": cyg.available, "tasks": bridge_recent_tasks, "approvals": list_approvals,
             "fires": fires, "persona": persona, "in_call": lambda: bool(call_warm_keys),
-            "google_ok": lambda: google_status() == "connected", "calendar": calendar}
+            "google_ok": lambda: google_status() == "connected", "calendar": calendar,
+            "infra_raw": lambda n, a=None: cyg.call(n, a or {}, raw=True), "persona2": persona2, "overnight": overnight,
+            "calendar_rows": calendar_rows}
 
 
 @app.get("/v1/tv")
-async def tv_get():
-    """The Roku dashboard's one read-only JSON (tv.py). The TV token (~/.config/biseo/tv_token) opens only this."""
+async def tv_get(v: int = 1):
+    """The Roku dashboard's one read-only JSON (tv.py): v1 by default, `?v=2` the structured shape. The TV token
+    (~/.config/biseo/tv_token) opens only this."""
     full_only()
-    return await tv_cache.get(lambda: tv.build(tv_deps()))
+    if v == 1:
+        return await tv_cache.get(lambda: tv.build(tv_deps()))
+    if v == 2:
+        return await tv_cache2.get(lambda: tv.build2(tv_deps()))
+    raise HTTPException(400, "v: 1 or 2")
 
 
 @app.get("/v1/status")

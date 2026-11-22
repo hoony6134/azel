@@ -678,6 +678,34 @@ device that created them.
   ```
   Each part is `null` when its source is missing or fails (the rest still answers). Lists are short display lines
   (≤ 10 lines of ≤ 90 characters). No command, approval detail, task result or message body is ever included.
+  **`GET /v1/tv?v=2`** (the TV design, `design/roku/SPEC.md` 2.2; same auth, same 30 s cache, `v=1` or no `v` = the shape
+  above, any other `v` → 400): the same sources, parsed into fields (a part is `null` when its source fails; times
+  without a date are today in KST, timestamps are ISO 8601 with offset; at most 10 items per list):
+  ```json
+  {"at": "…", "assistant": {"state": "idle"|"call", "persona": {"name": "세레나", "tint": "plum"}},
+   "infra": {"asof": "17:04"|null,
+             "hosts": [{"name","group","status": "ok"|"warn"|"problem"|"off","up","cpu","mem","disk","temp"|null,
+                        "load": "0.08/2"|null,"uptime": "142d"|null,"seen"|null}],
+             "alerts": [{"text","head","level": "warn"|"crit","at"|null,"group"|null}],
+             "down": [{"service","node","group","type","state": "down"|"degraded","note"|null,"since"|null}],
+             "notes": ["a line no parser claimed"]},
+   "tasks": {"running": [{"goal","since"}], "queued": {"count","next"|null},
+             "approvals": {"count","oldest"|null}, "overnight": {"count","starts": "01:00"},
+             "recent": [{"goal","status": "done"|"failed","at"}]},
+   "gistra": {"asof": "15:41"|null, "classes": [{"start","end","name","room"}],
+              "assignments": [{"title","course","due"|null}], "todos": [{"text","title","kind","due"|null}],
+              "sections": [{"title": "7일 안 마감", "items": [{"when": "11/23 23:59"|"마감 없음"|null, "due"|null,
+                            "date"|null, "kind": "하우스 문서", "title": "문서 부착 공지", "note", "tag"|null}]}]},
+   "calendar": [{"start","end"|null,"what","cal","where"}], "calls": [{"at","what"}],
+   "next_deadline": {"title","due","course","source": "gistra"|"calendar"}|null}
+  ```
+  `calendar` is read from every calendar the user has, timed events only (an imported feed whose name is a URL is
+  left out, the same title at the same minute shows once, and the `MyTT` timetable calendar wins a tie).
+  The Cygnus texts (`infra_health`, `infra_status`, `infra_alerts`, `gistra_today`, `gistra_assignments`) are parsed in
+  `tv.py`: markdown headers are group labels or section titles (never cards), `스냅샷:` and `As of …` become `asof`,
+  `없음` under a header is an empty section, and a line no parser understands is kept as a plain item or note.
+  Approvals are a count and the oldest time only, never a command. `tint` is the primary persona's `color` (a tint name
+  or `#rrggbb`).
   **Auth**: the gateway token, or the TV token in `~/.config/biseo/tv_token` (0600, ≥ 32 characters; read on every
   request, so deleting or rotating it revokes at once; ignored unless 0600). The TV token opens **only** `GET /v1/tv`
   (anything else → 401).
