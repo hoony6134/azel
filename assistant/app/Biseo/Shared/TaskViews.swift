@@ -209,6 +209,7 @@ struct TaskCreateView: View {
     @State private var devices: [String] = []
     @State private var notify = TaskNotify.push
     @State private var persona: String? = PersonaModel.shared.selected?.id
+    @State private var autoApprove = false
     @State private var saving = false
     @State private var message: String?
 
@@ -231,6 +232,12 @@ struct TaskCreateView: View {
                     ForEach(TaskNotify.allCases) { Text($0.label).tag($0) }
                 }
                 .pickerStyle(.segmented)
+                if BrainModeChoice.shared.lastCaps.contains("auto_approve") {
+                    Toggle("자동 승인", isOn: $autoApprove)
+                }
+                if autoApprove {
+                    Text("위험하지 않은 명령은 묻지 않고 실행해요. 위험한 건 여전히 물어봐요.").font(.footnote).foregroundStyle(Theme.text3)
+                }
             }
             if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
         }
@@ -242,7 +249,15 @@ struct TaskCreateView: View {
                 Button(saving ? "맡기는 중…" : "맡기기") {
                     saving = true
                     Task {
-                        do { try await tasks.create(goal: goal, device: device, persona: PersonaModel.shared.personas.count > 1 ? persona : nil, notify: notify); dismiss() }
+                        do {
+                            let t = try await tasks.create(goal: goal, device: device, persona: PersonaModel.shared.personas.count > 1 ? persona : nil, notify: notify)
+                            if autoApprove, let id = t?.id {
+                                if case .success(let g?) = await attempt({ try await AutoApproveAPI.grant(task: id, devices: device.map { [$0] }) }) {
+                                    AutoGrantCenter.remember(g.id)
+                                }
+                            }
+                            dismiss()
+                        }
                         catch GatewayError.rejected(let why) { message = why }
                         catch { message = "맡기지 못했어요: " + FriendlyError.describe(error).title }
                         saving = false

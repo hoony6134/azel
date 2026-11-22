@@ -84,6 +84,7 @@ struct RootView: View {
             CallScreen()
         }
         .approvalSheet(active: !call.inCall)
+        .autoGrantSheet()
     }
 }
 
@@ -96,6 +97,10 @@ final class TaskNotificationHandler: NSObject, UNUserNotificationCenterDelegate 
         let action = response.actionIdentifier
         if action != UNNotificationDefaultActionIdentifier && action != UNNotificationDismissActionIdentifier {
             await PushAction.perform(action: action, userInfo: response.notification.request.content.userInfo)
+            return
+        }
+        if let id = AutoGrantCenter.grantID(from: response.notification.request.content.userInfo) {
+            await AutoGrantCenter.shared.openGrant(id: id)
             return
         }
         if let id = ApprovalCenter.approvalID(from: response.notification.request.content.userInfo) {

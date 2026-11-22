@@ -131,9 +131,38 @@ struct BrainModeControl: View {
     var secret = false
     var canSecret = false
     var setSecret: (Bool) -> Void = { _ in }
+    /// Auto-approve for this call: on/off, when it ends, whether the server offers it.
+    var auto = false
+    var autoExpires: Date? = nil
+    var canAuto = false
+    var setAuto: (Bool, Int, [String]?) -> Void = { _, _, _ in }
+    @AppStorage("autoMinutes") private var autoMinutes = 60
+    @State private var devices: [String] = []
+    @State private var autoDevices: Set<String> = []
 
     var body: some View {
-        if choice.supported || canSecret {
+        HStack(spacing: Theme.s) {
+            menu
+            if auto {
+                // Subtle: the glyph and the time left; a tap turns it off.
+                Button { setAuto(false, autoMinutes, nil) } label: {
+                    TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                        HStack(spacing: 2) {
+                            Image(systemName: "bolt.shield").font(.caption2)
+                            if let r = AutoGrant.remaining(autoExpires, now: ctx.date) { Text(r) }
+                        }
+                        .font(.footnote).foregroundStyle(Theme.text3)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("자동 승인 켜짐, 끄기")
+            }
+        }
+        .task(id: canAuto) { if canAuto, devices.isEmpty, case .success(let d) = await attempt({ try await TaskAPI.devices() }) { devices = d } }
+    }
+
+    @ViewBuilder private var menu: some View {
+        if choice.supported || canSecret || canAuto {
             let m = BrainMode.current(current)
             Menu {
                 if choice.supported {
@@ -141,6 +170,25 @@ struct BrainModeControl: View {
                         ForEach(BrainMode.allCases) { Text($0.short).tag($0) }
                     }
                     .pickerStyle(.inline)
+                }
+                if canAuto {
+                    Divider()
+                    Toggle(isOn: Binding(get: { auto }, set: { setAuto($0, autoMinutes, autoDevices.isEmpty ? nil : Array(autoDevices)) })) {
+                        Label("자동 승인", systemImage: "bolt.shield")
+                    }
+                    if !auto {
+                        Picker("시간", selection: $autoMinutes) {
+                            Text("30분").tag(30); Text("1시간").tag(60); Text("2시간").tag(120)
+                        }
+                        if !devices.isEmpty {
+                            Menu("기기: " + (autoDevices.isEmpty ? "전체" : autoDevices.sorted().joined(separator: ", "))) {
+                                ForEach(devices, id: \.self) { d in
+                                    Toggle(d, isOn: Binding(get: { autoDevices.contains(d) },
+                                                            set: { if $0 { autoDevices.insert(d) } else { autoDevices.remove(d) } }))
+                                }
+                            }
+                        }
+                    }
                 }
                 if canSecret {
                     Divider()
@@ -151,7 +199,7 @@ struct BrainModeControl: View {
             } label: {
                 HStack(spacing: 3) {
                     if secret { Image(systemName: "eye.slash").font(.caption2).accessibilityLabel("시크릿") }
-                    Text(choice.supported ? m.short : (secret ? "시크릿" : "옵션"))
+                    Text(choice.supported ? m.short : (secret ? "시크릿" : "통화 옵션"))
                     Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
                 }
                 .font(.footnote)

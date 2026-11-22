@@ -409,6 +409,22 @@ final class CallClient {
     /// The server's capabilities when a frame lists them (`hello`).
     static func caps(_ e: CallEvent) -> [String]? { e.caps }
 
+    /// Auto-approve for this call (`{"type":"auto_approve","value",…}`); the server answers with the
+    /// grant's `expires_at`, and state frames carry `auto`.
+    func sendAutoApprove(_ on: Bool, minutes: Int? = nil, devices: [String]? = nil) {
+        var b: [String: Any] = ["type": "auto_approve", "value": on]
+        if on, let minutes { b["minutes"] = minutes }
+        if on, let devices, !devices.isEmpty { b["devices"] = devices }
+        guard let d = try? JSONSerialization.data(withJSONObject: b), let s = String(data: d, encoding: .utf8) else { return }
+        socket?.send(.string(s)) { _ in }
+    }
+
+    /// (on, expires) when a frame reports the call's auto-approve state.
+    static func reportedAuto(_ e: CallEvent) -> (on: Bool, expires: Date?)? {
+        if e.type == "auto_approve", let on = e.flag ?? e.auto { return (on, e.expires_at.map { Date(timeIntervalSince1970: $0) }) }
+        return e.auto.map { ($0, nil) }
+    }
+
     /// Secret (incognito) on or off mid-call; the server confirms with a secret frame.
     func sendSecret(_ on: Bool) {
         socket?.send(.string(#"{"type":"secret","value":\#(on)}"#)) { _ in }

@@ -116,7 +116,9 @@ struct CallScreen: View {
                     Text(call.callerName ?? name).font(.headline).foregroundStyle(Theme.text)
                 }
                 BrainModeControl(current: call.brainMode, pick: { call.chooseBrain($0) },
-                                 secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) })
+                                 secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) },
+                                 auto: call.autoOn, autoExpires: call.autoExpires, canAuto: call.canAuto,
+                                 setAuto: { call.setAuto($0, minutes: $1, devices: $2) })
             }
             Group {
                 if let r = call.log.lastRoute { RouteChip(route: r) }

@@ -245,3 +245,39 @@ final class DecidedElsewhereTests: XCTestCase {
         }
     }
 }
+
+final class AutoApproveTests: XCTestCase {
+    func testFramesAndGrantShape() throws {
+        let d = JSONDecoder()
+        let on = try d.decode(CallEvent.self, from: Data(#"{"type":"auto_approve","value":true,"expires_at":1795310000}"#.utf8))
+        XCTAssertEqual(CallClient.reportedAuto(on)?.on, true)
+        XCTAssertEqual(CallClient.reportedAuto(on)?.expires, Date(timeIntervalSince1970: 1_795_310_000))
+        let state = try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening","auto":true}"#.utf8))
+        XCTAssertEqual(CallClient.reportedAuto(state)?.on, true, "a voice grant just flips the state frame")
+        XCTAssertNil(CallClient.reportedAuto(try d.decode(CallEvent.self, from: Data(#"{"type":"state","value":"listening"}"#.utf8))))
+
+        let g = AutoGrant(["id": "a1b2c3d4e5", "scope": ["task": "abc123def456"], "devices": ["맥북"], "by": "app",
+                           "created": 1_795_300_000, "expires_at": 1_795_307_200, "ran": 2,
+                           "log": [["device": "macbook", "command": "brew services restart redis", "at": 1_795_300_100, "stage": "rules"]]])
+        XCTAssertEqual(g.scope, "작업")
+        XCTAssertEqual(g.devices, ["macbook"])
+        XCTAssertEqual(g.log.first?.command, "brew services restart redis")
+        XCTAssertEqual(AutoGrant.stageLabel(g.log.first?.stage), "규칙")
+        XCTAssertTrue(g.isLive(now: Date(timeIntervalSince1970: 1_795_300_200)))
+        XCTAssertFalse(AutoGrant(["id": "x", "ended": true, "log": []]).isLive())
+    }
+
+    func testRemainingTimeAndPush() {
+        let now = Date(timeIntervalSince1970: 0)
+        XCTAssertEqual(AutoGrant.remaining(now.addingTimeInterval(23 * 60), now: now), "23분 남음")
+        XCTAssertEqual(AutoGrant.remaining(now.addingTimeInterval(65 * 60), now: now), "1시간 5분 남음")
+        XCTAssertEqual(AutoGrant.remaining(now.addingTimeInterval(120 * 60), now: now), "2시간 남음")
+        XCTAssertEqual(AutoGrantCenter.grantID(from: ["type": "auto_summary", "grant_id": "a1b2c3d4e5"]), "a1b2c3d4e5")
+        XCTAssertNil(AutoGrantCenter.grantID(from: ["type": "approval", "approval_id": "x"]))
+    }
+
+    func testCallToggleFrame() throws {
+        let client = CallClient()
+        client.sendAutoApprove(true, minutes: 30, devices: ["macbook"])   // no socket: nothing sent, no crash
+    }
+}

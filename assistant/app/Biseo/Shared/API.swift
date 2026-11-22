@@ -19,13 +19,15 @@ struct CallEvent: Decodable, Equatable {
     var caps: [String]?       // what this call's server supports (`hello` frame): text, mode, played…
     var reason: String?       // text_rejected: too_long | too_fast
     var secret: Bool?         // state frames: this call is secret (incognito)
+    var auto: Bool?           // state frames: an auto-approve grant is live for this call
+    var expires_at: Double?   // auto_approve: when the grant ends (epoch)
     /// A boolean `value` (`{"type":"secret","value":true}`); `value` then stays nil.
     var flag: Bool?
 
     struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
 
     private enum CodingKeys: String, CodingKey {
-        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret
+        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at
     }
 
     init(type: String, value: String? = nil, text: String? = nil, route: String? = nil) {
@@ -44,6 +46,8 @@ struct CallEvent: Decodable, Equatable {
         context = try? c.decodeIfPresent(Context.self, forKey: .context)
         caps = try? c.decodeIfPresent([String].self, forKey: .caps)
         secret = try? c.decodeIfPresent(Bool.self, forKey: .secret)
+        auto = try? c.decodeIfPresent(Bool.self, forKey: .auto)
+        expires_at = try? c.decodeIfPresent(Double.self, forKey: .expires_at)
     }
 }
 

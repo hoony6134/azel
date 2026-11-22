@@ -293,6 +293,7 @@ struct SettingsScreen<Extra: View>: View {
                     }
                 }
                 ApprovalRulesCard()
+                AutoGrantsCard()
                 usageCard
                 statusCard
                 if let s = Binding($settings) {

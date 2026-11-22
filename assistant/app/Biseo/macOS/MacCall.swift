@@ -74,6 +74,10 @@ final class MacCall: ObservableObject {
     /// Secret (incognito): nothing kept, no recording, no captions on the Lock Screen.
     @Published private(set) var secret = false
     @Published private(set) var canSecret = false
+    /// Auto-approve: safe device commands run without a tap until `autoExpires`.
+    @Published private(set) var autoOn = false
+    @Published private(set) var autoExpires: Date?
+    @Published private(set) var canAuto = false
     /// The panel's text field is open (it grows to fit).
     @Published var typing = false { didSet { if typing != oldValue { resizePanel() } } }
     @Published var typedDraft = ""
@@ -217,6 +221,11 @@ final class MacCall: ObservableObject {
 
     func hangUp() { end(error: nil, keepPanel: false) }
 
+    func setAuto(_ on: Bool, minutes: Int, devices: [String]?) {
+        guard inCall else { return }
+        client.sendAutoApprove(on, minutes: minutes, devices: devices)
+    }
+
     func setSecret(_ on: Bool) {
         guard inCall else { return }
         client.sendSecret(on)
@@ -323,7 +332,13 @@ final class MacCall: ObservableObject {
         if let caps = CallClient.caps(event) {
             canType = caps.contains("text")
             canSecret = caps.contains("secret")
+            canAuto = caps.contains("auto_approve")
             Task { @MainActor in BrainModeChoice.shared.remember(caps: caps) }
+        }
+        if let a = CallClient.reportedAuto(event) {
+            autoOn = a.on
+            if !a.on { autoExpires = nil } else if let e = a.expires { autoExpires = e }
+            if a.on { Task { @MainActor in await AutoGrantCenter.shared.refresh() } }   // remember the grant for 설정 → 승인
         }
         if let s = CallClient.reportedSecret(event), s != secret {
             secret = s
@@ -380,6 +395,9 @@ final class MacCall: ObservableObject {
         canType = false
         secret = false
         canSecret = false
+        autoOn = false
+        autoExpires = nil
+        canAuto = false
         typing = false
         typedDraft = ""
         fadeTask?.cancel(); idleTask?.cancel()
@@ -492,7 +510,9 @@ struct CallPanelView: View {
                     // §17.8: the persona's name before the route chip.
                     if let p = call.activePersona, PersonaModel.shared.personas.count > 1 { PersonaChip(name: p.name, tint: p.tint, outlined: false) }
                     BrainModeControl(current: call.brainMode, pick: { call.chooseBrain($0) },
-                                     secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) })
+                                     secret: call.secret, canSecret: call.canSecret, setSecret: { call.setSecret($0) },
+                                 auto: call.autoOn, autoExpires: call.autoExpires, canAuto: call.canAuto,
+                                 setAuto: { call.setAuto($0, minutes: $1, devices: $2) })
                     if let r = call.log.lastRoute { RouteChip(route: r) }
                 }
             }

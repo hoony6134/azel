@@ -219,9 +219,11 @@ final class TaskModel: ObservableObject {
         }
     }
 
-    func create(goal: String, device: String?, persona: String?, notify: TaskNotify) async throws {
-        _ = try await TaskAPI.create(goal: goal, device: device, persona: persona, notify: notify)
+    @discardableResult
+    func create(goal: String, device: String?, persona: String?, notify: TaskNotify) async throws -> AgentTask? {
+        let t = try await TaskAPI.create(goal: goal, device: device, persona: persona, notify: notify)
         await refresh()
+        return t
     }
 
     func setNotify(_ t: AgentTask, call: Bool) async throws {

@@ -57,6 +57,10 @@ final class CallManager: NSObject, ObservableObject {
     /// Secret (incognito): nothing kept, no recording, no captions on the Lock Screen.
     @Published private(set) var secret = false
     @Published private(set) var canSecret = false
+    /// Auto-approve: safe device commands run without a tap until `autoExpires`.
+    @Published private(set) var autoOn = false
+    @Published private(set) var autoExpires: Date?
+    @Published private(set) var canAuto = false
     private var activeSession: String?
     /// The persona of the outgoing call (name and tint on screen, `persona=` on the socket).
     @Published private(set) var activePersona: Persona?
@@ -91,6 +95,11 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     // MARK: UI actions
+
+    func setAuto(_ on: Bool, minutes: Int, devices: [String]?) {
+        guard inCall else { return }
+        client.sendAutoApprove(on, minutes: minutes, devices: devices)
+    }
 
     func setSecret(_ on: Bool) {
         guard inCall else { return }
@@ -209,6 +218,9 @@ final class CallManager: NSObject, ObservableObject {
         canType = false
         secret = false
         canSecret = false
+        autoOn = false
+        autoExpires = nil
+        canAuto = false
         let session = AVAudioSession.sharedInstance()
         // .allowBluetooth: AirPods and other headsets (HFP, mic and speaker) can carry the call;
         // without it the route picker lists them but the route never moves (user bug, 2026-11-22).
@@ -248,7 +260,13 @@ final class CallManager: NSObject, ObservableObject {
         if let caps = CallClient.caps(event) {
             canType = caps.contains("text")
             canSecret = caps.contains("secret")
+            canAuto = caps.contains("auto_approve")
             Task { @MainActor in BrainModeChoice.shared.remember(caps: caps) }
+        }
+        if let a = CallClient.reportedAuto(event) {
+            autoOn = a.on
+            if !a.on { autoExpires = nil } else if let e = a.expires { autoExpires = e }
+            if a.on { Task { @MainActor in await AutoGrantCenter.shared.refresh() } }   // remember the grant for 설정 → 승인
         }
         if let s = CallClient.reportedSecret(event), s != secret {
             secret = s
