@@ -99,3 +99,17 @@ def test_the_agenda_tool_reads_both_sources_at_once(tmp_path, monkeypatch):
     bad = asyncio.run(g.bridge.run("agenda", {"from": "2026-11-01", "to": "2027-01-01"}, caller="qwen"))
     assert not bad["ok"] and bad["error"]["code"] == "invalid"
     assert "agenda" in g.tools_bridge.TAINT_TOOLS  # event titles are outside text: actions after it need a read-back
+
+
+def test_here_is_the_phones_city_in_a_call_and_nothing_otherwise(tmp_path, monkeypatch):
+    g = start(tmp_path, monkeypatch)
+    asked = []
+
+    async def live(kind, args, timeout):
+        asked.append((kind, timeout))
+        return reply
+    monkeypatch.setattr(g, "phone_live", live)
+    reply = {"ok": True, "data": {"name": "GIST", "place": "광주광역시 북구 오룡동", "activity": "walking"}}
+    assert asyncio.run(g.here_location()) == {"name": "광주광역시"} and asked == [("location", g.phone_data.LOCATION_S)]
+    for reply in ({"ok": False, "error": "offline"}, {"ok": True, "data": {}}):
+        assert asyncio.run(g.here_location()) is None  # no call, or no fix: the weather tool falls back to weather_home
