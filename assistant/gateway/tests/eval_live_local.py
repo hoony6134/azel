@@ -56,6 +56,14 @@ INFRA_CASES = ["야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐",
 INFRA_WANT = r"NemoClaw|네모클로|네모 클로|Vuja|뷰자|부자데|claw|클로"
 ALL_FINE = re.compile(r"모두\s*정상|다\s*정상|문제\s*없")
 PROMISE = re.compile(r"(확인|찾아|알아|살펴|점검)\s*(해\s*)?(볼게요|보겠습니다|드릴게요|할게요|하겠습니다)|잠시만요")
+# live 2026-11-23 (5374b183, 03:41): holdings are in memory; the answer must use them, every one, with figures
+HOLDINGS = "[아젤 기억 2026-11-23] 사용자는 애플, 토스, 엔비디아, 삼성전자, SK하이닉스 주식을 보유하고 있다."
+QUOTES = {("aapl", "apple", "애플"): "야후 파이낸스 기준 11월 21일 Apple Inc. 주가는 342.56달러예요. 전날보다 1.90% 내렸어요.",
+          ("nvda", "nvidia", "엔비디아"): "야후 파이낸스 기준 11월 21일 NVIDIA 주가는 125.53달러예요. 전날보다 14.01% 내렸어요.",
+          ("005930", "samsung", "삼성"): "네이버 증권 기준 11월 20일 삼성전자 주가는 180,900원이에요. 전날보다 8.13% 내렸어요.",
+          ("000660", "sk hynix", "하이닉스", "skhynix"): "네이버 증권 기준 11월 20일 SK하이닉스 주가는 412,000원이에요. 전날보다 5.20% 내렸어요."}
+HOLD_CASES = [("내가 갖고 있는 주식 현황 이용해가지고 어떤 주식이 얼마만큼 올랐는지 떨어졌는지 알려줘.", True),
+              ("내가 갖고 있는 주식 보유 현황 알려줘", False)]
 ANNOUNCE_ONLY = re.compile(r"^[^.?!]*(찾아|알아|확인해)\s*볼게요\.?$")
 
 
@@ -100,6 +108,11 @@ async def main():
         used.append((name, args))
         if name.startswith("infra_"):
             return INFRA_RESULT[name]
+        if name == "memory_recall" and holdings_on:
+            return HOLDINGS
+        if name == "stock_quote" and holdings_on:
+            q = str(args.get("query", "")).lower()
+            return next((v for ks, v in QUOTES.items() if any(k in q for k in ks)), "상장된 종목을 찾지 못했어요. 비상장일 수 있어요.")
         if name in phone_data.KIND:  # the gateway's phone tools: the synced days, the call has no live phone here
             try:
                 return (await phone_data.run(name, args, phone_store, no_phone, now))[0]
@@ -120,6 +133,7 @@ async def main():
     V.CALL_MODE.set("local")
 
     rows = []
+    holdings_on = False
     for i, (said, tool, want) in enumerate(CASES):
         used.clear()
         timings = {}
@@ -138,7 +152,9 @@ async def main():
         checks = {"read all three": {n for n, _ in used} >= set(INFRA_RESULT), "names the down service":
                   bool(re.search(INFRA_WANT, reply)) and not ALL_FINE.match(reply.strip()),
                   "no promise said": not any(PROMISE.search(x) for x in out), "no lookup failed": V.LOOKUP_FAILED not in reply,
-                  "tool first": bool(timings.get("tool_first"))}
+                  "looked up first": bool(used)}  # by tool-first or Qwen's own call: the answer came from the data
+        if not timings.get("tool_first"):
+            print(f"note: {said[:30]} was looked up by Qwen's own call, not tool-first")
         rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
     # live 2026-11-23 (4b69826f): small talk after stock quotes got a tool promise and "네, 대표님" four times
     azel = {"id": "azel", "name": "아젤", "primary": True, "voice": "sohee", "user_title": "대표님",
@@ -160,6 +176,24 @@ async def main():
                   "no tool talk": "도구" not in reply, "대표님 at most once": reply.count("대표님") <= 1, "said something": bool(out)}
         rows.append((f"{label}: {said}", checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
     V.CALL_PERSONA.set(None)
+    holdings_on = True
+    for i, (said, figures) in enumerate(HOLD_CASES):
+        used.clear()
+        timings = {}
+        t0 = time.perf_counter()
+        out = [s async for s, *_ in V.respond(said, f"hold-{i}", t0, timings)]
+        reply = " ".join(out)
+        names = ("애플", "토스", "엔비디아", "삼성", "하이닉스")
+        checks = {"memory first": bool(used) and used[0][0] == "memory_recall",
+                  "all five named": all(n in reply for n in names), "no empty lead-in": not V.LEAD_IN.search(reply.strip()),
+                  "no promise said": not any(PROMISE.search(x) for x in out)}
+        if figures:
+            checks["quoted four"] = sum(n == "stock_quote" for n, _ in used) >= 4
+            checks["figures"] = len(re.findall(r"\d[\d,.]*\s*(%|퍼센트|달러|원)", reply)) >= 4
+        rows.append((said, checks, reply, [n for n, _ in used], timings, time.perf_counter() - t0))
+        if os.environ.get("EVAL_DEBUG"):
+            print("DEBUG", used, {k: v for k, v in timings.items() if not k.endswith("_ms")})
+    holdings_on = False
     # the sleep exchange: the request itself, then the push after two unkept promises (as the call went live)
     for label, session, prior, said in (("수면 요청", "sleep-1", [], SLEEP_ASK),
                                         ("수면 재촉", "sleep-2", SLEEP_FAILED, SLEEP_PUSH)):

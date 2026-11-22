@@ -15,6 +15,7 @@ NAVER_QUOTE = "https://polling.finance.naver.com/api/realtime/domestic/stock/{co
 YAHOO_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 TIMEOUT_S = 6
+AC_TIMEOUT_S = 2  # the name lookup: a stalled one must not eat a voice turn's 8 s, Yahoo and search come after it
 UA = {"User-Agent": "Mozilla/5.0 (compatible; azel-quote)"}
 KST = timezone(timedelta(hours=9))
 CURRENCY = {"KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "CNY": "위안", "HKD": "홍콩달러", "GBP": "파운드"}
@@ -35,7 +36,7 @@ def clean(query):
 
 async def naver_find(q, c):
     try:
-        r = await c.get(NAVER_AC, params={"q": q, "target": "stock"})
+        r = await c.get(NAVER_AC, params={"q": q, "target": "stock"}, timeout=AC_TIMEOUT_S)
         items = r.json().get("items") or []
     except (httpx.HTTPError, ValueError):
         return None
