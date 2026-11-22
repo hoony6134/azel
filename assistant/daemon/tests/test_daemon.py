@@ -731,3 +731,110 @@ def test_spotify_transport_and_system_volume(cfg, fake_bins):
     assert [c["stdin"] for c in calls[:5]] == [d.SPOTIFY_SCRIPTS[k] for k in ("pause", "resume", "next", "previous", "now_playing")]
     assert calls[5]["stdin"] == d.SYSTEM_VOLUME and calls[5]["argv"] == ["-", "100"]
     assert calls[6]["stdin"] == d.SPOTIFY_SCRIPTS["resume"]
+
+
+# ---------- grants: team devices the gateway reaches but that cannot reach the gateway ----------
+
+@pytest.fixture
+def gcfg(cfg, gw):
+    d.CFG["approval_via"] = "gateway-grant"
+    d.CFG["approve_unlisted"] = True
+    d._issued.clear()
+    return d.CFG, gw[0]
+
+
+def make_grant(cfg, command, cwd, nonce, exp=None, key=None, device=None, aid="ap-1"):
+    exp = int(time.time()) + 300 if exp is None else exp
+    dev = device or cfg["id"]
+    mac = d.grant_mac(key or cfg["token"], aid, dev, command, cwd, nonce, exp)
+    return {"approval_id": aid, "device": dev, "command": command, "cwd": cwd, "nonce": nonce, "exp": exp, "mac": mac}
+
+
+def ask(command="pwd"):
+    r = d.run_command(command=command)
+    assert r["status"] == "needs_approval", r
+    return r
+
+
+def test_grant_mode_returns_needs_approval_without_contacting_the_gateway(gcfg):
+    cfg, calls = gcfg
+    r = ask("pwd")
+    assert set(r) == {"status", "command", "cwd", "device", "nonce"} and r["device"] == cfg["id"]
+    assert r["command"] == "pwd" and r["nonce"] in d._issued
+    assert calls == []
+    assert ask("pwd")["nonce"] != r["nonce"]
+    assert d.run_command(command="ls", cwd="proj")["status"] == "ok"  # a listed command needs nothing
+    assert d.run_command(command="rm x")["status"] == "needs_approval"  # risky ones too
+
+
+def test_grant_runs_the_command_once_and_the_used_file_is_private(gcfg, tmp_path):
+    cfg, calls = gcfg
+    r = ask("pwd")
+    g = make_grant(cfg, r["command"], r["cwd"], r["nonce"])
+    out = d.run_command(command="pwd", cwd=r["cwd"], grant=g)
+    assert out["status"] == "ok" and out["stdout"].strip() == r["cwd"]
+    assert calls == []  # nothing sent to the gateway: it audits on its side
+    used = d._used_nonces_file()
+    assert used.read_text().split() == [r["nonce"]] and used.stat().st_mode & 0o777 == 0o600
+    again = d.run_command(command="pwd", cwd=r["cwd"], grant=g)  # replay
+    assert again["status"] == "refused" and "nonce" in again["reason"]
+
+
+def test_grant_with_a_wrong_signature_is_refused_and_does_not_spend_the_nonce(gcfg):
+    cfg, _ = gcfg
+    r = ask("pwd")
+    bad = make_grant(cfg, "pwd", r["cwd"], r["nonce"], key="some-other-token")
+    res = d.run_command(command="pwd", cwd=r["cwd"], grant=bad)
+    assert res["status"] == "refused" and "signature" in res["reason"]
+    assert d.run_command(command="pwd", cwd=r["cwd"], grant=make_grant(cfg, "pwd", r["cwd"], r["nonce"]))["status"] == "ok"
+    tampered = make_grant(cfg, "pwd", r["cwd"], ask("pwd")["nonce"])
+    tampered["exp"] += 1
+    assert d.run_command(command="pwd", cwd=r["cwd"], grant=tampered)["status"] == "refused"
+
+
+def test_grant_expired_or_too_long_is_refused(gcfg):
+    cfg, _ = gcfg
+    r = ask("pwd")
+    old = make_grant(cfg, "pwd", r["cwd"], r["nonce"], exp=int(time.time()) - 1)
+    assert "expired" in d.run_command(command="pwd", cwd=r["cwd"], grant=old)["reason"]
+    long = make_grant(cfg, "pwd", r["cwd"], r["nonce"], exp=int(time.time()) + 3600)
+    assert "too long" in d.run_command(command="pwd", cwd=r["cwd"], grant=long)["reason"]
+
+
+def test_grant_for_another_cwd_command_or_device_is_refused(gcfg, tmp_path):
+    cfg, _ = gcfg
+    r = ask("pwd")
+    other = str((cfg["roots"][0] / "proj").resolve())
+    assert other != r["cwd"]
+    for command, cwd, device in (("pwd", other, None), ("ls", r["cwd"], None), ("pwd", r["cwd"], "elsewhere")):
+        g = make_grant(cfg, "pwd", r["cwd"], r["nonce"], device=device)
+        res = d.run_command(command=command, cwd=cwd if cwd == r["cwd"] else other, grant=g)
+        assert res["status"] == "refused", (command, cwd, device, res)
+    assert r["nonce"] in d._issued  # none of those spent it
+
+
+def test_grant_with_an_unissued_nonce_or_with_an_approval_id_is_refused(gcfg):
+    cfg, _ = gcfg
+    wd = str(cfg["roots"][0])
+    forged = make_grant(cfg, "pwd", wd, "never-issued-by-this-daemon")
+    assert "unknown" in d.run_command(command="pwd", grant=forged)["reason"]
+    r = ask("pwd")
+    g = make_grant(cfg, "pwd", r["cwd"], r["nonce"])
+    assert d.run_command(command="pwd", cwd=r["cwd"], grant=g, approval_id="x")["status"] == "refused"
+    assert d.run_command(command="pwd", approval_id="x")["status"] == "refused"  # no gateway round trip in this mode
+
+
+def test_hard_deny_beats_a_valid_grant(gcfg):
+    cfg, calls = gcfg
+    r = ask("pwd")  # a real nonce, a real signature, for a command no approval may unlock
+    for cmd in ("sudo id", "sh -c id", "osascript -e x"):
+        g = make_grant(cfg, cmd, r["cwd"], r["nonce"])
+        res = d.run_command(command=cmd, cwd=r["cwd"], grant=g)
+        assert res["status"] == "refused", cmd
+    assert r["nonce"] in d._issued and not d._used_nonces_file().exists()
+
+
+def test_default_mode_is_unchanged_and_never_returns_needs_approval(cfg, gw):
+    assert d.CFG["approval_via"] == "gateway"
+    d.CFG["approve_unlisted"] = True
+    assert d.run_command(command="pwd")["status"] == "pending_approval"
