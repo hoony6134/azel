@@ -317,7 +317,9 @@ HALLUCINATION_RE = re.compile(
     r"((MBC|KBS|SBS|YTN|JTBC|TV조선|채널A|MBN|연합)\s*)?뉴스\s*\S{2,4}\s*(입니다|이었습니다|기자입니다)"
     r"|시청\s*해\s*주셔서\s*(정말\s*)?감사(합니다|드립니다)|구독\s*(과|와|,)?\s*좋아요(\s*(부탁\S*|눌러\s*\S*|알림\S*))*"
     r"|(구독|좋아요|알림\s*설정)\s*(부탁\S*|해\s*주세요)|다음\s*(영상|시간)에\s*(서\s*)?(만나요|뵙겠습니다)"
-    r"|(한국어\s*)?자막\s*(제공|제작)\S*(\s*\S+)?|영상\s*편집\s*\S*", re.I)
+    r"|(한국어\s*)?자막\s*(제공|제작)\S*(\s*\S+)?|영상\s*편집\s*\S*"
+    r"|지금까지\s*.{0,24}?(였|이었)습니다|(\S+\s*)?뉴스\s*스토리(였습니다|입니다)?"  # "지금까지 뉴스 스토리였습니다"
+    r"|((MBC|KBS|SBS|YTN|JTBC|MBN|연합)\s*)+(뉴스)?", re.I)  # a broadcaster's name alone
 STT_KWARGS = {"language": "korean", "task": "transcribe"}
 # Whisper's own guards (transformers 4.57): no conditioning on earlier text, and a segment that is too repetitive
 # (compression), too unsure (log-prob) or silent (no-speech) is re-decoded or dropped.
@@ -2227,6 +2229,7 @@ def real_content(text):
 CALL_CAPS = ("text", "played", "mode", "secret", "auto_approve")
 SECRET_PREFIX = "secret-"  # a secret call's throwaway session key (the gateway keys its own rules off this)  # client messages /v1/call understands beyond audio, hangup and interrupt
 TEXT_MAX, TEXT_GAP_S = 1000, 1.0  # a typed message: at most this long, and one per second
+WAKE_GUARD_S = 2.0  # /v1/call?intent=wake: the first seconds use the noisy-mode VAD thresholds
 TAIL_GUARD_S = 1.0  # the phone may still be playing this long after the server's estimate (network, buffering)
 PLAYED_WAIT_S = 2.0  # an app that reports "played": wait this long past the estimate for it, then go on anyway
 
@@ -2309,6 +2312,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     log_id, started = uuid.uuid4().hex, time.time()  # one call-history entry per connection
     start_log = {"event": "start", "log_id": log_id}
     vad_turn = Turn(SileroVoiceActivityDetector(), mode=links.settings.get("noise_mode", "normal"))
+    # a wake-started call opens on room tone and the wake word's tail: its first WAKE_GUARD_S hear only louder,
+    # longer speech (the noisy-mode thresholds), so Whisper is not handed silence to hallucinate on
+    wake_guard_until = time.monotonic() + WAKE_GUARD_S if intent == "wake" else 0.0
     send_lock = asyncio.Lock()
     # play_end: when the client will finish playing what we already sent. Audio goes out
     # faster than real time, so "still talking" is judged by this, not by the task.
@@ -2746,7 +2752,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     CALL_MODE.set(v)  # from the next reply on
                     await send({"type": "mode", "value": v})
                 continue
-            vad_turn.set_mode(links.settings.get("noise_mode", "normal"))
+            vad_turn.set_mode("noisy" if time.monotonic() < wake_guard_until else links.settings.get("noise_mode", "normal"))
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
                 now = time.monotonic()
                 task = current["task"]
@@ -2811,9 +2817,12 @@ if __name__ == "__main__":
         assert korean_only("회의(會議)가 있어요.") == "회의가 있어요." and korean_only("好的。") == ""
         for noise in ["MBC 뉴스 김철수입니다.", "MBC 뉴스 이덕영입니다", "시청해 주셔서 감사합니다", "시청해주셔서 감사합니다!",
                       "구독과 좋아요 부탁드립니다", "구독, 좋아요 알림설정", "자막 제공 배달의민족", "감사합니다.",
-                      "아니 아니 아니 아니 아니 아니 아니 아니", "네 네 네 네 네 네 네"]:
+                      "아니 아니 아니 아니 아니 아니 아니 아니", "네 네 네 네 네 네 네", "지금까지 뉴스 스토리였습니다.",
+                      "지금까지 MBC 뉴스였습니다", "뉴스 스토리", "다음 시간에 만나요.", "MBC 뉴스", "KBS 뉴스.", "YTN",
+                      "감사합니다"]:
             assert clean_transcript(noise) == "", noise  # Whisper's noise/subtitle outputs are not the user
-        for real in ["아니", "아니 그게 아니라", "매우 좋아", "네 네", "뉴스 좀 틀어줘", "정말 감사합니다 덕분에 살았어요"]:
+        for real in ["아니", "아니 그게 아니라", "매우 좋아", "네 네", "뉴스 좀 틀어줘", "정말 감사합니다 덕분에 살았어요",
+                     "지금까지 한 거 정리해 줘", "MBC 뉴스 틀어 줘", "KBS 뉴스 보고 싶어", "오늘 뉴스 스토리 뭐 있어?"]:
             assert clean_transcript(real) == real, real  # short real speech passes untouched
         assert clean_transcript("매우 매우 매우 좋아") == "매우 좋아" and clean_transcript("아니아니아니아니") == "아니"
         assert clean_transcript("그게 아니라 그게 아니라 그게 아니라 진짜로") == "그게 아니라 진짜로"
@@ -3394,6 +3403,24 @@ if __name__ == "__main__":
                 raise AssertionError(f"loaded {broken!r}")
             except AssertionError as e:
                 assert "loaded" not in str(e)
+        def wake_guard_check(intent):
+            """A 0.3 s blip right after the call opens: heard on a normal call, dropped on a wake-started one."""
+            from fastapi.testclient import TestClient
+            heard = []
+
+            async def stt(audio):
+                heard.append(len(audio))
+                return "응"
+            globals().update(transcribe=stt, SileroVoiceActivityDetector=lambda: (
+                lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
+            blip = (np.ones(4800, np.int16) * 3000).tobytes() + np.zeros(16000, np.int16).tobytes()
+            with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
+                    f"/v1/call?session=wg{intent}&intent={intent}", headers={"Authorization": "Bearer app-tok"}) as w:
+                w.send_bytes(blip)
+                time.sleep(0.4)
+                w.send_text(json.dumps({"type": "hangup"}))
+            time.sleep(0.1)
+            return heard
         def history_check():
             """One incoming call with one spoken turn: the full link gets start, turn and end call_log events."""
             from fastapi.testclient import TestClient
@@ -4091,6 +4118,7 @@ if __name__ == "__main__":
         persona_check()
         games.update({"azel:h": {"kind": "chain", "last": "사과", "used": ["사과"]},
                       "azel:other": {"kind": "chain", "last": "기차", "used": ["기차"]}})
+        assert wake_guard_check("wake") == [] and len(wake_guard_check("chat")) == 1  # wake: louder, longer speech only
         logs = history_check()
         assert "azel:h" not in games and "azel:other" in games  # hangup ends this session's game, no other
         games.clear()
