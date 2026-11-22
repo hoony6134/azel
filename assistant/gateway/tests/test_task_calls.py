@@ -281,3 +281,50 @@ def test_the_voip_push_always_carries_a_context_label(tmp_path, monkeypatch):
         asyncio.run(g.place_call("task", "끝났어요.", context={"kind": "task", "id": "abcabcabcabc", "label": "경쟁사 조사"}))
     assert pushes[0]["context"] == {"kind": "morning_briefing", "label": "아침 브리핑"}
     assert pushes[1]["context"] == {"kind": "task", "id": "abcabcabcabc", "label": "작업 완료: 경쟁사 조사"}
+
+
+def test_a_delegated_job_keeps_the_task_running_until_it_ends(tgw, monkeypatch):
+    g, c, notes = tgw
+    polls, seen = [], []
+
+    async def round_(t, prompt, resume, deadline):  # the run hands the work to the Mac and stops
+        g.note_job(t, "macbook", '{"status": "ok", "job_id": "abcdefabcdef"}')
+        t["result"] = "맥북에서 시작했어요. 지금 진행 중이에요. 저는 전화를 직접 걸 수 없어요."
+        return None, None
+
+    async def devices():
+        return [{"id": "macbook", "url": "http://100.64.0.8:8765/mcp"}]
+
+    async def tools(devs):
+        return [], {"macbook__job_status": ("http://100.64.0.8:8765/mcp", "job_status")}
+
+    async def run_tool(block, where):
+        polls.append(block["input"]["job_id"])
+        seen.append((g.fake.db["kv"][f"task-{tid[0]}"]["status"], list(notes)))
+        done = len(polls) >= 3
+        body = {"status": "ok", "job_id": "abcdefabcdef", "job_status": "done" if done else "running",
+                "result": "연구를 마쳤어요. ~/dev/sandbox/dashboard-research.md 에 세 가지 방법을 정리했어요." if done else None}
+        return {"content": __import__("json").dumps(body, ensure_ascii=False), "is_error": False}
+    monkeypatch.setattr(g, "task_round", round_)
+    monkeypatch.setattr(g, "fresh_devices", devices)
+    monkeypatch.setattr(g, "device_tools", tools)
+    monkeypatch.setattr(g, "run_tool", run_tool)
+    monkeypatch.setattr(g, "JOB_POLL_S", 0.05)
+    tid = [None]
+    tid[0] = c.post("/v1/tasks", json={"goal": "대시보드 구현 방법 연구 맥북에서 해 줘", "notify": "call", "persona": "azel"}).json()["id"]
+    t = wait_for(c, tid[0], ("done", "failed"))
+    assert polls == ["abcdefabcdef"] * 3 and all(st == "running" and not n for st, n in seen)  # running, no call yet
+    assert t["status"] == "done" and "dashboard-research.md" in t["result"] and "전화" not in t["result"]
+    end = time.time() + 3
+    while not notes and time.time() < end:
+        time.sleep(0.02)
+    assert len(notes) == 1 and notes[0][:2] == ("call", "task")  # notified only after the job ended
+    assert any(s["kind"] == "job" for s in t["steps"]) and any(s["kind"] == "job_done" for s in t["steps"])
+
+
+def test_meta_lines_and_tool_labels(tgw):
+    g, c, notes = tgw
+    assert g.strip_meta("정리했어요. 저는 전화를 직접 걸 수 없어요. 끝나면 시스템이 알려 드릴 거예요.") == "정리했어요."
+    assert g.tool_label("macbook__delegate") == "macbook에서 작업 위임" and g.tool_label("macbook__read_file") == "macbook 파일 읽는 중"
+    assert g.tool_label("macbook__run_command") == "macbook에서 명령 실행 중" and g.tool_label("memory_recall") == "기억 찾는 중"
+    assert g.tool_label("mcp__macbook__list_dir") == "macbook 파일 보는 중" and g.tool_label("web_search") == "웹 검색 중"
