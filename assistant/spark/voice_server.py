@@ -30,6 +30,7 @@ import soundfile as sf
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
+import ko_read  # digits read out in Korean for TTS only, shipped beside this file (Dockerfile)
 import late_night  # the gateway's spoken-time rules, shipped beside this file (Dockerfile)
 
 LLM_URL = os.environ.get("LLM_URL", "http://100.64.0.11:8888/v1/chat/completions")
@@ -67,7 +68,7 @@ SYSTEM_BODY = (
     "'네'나 '알겠습니다'만 하고 끝내지 마. 사용자의 일정, 할 일, 마감, 메일은 절대 짐작하거나 지어내지 마. "
     "전화, 예약, 알림, 실행, 전송 같은 행동은 이번 대화에서 도구 결과로 확인됐을 때만 했다거나 하겠다고 말해. 너 혼자서는 예약할 수 "
     "없으니, 도구가 없으면 할 수 없다고 하고 다시 물어봐. "
-    "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자와 단위는 읽기 쉽게 말해. "
+    "마크다운, 목록, 이모지, 괄호 설명, URL은 쓰지 마. 숫자는 한글로 풀어 쓰지 말고 아라비아 숫자와 단위로 써(1,333원, 2도, 18.5%, 3시 30분). "
     "도구 결과의 영어 상태어(firing, resolved, pending, DOWN, critical 같은 것), 키 이름, 기호는 그대로 읽지 말고 "
     "'경보가 울리고 있는', '해결된', '멈춘'처럼 자연스러운 한국어로 바꿔 말해. 서버 이름은 그대로 말해. "
     f"중요: 답하려면 실제 데이터나 도구가 필요하면(일정, 할 일, 과제, 수업, 메일, 서버 상태, 예전에 한 말이나 기억, "
@@ -809,7 +810,8 @@ def gateway_tools_text(defs):
                "불러. 결과에 없는 사실은 지어내지 마. '기억해', '잊지 마'라고 하면 remember로 저장하고 결과 문장을 그대로 말해."
                if "memory_recall" in names else "")
             + ("\n날씨는 weather로(장소를 말하지 않으면 place는 비워)." if "weather" in names else "")
-            + ("\n뉴스, 주가, 환율, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '네이버 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
+            + ("\n주가와 환율은 stock_quote로(query는 회사 영어 이름이나 티커, 환율이면 '달러 환율')." if "stock_quote" in names else "")
+            + ("\n뉴스, 가격처럼 지금 정보는 web_search로 찾아. 출처는 '네이버 기준으로'처럼 사이트 이름만 말하고 주소는 읽지 마."
                if "web_search" in names else "")
             + "\n'찾아볼게요'라고만 하고 끝내지 마: 찾을 거면 바로 도구를 불러.")
 
@@ -1146,7 +1148,8 @@ LIVE_Q = re.compile(r"환율|주가|시세|가격|금리|유가|코스피|코스
 # a figure, in digits or in words ("천삼백삼십 원"): Qwen writes numbers both ways
 FIGURE = re.compile(r"\d|[일이삼사오육칠팔구십백천만억]{2,}\s*(원|달러|엔|도|퍼센트|%)")
 TOOL_NUDGE = (f"방금 찾아보겠다고만 하고 도구를 부르지 않았어. 지금 바로 도구를 불러: 다른 말 없이 {TOOL_TAG} "
-              '{"name": "도구 이름", "args": {…}} 한 줄만 출력해. 날씨는 weather, 그 밖의 지금 정보(주가, 환율, 가격, 뉴스)는 web_search.')
+              '{"name": "도구 이름", "args": {…}} 한 줄만 출력해. 날씨는 weather, 주가와 환율은 stock_quote, 그 밖의 지금 정보(가격, 뉴스)는 '
+              'web_search.')
 RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일을 한 도구가 없었어. 하지 않은 일을 했다고 하지 말고, 그 말은 빼고 "
                       "이어서 자연스럽게 다시 말해. 이미 한 말은 반복하지 마.",
            "personal": "방금 '{s}'라고 했는데, 사용자의 일정이나 개인 정보는 확인된 게 없어. 지어내지 말고 그 말은 빼고 이어서 "
@@ -1253,11 +1256,36 @@ def needs_answer(text):
     return bool(QUESTION.search(t)) and not TRIVIAL.fullmatch(t)
 
 
+# Qwen's own chat-template tool call, seen live 2026-11-22 instead of the [TOOL] line (and spoken aloud):
+#   <tool_call> <function=weather> <parameter=place> 광주 </parameter> </function> </tool_call>
+# or with JSON inside: <tool_call>{"name": "weather", "arguments": {"place": "광주"}}</tool_call>
+NATIVE_TAG = "<tool_call>"
+
+
+def native_call(text):
+    """The [TOOL] line for Qwen's native tool-call markup, or None."""
+    body = text.split(NATIVE_TAG, 1)[-1].split("</tool_call>")[0]
+    if m := re.search(r"<function=([\w-]+)>", body):
+        args = {}
+        for k, v in re.findall(r"<parameter=([\w-]+)>\s*(.*?)\s*</parameter>", body, re.S):
+            try:
+                args[k] = json.loads(v)
+            except ValueError:
+                args[k] = v
+        return TOOL_TAG + " " + json.dumps({"name": m[1], "args": args}, ensure_ascii=False)
+    try:
+        d = json.loads(body[body.index("{"):body.rindex("}") + 1])
+        return TOOL_TAG + " " + json.dumps({"name": d.get("name"), "args": d.get("arguments") or d.get("args") or {}},
+                                           ensure_ascii=False)
+    except ValueError:
+        return None
+
+
 def hold_tag_prefix(buf):
     """(speakable text, held tail): a tail that could still grow into the routing tag is never spoken early."""
-    at = buf.rfind("[")
+    at = max(buf.rfind("["), buf.rfind("<"))
     tail = buf[at:].rstrip()
-    if at != -1 and (ROUTE_TAG.startswith(tail) or TOOL_TAG.startswith(tail)) and len(buf) - at < len(ROUTE_TAG) + 2:
+    if at != -1 and any(t.startswith(tail) for t in (ROUTE_TAG, TOOL_TAG, NATIVE_TAG)) and len(buf) - at < len(ROUTE_TAG) + 2:
         return buf[:at], buf[at:]
     return buf, ""
 
@@ -1267,9 +1295,9 @@ def tag_state(head):
     'maybe' = too short to tell, 'no' = speak it."""
     if head.startswith(ROUTE_TAG):
         return "tag"
-    if head.startswith(TOOL_TAG):
+    if head.startswith((TOOL_TAG, NATIVE_TAG)):
         return "tool"
-    return "maybe" if ROUTE_TAG.startswith(head) or TOOL_TAG.startswith(head) else "no"
+    return "maybe" if any(t.startswith(head) for t in (ROUTE_TAG, TOOL_TAG, NATIVE_TAG)) else "no"
 
 
 def token_label(got: str, labels=("client",)):
@@ -1768,6 +1796,7 @@ def gap_free(now, buffered_s, pending, inflight=None):
 
 
 async def tts(sentence: str) -> tuple[bytes, int]:
+    sentence = ko_read.speakable(sentence)  # "1,333원" is captioned as written and spoken "천삼백삼십삼 원"
     p = CALL_PERSONA.get() or {}  # the call's persona: its speaker and optional style instruction
     voice, style = p.get("voice") or TTS_VOICE, p.get("voice_style") or ""
     # Fillers and short openers ("네, 알겠습니다.") repeat constantly: synthesize them once (per voice). Under
@@ -2000,12 +2029,14 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                     buf = buf.split(ROUTE_TAG)[0]
                                     break
                                 return await via_claude()
-                            if TOOL_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call, never say it
-                                before, _, after = buf.partition(TOOL_TAG)
+                            if TOOL_TAG in buf or NATIVE_TAG in buf:  # "찾아볼게요. [TOOL] {…}": say the words, collect the call
+                                tag = TOOL_TAG if TOOL_TAG in buf and (NATIVE_TAG not in buf or buf.index(TOOL_TAG) <
+                                                                       buf.index(NATIVE_TAG)) else NATIVE_TAG
+                                before, _, after = buf.partition(tag)
                                 for x in split_ready(before, final=True)[0]:
                                     said_round.append(x)
                                     await say(x)
-                                buf, state = TOOL_TAG + after, "tool"
+                                buf, state = tag + after, "tool"
                                 continue
                             speak, held = hold_tag_prefix(buf)  # a trailing "[CLA" might become the tag: keep it back
                             done, rest = split_ready(speak, final=False)
@@ -2022,7 +2053,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                             async def tool_say(text):  # "앱에서 허용해 주세요" while an approval is pending
                                 said_round.append(text)
                                 await sentences.put(text)
-                            line = buf.strip().split("\n")[0]
+                            line = (native_call(buf) or "") if NATIVE_TAG in buf else buf.strip().split("\n")[0]
                             for x in announced:  # "찾아볼게요" as the filler while the tool runs
                                 await sentences.put(x)
                             announced.clear()
@@ -2062,10 +2093,12 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                             continue
                         names = {t["name"] for t in gw_defs}  # twice: look it up for Qwen, then let it answer
                         pick_ = "weather" if WEATHER_Q.search(bare) and "weather" in names else \
+                            "stock_quote" if re.search(r"주가|주식|종가|환율", bare) and "stock_quote" in names else \
                             "web_search" if "web_search" in names else None
                         if pick_:
                             line = TOOL_TAG + " " + json.dumps({"name": pick_, "args": {} if pick_ == "weather" else
-                                                                {"query": bare[:200]}}, ensure_ascii=False)
+                                                                {"query": bare[:60 if pick_ == "stock_quote" else 200]}},
+                                                               ensure_ascii=False)
                             looked.append(line)
                             result = await run_tool(line, session, None)
                             timings.setdefault("tools", []).append(0)
@@ -3415,6 +3448,7 @@ if __name__ == "__main__":
         assert not grounded("오전 열 시에 팀 회의가 있어요.", "[일정·마감, 오늘 19:51 확인]\n- 내일 23:00 토론지 마감")
         assert not grounded("내일 일정은 두 건이에요.", "") and grounded("물은 백 도에서 끓어요.", "")
         assert grounded("지금은 오후 열한 시예요.", "")  # the clock is not a plan
+        ko_read.check()  # digits → Korean speech before TTS
         for chat in ("내일 일정이 빡빡하시면 일찍 주무세요.", "오늘 수업 어땠어?", "나 내일 수업 있어.", "과제 같이 할래?",
                      "시험 끝나면 놀러 가자."):
             assert grounded(chat, ""), chat  # chatter, not a claim about the user's plans
@@ -4795,6 +4829,22 @@ if __name__ == "__main__":
             assert ran == [{"name": "web_search", "args": {"query": "원달러 환율"}}]  # the guess was never said
             assert not LIVE_Q.search("3 더하기 4는 얼마야?") and LIVE_Q.search("삼성전자 주가 알려줘")
             assert FIGURE.search("약 천삼백십 원대예요.") and not FIGURE.search("오늘 이야기해 볼게요.")
+            # Qwen's native tool-call markup (live 2026-11-22: it was spoken aloud): run it, never say it
+            assert json.loads(native_call("<tool_call> <function=weather> <parameter=place> 광주 </parameter> "
+                                          "<parameter=when> now </parameter> </function> </tool_call>")[len(TOOL_TAG):]) == \
+                {"name": "weather", "args": {"place": "광주", "when": "now"}}
+            assert json.loads(native_call('<tool_call>{"name": "web_search", "arguments": {"query": "환율"}}</tool_call>')
+                              [len(TOOL_TAG):]) == {"name": "web_search", "args": {"query": "환율"}}
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["<tool_call> <function=weather> <parameter=place> 광주 </parameter> "
+                                                 "</function> </tool_call>", "지금 광주는 8도예요."])
+            said = asyncio.run(run("광주 날씨 알려줄래?", "s"))
+            assert ran == [{"name": "weather", "args": {"place": "광주"}}] and [x for x, _ in said] == ["지금 광주는 8도예요."], said
+            ann.clear(), ran.clear()
+            globals()["llm_stream"] = announcer(["확인해 볼게요. <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>",
+                                                 "맑아요."])
+            said = asyncio.run(run("서울 날씨 어때?", "s"))
+            assert ran == [{"name": "weather", "args": {}}] and not any("<" in x for x, _ in said), said
             gw_tools.clear(), gw_tools.update(saved_tools)
             globals()["run_tool"] = saved_run
             globals()["llm_stream"] = fake_llm
