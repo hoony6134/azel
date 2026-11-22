@@ -85,3 +85,15 @@ def test_a_pending_task_approval_reaches_its_live_activity(gw, monkeypatch):  # 
     assert c.post(f"/v1/approvals/{aid}", json={"decision": "once"}).status_code == 200
     kind, payload, _ = next(x for x in sent if x[0] == "liveactivity")
     assert t["status"] == "running" and "approval" not in payload["aps"]["content-state"]
+
+
+def test_recent_calls_answer_what_a_missed_call_was_about(gw):  # noqa: F811
+    """Live 2026-11-22 21:50: "전화 못 받았는데 방금 무슨 용건이었어?" was searched in memory and not found."""
+    import asyncio
+    g, _, _ = gw
+    asyncio.run(g.remember_placed("c1", "autonomous", "토론지 확인", "대표님, 토론지 업로드가 확인되지 않아 전화드렸어요."))
+    asyncio.run(g.remember_placed("c2", "task", "작업 끝남", "맡기신 보고서가 끝났어요."))
+    asyncio.run(g.call_answered("c2"))
+    r = asyncio.run(g.bridge.run("recent_calls", {}, caller="qwen"))
+    assert r["ok"] and "토론지 확인 (못 받음)" in r["spoken"] and "작업 끝남 (받음)" in r["spoken"]
+    assert r["spoken"].index("작업 끝남") < r["spoken"].index("토론지")  # newest first

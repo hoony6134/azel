@@ -31,6 +31,7 @@ CASES = {
     "create_task": ("맥북 다운로드 폴더 정리하는 거 작업으로 맡길게, 끝나면 알려줘", "model"),
     "task_status": ("아까 맡긴 작업 어떻게 됐어?", "model"),
     "overnight_list": ("밤새 하기로 한 거 뭐 있어?", "model"),
+    "recent_calls": ("전화 못 받았는데 방금 무슨 용건이었어?", "model"),
     "task_cancel": ("작업 a00000000001 그만해", "model"),
     "approval_status": ("승인 기다리는 거 있어?", "model"),
     "memory_recall": ("내가 좋아하는 커피 뭐였지?", "model"),

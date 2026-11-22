@@ -159,6 +159,10 @@ DEVICE_WORK = re.compile(r"맥북|macbook|맥에서|서버|스파크|spark|코�
 SAYS_AUTO = re.compile(r"자동(으로|\s*승인)|알아서\s*(승인|허용|진행|해)|묻지\s*말고|물어보지\s*말고")
 SAYS_ASK = re.compile(r"물어(보고|봐\s*줘|보면서)|그때(마다|그때)|하나(하나|씩)\s*(물어|확인)|승인\s*받고")
 TASK_APPROVE_DEFAULTS = ("ask", "auto", "ask_each")
+RECENT_CALLS = {"name": "recent_calls", "description": (
+    "비서가 사용자에게 건 최근 전화(24시간): 언제, 무슨 용건으로, 첫마디, 받았는지. '방금 왜 전화했어?', '못 받은 전화 "
+    "무슨 일이었어?'에 쓴다. 기억 검색이 아니라 이걸 써."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
 OVERNIGHT_LIST = {"name": "overnight_list", "description": "밤사이 하기로 맡긴 작업 목록과 상태('밤새 할 거 뭐 있어?', '어젯밤 맡긴 거').",
                   "input_schema": {"type": "object", "additionalProperties": False, "properties": {}}}
 
@@ -345,6 +349,13 @@ class Bridge:
             return say, view
         if name == "approval_status":
             return await self.approval_status(args)
+        if name == "recent_calls":
+            rows = await self.d["recent_calls"]()
+            if not rows:
+                return "최근 24시간 동안 제가 건 전화는 없어요.", []
+            lines = [f"{self.now().fromtimestamp(r['at'], self.now().tzinfo):%H:%M} {r.get('label') or r['reason']} "
+                     f"({'받음' if r.get('answered') else '못 받음'}): {r.get('opening', '')[:200]}" for r in rows[:6]]
+            return "\n".join(lines), rows
         if name == "overnight_list":
             items = await self.d["overnight_list"]()
             if not items:
@@ -1217,7 +1228,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1249,6 +1260,8 @@ ACTIONS = {
                     "rest": ("GET", "/v1/tasks/{id}"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
     "task_cancel": {"read_only": False, "scopes": ("internal", "qwen", "app"),
                     "rest": ("POST", "/v1/tasks/{id}/cancel"), "examples": ({"id": "{task}"}, {"id": "000000000000"})},
+    "recent_calls": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                     "no_rest": "앱에는 통화 기록 화면이 따로 있어요.", "examples": ({}, {"x": 1})},
     "overnight_list": {"read_only": True, "scopes": ("internal", "qwen", "app"),
                        "rest": ("GET", "/v1/tasks/overnight"), "examples": ({}, {"x": 1})},
     "approval_status": {"read_only": True, "scopes": ("internal", "qwen", "app"),
