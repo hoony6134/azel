@@ -1208,6 +1208,21 @@ def with_title(opening, title):
     return f"{title}, {opening}"
 
 
+CALL_LABELS = {"morning_briefing": "아침 브리핑", "deadline": "마감 알림", "server_down": "서버 알림", "wake": "깨우기",
+               "task_approval": "승인 필요"}
+LABEL_PREFIX = {"task": "작업 완료: ", "reminder": "알림: "}
+LABEL_MAX = 14
+
+
+def call_label(reason, hint=""):
+    """The CallKit caller line's label ("<persona> · <label>"): fixed for briefings, deadlines, alerts, wake-ups and
+    approvals; "작업 완료: …" / "알림: …" from the purpose; otherwise the reason. At most LABEL_MAX characters."""
+    if reason in CALL_LABELS:
+        return CALL_LABELS[reason]
+    text = LABEL_PREFIX.get(reason, "") + re.sub(r"\s+", " ", strip_marks(str(hint or reason or ""))).strip()
+    return text if len(text) <= LABEL_MAX else text[:LABEL_MAX - 1].rstrip() + "…"
+
+
 async def place_call(reason, opening=None, call_id=None, persona_id=None, origin_session=None, context=None,
                      detail=None):
     """Ring the phone as a persona (the primary by default: briefings, deadlines, alerts, autonomous calls).
@@ -1233,8 +1248,11 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
                      "persona": persona["id"], **({"origin_session": origin_session} if origin_session else {}),
                      **({"context": context} if context else {}),
                      **({"detail": detail[:4000]} if detail else {})})  # what follow-up questions are answered from
-    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],
-                                 "persona": persona["id"], **({"context": context} if context else {})})
+    kind = (context or {}).get("kind") or ("task" if reason.startswith("task") else
+                                           "schedule" if reason in ("wake", "reminder") else reason)
+    caller_ctx = {**(context or {}), "kind": kind, "label": call_label(reason, (context or {}).get("label"))}
+    push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],  # every call is labeled
+                                 "persona": persona["id"], "context": caller_ctx})
     return {"call_id": call_id, **push}
 
 
@@ -1555,7 +1573,8 @@ async def autonomous_tick(now_dt, a):
     if blocked is None:  # write the row first: if it cannot be recorded, the cap cannot count it, so no call
         entry["call_id"] = uuid.uuid4().hex
         await state.call("POST", "/v1/state/proactive_log", entry)
-        await place_call("autonomous", decision["opening"] or decision["reason"], call_id=entry["call_id"])
+        await place_call("autonomous", decision["opening"] or decision["reason"], call_id=entry["call_id"],
+                         context={"kind": "autonomous", "label": decision["reason"]})
         return entry
     await state.call("POST", "/v1/state/proactive_log", entry)
     return entry
@@ -3112,7 +3131,7 @@ TASK_MAX_ROUNDS = 4  # one approval wait per round
 TASK_STATUSES = ("queued", "running", "waiting_approval", "done", "failed", "cancelled")
 TASK_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로"
               " 요약해. 도구가 pending_approval을 돌려주면 그 명령을 다시 시도하지 말고 'APPROVAL_PENDING <approval_id>'"
-              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+              "라고만 쓰고 멈춰. 사용자의 승인 결과를 받으면 이어서 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
 PENDING_RE = re.compile(r'"?status"?\s*[:=]\s*"?pending_approval"?.{0,80}?"?approval_id"?\s*[:=]\s*"?([\w-]{2,64})', re.S)
 task_slots = asyncio.Semaphore(TASK_SLOTS)
 task_runs: dict[str, asyncio.Task] = {}  # tasks this gateway is running
@@ -3208,10 +3227,9 @@ async def task_create(body, source="api"):
          "finished": None, "owner": DEVICE, "source": source, "steps": [], "result": None, "error": None,
          "cost_usd": 0.0, "cancel_requested": False, "origin_session": origin_ctx.get() or None}
     dev = next((d for d in await fresh_devices() if d["id"] == spec["device"]), None) if spec["device"] else None
-    if dev and dev.get("limited") and WRITES.search(spec["goal"]):  # the user's pick stands; say what it can't do
+    if dev and dev.get("limited") and WRITES.search(spec["goal"]):  # the user's pick stands; say how it works there
         word = DEVICE_WORD.get(dev["id"], dev["id"])
-        t["note"] = (f"{word}는 읽기·진단만 되는 기기라 결과를 저장하거나 고치는 건 못 해요. 맥북에서 할까요? "
-                     "우선 거기서 할 수 있는 것부터 해 볼게요.")
+        t["note"] = f"{word}에서 할게요. 바꾸는 명령은 앱에서 승인해 주시면 진행돼요."
     task_runs[t["id"]] = None  # reserved: the queued-task watcher must not start it a second time meanwhile
     try:
         await task_save(t)
@@ -3245,11 +3263,11 @@ async def task_backend_for(spec, settings):
 
 def task_prompt(t, devices):
     where = (f"작업 기기: {t['device']}." if t["device"] else
-             "작업 기기는 기본 순서대로 고르되, 파일 저장·수정·설치처럼 쓰는 일은 한도 기기 말고 전체 권한 기기(맥북)에서 해.")
+             "작업 기기는 기본 순서대로 고르되, 파일 저장·수정·설치처럼 쓰는 일은 전체 권한 기기(맥북)를 우선해.")
     limited = [d["id"] for d in devices if d.get("limited")]
-    note = f" 한도 기기(읽기·진단만): {', '.join(limited)}." if limited else ""
+    note = f" 한도 기기(팀 기기: 바꾸는 명령은 승인을 받아야 하고 delegate는 안 됨): {', '.join(limited)}." if limited else ""
     if t["device"] and t["device"] in limited:
-        note += " 사용자가 이 한도 기기를 골랐어: 거기서는 읽기·진단만 하고, 저장할 결과는 작업 결과(텍스트)로 돌려줘."
+        note += " 사용자가 이 한도 기기를 골랐어: 거기서 해. 바꾸는 명령은 승인을 받고 해."
     note += " 전화·알림·예약은 하지 마: 끝나면 정해진 방법으로 알리는 건 시스템이 해."
     return f"{where}{note}\n\n목표: {t['goal']}"
 
@@ -3630,7 +3648,8 @@ async def task_cancel(tid):
     return task_view(await state.call("GET", task_key(tid)) or t, steps=False), "작업을 멈췄어요."
 
 
-DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크"}
+DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크",
+               "core": "코어"}
 
 
 async def serve_task(m):
@@ -3702,7 +3721,7 @@ GOOGLE_STYLE = ("메일과 캘린더는 calendar_events, gmail_search, gmail_rea
                 "말하지 마.")
 TASK_API_STYLE = (" 지금은 통화가 아니라 백그라운드 작업이야. 목표를 끝까지 스스로 처리하고, 마지막에 결과를 두세 문장으로 요약해. "
                   "허용이 필요한 명령은 도구가 사용자의 허용을 기다렸다가 결과를 돌려줘. 거절되면 그 명령 없이 할 수 있는 만큼 해. "
-                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기에는 읽기와 진단만 해.")
+                  "여러 명령을 이어 붙이지 말고 하나씩 결과를 보며 해. 한도(limited) 기기(팀 기기)도 바꾸는 명령(재시작 등)은 승인을 받으면 할 수 있어. 거기선 delegate는 쓰지 마.")
 bridge = tools_bridge.Bridge(
     who=lambda: requester_ctx.get(),  # the run (ask:<session> | task:<id>): the prompt-injection guard's key
     fresh_devices=lambda: fresh_devices(), device_tools=lambda d: device_tools(d), run_tool=lambda b, w: run_tool(b, w),

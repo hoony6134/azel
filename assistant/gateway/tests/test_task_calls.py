@@ -129,4 +129,35 @@ def test_a_limited_device_the_user_picked_says_what_it_cannot_do(tgw, monkeypatc
     monkeypatch.setattr(g, "fresh_devices", devices)
     r = c.post("/v1/tasks", json={"goal": "코어에서 창업 아이템 리서치 해 줘", "device": "core", "notify": "none"})
     assert r.status_code == 201, r.text
-    assert "읽기·진단만" in (r.json().get("note") or "") and r.json()["device"] == "core"  # the pick stands
+    assert "승인" in (r.json().get("note") or "") and r.json()["device"] == "core"  # the pick stands; changes need approval
+
+
+def test_every_placed_call_is_labeled_for_callkit(tgw, monkeypatch):
+    g, c, notes = tgw
+    for reason, hint, want in [("morning_briefing", None, "아침 브리핑"), ("deadline", None, "마감 알림"),
+                               ("server_down", None, "서버 알림"), ("wake", "아침 7시", "깨우기"),
+                               ("task_approval", "정리", "승인 필요"), ("task", "경쟁사 조사", "작업 완료: 경쟁사 조사"),
+                               ("reminder", "약 먹기", "알림: 약 먹기"), ("autonomous", "토론지 마감", "토론지 마감")]:
+        assert g.call_label(reason, hint) == want, reason
+    assert len(g.call_label("task", "아주 긴 창업 아이템 경쟁사 리서치와 정리")) <= 14
+    assert g.call_label("task", "**경쟁사** 조사").startswith("작업 완료: 경쟁사")  # no markdown on the lock screen
+
+
+def test_the_voip_push_always_carries_a_context_label(tmp_path, monkeypatch):
+    from test_gateway import TestClient, start
+    g = start(tmp_path, monkeypatch, BISEO_DEVICE="macbook")
+    pushes = []
+
+    async def voip(payload):
+        pushes.append(payload)
+        return {"sent": 1}
+
+    async def link_send(m):
+        pass
+    monkeypatch.setattr(g, "send_voip_push", voip)
+    monkeypatch.setattr(g, "link_send", link_send)
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}):
+        asyncio.run(g.place_call("morning_briefing", "좋은 아침이에요."))
+        asyncio.run(g.place_call("task", "끝났어요.", context={"kind": "task", "id": "abcabcabcabc", "label": "경쟁사 조사"}))
+    assert pushes[0]["context"] == {"kind": "morning_briefing", "label": "아침 브리핑"}
+    assert pushes[1]["context"] == {"kind": "task", "id": "abcabcabcabc", "label": "작업 완료: 경쟁사 조사"}
