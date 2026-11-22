@@ -183,6 +183,7 @@ def test_delegate_token_only_for_the_delegate(cfg, monkeypatch, tmp_path):
 
     monkeypatch.setattr(d.subprocess, "run", fake_run)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    d.CFG["claude_token_file"] = str(tmp_path / "missing")  # never read the real ~/.config token in tests
     wait(d.delegate(task="a", cwd="proj")["job_id"])  # no token file: nothing is added
     tok = tmp_path / "claude_oauth_token"
     tok.write_text("long-lived-token\n")
