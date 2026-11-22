@@ -123,6 +123,7 @@ final class CallClient {
             if holdFrame(data) { return }   // the wake handoff: waits until the listener's recording is sent
             let action = sending ? Self.micAction(muted: muted, held: held) : .drop
             if action == .send {
+                micSent()
                 task?.send(.data(data)) { error in if let error { Log.call.error("mic send failed: \(error.localizedDescription, privacy: .public)") } }
                 let p = Self.peak(data)
                 statsLock.lock(); sentBytes += data.count; sentPeak = max(sentPeak, p); statsLock.unlock()
@@ -285,16 +286,34 @@ final class CallClient {
     private var timing = CallTiming()
     private let timingLock = NSLock()
 
-    func beginTiming(_ source: String) { timingLock.lock(); timing.begin(source); timingLock.unlock() }
+    func beginTiming(_ source: String) {
+        timingLock.lock(); timing.begin(source); lastMicAt = nil; micGapMax = 0; timingLock.unlock()
+    }
 
     /// Starts timing unless the wake handoff just began it for this call (begun, nothing marked yet).
     func beginTimingIfIdle(_ source: String) {
-        timingLock.lock(); if !timing.justBegun { timing.begin(source) }; timingLock.unlock()
+        timingLock.lock(); if !timing.justBegun { timing.begin(source); lastMicAt = nil; micGapMax = 0 }; timingLock.unlock()
     }
 
     func markTiming(_ name: String) { timingLock.lock(); timing.mark(name); timingLock.unlock() }
 
+    /// Mic flow for the timing line (Mac turn-end bug, 2026-11-23: the server ended turns ~17 s late,
+    /// most likely because no mic frames arrived after the user spoke): the first frame sent and
+    /// the longest pause between two sent frames, with when it began.
+    private var lastMicAt: Double?
+    private var micGapMax = 0.0, micGapAt = 0.0
+
+    private func micSent(now: Double = ProcessInfo.processInfo.systemUptime) {
+        timingLock.lock(); defer { timingLock.unlock() }
+        timing.mark("mic_first", now: now)
+        if let last = lastMicAt, now - last > micGapMax { micGapMax = now - last; micGapAt = last }
+        lastMicAt = now
+    }
+
     private func logTiming() {
+        timingLock.lock()
+        if micGapMax > 0 { timing.note("mic_gap_max", ms: Int(micGapMax * 1000), at: micGapAt) }
+        timingLock.unlock()
         timingLock.lock(); let line = timing.takeLine(); timingLock.unlock()
         if let line { Log.call.notice("call timing \(line, privacy: .public)") }
     }
@@ -658,7 +677,14 @@ struct CallTiming {
 
     var justBegun: Bool { t0 != nil && marks.isEmpty && !logged }
 
-    var line: String { "\(source): " + marks.map { "\($0.0)=\($0.1)" }.joined(separator: " ") }
+    /// A measurement that isn't a moment: "mic_gap_max=17000@1900" (ms, and when it began).
+    mutating func note(_ name: String, ms: Int, at: Double) {
+        guard let t0 else { return }
+        extra.append("\(name)=\(ms)@\(Int(((at - t0) * 1000).rounded()))")
+    }
+    private var extra: [String] = []
+
+    var line: String { "\(source): " + (marks.map { "\($0.0)=\($0.1)" } + extra).joined(separator: " ") }
 
     /// The line once (at the first reply audio, or at hangup if none came).
     mutating func takeLine() -> String? {
