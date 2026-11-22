@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<component name="Logo" extends="Group">
+    <interface>
+        <field id="tint" type="string" value="0x82CBB4FF" onChange="onTint" />
+        <field id="inCall" type="boolean" value="false" onChange="onMode" />
+        <field id="active" type="boolean" value="true" onChange="onMode" />
+    </interface>
+    <script type="text/brightscript" uri="pkg:/components/Logo.brs" />
+    <children>
+        <Group id="g" scaleRotateCenter="[32,38]">
+            <Poster id="body" uri="pkg:/images/orb_body.png" width="64" height="64" />
+            <Poster id="rim" uri="pkg:/images/orb_rim.png" width="64" height="64" blendColor="0x82CBB4FF" />
+            <Poster id="light" uri="pkg:/images/orb_light.png" translation="[9,8]" width="26" height="22" opacity="0" />
+        </Group>
+        <Animation id="breath" duration="4.6" repeat="true" easeFunction="inOutCubic">
+            <Vector2DFieldInterpolator id="breathI" fieldToInterp="g.scale" key="[0.0, 0.5, 1.0]" keyValue="[[0.975, 0.975], [1.025, 1.025], [0.975, 0.975]]" />
+        </Animation>
+        <Animation id="sway" duration="9" repeat="true" easeFunction="inOutCubic">
+            <FloatFieldInterpolator id="swayI" fieldToInterp="g.rotation" key="[0.0, 0.5, 1.0]" keyValue="[-0.026, 0.026, -0.026]" />
+        </Animation>
+        <Animation id="shim" duration="1.6" repeat="false" easeFunction="inOutQuad">
+            <Vector2DFieldInterpolator id="shimP" fieldToInterp="light.translation" key="[0.0, 1.0]" keyValue="[[9, 8], [28, 26]]" />
+            <FloatFieldInterpolator id="shimO" fieldToInterp="light.opacity" key="[0.0, 0.5, 1.0]" keyValue="[0.0, 0.35, 0.0]" />
+        </Animation>
+        <Timer id="shimT" duration="10" repeat="true" />
+    </children>
+</component>

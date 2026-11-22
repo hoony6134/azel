@@ -134,8 +134,9 @@ class Cygnus:
             "Authorization": f"Bearer {pat}", "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json"})
 
-    async def call(self, name, args):
-        key = (name, json.dumps(args, sort_keys=True))
+    async def call(self, name, args, raw=False):
+        """`raw`: the tool's own text, neither made speakable nor trimmed to a prompt (for code that parses it)."""
+        key = (name, json.dumps(args, sort_keys=True), raw)
         hit = self.cache.get(key)
         if hit and time.monotonic() - hit[0] < CACHE_S:
             return hit[1]
@@ -153,7 +154,7 @@ class Cygnus:
             raise RuntimeError(str(msg["error"].get("message", "MCP error"))[:120])
         res = msg["result"]
         text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text").strip()
-        out = trim(speakable(text) if text else "(결과 없음)")
+        out = text if raw else trim(speakable(text) if text else "(결과 없음)")
         if res.get("isError"):
             return f"Cygnus가 거절했어요: {out[:200]}"
         if len(self.cache) > 200:
@@ -191,7 +192,7 @@ def tools(shared=True):
     return tool_defs([n for n in TOOLS if shared or n not in SHARED_ONLY]) if available() else []
 
 
-async def call(name, args):
+async def call(name, args, raw=False):
     """Run one Cygnus tool for a model; always a short string, never an exception."""
     global _shared_client
     if name not in TOOLS:
@@ -207,7 +208,7 @@ async def call(name, args):
         _shared_client = Cygnus(os.environ.get("BRAIN_CYGNUS_URL", "https://mcp.scian.xyz"),
                                 _pat_file().read_text().strip())
     try:
-        return await _shared_client.call(name, checked)
+        return await _shared_client.call(name, checked, raw)
     except (PermissionError, RuntimeError, httpx.HTTPError) as e:
         return f"지금은 Cygnus를 볼 수 없어요. ({type(e).__name__})"
 

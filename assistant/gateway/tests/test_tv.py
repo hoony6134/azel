@@ -86,3 +86,104 @@ def test_tv_token_opens_only_the_tv_route(gw):
     assert c.get("/v1/tv", headers={"Authorization": "Bearer short"}).status_code == 401
     assert c.get("/v1/tv", headers={"Authorization": "Bearer nope"}).status_code == 401
     assert c.get("/v1/tv").json().keys() >= {"at", "infra", "tasks", "calls", "assistant"}  # the full token works too
+
+
+HEALTH = """As of 2026-11-22 13:27 KST (cpu = 5-min avg, disk = /)
+✓ albireo [cygnus] cpu 0% · mem 69% · disk 15% · load 0.05/2 · uptime 142d
+✓ fawaris [cygnus] cpu 2% · mem 50% · disk 29% · 74°C · load 0.14/4 · uptime 23d
+✗ gienah [cygnus] DOWN"""
+STATUS = """# Cygnus · Ops (internal)
+## vd-spark · Vuja De GPU
+  ✗ Vuja De claw (NemoClaw) (http) DOWN · 24h 0.00%"""
+ASSIGN = """스냅샷: 11월 22일 (일) 11:08
+
+## 남은 항목 (7)
+- ⬜ 11월 22일 (일) 23:00 · 역사학특강 — 12주차 토론지 제출 [과제]
+- ⬜ 11월 23일 (월) 23:59 · 컴파일러 프로젝트 [할 일]
+- ⬜ 11월 23일 (월) 23:59 · 과기사관 — 공결 확인서 전송 메일 [할 일]
+- ⬜ 마감 없음 · 대외부 — 대외부장 인수인계 기록지 작성 [할 일]"""
+TODAY = """## 2026-11-22 기준
+
+### 수업
+- 13:00~14:15 · 자료구조 · 대학 A동 212호
+
+### 7일 안 마감
+- 11월 22일 (일) 23:00 · 역사학특강 — 12주차 토론지 제출"""
+CAL = """캘린더 2026-11-22~2026-11-22 (KST)
+- 11/22(Sun) 19:00~20:00 연구실 회의 @ 대학 B동
+- 2026-11-22 종일 듀오링고"""
+SUNDAY = 1_795_000_000  # any instant: only the year logic uses it
+
+
+def test_v2_parsers_on_real_cygnus_text():
+    nodes = tv.parse_nodes(HEALTH, NOW)
+    assert nodes[0] == {"name": "albireo", "up": True, "seen": "2026-11-22T13:27:00+09:00", "cpu": 0, "ram": 69, "disk": 15, "temp": None}
+    assert nodes[1]["temp"] == 74 and nodes[2]["up"] is False and nodes[2]["cpu"] is None and nodes[2]["seen"] is None
+    assert tv.parse_down(STATUS) == [{"service": "Vuja De claw (NemoClaw)", "node": "vd-spark", "since": None}]
+    assert tv.parse_alerts("No firing alerts.") == []
+    a = tv.parse_alerts("deneb disk 91% (warning)\nCRITICAL: gienah down")
+    assert [x["level"] for x in a] == ["warn", "crit"] and [x["head"] for x in a] == ["디스크 부족", "응답 없음"]
+    assign, todos = tv.parse_assignments(ASSIGN, NOW)
+    assert assign == [{"title": "12주차 토론지 제출", "course": "역사학특강", "due": assign[0]["due"]}]
+    assert assign[0]["due"].endswith("-11-22T23:00:00+09:00")
+    assert [t["text"] for t in todos] == ["컴파일러 프로젝트", "과기사관 — 공결 확인서 전송 메일", "대외부 — 대외부장 인수인계 기록지 작성"]
+    assert todos[0]["due"].endswith("-11-23T23:59:00+09:00") and todos[2]["due"] is None
+    assert tv.parse_classes(TODAY) == [{"start": "13:00", "end": "14:15", "name": "자료구조", "room": "대학 A동 212호"}]
+    assert tv.parse_classes("### 수업\n없음\n") == []
+    assert tv.parse_calendar(CAL) == [{"start": "19:00", "end": "20:00", "what": "연구실 회의"},
+                                      {"start": "종일", "end": None, "what": "듀오링고"}]
+
+
+def deps2(**over):
+    async def raw(n, a=None):
+        return {"infra_health": HEALTH, "infra_status": STATUS, "infra_alerts": "No firing alerts.",
+                "gistra_assignments": ASSIGN, "gistra_today": TODAY}[n]
+
+    async def persona2():
+        return {"name": "세레나", "tint": "plum"}
+
+    async def overnight():
+        return {"count": 2, "starts": "01:00"}
+
+    async def tasks(n):
+        return [{"goal": "보고서", "status": "running", "started": NOW - 600, "result": "SECRET-BODY"},
+                {"goal": "다음 일", "status": "queued"}]
+
+    async def approvals():
+        return [{"id": "x", "command": "rm -rf /secret", "created": NOW - 900}]
+
+    return {**deps(tasks=tasks, approvals=approvals), "infra_raw": raw, "persona2": persona2, "overnight": overnight, **over}
+
+
+def test_build2_shape_and_no_secrets():
+    out = asyncio.run(tv.build2(deps2(), NOW))
+    assert out["assistant"] == {"state": "idle", "persona": {"name": "세레나", "tint": "plum"}}
+    assert out["infra"]["nodes"][1]["name"] == "fawaris" and out["infra"]["down"][0]["node"] == "vd-spark"
+    t = out["tasks"]
+    assert t["running"][0]["since"] and t["queued"] == {"count": 1, "next": "다음 일"}
+    assert t["approvals"] == {"count": 1, "oldest": t["approvals"]["oldest"]} and t["approvals"]["oldest"]
+    assert t["overnight"] == {"count": 2, "starts": "01:00"}
+    assert out["gistra"]["classes"][0]["name"] == "자료구조" and out["gistra"]["assignments"][0]["course"] == "역사학특강"
+    assert out["calendar"] == []  # the fake calendar text is not in the real line format
+    assert "rm -rf" not in str(out) and "SECRET-BODY" not in str(out)
+
+
+def test_build2_a_failing_part_is_null():
+    async def boom(n, a=None):
+        raise RuntimeError("down")
+
+    out = asyncio.run(tv.build2(deps2(infra_raw=boom, google_ok=lambda: False), NOW))
+    assert out["infra"] is None and out["gistra"] is None and out["calendar"] is None and out["tasks"]["queued"]["count"] == 1
+
+
+def test_tv_route_versions(gw):
+    g, c, tmp = gw
+    assert "tasks" in c.get("/v1/tv").json() and "gistra" not in c.get("/v1/tv").json()  # v1 is unchanged
+    v2 = c.get("/v1/tv?v=2")
+    assert v2.status_code == 200 and v2.json().keys() >= {"at", "infra", "tasks", "gistra", "calls", "calendar", "assistant"}
+    assert v2.json()["assistant"]["persona"]["tint"]
+    assert c.get("/v1/tv?v=3").status_code == 400
+    path = tmp / "tv_token"
+    path.write_text("t" * 40)
+    path.chmod(0o600)
+    assert c.get("/v1/tv?v=2", headers={"Authorization": "Bearer " + "t" * 40}).status_code == 200

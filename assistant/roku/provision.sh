@@ -1,6 +1,6 @@
 #!/bin/sh
 # Pushes the gateway URL and the TV token to a Roku over ECP so nothing has to be typed with the remote.
-# Usage: ./provision.sh <roku-ip> [gateway-url]   (token from ~/.config/biseo/tv_token on THIS machine; never printed)
+# Usage: ./provision.sh <roku-ip> [gateway-url | demo]   (token from ~/.config/biseo/tv_token on THIS machine; never printed)
 set -eu
 ROKU="${1:?roku ip}"
 URL="${2:-https://azel.scian.xyz}"

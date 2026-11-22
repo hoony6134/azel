@@ -678,6 +678,22 @@ device that created them.
   ```
   Each part is `null` when its source is missing or fails (the rest still answers). Lists are short display lines
   (≤ 10 lines of ≤ 90 characters). No command, approval detail, task result or message body is ever included.
+  **`GET /v1/tv?v=2`** (the TV design, `design/roku/SPEC.md` 2.2; same auth, same 30 s cache, `v=1` or no `v` = the shape
+  above, any other `v` → 400): the same sources, parsed into fields (a part is `null` when its source fails; times
+  without a date are today in KST, timestamps are ISO 8601 with offset; at most 10 items per list):
+  ```json
+  {"at": "…", "assistant": {"state": "idle"|"call", "persona": {"name": "세레나", "tint": "plum"}},
+   "infra": {"nodes": [{"name","up","cpu","ram","disk","temp"|null,"seen"|null}],
+             "alerts": [{"text","head","level": "warn"|"crit","at"|null}], "down": [{"service","node","since"|null}]},
+   "tasks": {"running": [{"goal","since"}], "queued": {"count","next"|null},
+             "approvals": {"count","oldest"|null}, "overnight": {"count","starts": "01:00"},
+             "recent": [{"goal","status": "done"|"failed","at"}]},
+   "gistra": {"classes": [{"start","end","name","room"}], "assignments": [{"title","course","due"|null}],
+              "todos": [{"text","due"|null}]},
+   "calendar": [{"start","end"|null,"what"}], "calls": [{"at","what"}]}
+  ```
+  Approvals are a count and the oldest time only, never a command. `tint` is the primary persona's `color` (a tint name
+  or `#rrggbb`).
   **Auth**: the gateway token, or the TV token in `~/.config/biseo/tv_token` (0600, ≥ 32 characters; read on every
   request, so deleting or rotating it revokes at once; ignored unless 0600). The TV token opens **only** `GET /v1/tv`
   (anything else → 401).
