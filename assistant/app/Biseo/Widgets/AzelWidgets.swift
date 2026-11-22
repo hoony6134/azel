@@ -41,11 +41,17 @@ private struct ApprovalButtons: View {
                     .font(.caption.monospaced()).lineLimit(1)
             }
             HStack(spacing: 6) {
-                Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "once")) { Text("허용").frame(maxWidth: .infinity) }
-                    .tint(tint)
+                Group {
+                    if approval.onceNeedsAuth {
+                        Button(intent: ApprovalAuthDecisionIntent(approvalID: approval.id, decision: "once")) { Text("허용").frame(maxWidth: .infinity) }
+                    } else {
+                        Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "once")) { Text("허용").frame(maxWidth: .infinity) }
+                    }
+                }
+                .tint(tint)
                 Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "deny")) { Text("거부").frame(maxWidth: .infinity) }
                     .tint(.red)
-                Button(intent: ApprovalDecisionIntent(approvalID: approval.id, decision: "always")) { Text("항상 허용").frame(maxWidth: .infinity) }
+                Button(intent: ApprovalAuthDecisionIntent(approvalID: approval.id, decision: "always")) { Text("항상 허용").frame(maxWidth: .infinity) }
                     .tint(.gray)
                     .disabled(approval.forcedOnce)
             }

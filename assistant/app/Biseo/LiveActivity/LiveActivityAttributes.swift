@@ -30,6 +30,8 @@ struct PendingApproval: Codable, Hashable {
     var command: String?
     /// "항상 허용" isn't allowed for this one.
     var forcedOnce: Bool
+    /// The server marked the command risky: even 허용 needs authentication on the lock screen.
+    var risky: Bool = false
 
     /// The command cut for the Lock Screen.
     var shortCommand: String? { command.map { $0.count <= 40 ? $0 : String($0.prefix(39)) + "…" } }

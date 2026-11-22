@@ -1,4 +1,7 @@
 import AppIntents
+#if os(iOS)
+import UIKit
+#endif
 
 /// A persona Siri can name ("Azel로 미아 불러줘"); the list comes from the cached personas.
 struct PersonaEntity: AppEntity, Identifiable {
@@ -22,11 +25,42 @@ struct PersonaQuery: EntityQuery {
 }
 
 /// "시리야, 아젤 불러줘": starts a call. iPhone: the CallKit outgoing call into the call screen;
-/// Mac: the call panel. From the lock screen the system asks to unlock first (the app opens).
+/// Mac: the call panel. Never opens the app, so it works on a locked iPhone (user report,
+/// 2026-11-22: "기기 잠금을 해제해야 합니다" with AirPods in a pocket): when the app isn't open and
+/// unlocked, the gateway rings back through the VoIP push, and an incoming CallKit call works
+/// fully on the lock screen.
 struct StartAzelCallIntent: AppIntent {
     static let title: LocalizedStringResource = "Azel 부르기"
     static let description = IntentDescription("Azel에게 전화를 걸어요.")
-    static let openAppWhenRun = true
+    static let openAppWhenRun = false
+    static let authenticationPolicy: IntentAuthenticationPolicy = .alwaysAllowed
+
+    /// How a Siri request becomes a call.
+    enum Route: Equatable {
+        /// The app is open and unlocked: the CallKit outgoing call, as from the call button.
+        case local
+        /// Locked or in the background: `POST /v1/calls`; the gateway rings back.
+        case ringback
+    }
+
+    static func route(appActive: Bool, protectedDataAvailable: Bool) -> Route {
+        appActive && protectedDataAvailable ? .local : .ringback
+    }
+
+    static let ringbackReason = "사용자가 Siri로 불렀어요"
+
+    static func ringbackBody(persona: Persona?) -> [String: Any] {
+        var b: [String: Any] = ["reason": ringbackReason, "intent": "siri"]
+        if let id = persona?.id { b["persona_id"] = id }
+        return b
+    }
+
+    /// Asks the gateway to call now (call_user: the same daily cap and in-call refusal).
+    static func ringback(persona: Persona?) async throws -> String {
+        let r = ActionResult(try await Gateway.send("POST", "/v1/calls", json: ringbackBody(persona: persona)))
+        if let q = r.needs?.question { return q }
+        return r.ok ? "곧 전화드릴게요." : (r.spoken ?? "지금은 전화할 수 없어요.")
+    }
 
     /// Optional: which persona answers; empty calls the primary.
     @Parameter(title: "비서") var persona: PersonaEntity?
@@ -34,12 +68,20 @@ struct StartAzelCallIntent: AppIntent {
     init() {}
     init(persona: PersonaEntity?) { self.persona = persona }
 
-    /// Where the call starts (tests replace it).
-    @MainActor static var startCall: (Persona?) -> Void = { p in
+    /// Where the call starts (tests replace it); returns what Siri says.
+    @MainActor static var startCall: (Persona?) async -> String = { p in
         #if os(iOS)
-        CallManager.shared.startCall(persona: p)
+        switch route(appActive: UIApplication.shared.applicationState == .active,
+                     protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable) {
+        case .local:
+            CallManager.shared.startCall(persona: p)
+            return ""
+        case .ringback:
+            do { return try await ringback(persona: p) } catch { return "\(AssistantName.current)에게 닿지 않아요." }
+        }
         #else
         MacCall.shared.start(panel: true, persona: p)
+        return ""
         #endif
     }
 
@@ -48,9 +90,9 @@ struct StartAzelCallIntent: AppIntent {
         return entity.flatMap { e in m.personas.first { $0.id == e.id } ?? m.match(name: e.name) } ?? m.primary
     }
 
-    @MainActor func perform() async throws -> some IntentResult {
-        Self.startCall(Self.resolve(persona))
-        return .result()
+    @MainActor func perform() async throws -> some IntentResult & ProvidesDialog {
+        let said = await Self.startCall(Self.resolve(persona))
+        return .result(dialog: IntentDialog(stringLiteral: said))
     }
 
     /// After each call, so Siri and Spotlight suggest calling this persona again.

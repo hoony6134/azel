@@ -117,7 +117,9 @@ final class CallManager: NSObject, ObservableObject {
     }
 
     /// `persona`: nil = the one chosen in the app (or the primary).
-    @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil) {
+    /// `ringbackOnFailure`: from Siri's INStartCallIntent, possibly in the background. If CallKit
+    /// refuses the outgoing call, the gateway rings back instead (that works on the lock screen).
+    @MainActor func startCall(prefix: String = "iphone", persona: Persona? = nil, ringbackOnFailure: Bool = false) {
         guard !inCall else { return }
         sessionPrefix = prefix
         let who = persona ?? PersonaModel.shared.selected
@@ -126,7 +128,13 @@ final class CallManager: NSObject, ObservableObject {
         // §17.6: the handle is the persona id; the system UI and Recents show localizedCallerName.
         let action = CXStartCallAction(call: UUID(), handle: CXHandle(type: .generic, value: who?.id ?? AssistantName.current))
         controller.request(CXTransaction(action: action)) { [weak self] err in
-            if let err { DispatchQueue.main.async { self?.error = err.localizedDescription } }
+            guard let err else { return }
+            if ringbackOnFailure {
+                Log.call.error("outgoing call refused (\(err.localizedDescription, privacy: .public)): asking for a ringback")
+                Task { _ = try? await StartAzelCallIntent.ringback(persona: who) }
+            } else {
+                DispatchQueue.main.async { self?.error = err.localizedDescription }
+            }
         }
     }
 
@@ -242,7 +250,8 @@ final class CallManager: NSObject, ObservableObject {
         brainMode = mode
         let wantSecret = MainActor.assumeIsolated { BrainModeChoice.shared.takeSecretForCall() }
         secret = wantSecret
-        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode, secret: wantSecret) } catch {
+        let locked = MainActor.assumeIsolated { !UIApplication.shared.isProtectedDataAvailable }
+        do { try client.start(session: activeSession!, callID: callID, intent: intent, persona: callID == nil ? activePersona?.id : nil, mode: mode, secret: wantSecret, locked: locked) } catch {
             return fail(error.localizedDescription)
         }
         if callID == nil { provider.reportOutgoingCall(with: uuid, connectedAt: nil) }
