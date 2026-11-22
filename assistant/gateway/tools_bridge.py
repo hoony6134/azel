@@ -371,6 +371,14 @@ class Bridge:
             return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
                 f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마. 같은 걸 다시 검색하지 " \
                 "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
+        if name == "weather":
+            try:
+                r = await self.d["weather"](str(args.get("place") or "").strip(), args.get("when") or "now")
+            except LookupError as e:
+                raise Fail("not_found", str(e))
+            except Exception as e:  # noqa: BLE001  Open-Meteo down or slow
+                raise Fail("unavailable", f"지금은 날씨를 가져오지 못했어요({type(e).__name__}).")
+            return r["spoken"], r, r["spoken"] + " (Open-Meteo 기준. 이 문장대로 답해.)"
         if name == "web_fetch":
             try:
                 r = await self.d["web_fetch"](str(args["url"]))
@@ -1062,9 +1070,16 @@ FORGET = {
 MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것 목록(최근 순, 직접 기억한 것과 통화에서 자동으로 남긴 것).",
                "input_schema": {"type": "object", "additionalProperties": False, "properties": {
                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
+WEATHER = {
+    "name": "weather",
+    "description": ("날씨(기온, 최고·최저, 비 올 확률, 하늘). 날씨를 물으면 웹 검색 말고 이걸 불러. place는 사용자가 말한 "
+                    "지명 그대로(없으면 비워: 사용자가 사는 곳), when은 now(기본)|today|tomorrow|day_after. 결과 문장대로 답해."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "place": {"type": "string", "maxLength": 40},
+        "when": {"type": "string", "enum": ["now", "today", "tomorrow", "day_after"]}}}}
 WEB_SEARCH = {
     "name": "web_search",
-    "description": ("웹 검색(날씨, 뉴스, 가격·환율, 사실 확인처럼 지금 정보가 필요할 때). 답할 때는 '○○ 기준으로'처럼 출처 "
+    "description": ("웹 검색(뉴스, 가격·주가·환율, 사실 확인처럼 지금 정보가 필요할 때; 날씨는 weather). 답할 때는 '○○ 기준으로'처럼 출처 "
                     "사이트 이름만 짧게 말하고 URL은 읽지 마."),
     "input_schema": {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
         "query": {"type": "string", "maxLength": 200}, "max": {"type": "integer", "minimum": 1, "maximum": 8}}}}
@@ -1121,7 +1136,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, WEATHER, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1171,6 +1186,9 @@ ACTIONS = {
                     "rest": ("GET", "/v1/memories"), "examples": ({}, {"limit": 0})},
 }
 for _n, _m in {
+    "weather": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
+                "no_rest": "앱에는 날씨 화면이 없어요(모델 경로 전용).",
+                "examples": ({"place": "광주", "when": "tomorrow"}, {"when": "next_year"})},
     "web_search": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                    "no_rest": "앱에는 검색 화면이 없어요(모델 경로 전용; claude -p는 자체 WebSearch).",
                    "examples": ({"query": "광주 날씨"}, {"query": ""})},

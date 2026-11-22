@@ -189,3 +189,25 @@ def test_local_mode_offers_web_search_only_while_searxng_answers():
     up["ok"] = False
     assert "web_search" not in [t["name"] for t in asyncio.run(b.tools("qwen"))[0]]
     assert asyncio.run(b.run("web_search", {"query": "날씨"}, caller="qwen"))["error"]["code"] == "unavailable"
+
+
+def test_a_numeric_question_reads_the_top_pages_even_with_long_snippets(monkeypatch):
+    long = {"results": [{"title": "삼성전자 주가", "url": "https://finance.example/005930", "content": "증권 정보 " * 60}]}
+    read = []
+
+    async def page(url, client=None):
+        read.append(url)
+        return {"url": url, "text": "현재가 71,200원 (+1.2%)"}
+    monkeypatch.setattr(web, "fetch", page)
+    r = asyncio.run(web.searxng("삼성전자 주가", 5, client=sx_client(long)))
+    assert read == ["https://finance.example/005930"] and "현재가 71,200원" in r["text"]
+    read.clear()
+    asyncio.run(web.searxng("광주 맛집 추천", 5, client=sx_client(long)))
+    assert read == []  # long snippets and not a number question: the snippets do
+
+    async def slow(url, client=None):
+        await asyncio.sleep(5)
+    monkeypatch.setattr(web, "fetch", slow)
+    monkeypatch.setattr(web, "PAGES_S", 0.2)
+    r = asyncio.run(web.searxng("원달러 환율", 5, client=sx_client(long)))
+    assert r and "본문" not in r["text"]  # a slow page never holds the answer up

@@ -40,6 +40,7 @@ CASES = {
     "memory_list": ("너 나에 대해 뭐 기억하고 있어? 목록 보여 줘", "model"),
     "web_search": ("오늘 광주 날씨 어때?", "model"),
     "web_fetch": ("https://example.com 이 페이지에 뭐라고 써 있어?", "model"),
+    "weather": ("내일 서울 날씨 어때?", "model"),
     "music_play": ("아이유 노래 틀어줘", "model"),
     "music_control": ("다음 곡으로 넘겨줘", "model"),
     "home_scene": ("영화 모드로 집 불 꺼줘", "model"),
