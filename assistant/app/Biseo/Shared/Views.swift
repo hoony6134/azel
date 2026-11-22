@@ -190,10 +190,11 @@ struct SetupFlow: View {
     }
 
     static func requestMic() async -> Bool {
+        guard AudioIO.hardware else { return false }   // never a permission prompt from the test host
         #if os(iOS)
-        await AVAudioApplication.requestRecordPermission()
+        return await AVAudioApplication.requestRecordPermission()
         #else
-        await AVCaptureDevice.requestAccess(for: .audio)
+        return await AVCaptureDevice.requestAccess(for: .audio)
         #endif
     }
 }

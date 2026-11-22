@@ -141,6 +141,12 @@ enum EarconPreview {
     static var peak: Float { lock.lock(); defer { lock.unlock() }; return _peak }
 
     static func play() {
+        guard AudioIO.hardware else {
+            // Test host: no engine at all; the peak is what the player would have been fed.
+            let m = Cue.allCases.map { Earcon.render($0).map(abs).max() ?? 0 }.max() ?? 0
+            lock.lock(); _peak = m; lock.unlock()
+            return
+        }
         PreviewAudio.activate()
         engine?.stop()
         let e = AVAudioEngine(), p = AVAudioPlayerNode()

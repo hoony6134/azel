@@ -202,6 +202,7 @@ final class MacCall: ObservableObject {
         state = ""
         error = nil
         if usePanel { showPanel() }
+        guard AudioIO.hardware else { return }   // the test host never asks for the mic or dials out
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: connect()
         case .notDetermined:
