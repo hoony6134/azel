@@ -842,3 +842,71 @@ def test_default_mode_is_unchanged_and_never_returns_needs_approval(cfg, gw):
 
 def test_grant_mac_matches_the_gateways_golden_value():
     assert d.grant_mac("tok", "ap-1", "vd-spark", "ls -la", "/home/u/x", "n0nce", 1700000000) == "78a6c4f27e365ff9965f2d61eb1bfeec26de56c0587bd4ab0a6013c5eea7f0f7"
+
+
+SID = "0a1b2c3d-4e5f-6789-abcd-ef0123456789"
+SID2 = "11111111-2222-3333-4444-555555555555"
+
+
+def run_job(monkeypatch, sid=SID, **kw):
+    seen = {}
+
+    def fake_run(argv, **k):
+        seen["argv"], seen["cwd"] = argv, k["cwd"]
+        return subprocess.CompletedProcess(argv, 0, json.dumps(
+            {"result": "did it", "session_id": sid, "total_cost_usd": 0.1}).encode(), b"")
+
+    monkeypatch.setattr(d.subprocess, "run", fake_run)
+    r = d.delegate(**kw)
+    for _ in range(100):
+        if r.get("job_id") and d.job_status(job_id=r["job_id"])["job_status"] != "running":
+            break
+        time.sleep(0.02)
+    return r, seen
+
+
+def test_delegate_reports_the_session_id_cwd_and_an_output_file(cfg, monkeypatch):
+    r, seen = run_job(monkeypatch, task="fix bug", cwd="proj")
+    st = d.job_status(job_id=r["job_id"])
+    assert st["session_id"] == SID and st["cwd"] == seen["cwd"].as_posix() or st["cwd"] == str(seen["cwd"])
+    out = __import__("pathlib").Path(st["output_file"])
+    assert out.read_text() == "did it" and out.stat().st_mode & 0o777 == 0o600
+    assert next(j for j in d.list_jobs()["jobs"] if j["job_id"] == r["job_id"])["session_id"] == SID
+    sessions = d._sessions_file()
+    assert json.loads(sessions.read_text())[SID]["cwd"] == str(seen["cwd"]) and sessions.stat().st_mode & 0o777 == 0o600
+
+
+def test_resume_continues_the_same_session_in_the_same_cwd(cfg, monkeypatch):
+    run_job(monkeypatch, task="first", cwd="proj")
+    r, seen = run_job(monkeypatch, sid=SID2, task="and now the tests too", cwd="proj", resume=SID)
+    assert r["status"] == "ok"
+    argv = seen["argv"]
+    assert argv[:5] == ["claude", "-p", "and now the tests too", "--resume", SID]
+    assert "acceptEdits" in argv and "Bash(sudo:*)" in argv  # the same guards on a resumed run
+    st = d.job_status(job_id=r["job_id"])
+    assert st["resumes"] == SID and st["session_id"] == SID2
+    assert SID2 in d._sessions()  # a resumed run's own session id can be resumed next
+
+
+def test_resume_refuses_bad_unknown_or_foreign_sessions(cfg, monkeypatch):
+    run_job(monkeypatch, task="first", cwd="proj")
+    for bad in ("../../etc/passwd", "latest", "0A1B2C3D-4E5F-6789-ABCD-EF0123456789", SID + " --dangerously-skip", ""):
+        if bad:
+            assert d.delegate(task="x", cwd="proj", resume=bad)["status"] == "refused", bad
+    assert "unknown session" in d.delegate(task="x", cwd="proj", resume=SID2)["reason"]  # valid shape, not ours
+    other = d.CFG["roots"][0] / "other"
+    other.mkdir()
+    assert "lives in" in d.delegate(task="x", cwd="other", resume=SID)["reason"]  # another cwd
+
+
+def test_resume_refuses_while_the_session_is_still_running(cfg, monkeypatch):
+    run_job(monkeypatch, task="first", cwd="proj")
+    d.JOBS["busy"] = {"job_id": "busy", "status": "running", "session_id": SID}
+    assert "still running" in d.delegate(task="x", cwd="proj", resume=SID)["reason"]
+    d.JOBS["busy"]["status"] = "done"
+
+
+def test_there_is_no_team_device_block_on_delegate_in_the_daemon(cfg, monkeypatch):
+    d.CFG["id"] = "vd-spark"
+    r, _ = run_job(monkeypatch, task="x", cwd="proj")
+    assert r["status"] == "ok"
