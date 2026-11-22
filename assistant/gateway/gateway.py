@@ -1216,9 +1216,49 @@ async def send_alert_push(title, body, category=None, **extra):
     return await apns_send({"aps": aps, **extra}, "alert")
 
 
-async def apns_send(payload, kind):
+async def push_task_activity(t, approval=None):
+    """Update a task's Live Activity by push (the app is asleep while the phone is locked): its status, and the
+    approval's buttons. The content-state matches TaskActivityAttributes.ContentState key for key."""
+    rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+    cfg, row = apns_config(), rows.get(t["id"])
+    if not cfg or not row:
+        return {"sent": 0}
+    steps = t.get("steps") or []
+    state_ = {"status": t["status"], "step": (steps[-1].get("label") if steps else None), "steps": len(steps),
+              **({"approval": approval} if approval else {})}
+    payload = {"aps": {"timestamp": int(time.time()), "event": "update", "content-state": state_,
+                       **({"alert": {"title": "승인 요청", "body": f"{approval['device']}에서 실행 승인이 필요해요"}}
+                          if approval else {})}}
+    return await apns_send(payload, "liveactivity", tokens=[{"token": row["token"], "env": row["env"],
+                                                             "bundle_id": APP_BUNDLE}])
+
+
+async def task_hold(tid, aid, row, meta):
+    """A task's approval is pending: the task shows "승인 필요" and its Live Activity gets the buttons."""
+    t = task_live.get(tid)
+    if not t or t["status"] not in ("running", "waiting_approval"):
+        return
+    if t["status"] != "waiting_approval":  # the agent loop's own wait_approval already marked it
+        t["status"] = "waiting_approval"
+        task_step(t, "approval", approval_id=aid)
+        await task_save(t)
+    await push_task_activity(t, {"id": aid, "device": row["device"], "command": row["command"][:200],
+                                 "forcedOnce": not always_ok(row["command"]), "risky": False})
+
+
+async def task_release(tid):
+    """Its approval was decided: back to running, buttons gone (unless another one is still pending)."""
+    t = task_live.get(tid)
+    if not t or t["status"] != "waiting_approval":
+        return
+    t["status"] = "running"
+    await task_save(t)
+    await push_task_activity(t)
+
+
+async def apns_send(payload, kind, tokens=None):
     cfg = apns_config()
-    tokens = [t for t in await push_tokens() if t.get("kind", "voip") == kind]
+    tokens = tokens or [t for t in await push_tokens() if t.get("kind", "voip") == kind]
     if not cfg or not tokens:
         return {"sent": 0, "reason": "APNs key or device token not configured"}
     if time.time() - _apns_jwt["ts"] > 50 * 60:  # APNs wants a fresh JWT at most hourly
@@ -1232,7 +1272,7 @@ async def apns_send(payload, kind):
             host = "api.sandbox.push.apple.com" if t["env"] == "sandbox" else "api.push.apple.com"
             r = await c.post(f"https://{host}/3/device/{t['token']}", json=payload, headers={
                 "authorization": f"bearer {_apns_jwt['token']}",
-                "apns-topic": t["bundle_id"] + (".voip" if kind == "voip" else ""),
+                "apns-topic": t["bundle_id"] + {"voip": ".voip", "liveactivity": ".push-type.liveactivity"}.get(kind, ""),
                 "apns-push-type": kind, "apns-priority": "10", "apns-expiration": "0"})
             sent += r.status_code == 200
     return {"sent": sent}
@@ -3174,6 +3214,16 @@ MAX_PUSH_TOKENS = 10
 async def push_register(body: dict):
     if body.get("bundle_id") != APP_BUNDLE:
         raise HTTPException(400, f"bundle_id must be {APP_BUNDLE}")
+    if body.get("activity_token") is not None:  # a task's Live Activity: its own token, updated by push while locked
+        tok, tid = body.get("activity_token"), body.get("task_id")
+        if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Fa-f]{16,200}", tok)
+                and isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{12}", tid)):
+            raise HTTPException(400, "activity_token (hex) and task_id required")
+        rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+        rows = {k: v for k, v in rows.items() if time.time() - v.get("at", 0) < 86400}  # a day at most
+        rows[tid] = {"token": tok, "env": body.get("env", "sandbox"), "at": time.time()}
+        await state.call("PUT", "/v1/state/kv/activity-tokens", rows)
+        return {"ok": True}
     if not (body.get("voip_token") or body.get("alert_token")):
         raise HTTPException(400, "voip_token and/or alert_token required")  # macOS: alert only
     for kind, tok in (("voip", body.get("voip_token")), ("alert", body.get("alert_token"))):
@@ -3399,6 +3449,11 @@ async def create_approval(body: dict):
                               **({"forced_once": True} if once else {}))  # the command only in the app, never here
     except Exception as e:
         print("approval push failed:", type(e).__name__, flush=True)
+    if requester and requester.get("task_id"):
+        try:
+            await task_hold(requester["task_id"], aid, row, meta)
+        except Exception as e:  # the approval stands either way
+            print("task hold failed:", type(e).__name__, flush=True)
     return {"approval_id": aid, "status": "pending", "expires_at": meta["expires_at"]}
 
 
@@ -3640,6 +3695,11 @@ async def decide(aid: str, body: dict):
         await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
         meta["rule_id"] = rule["id"]
     meta["decision"] = decision
+    if (tid := (meta.get("requester") or {}).get("task_id")) and tid in task_live:
+        try:
+            await task_release(tid)
+        except Exception as e:
+            print("task release failed:", type(e).__name__, flush=True)
     await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
     return {**out, "decision": decision, **({"rule_id": meta["rule_id"]} if decision == "always" else {}),
             **({"forced_once": True, "forced_reason": SECRET_ALWAYS if secret else ALWAYS_NO} if forced else {})}
