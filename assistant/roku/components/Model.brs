@@ -4,8 +4,8 @@
 function newCard(t as String, w as Integer) as Object
     return {
         t: t, w: w, head: "", hl: "", sent: "", meta: "", when: "", tail: "", soon: false, now: false, name: ""
-        v: [-1, -1, -1, -1], down: "", n1: "", l1: "", m1: "", n2: "", l2: "", m2: ""
-        ts: 0, dtitle: "", dsub: "", dsoon: false, facts: []
+        title: "", v: [-1, -1, -1, -1], down: "", n1: "", l1: "", m1: "", n2: "", l2: "", m2: ""
+        status: "", load: "", upt: "", note: "", ts: 0, dtitle: "", dsub: "", dsoon: false, facts: []
     }
 end function
 
@@ -120,31 +120,83 @@ function dueCard(title as String, course as String, e as Integer, now as Integer
     return c
 end function
 
-function nodeCard(n as Object, now as Integer) as Object
-    c = newCard("node", 268)
+function hostCard(n as Object, now as Integer) as Object
+    c = newCard("host", 414)
     c.name = sv(n.name)
     c.dtitle = c.name
-    seen = isoEpoch(n.seen)
-    if n.up = false
-        c.t = "nodedown"
-        c.down = "응답 없음"
-        if seen > 0
-            c.down = Int((now - seen) / 60).ToStr() + "분째 응답 없음"
-            c.meta = "마지막 응답 " + fmtHM(seen)
-            c.facts.Push(fact("마지막 응답", fmtHM(seen)))
-        end if
-        c.facts.Push(fact("상태", "응답 없음"))
-        c.dsub = c.down
-        return c
+    st = sv(n.status)
+    if st = "" then
+        st = "ok"
+        if n.up = false then st = "off"
     end if
-    c.v = [nz(n.cpu), nz(n.ram), nz(n.disk), nz(n.temp)]
-    if seen > 0 then c.facts.Push(fact("마지막 응답", relAgo(seen, now)))
-    c.facts.Push(fact("상태", "정상"))
+    c.status = st
+    seen = isoEpoch(n.seen)
+    mem = n["mem"]
+    if mem = invalid then mem = n.ram
+    c.v = [nz(n.cpu), nz(mem), nz(n.disk), nz(n.temp)]
+    c.load = sv(n.load)
+    c.upt = sv(n.uptime)
+    words = {ok: "정상", warn: "주의", problem: "문제", off: "꺼짐"}
+    c.dsub = sv(words[st])
+    if st = "off"
+        c.meta = ""
+        if seen > 0 then c.meta = "마지막 응답 " + fmtHM(seen)
+        if c.meta <> "" then c.facts.Push(fact("마지막 응답", fmtHM(seen)))
+    else
+        if seen > 0 then c.facts.Push(fact("마지막 응답", relAgo(seen, now)))
+        if c.upt <> "" then c.facts.Push(fact("가동 시간", c.upt))
+    end if
+    c.facts.Push(fact("상태", c.dsub))
+    if sv(n.group) <> "" then c.facts.Push(fact("그룹", sv(n.group)))
     return c
 end function
 
-function strHM(s as String) as String
-    return s
+function hostGroup(c as Object, infra as Object) as String
+    hl = infra.hosts
+    if hl = invalid then return ""
+    for each h in hl
+        if sv(h.name) = c.name then return sv(h.group)
+    end for
+    return ""
+end function
+
+function knownTitle(cards as Object, title as String) as Boolean
+    for each c in cards
+        if c.dtitle = title or c.sent = title then return true
+    end for
+    return false
+end function
+
+' a generic GISTRA list item: its date on top, the title, then the course or category and the note
+function itemCard(it as Object, now as Integer) as Object
+    c = newCard("item", 414)
+    ' dated items (a deadline, an LMS notice): the date on top, the title (with its note) and the course below;
+    ' undated ones (a unit to review): the course on top, the title, and the note below
+    ttl = clean(sv(it.title))
+    if sv(it.when) <> ""
+        c.title = sv(it.when)
+        c.sent = ttl
+        if sv(it.note) <> "" then c.sent = ttl + " — " + clean(sv(it.note))
+        c.meta = sv(it.kind)
+    else
+        c.title = sv(it.kind)
+        c.sent = ttl
+        c.meta = sv(it.note)
+    end if
+    c.dtitle = ttl
+    e = isoEpoch(it.due)
+    if e > 0
+        c.dsub = dueText(e, now) + " · " + remainText(e, now)
+        c.soon = e - now < 86400 and e > now
+        c.dsoon = c.soon
+        c.facts.Push(fact("마감", dateKo(e) + " " + fmtHM(e)))
+    else
+        c.dsub = sv(it.when)
+    end if
+    if sv(it.kind) <> "" then c.facts.Push(fact("분류", sv(it.kind)))
+    if sv(it.note) <> "" then c.facts.Push(fact("메모", sv(it.note)))
+    c.facts.Push(fact("출처", "GISTRA"))
+    return c
 end function
 
 ' ---------- v2 ----------
@@ -168,13 +220,28 @@ function buildV2(d as Object, now as Integer) as Object
     nodes = []
     downNodeCards = []
 
+    infraAsOf = ""
     if infra <> invalid
+        infraAsOf = sv(infra.asof)
         for each s in arr(infra.down)
-            downSvc = downSvc + 1
-            down.Push(urgentCard("crit", "서비스 꺼짐", sv(s.node) + "의 " + sv(s.service) + josaGa(sv(s.service)) + " 응답하지 않아요", "인프라"))
+            where = sv(s.node)
+            sent = sv(s.service) + josaGa(sv(s.service)) + " 응답하지 않아요"
+            if where <> "" then sent = where + "의 " + sent
+            meta = "인프라"
+            if sv(s.note) <> "" then meta = "인프라 · " + sv(s.note)
+            if sv(s.state) = "degraded"
+                soonRest.Push(urgentCard("soon", "서비스 느림", sv(s.service) + " 응답이 느려요", meta))
+            else
+                downSvc = downSvc + 1
+                down.Push(urgentCard("crit", "서비스 꺼짐", sent, meta))
+            end if
         end for
-        for each n in arr(infra.nodes)
-            if n.up = false
+        hostList = infra.hosts
+        if hostList = invalid then hostList = infra.nodes
+        for each n in arr(hostList)
+            c = hostCard(n, now)
+            st = c.status
+            if st = "off" or st = "problem"
                 downNodes = downNodes + 1
                 seen = isoEpoch(n.seen)
                 mins = ""
@@ -183,10 +250,13 @@ function buildV2(d as Object, now as Integer) as Object
                     mins = " " + Int((now - seen) / 60).ToStr() + "분째"
                     meta = "인프라 · " + fmtHM(seen) + "부터"
                 end if
-                down.Push(urgentCard("crit", "노드 응답 없음", sv(n.name) + josaGa(sv(n.name)) + mins + " 응답하지 않아요", meta))
-                downNodeCards.Push(nodeCard(n, now))
+                head = "노드 응답 없음"
+                if st = "problem" then head = "노드 문제"
+                down.Push(urgentCard("crit", head, sv(n.name) + josaGa(sv(n.name)) + mins + " 응답하지 않아요", meta))
+                downNodeCards.Push(c)
             else
-                nodes.Push(nodeCard(n, now))
+                if st = "warn" then soonRest.Push(urgentCard("soon", "노드 주의", sv(n.name) + "에 주의가 필요해요", "인프라"))
+                nodes.Push(c)
             end if
         end for
         for each a in arr(infra.alerts)
@@ -194,7 +264,8 @@ function buildV2(d as Object, now as Integer) as Object
             if head = "" then head = "경고"
             at = isoEpoch(a.at)
             meta = "인프라"
-            if at > 0 then meta = "인프라 · " + relAgo(at, now)
+            if sv(a.group) <> "" then meta = "인프라 · " + sv(a.group)
+            if at > 0 then meta = meta + " · " + relAgo(at, now)
             if sv(a.level) = "crit"
                 alertsCrit = alertsCrit + 1
                 down.Push(urgentCard("crit", head, sv(a.text), meta))
@@ -241,21 +312,26 @@ function buildV2(d as Object, now as Integer) as Object
         for each t in arr(gistra.todos)
             e = isoEpoch(t.due)
             c = newCard("todo", 414)
-            c.sent = clean(sv(t.text))
+            title = sv(t["title"])
+            if title = "" then title = sv(t.text)
+            kind = sv(t.kind)
+            if kind = "" then kind = "할 일"
+            c.sent = clean(title)
             c.dtitle = c.sent
-            c.meta = "할 일"
+            c.meta = kind
             c.facts.Push(fact("출처", "GISTRA"))
+            if kind <> "할 일" then c.facts.Push(fact("분류", kind))
             if e > 0
-                c.meta = "할 일 · " + dueWord(e, now)
+                c.meta = kind + " · " + dueWord(e, now)
                 c.dsub = dueText(e, now) + " · " + remainText(e, now)
                 c.facts.Unshift(fact("마감", dateKo(e) + " " + fmtHM(e)))
                 if e > now
                     if nextDue < 0 or e < nextDue
                         nextDue = e
-                        nextDueTitle = sv(t.text)
+                        nextDueTitle = title
                     end if
                     if e - now < 86400
-                        u = urgentCard("soon", "마감 " + remainBig(e, now) + " 전", sv(t.text), dueText(e, now))
+                        u = urgentCard("soon", "마감 " + remainBig(e, now) + " 전", title, dueText(e, now))
                         u.ts = e
                         u.dtitle = u.head + " · " + u.sent
                         u.dsub = remainText(e, now)
@@ -266,6 +342,15 @@ function buildV2(d as Object, now as Integer) as Object
             end if
             todos.Push(c)
         end for
+    end if
+
+    nd = d.next_deadline
+    if nd <> invalid
+        e = isoEpoch(nd.due)
+        if e > now
+            nextDue = e
+            nextDueTitle = sv(nd.title)
+        end if
     end if
 
     ' strip: 경고 = services down + nodes down + crit alerts (warn alerts only show in the urgent row)
@@ -303,7 +388,7 @@ function buildV2(d as Object, now as Integer) as Object
     appendAll(urgent, down)
     appendAll(urgent, soonDue)
     appendAll(urgent, soonRest)
-    if urgent.Count() > 0 then sections.Push({title: "지금 확인할 것", w: 414, cap: 4, cards: urgent})
+    if urgent.Count() > 0 then sections.Push({title: "지금 확인할 것", w: 414, cap: 4, note: "", cards: urgent})
 
     ' 오늘: classes, calendar events and scheduled calls, one timetable from now to midnight
     slots = []
@@ -332,20 +417,40 @@ function buildV2(d as Object, now as Integer) as Object
     sorted = sortSlots(slots)
     appendAll(cards, sorted)
     if cards.Count() = 0 then cards.Push(emptyCard(560, "오늘 남은 일정이 없어요"))
-    sections.Push({title: "오늘", w: 560, cap: 3, cards: cards})
+    sections.Push({title: "오늘", w: 560, cap: 3, note: "", cards: cards})
 
-    ' 인프라: down nodes first
-    cards = []
+    ' 인프라: one row per host group (the [cygnus] / [vujade] of the health text), the ones that need a look first
     if infra = invalid
-        cards.Push(failCard(414, "인프라", ""))
+        sections.Push({title: "인프라", w: 414, cap: 4, note: "", cards: [failCard(414, "인프라", "")]})
     else
-        appendAll(cards, downNodeCards)
-        appendAll(cards, nodes)
-        if cards.Count() = 0 then cards.Push(emptyCard(414, "노드 정보가 없어요"))
+        all = []
+        appendAll(all, downNodeCards)
+        appendAll(all, nodes)
+        groups = []
+        for each c in all
+            g = hostGroup(c, infra)
+            found = false
+            for each x in groups
+                if x.g = g then found = true
+            end for
+            if not found then groups.Push({g: g})
+        end for
+        note = ""
+        if infraAsOf <> "" then note = infraAsOf + " 기준"
+        if all.Count() = 0
+            sections.Push({title: "인프라", w: 414, cap: 4, note: note, cards: [emptyCard(414, "노드 정보가 없어요")]})
+        else
+            for each x in groups
+                cs = []
+                for each c in all
+                    if hostGroup(c, infra) = x.g then cs.Push(c)
+                end for
+                title = "인프라"
+                if groups.Count() > 1 and x.g <> "" then title = "인프라 · " + x.g
+                sections.Push({title: title, w: 414, cap: 4, note: note, cards: cs})
+            end for
+        end if
     end if
-    w = 268
-    if infra = invalid or cards.Count() = 1 and cards[0].t <> "node" and cards[0].t <> "nodedown" then w = 414
-    sections.Push({title: "인프라", w: w, cap: 6, cards: cards})
 
     ' Azel 작업
     cards = []
@@ -406,18 +511,38 @@ function buildV2(d as Object, now as Integer) as Object
         end for
         if cards.Count() = 0 then cards.Push(emptyCard(560, "진행 중인 작업이 없어요"))
     end if
-    sections.Push({title: "Azel 작업", w: 560, cap: 3, cards: cards})
+    sections.Push({title: "Azel 작업", w: 560, cap: 3, note: "", cards: cards})
 
-    ' 과제와 할 일
+    ' 과제와 할 일 (남은 항목), then the other GISTRA lists as rows of their own: 7일 안 마감 (what is not already above),
+    ' 복습할 단원, LMS 알림, and whatever else the server sends
     cards = []
+    gnote = ""
     if gistra = invalid
         cards.Push(failCard(414, "GISTRA", ""))
     else
+        if sv(gistra.asof) <> "" then gnote = sv(gistra.asof) + " 기준"
         appendAll(cards, assigns)
         appendAll(cards, todos)
         if cards.Count() = 0 then cards.Push(emptyCard(414, "마감이 가까운 과제가 없어요"))
     end if
-    sections.Push({title: "과제와 할 일", w: 414, cap: 4, cards: cards})
+    sections.Push({title: "과제와 할 일", w: 414, cap: 4, note: gnote, cards: cards})
+    if gistra <> invalid
+        for each sec in arr(gistra.sections)
+            t = sv(sec.title)
+            if t <> "남은 항목" and t <> "수업" and arr(sec.items).Count() > 0
+                rows = []
+                for each it in arr(sec.items)
+                    if not (t = "7일 안 마감" and knownTitle(cards, sv(it.title)))
+                        rows.Push(itemCard(it, now))
+                    end if
+                end for
+                if rows.Count() > 0
+                    t = Left(t, Instr(1, t + " (", " (") - 1)
+                    sections.Push({title: "GISTRA · " + t, w: 414, cap: 4, note: gnote, cards: rows})
+                end if
+            end if
+        end for
+    end if
 
     return finishModel(sections, [f1, f2, f3, f4], urgent, downSvc + downNodes + alertsCrit, running, nextCall)
 end function
@@ -535,7 +660,7 @@ function buildV1(d as Object, now as Integer) as Object
         end if
     end for
     sections = []
-    if urgent.Count() > 0 then sections.Push({title: "지금 확인할 것", w: 414, cap: 4, cards: urgent})
+    if urgent.Count() > 0 then sections.Push({title: "지금 확인할 것", w: 414, cap: 4, note: "", cards: urgent})
     cs = []
     if d.calendar = invalid then cs.Push(failCard(560, "캘린더", ""))
     for each e in arr(d.calls)
@@ -553,13 +678,13 @@ function buildV1(d as Object, now as Integer) as Object
         end if
     end for
     if cs.Count() = 0 then cs.Push(emptyCard(560, "오늘 남은 일정이 없어요"))
-    sections.Push({title: "오늘", w: 560, cap: 3, cards: cs})
+    sections.Push({title: "오늘", w: 560, cap: 3, note: "", cards: cs})
     if infra = invalid
-        sections.Push({title: "인프라", w: 414, cap: 4, cards: [failCard(414, "인프라", "")]})
+        sections.Push({title: "인프라", w: 414, cap: 4, note: "", cards: [failCard(414, "인프라", "")]})
     else
         cs = textCards(infra.health, 414)
         if cs.Count() = 0 then cs.Push(emptyCard(414, "노드 정보가 없어요"))
-        sections.Push({title: "인프라", w: 414, cap: 4, cards: cs})
+        sections.Push({title: "인프라", w: 414, cap: 4, note: "", cards: cs})
     end if
     cs = []
     if tasks = invalid
@@ -582,14 +707,14 @@ function buildV1(d as Object, now as Integer) as Object
         end for
         if cs.Count() = 0 then cs.Push(emptyCard(560, "진행 중인 작업이 없어요"))
     end if
-    sections.Push({title: "Azel 작업", w: 560, cap: 3, cards: cs})
+    sections.Push({title: "Azel 작업", w: 560, cap: 3, note: "", cards: cs})
     if todo = invalid
-        sections.Push({title: "과제와 할 일", w: 414, cap: 4, cards: [failCard(414, "GISTRA", "")]})
+        sections.Push({title: "과제와 할 일", w: 414, cap: 4, note: "", cards: [failCard(414, "GISTRA", "")]})
     else
         cs = textCards(todo.assignments, 414)
         appendAll(cs, textCards(todo.today, 414))
         if cs.Count() = 0 then cs.Push(emptyCard(414, "마감이 가까운 과제가 없어요"))
-        sections.Push({title: "과제와 할 일", w: 414, cap: 4, cards: cs})
+        sections.Push({title: "과제와 할 일", w: 414, cap: 4, note: "", cards: cs})
     end if
     return finishModel(sections, [f1, f2, f3, f4], urgent, broken, running, nextCall)
 end function
@@ -604,13 +729,14 @@ function makeContent(sections as Object) as Object
     for each sec in sections
         row = root.CreateChild("ContentNode")
         row.title = sec.title
+        row.AddFields({d_note: sec.note})
         for each c in sec.cards
             item = row.CreateChild("ContentNode")
             item.AddFields({
                 d_t: c.t, d_w: c.w, d_head: c.head, d_hl: c.hl, d_sent: c.sent, d_meta: c.meta, d_when: c.when
                 d_tail: c.tail, d_soon: c.soon, d_now: c.now, d_name: c.name, d_v1: c.v[0], d_v2: c.v[1]
                 d_v3: c.v[2], d_v4: c.v[3], d_down: c.down, d_n1: c.n1, d_l1: c.l1, d_m1: c.m1, d_n2: c.n2
-                d_l2: c.l2, d_m2: c.m2
+                d_l2: c.l2, d_m2: c.m2, d_status: c.status, d_load: c.load, d_upt: c.upt, d_title: c.title
             })
         end for
     end for

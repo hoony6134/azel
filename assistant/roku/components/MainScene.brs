@@ -114,8 +114,13 @@ sub updateCounter()
     if f = invalid or f.Count() <> 2 or m.model = invalid then return
     if f[0] >= m.model.sections.Count() then return
     sec = m.model.sections[f[0]]
-    if sec.cards.Count() <= sec.cap then return
-    m.counter.text = (f[1] + 1).ToStr() + " / " + sec.cards.Count().ToStr()
+    txt = sec.note
+    if sec.cards.Count() > sec.cap
+        n = (f[1] + 1).ToStr() + " / " + sec.cards.Count().ToStr()
+        if txt <> "" then txt = txt + "  ·  " + n else txt = n
+    end if
+    if txt = "" then return
+    m.counter.text = txt
     m.counter.visible = true
 end sub
 

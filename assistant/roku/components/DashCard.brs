@@ -21,12 +21,16 @@ sub init()
     m.down = mkLabel(m.top, 28, 68, 212, 30, 24, "sb", pal("danger"))
     m.rowL = []
     m.rowV = []
-    for i = 0 to 3
-        m.rowL.Push(mkLabel(m.top, 28, 68 + i * 27, 120, 30, 24, "r", pal("text2")))
-        v = mkLabel(m.top, 28, 68 + i * 27, 212, 30, 24, "sb", pal("text"))
+    for i = 0 to 5
+        m.rowL.Push(mkLabel(m.top, 28, 68 + i * 27, 100, 30, 24, "r", pal("text2")))
+        v = mkLabel(m.top, 28, 68 + i * 27, 172, 30, 24, "sb", pal("text"))
         v.horizAlign = "right"
         m.rowV.Push(v)
     end for
+    m.dot = mkLabel(m.top, 28, 25, 0, 30, 24, "sb", pal("text2"))
+    m.dot.width = 0
+    m.stat = mkLabel(m.top, 28, 28, 358, 30, 24, "r", pal("text3"))
+    m.stat.horizAlign = "right"
     m.bn = []
     m.bl = []
     m.bm = []
@@ -38,7 +42,7 @@ sub init()
         m.bl[i].width = 0
         m.bm.Push(mkLabel(m.top, x, 146, 216, 30, 24, "r", pal("text3")))
     end for
-    m.all = [m.kind, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down]
+    m.all = [m.kind, m.big, m.tail, m.nowL, m.sent, m.meta, m.name, m.down, m.dot, m.stat]
     m.fillBase = pal("card")
 end sub
 
@@ -46,7 +50,7 @@ sub hideAll()
     for each n in m.all
         n.visible = false
     end for
-    for i = 0 to 3
+    for i = 0 to 5
         m.rowL[i].visible = false
         m.rowV[i].visible = false
     end for
@@ -62,18 +66,31 @@ sub show(n as Object, x as Integer, y as Integer)
     n.visible = true
 end sub
 
-sub setRow(i as Integer, label as String, v as Integer, warnAt as Integer, suffix as String)
+' figure i of a host card: two columns of three, label on the left, value on the right
+sub setFig(i as Integer, label as String, text as String, amber as Boolean)
+    x = 28 + Int(i / 3) * 186
+    y = 76 + (i mod 3) * 32
+    m.rowL[i].translation = [x, y]
     m.rowL[i].text = label
     m.rowL[i].visible = true
+    m.rowV[i].translation = [x, y]
+    m.rowV[i].text = text
+    if amber then m.rowV[i].color = pal("amber") else m.rowV[i].color = pal("text")
     m.rowV[i].visible = true
-    if v < 0
-        m.rowV[i].text = "—"
-        m.rowV[i].color = pal("text2")
-        return
-    end if
-    m.rowV[i].text = v.ToStr() + suffix
-    if v >= warnAt then m.rowV[i].color = pal("amber") else m.rowV[i].color = pal("text")
 end sub
+
+function pctText(v as Integer, suffix as String) as String
+    if v < 0 then return "—"
+    return v.ToStr() + suffix
+end function
+
+function loadHot(load as String) as Boolean
+    p = Instr(1, load, "/")
+    if p < 2 then return false
+    cores = Val(Mid(load, p + 1))
+    if cores <= 0 then return false
+    return Val(Left(load, p - 1)) / cores > 1
+end function
 
 sub onContent()
     c = m.top.itemContent
@@ -122,20 +139,60 @@ sub onContent()
         m.sent.height = 80
         show(m.sent, 28, 84)
         show(m.meta, 28, 146)
-    else if t = "node"
+    else if t = "host"
+        st = c.d_status
         m.name.text = c.d_name
-        m.name.color = pal("text")
-        show(m.name, 28, 24)
-        setRow(0, "CPU", c.d_v1, 85, "%")
-        setRow(1, "메모리", c.d_v2, 90, "%")
-        setRow(2, "디스크", c.d_v3, 85, "%")
-        setRow(3, "온도", c.d_v4, 80, "°")
-    else if t = "nodedown"
-        m.name.text = c.d_name
-        m.name.color = pal("text2")
-        show(m.name, 28, 24)
-        m.down.text = c.d_down
-        show(m.down, 28, 68)
+        if st = "off" then m.name.color = pal("text2") else m.name.color = pal("text")
+        show(m.name, 56, 24)
+        ' the status icon: a filled dot, hollow when the host is off; colour only when it needs a look
+        m.dot.text = "●"
+        dc = pal("text3")
+        word = "정상"
+        wc = pal("text3")
+        if st = "warn"
+            dc = pal("amber")
+            word = "주의"
+            wc = pal("amber")
+        else if st = "problem"
+            dc = pal("danger")
+            word = "문제"
+            wc = pal("danger")
+        else if st = "off"
+            m.dot.text = "○"
+            dc = pal("danger")
+            word = "꺼짐"
+            wc = pal("danger")
+        end if
+        m.dot.color = dc
+        show(m.dot, 28, 25)
+        m.stat.text = word
+        m.stat.color = wc
+        show(m.stat, 28, 28)
+        if st = "off"
+            show(m.meta, 28, 146)
+        else
+            setFig(0, "CPU", pctText(c.d_v1, "%"), c.d_v1 >= 85)
+            setFig(1, "메모리", pctText(c.d_v2, "%"), c.d_v2 >= 90)
+            setFig(2, "디스크", pctText(c.d_v3, "%"), c.d_v3 >= 85)
+            setFig(3, "온도", pctText(c.d_v4, "°"), c.d_v4 >= 80)
+            lt = c.d_load
+            if lt = "" then lt = "—"
+            setFig(4, "부하", lt, loadHot(c.d_load))
+            ut = c.d_upt
+            if ut = "" then ut = "—"
+            setFig(5, "가동", ut, false)
+        end if
+    else if t = "item"
+        m.kind.text = c.d_title
+        if c.d_soon then m.kind.color = pal("amber") else m.kind.color = pal("text2")
+        m.sent.text = c.d_sent
+        m.sent.height = 80
+        if c.d_title <> ""
+            show(m.kind, 28, 24)
+            show(m.sent, 28, 58)
+        else
+            show(m.sent, 28, 24)
+        end if
         show(m.meta, 28, 146)
     else if t = "count"
         for i = 0 to 1
