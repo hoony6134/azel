@@ -3,7 +3,7 @@
 # systemctl --user daemon-reload && systemctl --user enable --now biseo-gateway
 # (loginctl enable-linger $USER to keep it running without a login session).
 [Unit]
-Description=Biseo Claude gateway
+Description=Azel Claude gateway
 After=network-online.target tailscaled.service
 Wants=network-online.target
 

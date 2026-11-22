@@ -2,7 +2,7 @@
 # systemctl --user daemon-reload && systemctl --user enable --now biseo-daemon
 # (loginctl enable-linger $USER to keep it running without a login session).
 [Unit]
-Description=Biseo agent daemon (MCP)
+Description=Azel agent daemon (MCP)
 After=network-online.target tailscaled.service
 Wants=network-online.target
 

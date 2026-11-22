@@ -2444,7 +2444,7 @@ async def reap_warm():
                 print("oauth refresh failed:", type(e).__name__, flush=True)
 
 
-app = FastAPI(title="biseo-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
+app = FastAPI(title="azel-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
 if MODE == "full":  # wake-word enrollment (wake_enroll.py): the user's own clips stay on jh devices
     app.include_router(wake_enroll.router)
 
