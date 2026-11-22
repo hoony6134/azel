@@ -644,7 +644,10 @@ end sub
 sub onPageFetch(ev as Object)
     r = ev.getData()
     if m.mode <> "page" then return
-    if r.ok
+    ' a gateway from before ?detail= ignores it and answers the dashboard JSON: that is "couldn't load", not "nothing"
+    want = "groups"
+    if m.page.kind = "tasks" then want = "active"
+    if r.ok and r.data.DoesExist(want)
         m.page.data = r.data
         m.page.state = "ok"
     else
