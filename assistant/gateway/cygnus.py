@@ -7,6 +7,7 @@ every write tool server-side, and without `--sens` sensitive memories stay hidde
 ever calls the curated tools below, with arguments it validates itself (Qwen's arguments are steered by what the
 user says), and trims what comes back before it reaches Qwen's prompt.
 """
+import asyncio
 import json
 import re
 import time
@@ -61,10 +62,11 @@ TOOLS = {
     "memory_recall": ("사용자의 장기 기억 검색(취향, 사람, 프로젝트, 결정)", {"query": _text(120), "kind": _memkind},
                       ("query",), {"limit": 5}),
     "gistra_people": ("교수·조교 목록과 맡은 과목, 연락처·사무실·면담 시간(query로 이름·과목 필터)", {"query": _text(60)}, (), {}),
-    "infra_health": ("서버·인프라·노드·홈서버·내부 시스템 상태: 서버별 켜짐, CPU, 메모리(RAM), 디스크, 온도, 컨테이너",
-                     {}, (), {}),
-    "infra_status": ("서비스·컨테이너 모니터 중 지금 문제 있는 것(내부 시스템이 괜찮은지)", {}, (), {"problems_only": True}),
-    "infra_alerts": ("지금 울리고 있는 서버·인프라 경보", {}, (), {}),
+    "infra_health": ("서버(호스트)의 자원 상태: 켜짐, CPU, 메모리(RAM), 디스크, 온도, 컨테이너. 서비스가 멈췄는지는 "
+                     "infra_status: 서버 상태를 물으면 infra_status도 같이 봐", {}, (), {}),
+    "infra_status": ("지금 멈추거나 문제 있는 서비스·컨테이너(모니터 기준). 서버가 정상이어도 그 위 서비스는 멈췄을 수 "
+                     "있으니 서버 상태를 물으면 이것도 같이 봐", {}, (), {"problems_only": True}),
+    "infra_alerts": ("지금 울리고 있는 서버·인프라 경보. 경보가 없어도 멈춘 서비스는 있을 수 있어: infra_status도 봐", {}, (), {}),
 }
 SHARED_ONLY = {"memory_recall"}
 # JSON schemas of the arguments, for models that call these tools natively (the Claude API path); check_args still
@@ -207,10 +209,38 @@ async def call(name, args, raw=False):
         import os
         _shared_client = Cygnus(os.environ.get("BRAIN_CYGNUS_URL", "https://mcp.scian.xyz"),
                                 _pat_file().read_text().strip())
+    if name in WITH_DOWN and not raw:  # the TV parses the raw text: it keeps it as it was
+        main, status = await asyncio.gather(_one(name, checked), _one("infra_status", TOOLS["infra_status"][3]))
+        down = down_lines(status)
+        if not down or main.startswith(FAILED):
+            return main if not down else f"지금 문제가 있는 서비스: {'; '.join(down)}\n{main}"
+        block = f"지금 문제가 있는 서비스: {'; '.join(down)}\n{HOST_NOTE}"
+        return f"{block}\n{main}" if name == "infra_health" else f"{main}\n{block}"
+    return await _one(name, checked, raw)
+
+
+# Live 2026-11-23: NemoClaw was down, infra_alerts said no alerts and infra_health had every host 정상, so "서버 상태"
+# was answered 정상. A host or alert read now carries the services that are down, on every engine.
+WITH_DOWN = ("infra_health", "infra_alerts")
+FAILED = "지금은 Cygnus를 볼 수 없어요"
+HOST_NOTE = "(서버가 정상이어도 그 위의 서비스가 모두 켜져 있다는 뜻은 아니에요.)"
+DOWN_WORD = re.compile(r"멈춤|문제|느려짐|주의|경보 울리는 중")
+NO_PROBLEM = re.compile(r"문제\s*(없|0\b)|이상\s*없|모두\s*정상")
+
+
+def down_lines(status):
+    """infra_status's problem lines ([] when there are none or it could not be read)."""
+    if not isinstance(status, str) or status.startswith((FAILED, "Cygnus가 거절", "(결과 없음)")):
+        return []
+    return [x.strip("- ").strip() for x in status.splitlines()
+            if DOWN_WORD.search(x) and not NO_PROBLEM.search(x)][:8]
+
+
+async def _one(name, checked, raw=False):
     try:
-        return await _shared_client.call(name, checked, raw)
+        return await _shared_client.call(name, checked, raw)  # its 60 s cache: the extra status read is often free
     except (PermissionError, RuntimeError, httpx.HTTPError) as e:
-        return f"지금은 Cygnus를 볼 수 없어요. ({type(e).__name__})"
+        return f"{FAILED}. ({type(e).__name__})"
 
 
 # ---------- memory writes: a separate memory-scoped PAT (cygnus_pat_rw), on the Mac gateway only ----------
