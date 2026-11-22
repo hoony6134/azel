@@ -176,6 +176,7 @@ final class MacCall: ObservableObject {
     /// shows without taking focus and the mic is live at once for the sentence after the name.
     func wake(persona key: String?, utterance: String? = nil) {
         if inCall { showPanel(); return }
+        client.beginTiming(utterance == nil ? "wake" : "wake+utterance")
         let p = key.flatMap { k in PersonaModel.shared.personas.first { $0.id == k || $0.name == k } } ?? PersonaModel.shared.primary
         wakeCall = true
         pendingUtterance = utterance
@@ -191,12 +192,12 @@ final class MacCall: ObservableObject {
 
     /// Sends the waiting utterance, then opens the live mic.
     private func sendUtterance(_ id: String) {
-        client.sending = false
         Task { [weak self] in
-            let data = await AzelFiles.takeUtterance(id)
+            let got = await AzelFiles.takeUtterance(id)
             guard let self, self.inCall else { return }
-            if let data { self.client.sendUserAudio(data) }
-            self.client.sending = true
+            self.client.releaseMic(first: got.data, cutoff: got.at)
+            self.client.markTiming(got.data == nil ? "utterance_none" : "utterance_sent")
+            if let d = got.data { Log.call.notice("wake utterance \(d.count / 32) ms") }
         }
     }
 
@@ -209,7 +210,8 @@ final class MacCall: ObservableObject {
         activity = ActivityLog()
         state = ""
         error = nil
-        if usePanel { showPanel() }
+        client.beginTimingIfIdle(pttCall || talking ? "hotkey" : "start")
+        if usePanel { showPanel(); client.markTiming("panel") }
         guard AudioIO.hardware else { return }   // the test host never asks for the mic or dials out
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: connect()
@@ -335,12 +337,13 @@ final class MacCall: ObservableObject {
     private static var micDenied: String { "\(AssistantName.josa(AssistantName.current, "이", "가")) 말을 들으려면 마이크를 허용해 주세요. 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 Azel을 켜 주세요." }
 
     private func connect() {
+        client.markTiming("mic_ok")
         inCall = true
         applyDevices()
         do {
             let mode = BrainModeChoice.shared.takeForCall()
             brainMode = mode
-            if pendingUtterance != nil { client.sending = false }   // nothing live goes ahead of the utterance
+            if pendingUtterance != nil { client.holdMic() }   // live frames wait (not dropped) behind the utterance
             let wantSecret = BrainModeChoice.shared.takeSecretForCall()
             secret = wantSecret
             try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
@@ -463,9 +466,14 @@ final class MacCall: ObservableObject {
             let f = screen.visibleFrame
             p.setFrameOrigin(NSPoint(x: f.midX - p.frame.width / 2, y: f.minY + 80))
         }
-        panel?.alphaValue = 0
+        // On screen now, not after a fade: the fade ran on the main thread, which the audio engine's
+        // start (voice processing, synchronous) blocks right after, so the panel stayed invisible
+        // through it (user report, 2026-11-23: a long gap between "네?" and the panel).
+        panel?.alphaValue = 1
         panel?.makeKeyAndOrderFront(nil) // non-activating: takes Esc without pulling focus from the current app
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.25; panel?.animator().alphaValue = 1 }
+        panel?.contentView?.layoutSubtreeIfNeeded()
+        panel?.displayIfNeeded()
+        CATransaction.flush()   // drawn before connect() blocks the main thread
     }
 }
 

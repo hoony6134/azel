@@ -39,22 +39,24 @@ enum AzelFiles {
     /// at end of speech, when `mic-live` appears, or after 10 s), then it is renamed to `.pcm`; zero
     /// bytes = nothing was said. Waits while the `.part` exists (up to `partLimit`), or `appear` for
     /// either file to show up at all; reads the `.pcm` once and deletes both. nil = go live without it.
-    static func takeUtterance(_ id: String, appear: TimeInterval = 5, partLimit: TimeInterval = 12) async -> Data? {
+    /// `at`: when the finished file appeared (system uptime), i.e. when the listener stopped capturing.
+    static func takeUtterance(_ id: String, appear: TimeInterval = 5, partLimit: TimeInterval = 12) async -> (data: Data?, at: Double?) {
         let url = utterance(id), part = url.appendingPathExtension("part")
         let fm = FileManager.default
         let start = Date()
         while !fm.fileExists(atPath: url.path) {
             let waited = Date().timeIntervalSince(start)
             if fm.fileExists(atPath: part.path) ? waited >= partLimit : waited >= appear { break }
-            // 20 ms: the live mic is held until the file is read, so this poll is the only audio gap
-            // (the listener's file already covers everything up to the frame where it saw mic-live).
+            // 20 ms: the app's live mic is held (not dropped) meanwhile, and only its frames after the
+            // file appeared are sent after it, so this poll sets the seam's precision, not a gap.
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
+        let at = fm.fileExists(atPath: url.path) ? ProcessInfo.processInfo.systemUptime : nil
         let data = try? Data(contentsOf: url)
         try? FileManager.default.removeItem(at: url)
         try? FileManager.default.removeItem(at: part)
-        guard let data, data.count >= 2 else { return nil }
-        return data.count % 2 == 0 ? data : data.dropLast()   // whole 16-bit samples only
+        guard let data, data.count >= 2 else { return (nil, at) }
+        return (data.count % 2 == 0 ? data : data.dropLast(), at)   // whole 16-bit samples only
     }
 }
 #endif

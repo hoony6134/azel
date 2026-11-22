@@ -114,19 +114,23 @@ final class CallClient {
         receivedAny = false
         statsLock.lock(); sentBytes = 0; sentPeak = 0; receivedAudioBytes = 0; droppedAudioBytes = 0; statsLock.unlock()
         Log.call.info("call start session=\(session, privacy: .public) intent=\(intent ?? "-", privacy: .public) host=\(task.originalRequest?.url?.host ?? "?", privacy: .public)")
+        markTiming("ws_start")
         task.resume()
         if let hello = Self.phoneHello?() { task.send(.string(hello)) { _ in } }
         audio.onConfigurationChange = { [weak self] in self?.routeChanged() }
         audio.onMic = { [weak self, weak task] data in
             guard let self else { return }
+            if holdFrame(data) { return }   // the wake handoff: waits until the listener's recording is sent
             let action = sending ? Self.micAction(muted: muted, held: held) : .drop
             if action == .send {
+                micSent()
                 task?.send(.data(data)) { error in if let error { Log.call.error("mic send failed: \(error.localizedDescription, privacy: .public)") } }
                 let p = Self.peak(data)
                 statsLock.lock(); sentBytes += data.count; sentPeak = max(sentPeak, p); statsLock.unlock()
             }
             if action != .drop { recorder?.mic(data, silent: action == .silence) }
         }
+        defer { markTiming("audio_up") }   // engine and voice processing running (synchronous, on this thread)
         do { try audio.start() } catch {
             Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
             throw StartError.audio
@@ -159,7 +163,7 @@ final class CallClient {
             guard let self else { return }
             switch result {
             case .success(let message):
-                if !receivedAny { receivedAny = true; Log.call.info("call socket open, first message") }
+                if !receivedAny { receivedAny = true; markTiming("ws_first_frame"); Log.call.info("call socket open, first message") }
                 deliver(message, call: call)
             case .failure:
                 let status = (task.response as? HTTPURLResponse)?.statusCode
@@ -203,6 +207,8 @@ final class CallClient {
             // After an interrupt, frames of the old reply may still arrive: drop them.
             admissionLock.lock(); let admit = admission.admits; admissionLock.unlock()
             guard admit else { statsLock.lock(); droppedAudioBytes += pcm.count; statsLock.unlock(); return }
+            markTiming("first_reply_audio")
+            logTiming()
             audio.play(pcm)
             karaokeLock.lock(); karaoke.audio(samples: pcm.count / 2); karaokeLock.unlock()
             playedLock.lock(); played.audio(samples: pcm.count / 2); playedLock.unlock()
@@ -211,6 +217,13 @@ final class CallClient {
             recorder?.assistant(pcm)
         case .string(let text):
             guard let event = try? JSONDecoder().decode(CallEvent.self, from: Data(text.utf8)) else { return }
+            switch event.type {
+            case "hello": markTiming("hello")
+            case "state": markTiming("state_" + (event.value ?? ""))   // state_listening, state_thinking, …
+            case "transcript": markTiming("transcript")
+            case "reply": markTiming("reply_text")
+            default: break
+            }
             if event.type == "phone_query" {  // answered off the receive path; never shown or recorded
                 if let answer = Self.phoneQuery {
                     Task { [weak self] in if let r = await answer(Data(text.utf8)) { self?.socket?.send(.string(r)) { _ in } } }
@@ -269,6 +282,41 @@ final class CallClient {
     /// `{"type":"played","reply_id":N}` once reply N's last buffer has actually played, so the server
     /// stops guessing when playback ended (the cut-off investigation, 2026-11-22).
     private var played = PlayedTracker()
+    /// Call-start timing (see CallTiming); the owner calls `beginTiming` when the user asks for the call.
+    private var timing = CallTiming()
+    private let timingLock = NSLock()
+
+    func beginTiming(_ source: String) {
+        timingLock.lock(); timing.begin(source); lastMicAt = nil; micGapMax = 0; timingLock.unlock()
+    }
+
+    /// Starts timing unless the wake handoff just began it for this call (begun, nothing marked yet).
+    func beginTimingIfIdle(_ source: String) {
+        timingLock.lock(); if !timing.justBegun { timing.begin(source); lastMicAt = nil; micGapMax = 0 }; timingLock.unlock()
+    }
+
+    func markTiming(_ name: String) { timingLock.lock(); timing.mark(name); timingLock.unlock() }
+
+    /// Mic flow for the timing line (Mac turn-end bug, 2026-11-23: the server ended turns ~17 s late,
+    /// most likely because no mic frames arrived after the user spoke): the first frame sent and
+    /// the longest pause between two sent frames, with when it began.
+    private var lastMicAt: Double?
+    private var micGapMax = 0.0, micGapAt = 0.0
+
+    private func micSent(now: Double = ProcessInfo.processInfo.systemUptime) {
+        timingLock.lock(); defer { timingLock.unlock() }
+        timing.mark("mic_first", now: now)
+        if let last = lastMicAt, now - last > micGapMax { micGapMax = now - last; micGapAt = last }
+        lastMicAt = now
+    }
+
+    private func logTiming() {
+        timingLock.lock()
+        if micGapMax > 0 { timing.note("mic_gap_max", ms: Int(micGapMax * 1000), at: micGapAt) }
+        timingLock.unlock()
+        timingLock.lock(); let line = timing.takeLine(); timingLock.unlock()
+        if let line { Log.call.notice("call timing \(line, privacy: .public)") }
+    }
     private let playedLock = NSLock()
 
     private func reportPlayed() {
@@ -382,6 +430,8 @@ final class CallClient {
 
     /// Says goodbye, closes the socket and stops audio. Safe to call twice.
     func stop() {
+        logTiming()   // a call that never got reply audio still reports how far it got
+        micHoldLock.lock(); micHold = nil; micHoldLock.unlock()
         _ = beginCall()            // the old socket's late frames are dropped from here on
         silenceCheck?.cancel()
         pulseTimer?.invalidate()
@@ -406,6 +456,38 @@ final class CallClient {
         held = false
         playback = PlaybackGate()
         sending = true
+    }
+
+    /// The wake handoff (user bug, 2026-11-23: "아젤, 내일 날씨…" in one breath lost its middle): live
+    /// mic frames wait here with their arrival time instead of being dropped while the listener's
+    /// recording is read, then go out right after it.
+    private var micHold: [(at: Double, pcm: Data)]?
+    private let micHoldLock = NSLock()
+    static let micHoldLimit = 600   // ~12 s of tap buffers; a stuck handoff never grows without bound
+
+    func holdMic() { micHoldLock.lock(); micHold = []; micHoldLock.unlock() }
+
+    private func holdFrame(_ data: Data) -> Bool {
+        micHoldLock.lock(); defer { micHoldLock.unlock() }
+        guard micHold != nil else { return false }
+        if micHold!.count < Self.micHoldLimit { micHold!.append((ProcessInfo.processInfo.systemUptime, data)) }
+        return true
+    }
+
+    /// Held frames the listener's recording doesn't already cover: those that arrived at or after
+    /// `cutoff` (when its finished file appeared, i.e. when it stopped capturing).
+    static func seam(_ held: [(at: Double, pcm: Data)], cutoff: Double?) -> [Data] {
+        held.filter { cutoff == nil || $0.at >= cutoff! }.map(\.pcm)
+    }
+
+    /// Sends the listener's recording, then the held frames after its end, then lets the live mic
+    /// through, in that order (live frames wait on the lock meanwhile).
+    func releaseMic(first: Data?, cutoff: Double?) {
+        micHoldLock.lock(); defer { micHoldLock.unlock() }
+        if let first { sendUserAudio(first) }
+        let rest = Self.seam(micHold ?? [], cutoff: first == nil ? nil : cutoff)
+        if Self.micAction(muted: muted, held: held) == .send { rest.forEach { sendUserAudio($0) } }
+        micHold = nil
     }
 
     /// Audio the user already said (the wake listener's recording) sent as mic frames, 100 ms each,
@@ -572,5 +654,42 @@ struct PlayedTracker: Equatable {
             replies.removeFirst()
         }
         return out
+    }
+}
+
+/// Milliseconds from the call's start to each stage, logged once per call at `.notice` (kept by
+/// the unified log, unlike `.info`): `log show --predicate 'subsystem == "xyz.scian.biseo"' | grep timing`.
+struct CallTiming {
+    private(set) var source = ""
+    private var t0: Double?
+    private(set) var marks: [(String, Int)] = []
+    private var logged = false
+
+    mutating func begin(_ source: String, now: Double = ProcessInfo.processInfo.systemUptime) {
+        self = CallTiming(); self.source = source; t0 = now
+    }
+
+    /// The first time `name` happens in this call; later repeats are ignored.
+    mutating func mark(_ name: String, now: Double = ProcessInfo.processInfo.systemUptime) {
+        guard let t0, !marks.contains(where: { $0.0 == name }) else { return }
+        marks.append((name, Int(((now - t0) * 1000).rounded())))
+    }
+
+    var justBegun: Bool { t0 != nil && marks.isEmpty && !logged }
+
+    /// A measurement that isn't a moment: "mic_gap_max=17000@1900" (ms, and when it began).
+    mutating func note(_ name: String, ms: Int, at: Double) {
+        guard let t0 else { return }
+        extra.append("\(name)=\(ms)@\(Int(((at - t0) * 1000).rounded()))")
+    }
+    private var extra: [String] = []
+
+    var line: String { "\(source): " + (marks.map { "\($0.0)=\($0.1)" } + extra).joined(separator: " ") }
+
+    /// The line once (at the first reply audio, or at hangup if none came).
+    mutating func takeLine() -> String? {
+        guard t0 != nil, !logged, !marks.isEmpty else { return nil }
+        logged = true
+        return line
     }
 }

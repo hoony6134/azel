@@ -168,3 +168,26 @@ final class PlayedReportTests: XCTestCase {
         XCTAssertEqual(client.audioCounts.dropped, 0)
     }
 }
+
+final class CallTimingTests: XCTestCase {
+    func testMarksOnceAndOneLine() {
+        var t = CallTiming()
+        t.begin("wake", now: 100)
+        XCTAssertTrue(t.justBegun)
+        t.mark("panel", now: 100.012)
+        t.mark("audio_up", now: 100.430)
+        t.mark("panel", now: 101)                       // repeats ignored
+        t.mark("first_reply_audio", now: 102.5)
+        XCTAssertEqual(t.line, "wake: panel=12 audio_up=430 first_reply_audio=2500")
+        XCTAssertEqual(t.takeLine(), "wake: panel=12 audio_up=430 first_reply_audio=2500")
+        XCTAssertNil(t.takeLine(), "logged once per call")
+        var gap = CallTiming()
+        gap.begin("wake", now: 0)
+        gap.mark("mic_first", now: 0.9)
+        gap.note("mic_gap_max", ms: 17000, at: 1.9)
+        XCTAssertEqual(gap.line, "wake: mic_first=900 mic_gap_max=17000@1900")
+        var none = CallTiming()
+        none.mark("panel")
+        XCTAssertNil(none.takeLine(), "no call begun: nothing")
+    }
+}
