@@ -164,3 +164,12 @@ def test_browser_commits_are_never_auto_approved(agw):
     r = c.post("/v1/approvals", json={"device": "macbook", "tool": "browser", "cwd": "browser",
                                       "command": "클릭: 결제하기 (https://shop.example/checkout)", "requester": "ask:azel:s1"}).json()
     assert r["status"] == "pending" and not r.get("auto")
+
+
+
+def test_an_app_task_grant_may_last_as_long_as_the_task(agw):
+    g, c, _ = agw
+    t = asyncio.run(g.grant_create({"task": "abcabcabcabc"}, None, 240, by="app"))
+    assert 4 * 3600 - 5 < t["expires_at"] - time.time() <= 4 * 3600 + 1
+    s = asyncio.run(g.grant_create({"session": "azel:s1"}, None, 240, by="app"))
+    assert s["expires_at"] - time.time() <= 7200 + 1  # a call's grant stays at 2 h

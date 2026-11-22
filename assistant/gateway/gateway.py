@@ -3197,6 +3197,7 @@ async def create_approval(body: dict):
 
 # ---------- auto-approve: the user lets ordinary commands run without a tap for one call or task ----------
 AUTO_MAX_S = 7200
+TASK_AUTO_MAX_S = 4 * 3600  # an app-made task grant may last as long as the task may (it ends with the task anyway)
 NEVER_AUTO = {"browser"}  # a click that commits (buy, send, submit) or a first print: always the user's tap
 AUTO_KEY = "/v1/state/kv/auto-grants"
 secret_grants: dict[str, dict] = {}  # secret calls' grants: memory only, nothing persists
@@ -3221,12 +3222,13 @@ async def grant_create(scope, devices=None, minutes=120, by="app"):
     if devices is not None and not (isinstance(devices, list) and all(isinstance(d, str) for d in devices)):
         raise HTTPException(400, "devices: a list of device ids")
     if not isinstance(minutes, (int, float)) or minutes <= 0:
-        raise HTTPException(400, "minutes: a positive number (at most 120)")
+        raise HTTPException(400, "minutes: a positive number (at most 120; 240 for a task's grant from the app)")
     key = {"session": scope["session"]} if scope.get("session") else {"task": scope["task"]}
     for g in [g for g in await grants_live() if g["scope"] == key]:
         await grant_end(g, "replaced", summary=False)
+    cap = TASK_AUTO_MAX_S if key.get("task") and by == "app" else AUTO_MAX_S
     g = {"id": uuid.uuid4().hex[:10], "scope": key, "devices": devices, "by": by, "created": time.time(),
-         "expires_at": time.time() + min(minutes * 60, AUTO_MAX_S), "secret": is_secret(key.get("session")), "log": []}
+         "expires_at": time.time() + min(minutes * 60, cap), "secret": is_secret(key.get("session")), "log": []}
     if g["secret"]:
         secret_grants[g["id"]] = g
     else:
