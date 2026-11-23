@@ -184,6 +184,7 @@ SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "sche
                 "holdings_update": "보유 종목 바꾸기",
                 "web_task": "브라우저 작업 맡기기"}
 TAINT_S = 600
+AUDIT_WAIT_S = 0.3  # a tool's answer waits at most this for its audit row; the rest finishes in the background
 
 
 TASK_NEVER = {"calendar_write", "create_task", "web_task", "end_call", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send",
@@ -231,6 +232,8 @@ class Bridge:
         self.confirming = {}  # run id -> when a confirm/clarify question went out (end_call waits for the answer)
         self.task_asked = {}  # run id -> when create_task asked how approvals should go
         self.cal_pending = {}  # pending id -> {who, turn, at, args, plan}: calendar_write's read-backs awaiting a yes
+        self.audits = set()  # audit rows still being written (a slow ruchba)
+        self.audit_locks = {}  # event loop -> its lock (tests run several loops)
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -460,11 +463,24 @@ class Bridge:
             code = HTTP_CODES.get(getattr(e, "status_code", None))
             msg = e.detail if code and isinstance(getattr(e, "detail", None), str) else f"도구가 실패했어요: {type(e).__name__}"
             r = result(False, msg, error={"code": code or "failed", "message": msg})
-        await self.audit(name, args, caller, surface, persona_id, r)
+        # the audit row never holds up the answer: a slow ruchba finishes it in the background (one at a time)
+        job = asyncio.ensure_future(self.audit(name, args, caller, surface, persona_id, r))
+        self.audits.add(job)
+        job.add_done_callback(self.audits.discard)
+        try:
+            await asyncio.wait_for(asyncio.shield(job), AUDIT_WAIT_S)
+        except asyncio.TimeoutError:
+            pass
         return r
 
     async def audit(self, name, args, caller, surface, persona_id, r):
         """One row per action in kv actions-<KST date>: never the inputs, only what and whom (ACTIONS.md §6)."""
+        loop = asyncio.get_running_loop()
+        self.audit_locks = {lp: lk for lp, lk in self.audit_locks.items() if not lp.is_closed()}
+        async with self.audit_locks.setdefault(loop, asyncio.Lock()):  # read-modify-write: two at once drop a row
+            await self.audit_row(name, args, caller, surface, persona_id, r)
+
+    async def audit_row(self, name, args, caller, surface, persona_id, r):
         try:
             day = self.now().strftime("%Y-%m-%d")
             rows = await self.d["state"]("GET", f"/v1/state/kv/actions-{day}") or []

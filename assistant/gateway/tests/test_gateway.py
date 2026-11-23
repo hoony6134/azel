@@ -1826,3 +1826,52 @@ def test_tools_frame_flags_read_only(gw, monkeypatch):
     assert flags == {"agenda": True, "calendar_write": False, "web_search": True, "remember": False, "gistra_today": True,
                      "infra_health": True, "calendar_events": True, "spotify_play": False, "spotify_now_playing": True,
                      "mac__run_command": False}
+
+
+def test_slow_state_reads_fall_back_at_once(gw, monkeypatch, capsys):
+    """A relayed ruchba (2 s RTT): a read with a fallback gives up after STATE_WAIT_S, warns once, and later reads
+    use the fallback without waiting while a background refresh runs."""
+    g, _, _ = gw
+    monkeypatch.setattr(g, "STATE_WAIT_S", 0.05)
+    hits = []
+
+    async def handler(req):
+        hits.append(req.url.path)
+        await asyncio.sleep(0.2)
+        return httpx.Response(200, json=[{"id": "new"}])
+    st = g.State("http://state")
+    st.client = httpx.AsyncClient(base_url="http://state", transport=httpx.MockTransport(handler))
+    st.cache[("/v1/state/devices", ())] = [{"id": "old"}]
+
+    async def go():
+        t0 = time.monotonic()
+        first = await st.get("/v1/state/devices")
+        second = await st.get("/v1/state/devices")
+        took = time.monotonic() - t0
+        await asyncio.sleep(0.3)  # the background refresh lands
+        return first, second, took, await st.get("/v1/state/devices")
+    first, second, took, later = asyncio.run(go())
+    assert first == second == [{"id": "old"}] and took < 0.15 and st.slow()
+    assert later == [{"id": "new"}]
+    assert capsys.readouterr().out.count("warning: ruchba is slow") == 1
+
+
+def test_tool_answer_does_not_wait_for_the_audit(gw):
+    """The audit row (GET + PUT on ruchba) finishes in the background when ruchba is slow."""
+    import tools_bridge as B
+    written = []
+
+    async def state(method, path, body=None):
+        await asyncio.sleep(0.5)
+        if method == "PUT":
+            written.append(body)
+    bridge = B.Bridge(state=state, who=lambda: "")
+
+    async def go():
+        t0 = time.monotonic()
+        r = await bridge.run("nope_tool_x", {}, caller="qwen")
+        took = time.monotonic() - t0
+        await asyncio.sleep(1.2)
+        return r, took
+    r, took = asyncio.run(go())
+    assert took < B.AUDIT_WAIT_S + 0.2 and written and written[0][-1]["action"] == "nope_tool_x"
