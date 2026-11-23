@@ -10,7 +10,9 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=%h/biseo/gateway
 EnvironmentFile=%h/.config/biseo/gateway.env
-ExecStart=%h/.local/bin/uv run --frozen --project %h/biseo/gateway python %h/biseo/gateway/gateway.py
+# the venv's python itself (run `uv sync --frozen` in %h/biseo/gateway first): `uv run` stayed resident as an 18 MB
+# parent process, too much on a 1 GB host
+ExecStart=%h/biseo/gateway/.venv/bin/python %h/biseo/gateway/gateway.py
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=10
