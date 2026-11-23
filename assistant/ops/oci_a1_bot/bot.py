@@ -3,6 +3,7 @@
 
 Commands: run | dry-run | status | selfcheck.  Reads ~/.oci/config; never prints key material.
 """
+import base64
 import hashlib
 import json
 import logging
@@ -11,15 +12,18 @@ import os
 import random
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 SHAPE, OCPUS, MEM_GB = "VM.Standard.A1.Flex", 2, 12  # the only thing this bot may launch
-NAME, REF_NAME = "chuncheon-a1", "main-amd"  # new instance name; instance whose subnet/keys we copy
+NAME, REF_NAME = "kepler", "main-amd"  # new instance name; instance whose subnet/keys we copy
 FREE_OCPUS, FREE_MEM, FREE_STORAGE = 2, 12, 200  # Always Free caps (A1 total, boot+block GB)
 BOOT_WANT, BOOT_MIN = 50, 47
 BASE_S, JITTER_S, BACKOFF_MAX_S = 60, 20, 900
 NTFY_URL, NTFY_TOKEN = "http://100.64.0.6:8090/infra", Path.home() / ".ntfy_token"  # same path the old a1bot used
+CALL_URL, AZEL_TOKEN = "https://azel.scian.xyz/v1/calls", Path.home() / ".config/azel/token"
+INIT = Path(__file__).with_name("kepler-init.sh")
 STATE_DIR = Path.home() / ".local/state/a1bot"
 STATE, DONE, LOGFILE = STATE_DIR / "state.json", STATE_DIR / "DONE", STATE_DIR / "a1bot.log"
 LIVE = ("PROVISIONING", "AVAILABLE", "RESTORING", "CREATING_IMAGE", "STARTING", "RUNNING", "STOPPING", "STOPPED")
@@ -149,7 +153,7 @@ class Oci:
             display_name=NAME, shape=SHAPE, shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=OCPUS, memory_in_gbs=MEM_GB),
             source_details=m.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=boot_gb),
             create_vnic_details=m.CreateVnicDetails(subnet_id=subnet, assign_public_ip=True),
-            metadata={"ssh_authorized_keys": keys})
+            metadata={"ssh_authorized_keys": keys, "user_data": user_data(keys)})
         return self.compute.launch_instance(d).data
 
     def public_ip(self, inst):
@@ -162,6 +166,12 @@ class Oci:
                     return ip
             time.sleep(10)
         return "unknown"
+
+
+def user_data(keys):
+    """kepler-init.sh with deneb's public keys prepended, base64 for cloud-init."""
+    script = "#!/usr/bin/env bash\nexport KEYS=%s\n" % json.dumps(keys.strip()) + INIT.read_text().split("\n", 1)[1]
+    return base64.b64encode(script.encode()).decode()
 
 
 def key_summary(keys):
@@ -194,17 +204,52 @@ def dry_run():
     print(f"boot volume {boot} GB (remainder {FREE_STORAGE - store}, want {BOOT_WANT}, min {BOOT_MIN})")
     ok, why = guard(ocpus, mem, store, boot or 0) if boot else (False, "storage remainder < 47 GB")
     print(f"launch      {SHAPE} {OCPUS} OCPU / {MEM_GB} GB '{NAME}' public IP -> guard: {'PASS' if ok else 'FAIL ' + why}")
+    print(f"cloud-init  kepler-init.sh {len(base64.b64decode(user_data(keys)))} bytes (oracle limit 32768)")
+    try:
+        print(f"azel token  {AZEL_TOKEN} mode {oct(AZEL_TOKEN.stat().st_mode & 0o777)} size {AZEL_TOKEN.stat().st_size}")
+    except OSError:
+        print(f"azel token  MISSING at {AZEL_TOKEN}; the Azel call would be skipped")
+    for what, url, method in (("azel endpoint", CALL_URL, "OPTIONS"), ("ntfy endpoint", NTFY_URL, "OPTIONS")):
+        try:  # unauthenticated OPTIONS never rings; any HTTP answer proves reachability
+            print(f"{what} {method} -> {urllib.request.urlopen(urllib.request.Request(url, method=method), timeout=10).status}")
+        except urllib.error.HTTPError as e:
+            print(f"{what} {method} -> HTTP {e.code} (reachable)")
+        except Exception as e:
+            print(f"{what} {method} -> {type(e).__name__}")
+    print(f"ntfy token  {'present' if NTFY_TOKEN.exists() else 'MISSING'}")
     return 0 if ok else 1
 
 
-def notify(title, body):
+def post(url, body, headers, retries=3):
+    for n in range(retries):
+        try:
+            req = urllib.request.Request(url, body, headers)
+            return urllib.request.urlopen(req, timeout=15).status
+        except urllib.error.HTTPError as e:
+            return e.code  # server answered; do not retry (could ring twice)
+        except Exception:
+            time.sleep(5 * (n + 1))
+    return "network error"
+
+
+def notify(ip, boot):
+    """ntfy first, then the Azel call; each tried regardless of the other; only statuses are logged."""
+    info = f"kepler: {ip}, 2 OCPU / 12 GB / {boot} GB"
     try:
         tok = NTFY_TOKEN.read_text().strip()
-        req = urllib.request.Request(NTFY_URL, body.encode(), {"Authorization": f"Bearer {tok}", "Title": title,
-                                                              "Priority": "max", "Tags": "rocket"})
-        urllib.request.urlopen(req, timeout=10).read()
-    except Exception as e:  # never let a failed notification lose the success
-        log.info("notify failed: %s", type(e).__name__)
+        title = "=?UTF-8?B?%s?=" % base64.b64encode("kepler 생성됨".encode()).decode()
+        r = post(NTFY_URL, info.encode(), {"Authorization": f"Bearer {tok}", "Title": title, "Priority": "high", "Tags": "rocket"})
+    except OSError:
+        r = "no token"
+    log.info("ntfy: %s", r)
+    try:
+        tok = AZEL_TOKEN.read_text().strip()
+        reason = f"춘천 A1 서버 kepler가 만들어졌어요. 공인 IP {ip}, 2 OCPU 12GB."[:200]
+        r = post(CALL_URL, json.dumps({"reason": reason}).encode(),
+                 {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    except OSError:
+        r = "no token"
+    log.info("azel call: %s", r)
 
 
 def run():
@@ -234,7 +279,7 @@ def run():
             DONE.write_text(f"{inst.id} {ip} {time.strftime('%F %T')}\n")
             log.info("SUCCESS %s ip %s", inst.id, ip)
             print(f"instance {inst.id}\npublic ip {ip}")
-            notify("A1 launched", f"chuncheon-a1 (2 OCPU/12 GB/{boot} GB) created: {ip}")
+            notify(ip, boot)
             save_state(st)
             return 0
         except c.oci.exceptions.ServiceError as e:
