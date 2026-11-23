@@ -21,15 +21,17 @@ struct CallEvent: Decodable, Equatable {
     var expires_at: Double?   // auto_approve: when the grant ends (epoch)
     /// A boolean `value` (`{"type":"secret","value":true}`); `value` then stays nil.
     var flag: Bool?
+    /// `card`: a visual card for the reply (nil for an unknown kind).
+    var card: ReplyCard?
 
     struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
 
     private enum CodingKeys: String, CodingKey {
-        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at
+        case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at, card
     }
 
-    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil) {
-        self.type = type; self.value = value; self.text = text; self.route = route
+    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil, card: ReplyCard? = nil) {
+        self.type = type; self.value = value; self.text = text; self.route = route; self.card = card
     }
 
     /// Field by field and tolerant: one odd field never drops the whole frame.
@@ -46,5 +48,20 @@ struct CallEvent: Decodable, Equatable {
         secret = try? c.decodeIfPresent(Bool.self, forKey: .secret)
         auto = try? c.decodeIfPresent(Bool.self, forKey: .auto)
         expires_at = try? c.decodeIfPresent(Double.self, forKey: .expires_at)
+        if type == "card", let obj = (try? c.decodeIfPresent(AnyJSON.self, forKey: .card))?.value as? [String: Any] { card = ReplyCard(json: obj) }
+    }
+}
+
+/// Any JSON value as Foundation types, for the free-form card payload.
+struct AnyJSON: Decodable {
+    let value: Any
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { value = NSNull() }
+        else if let b = try? c.decode(Bool.self) { value = b }
+        else if let d = try? c.decode(Double.self) { value = d }
+        else if let s = try? c.decode(String.self) { value = s }
+        else if let a = try? c.decode([AnyJSON].self) { value = a.map(\.value) }
+        else { value = try c.decode([String: AnyJSON].self).mapValues(\.value) }
     }
 }

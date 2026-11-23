@@ -9,6 +9,10 @@ struct CallLine: Identifiable, Codable, Equatable {
     var interrupted = false
     /// Typed during the call rather than spoken (optional so saved logs still decode).
     var typed: Bool? = nil
+    /// Cards the server attached to this reply's turn, shown under it (not saved).
+    var cards: [ReplyCard] = []
+
+    private enum CodingKeys: String, CodingKey { case id, mine, text, route, interrupted, typed }
 }
 
 /// What the call screens show, built from server events. Reply sentences of one turn join into one
@@ -16,6 +20,8 @@ struct CallLine: Identifiable, Codable, Equatable {
 struct CallLog: Equatable {
     var lines: [CallLine] = []
     private var replyOpen = false
+    /// Cards that arrived before their turn's reply text: they join the reply line when it starts.
+    private var pendingCards: [ReplyCard] = []
     /// A typed line waiting for the server's echo (if it sends one), so it shows once.
     private var pendingTyped: String?
 
@@ -50,6 +56,7 @@ struct CallLog: Equatable {
             replyOpen = false
             if let p = pendingTyped, p == t { pendingTyped = nil; return }   // the server echoed the typed line
             pendingTyped = nil
+            pendingCards = []
             // The server joined a half-said request to what came next ("…주식" + "오늘 알려줘"): one line, not two.
             if let i = lines.indices.last, lines[i].mine, t.hasPrefix(lines[i].text) { lines[i].text = t; return }
             lines.append(CallLine(mine: true, text: t))
@@ -63,9 +70,14 @@ struct CallLog: Equatable {
                 lines[i].text += " " + t
                 lines[i].route = event.route ?? lines[i].route
             } else {
-                lines.append(CallLine(mine: false, text: t, route: event.route))
+                lines.append(CallLine(mine: false, text: t, route: event.route, cards: pendingCards))
+                pendingCards = []
                 replyOpen = true
             }
+        case "card":
+            guard let card = event.card else { return }   // unknown kind
+            // This turn's reply already started (the last line is the assistant's): under it; else wait for it.
+            if let i = lines.indices.last, !lines[i].mine { lines[i].cards.append(card) } else { pendingCards.append(card) }
         case "interrupt":
             if replyOpen, let i = lines.indices.last, !lines[i].mine { lines[i].interrupted = true }
             replyOpen = false

@@ -133,6 +133,7 @@ targets:
       - path: Azel/Shared/AssistantName.swift
       - path: Azel/Shared/Log.swift
       - path: Azel/Shared/CallEvent.swift
+      - path: Azel/Shared/Cards.swift
       - path: Azel/Shared/Activity.swift
       - path: Azel/Shared/Earcon.swift
       - path: Azel/Shared/Karaoke.swift

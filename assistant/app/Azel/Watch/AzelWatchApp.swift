@@ -131,6 +131,11 @@ struct WatchCallScreen: View {
                         .multilineTextAlignment(.center)
                     }
                     .animation(Theme.caption, value: line.text)
+                    // Cards: one line each on the Watch, no charts.
+                    ForEach(Array(line.cards.enumerated()), id: \.offset) { _, c in
+                        Text(c.summary()).font(.caption2.weight(.semibold).monospacedDigit()).foregroundStyle(Theme.celadon)
+                            .lineLimit(1).minimumScaleFactor(0.8)
+                    }
                 }
                 Spacer(minLength: 0)
                 HStack(spacing: Theme.l) {
