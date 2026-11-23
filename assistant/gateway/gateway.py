@@ -376,6 +376,12 @@ class State:
             self.warned = time.monotonic()
             print(f"warning: ruchba is slow ({why}): tool calls use cached settings and devices for now", flush=True)
 
+    async def settle(self, key, make, wait=1.5):
+        """make() in the background (as background()), waiting at most `wait` s for it: a quick ruchba answers as
+        before, a slow one never holds the caller (the app's timeout, a daemon's 10 s)."""
+        self.background(key, make)
+        await asyncio.wait({self.bg[key]}, timeout=wait)
+
     def background(self, key, make):
         """Run make() once in the background (never two for one key); its errors are dropped."""
         t = self.bg.get(key)
@@ -719,7 +725,10 @@ async def post_call_facts(log_id, persona_id):
 
 
 async def push_tokens():
-    return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
+    """Stored tokens, newest first, with ones registered here but not yet stored in front."""
+    rows = await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
+    fresh = [{**r} for r in reversed(list(push_pending.values()))]
+    return fresh + [r for r in rows if r.get("token") not in push_pending]
 
 
 async def take_lease(name, ttl_s, priority=100, holder=None):
@@ -1334,7 +1343,7 @@ async def send_alert_push(title, body, category=None, **extra):
 async def push_task_activity(t, approval=None):
     """Update a task's Live Activity by push (the app is asleep while the phone is locked): its status, and the
     approval's buttons. The content-state matches TaskActivityAttributes.ContentState key for key."""
-    rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+    rows = {**(await state.get("/v1/state/kv/activity-tokens") or {}), **activity_pending}
     cfg, row = apns_config(), rows.get(t["id"])
     if not cfg or not row:
         return {"sent": 0}
@@ -2960,10 +2969,8 @@ async def register(body: dict):
         raise HTTPException(400, "id must be an ASCII slug")
     row = {"name": body["name"], "url": body["url"], "harness": body.get("harness", []), "gateway": DEVICE}
     local_devices[body["id"]] = {"id": body["id"], **row, "last_seen": time.time(), "writer": MODE}
-    try:
-        await state.call("PUT", f"/v1/state/devices/{body['id']}", row)
-    except StateDown:
-        pass  # still usable from this gateway via local_devices
+    # answered now; ruchba in the background (a daemon's 10 s timeout and a 2 s relayed RTT made it fail)
+    await state.settle(("device", body["id"]), lambda: state.call("PUT", f"/v1/state/devices/{body['id']}", row))
     return {"ok": True}
 
 
@@ -3535,10 +3542,8 @@ async def push_register(body: dict):
         if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Fa-f]{16,200}", tok)
                 and isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{12}", tid)):
             raise HTTPException(400, "activity_token (hex) and task_id required")
-        rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
-        rows = {k: v for k, v in rows.items() if time.time() - v.get("at", 0) < 86400}  # a day at most
-        rows[tid] = {"token": tok, "env": body.get("env", "sandbox"), "at": time.time()}
-        await state.call("PUT", "/v1/state/kv/activity-tokens", rows)
+        activity_pending[tid] = {"token": tok, "env": body.get("env", "sandbox"), "at": time.time()}
+        await state.settle(("push-flush",), flush_push)  # at most 1.5 s: a 2 s relayed ruchba timed the app out
         return {"ok": True}
     if not (body.get("voip_token") or body.get("alert_token")):
         raise HTTPException(400, "voip_token and/or alert_token required")  # macOS: alert only
@@ -3547,15 +3552,47 @@ async def push_register(body: dict):
             continue
         if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Za-z_-]{3,200}", tok)):
             raise HTTPException(400, f"{kind}_token: a device token")
-        await state.call("PUT", f"/v1/state/push_tokens/{quote(tok, safe='')}",
-                         {"bundle_id": APP_BUNDLE, "env": body.get("env", "sandbox"),
-                          **({"kind": "alert"} if kind == "alert" else {})})
-    rows = await state.call("GET", "/v1/state/push_tokens") or []  # newest first
-    for kind in ("voip", "alert"):  # at most MAX_PUSH_TOKENS per kind: the oldest go
-        for old in [r for r in rows if r.get("kind", "voip") == kind][MAX_PUSH_TOKENS:]:
-            await state.call("DELETE", f"/v1/state/push_tokens/{quote(old['token'], safe='')}")
-    await push_tokens()  # refresh the restart-proof copy
+    for kind, tok in (("voip", body.get("voip_token")), ("alert", body.get("alert_token"))):
+        if tok:  # pushes use it at once (push_tokens merges these); ruchba gets it in the background, in order
+            push_pending[tok] = {"token": tok, "bundle_id": APP_BUNDLE, "env": body.get("env", "sandbox"),
+                                 **({"kind": "alert"} if kind == "alert" else {})}
+    await state.settle(("push-flush",), flush_push)
     return {"ok": True}
+
+
+push_pending: dict = {}  # token -> row, registered here but not yet on ruchba (newest last)
+activity_pending: dict = {}  # task id -> Live Activity token row, likewise
+PUSH_RETRY_S = (2, 5, 10, 30, 60)
+
+
+async def flush_push():
+    """The one background writer for push registrations: idempotent PUTs, then the per-kind prune, retried while
+    ruchba is slow or down; a row stays in the pending map (and so in use) until it is stored."""
+    for wait in (0, *PUSH_RETRY_S, *(60,) * 30):
+        await asyncio.sleep(wait)
+        try:
+            for tok, row in list(push_pending.items()):
+                await state.call("PUT", f"/v1/state/push_tokens/{quote(tok, safe='')}",
+                                 {k: v for k, v in row.items() if k != "token"})
+                if push_pending.get(tok) is row:
+                    del push_pending[tok]
+            rows = await state.call("GET", "/v1/state/push_tokens") or []  # newest first
+            for kind in ("voip", "alert"):  # at most MAX_PUSH_TOKENS per kind: the oldest go
+                for old in [r for r in rows if r.get("kind", "voip") == kind][MAX_PUSH_TOKENS:]:
+                    await state.call("DELETE", f"/v1/state/push_tokens/{quote(old['token'], safe='')}")
+            if activity_pending:
+                rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+                sent = dict(activity_pending)
+                rows = {k: v for k, v in {**rows, **sent}.items() if time.time() - v.get("at", 0) < 86400}  # a day
+                await state.call("PUT", "/v1/state/kv/activity-tokens", rows)
+                for k, v in sent.items():
+                    if activity_pending.get(k) is v:
+                        del activity_pending[k]
+            await push_tokens()  # refresh the restart-proof copy
+            if not push_pending and not activity_pending:
+                return
+        except (StateDown, HTTPException) as e:
+            print("push register: ruchba write waits:", type(e).__name__, flush=True)
 
 
 @app.post("/v1/calls")

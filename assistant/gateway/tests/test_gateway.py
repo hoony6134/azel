@@ -1937,3 +1937,25 @@ def test_a_secondary_without_voice_runs_no_link_and_no_scheduler(tmp_path, monke
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         assert c.get("/v1/devices").status_code == 200
     assert not g.VOICE_ON and ran == []
+
+
+def test_push_register_answers_fast_when_ruchba_is_slow(gw, monkeypatch):
+    """A 2 s relayed ruchba timed the app's push registration out: it answers within ~1.5 s, the token is used for
+    pushes at once, and it lands on ruchba in the background."""
+    g, c, _ = gw
+    real = g.state.call
+
+    async def slow(method, path, body=None, **params):
+        if "push_tokens" in path or "devices/" in path:
+            await asyncio.sleep(3)
+        return await real(method, path, body, **params)
+    monkeypatch.setattr(g.state, "call", slow)
+    t0 = time.monotonic()
+    assert c.post("/v1/push/register", json={"voip_token": "slowtok", "bundle_id": "xyz.scian.biseo"}).json() == {"ok": True}
+    assert c.post("/v1/devices/register", json={"id": "albireo", "name": "albireo", "url": "http://a/mcp"}).json() == {"ok": True}
+    assert time.monotonic() - t0 < 4  # two requests, each at most ~1.5 s
+    assert c.portal.call(g.push_tokens)[0]["token"] == "slowtok"  # pushes reach the new token before the flush
+    end = time.monotonic() + 15
+    while "slowtok" not in g.fake.db["push"] and time.monotonic() < end:
+        time.sleep(0.2)
+    assert "slowtok" in g.fake.db["push"] and not g.push_pending
