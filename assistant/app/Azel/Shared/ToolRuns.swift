@@ -4,7 +4,7 @@ import SwiftUI
 /// command on which host, its input, and its output as it streams. Its own ObservableObject, so a chunk
 /// redraws only this run's detail, and the output is kept as lines (a lazy list appends rows instead of
 /// re-laying out one big text), capped at `cap` bytes from the start.
-@MainActor
+/// Main queue only (call events are delivered there).
 final class ToolRun: ObservableObject, Identifiable {
     struct Line: Identifiable, Equatable { let id: Int; var text: String }
 
@@ -68,7 +68,7 @@ final class ToolRun: ObservableObject, Identifiable {
 }
 
 /// Every tool run of the current call, in start order (kept for the whole call).
-@MainActor
+/// Main queue only.
 final class ToolRunStore: ObservableObject {
     @Published private(set) var runs: [ToolRun] = []
 
@@ -266,7 +266,7 @@ extension View {
 
 extension ActivityLog {
     /// What a tap opens: the running step's detail, else the list.
-    @MainActor func tapTarget(_ store: ToolRunStore) -> ToolRunTarget {
+    func tapTarget(_ store: ToolRunStore) -> ToolRunTarget {
         if let id = current?.callId, store.run(id) != nil { return .run(id) }
         return .list
     }
