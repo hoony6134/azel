@@ -587,9 +587,13 @@ final class CallClient {
     /// A typed user turn (`{"type":"text","text":…,"speak":…}`): answered like speech, with
     /// audio when `speak`, as text only otherwise.
     func sendText(_ text: String, speak: Bool) {
-        guard let data = try? JSONSerialization.data(withJSONObject: ["type": "text", "text": text, "speak": speak]),
-              let s = String(data: data, encoding: .utf8) else { return }
+        guard let s = Self.textFrame(text, speak: speak) else { return }
         socket?.send(.string(s)) { _ in }
+    }
+
+    /// The typed turn as sent: exactly what was typed, no display decoration.
+    static func textFrame(_ text: String, speak: Bool) -> String? {
+        (try? JSONSerialization.data(withJSONObject: ["type": "text", "text": text, "speak": speak])).flatMap { String(data: $0, encoding: .utf8) }
     }
 
     /// The server's capabilities when a frame lists them (`hello`).

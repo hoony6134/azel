@@ -161,7 +161,7 @@ struct CallScreen: View {
                                     }
                                 }
                             } else if line.typed == true {
-                                Text("\(Image(systemName: "keyboard")) \(line.text)").accessibilityLabel("입력: \(line.text)")
+                                TypedCaption.text(line).accessibilityLabel("입력: \(line.text)")
                             } else {
                                 Text(line.text + (line.interrupted ? " …" : ""))
                             }

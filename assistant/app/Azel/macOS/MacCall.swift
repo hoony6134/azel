@@ -631,7 +631,8 @@ struct CallPanelView: View {
                     .lineLimit(1)
                     .accessibilityElement(children: .combine)
                 } else if let u = call.lines.last(where: { $0.mine }) {
-                    Text(u.typed == true ? "\(Image(systemName: "keyboard")) \(u.text)" : u.text).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
+                    TypedCaption.text(u).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
+                        .accessibilityLabel(u.typed == true ? "입력: \(u.text)" : u.text)
                 }
                 if let reply { PanelReply(call: call, reply: reply) }
                 if let a = approvals.pending.first { PanelApprovalRow(request: a, secret: call.secret) { call.decideApproval(a, $0) } }
