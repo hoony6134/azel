@@ -42,8 +42,30 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
     /// Waiting for its time (overnight, or an exact time).
     var isScheduled: Bool { status == "scheduled" }
     var scheduledFor: Date?
+    var started: Date?
+    var finished: Date?
 
-    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, cost_usd, device, persona, persona_id, created_at, created, backend, fallback_reason, note, notify, error, scheduled_for }
+    /// Finished with a result in the last 36 h: shown on the home card (overnight results were only under "모두 보기").
+    func isRecentResult(now: Date = Date()) -> Bool {
+        status == "done" && !(result ?? "").isEmpty && now.timeIntervalSince(finished ?? created_at ?? .distantPast) < 36 * 3600
+    }
+
+    /// File paths mentioned in the result (absolute or ~/…), to copy or reveal.
+    var paths: [String] { Self.paths(in: result ?? "") }
+
+    static func paths(in text: String) -> [String] {
+        let pattern = #"(?<![\w/])(?:~/|/(?:Users|home|tmp|private|Volumes|mnt|data|opt|var)/)[^\s`'"()<>\[\]]+"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = text as NSString
+        var out: [String] = []
+        for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let p = ns.substring(with: m.range).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?"))
+            if !out.contains(p) { out.append(p) }
+        }
+        return out
+    }
+
+    private enum Keys: String, CodingKey { case id, goal, status, steps, result, cost, cost_usd, device, persona, persona_id, created_at, created, backend, fallback_reason, note, notify, error, scheduled_for, started, finished }
 
     init(id: String, goal: String, status: String, steps: [Step] = [], result: String? = nil, cost: Double? = nil, device: String? = nil) {
         self.id = id; self.goal = goal; self.status = status; self.steps = steps; self.result = result; self.cost = cost; self.device = device
@@ -52,15 +74,16 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         if let s = try? c.decode(String.self, forKey: .id) { id = s } else { id = String(try c.decode(Int.self, forKey: .id)) }
-        goal = try c.decodeIfPresent(String.self, forKey: .goal) ?? ""
-        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "queued"
+        // Lenient: one odd field never drops a task (or the whole list).
+        goal = (try? c.decodeIfPresent(String.self, forKey: .goal)) ?? ""
+        status = (try? c.decodeIfPresent(String.self, forKey: .status)) ?? "queued"
         steps = (try? c.decodeIfPresent([Step].self, forKey: .steps)) ?? []
         result = try? c.decodeIfPresent(String.self, forKey: .result)
         // cost: a USD number, or an object with cost_usd
         if let n = try? c.decodeIfPresent(Double.self, forKey: .cost) { cost = n }
         else if let o = try? c.decodeIfPresent([String: Double].self, forKey: .cost) { cost = o["cost_usd"] ?? o["usd"] }
         else if let n = try? c.decodeIfPresent(Double.self, forKey: .cost_usd) { cost = n }   // the gateway's task_view
-        device = try c.decodeIfPresent(String.self, forKey: .device)
+        device = (try? c.decodeIfPresent(String.self, forKey: .device)) ?? nil
         persona = (try? c.decodeIfPresent(String.self, forKey: .persona)) ?? (try? c.decodeIfPresent(String.self, forKey: .persona_id))
         created_at = TaskTime.decode(c, .created_at) ?? TaskTime.decode(c, .created)
         backend = try? c.decodeIfPresent(String.self, forKey: .backend)
@@ -69,6 +92,8 @@ struct AgentTask: Decodable, Identifiable, Equatable, Hashable {
         notify = try? c.decodeIfPresent(String.self, forKey: .notify)
         error = (try? c.decodeIfPresent(String.self, forKey: .error)).flatMap { $0.isEmpty ? nil : $0 }
         scheduledFor = TaskTime.decode(c, .scheduled_for)
+        started = TaskTime.decode(c, .started)
+        finished = TaskTime.decode(c, .finished)
     }
 
     static func == (a: AgentTask, b: AgentTask) -> Bool { a.id == b.id && a.status == b.status && a.steps == b.steps && a.result == b.result }
@@ -167,10 +192,10 @@ enum TaskNotify: String, CaseIterable, Identifiable {
 enum TaskAPI {
     static func list() async throws -> [AgentTask] {
         let data = try await Gateway.send("GET", "/v1/tasks")
-        if let l = try? JSONDecoder().decode([AgentTask].self, from: data) { return l }
-        struct Envelope: Decodable { let tasks: [AgentTask]?; let items: [AgentTask]? }
+        if let l = try? JSONDecoder().decode([Lenient<AgentTask>].self, from: data) { return l.compactMap(\.value) }
+        struct Envelope: Decodable { let tasks: [Lenient<AgentTask>]?; let items: [Lenient<AgentTask>]? }
         let e = try JSONDecoder().decode(Envelope.self, from: data)
-        return e.tasks ?? e.items ?? []
+        return (e.tasks ?? e.items ?? []).compactMap(\.value)
     }
 
     static func get(_ id: String) async throws -> AgentTask {
@@ -335,4 +360,10 @@ struct CallContext: Equatable {
         default: return label
         }
     }
+}
+
+/// One array element that may fail to decode without failing the array.
+struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
 }
