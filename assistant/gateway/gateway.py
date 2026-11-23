@@ -5203,8 +5203,10 @@ async def agenda_with_rows(f, t):
 
 async def quote_now(q):
     """A quote; a Korean name neither source knows is looked up on the user's SearXNG (free) to find its ticker."""
-    url = (await load_settings()).get("searxng_url") or web.SEARXNG_URL
-    return await stock_quotes.quote(q, search=lambda s: web.searxng(s, 6, url, fetch_pages=False))
+    settings = await load_settings()
+    url = settings.get("searxng_url") or web.SEARXNG_URL
+    return await stock_quotes.quote(q, search=lambda s: web.searxng(s, 6, url, fetch_pages=False),
+                                    holdings=settings.get("holdings") or ())
 
 
 KMA_KEY_PATH = HOME / "kma_key"  # data.go.kr 기상청 key (Decoding), 0600, on the Mac's gateway only
@@ -5280,11 +5282,11 @@ async def bridge_schedule_text():
 
 
 async def bridge_recent_tasks(n):
-    out = []
-    for tid in (await state.call("GET", "/v1/state/kv/tasks-index") or [])[:n]:
-        if t := await state.call("GET", task_key(tid)):
-            out.append(t)
-    return out
+    """The latest n tasks: read at once, each from the last-good cache when ruchba is slow (a 2 s RTT made 20 serial
+    reads take 40 s and /v1/tasks time out)."""
+    ids = (await state.get("/v1/state/kv/tasks-index") or [])[:n]
+    rows = await asyncio.gather(*(state.get(task_key(tid)) for tid in ids))
+    return [t for t in rows if t]
 
 
 def google_status():
