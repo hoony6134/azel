@@ -313,7 +313,7 @@ def no_handover(text):
 
 def local_prompt(text):
     """Qwen's prompt in local mode: no hand-over tag to emit (there is no Claude to hand over to)."""
-    return no_handover(text) + " 사용자의 일정이나 개인 정보, 최신 정보처럼 확인할 수 없는 사실은 모른다고 말해. 잡담과 네 이야기는 성격대로 편하게 해."
+    return no_handover(text) + " 날씨, 주가, 일정처럼 도구가 있는 건 꼭 도구로 확인하고, 도구로도 확인할 수 없는 사실만 모른다고 말해. 잡담과 네 이야기는 성격대로 편하게 해."
 
 
 def system_prompt(name, length="normal", context="", persona="", title=""):
@@ -1346,6 +1346,10 @@ LOOKUP_FAILED = "죄송해요, 지금은 그걸 찾아보지 못했어요."
 WEATHER_Q = re.compile(r"날씨|기온|몇\s*도|비\s*(와|올|오)|눈\s*(와|올|오)|우산|추워|더워|미세먼지")
 # Today's figures (rates, prices, weather): a number said before any lookup is a guess ("환율은 약 1,310원대",
 # live 2026-11-22), so it is held back and Qwen is asked to look it up (re-asked, never cut to a filler).
+# "시세 정보를 드리기 어렵습니다", "증권사 앱에서 확인하는 게 빨라" (live 2026-11-23, typed stock questions on both
+# personas): a refusal to look up what a tool answers. Held like a guess; the lookup runs instead.
+REFUSED_LOOKUP = re.compile(r"(드리기|알려\s*드리기|확인하기|제공하기|보여\s*드리기|찾기)\s*(가\s*)?어렵|확인할\s*수\s*(가\s*)?없|"
+                            r"알\s*수\s*(가\s*)?없|실시간.{0,12}(못|없|어렵|않)|(앱|사이트|증권사|포털|검색).{0,14}(확인|보시|보는|찾아\s*보)")
 LIVE_Q = re.compile(r"환율|주가|주식|시세|가격|금리|유가|코스피|코스닥|나스닥|비트코인|날씨|기온|몇\s*도|상장|IPO")
 # a listing claim from memory ("엔트로픽은 비상장이라"): live 2026-11-22 it was stale, ANT had listed on Nasdaq
 LISTING = re.compile(r"비상장|상장\s*(전|안|되지|않|된|됐|했|돼)|상장사|기업\s*공개|IPO")
@@ -2514,6 +2518,10 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     return
                 if not looked and lookup_turn and CHECKED.search(s):
                     guessed.append(s)  # "확인해 봤는데 정상" with no tool: never said, the lookup runs instead
+                    return
+                if not looked and wants_lookup and REFUSED_LOOKUP.search(s):
+                    timings["refused_lookup"] = s[:80]
+                    guessed.append(s)  # "can't look that up" with the tool right there: never said, the lookup runs
                     return
                 if LEAD_IN.search(s):
                     lead.append(s)  # "다음과 같아요." waits for what follows it
@@ -5451,6 +5459,54 @@ if __name__ == "__main__":
         said, prompts, events, claude_calls = schedule_local_check("오늘 코스피 어때?")
         assert claude_calls and said == ["코스피는 오늘 올랐어요."], (said, claude_calls)  # not a schedule: may hand over
         assert SCHEDULE_TURN.search("오늘 할 일 뭐 있어?") and SCHEDULE_TURN.search("내일 회의 지워 줘")
+
+        def stock_refusal_check():
+            """Live 2026-11-23 (Mac, typed, 서아, local): "오늘 애플 주식 차트 보…" got "증권사 앱에서 확인하는 게 빠를 거야"
+            with no lookup. A live-data question always looks it up, the refusal is never said, the stock card is sent."""
+            calls, events, prompts = [], [], []
+
+            class StockLink:
+                async def send(self, obj):
+                    calls.append((obj["name"], obj["args"]))
+                    links.queues[obj["id"]][0].put_nowait({"type": "tool_result", "result": "애플 271.5달러, 0.8% 상승",
+                                                           "card": CARDS["stock_quote"]})
+
+            async def qwen(messages, max_tokens=600):
+                prompts.append(messages[0]["content"])
+                if "[도구 결과]" in messages[-1]["content"]:
+                    yield "오빠, 애플은 지금 271.5달러야. 오늘 0.8% 올랐어."
+                else:  # refuses every time, even after the tool nudge: the server looks it up itself
+                    yield "오빠, 증권사 앱에서 바로 확인하는 게 제일 빠를 거야. 혹시 오늘 하루는 어땠어?"
+
+            async def on_event(ev):
+                events.append(ev)
+            saved = llm_stream, tts, route_lookup, dict(gw_tools), links.settings, links.pick
+            globals().update(llm_stream=qwen, tts=lambda s, *a, **k: asyncio.sleep(0, (b"", 24000)),
+                             route_lookup=lambda *a, **k: asyncio.sleep(0, []))  # the router undecided, as it can be
+            gw_tools.update(at=time.time(), defs=[{"name": "stock_quote", "read_only": True, "description": "주가",
+                                                   "input_schema": {"type": "object", "properties": {"query": {}}}},
+                                                  {"name": "web_search", "read_only": True, "description": "검색"}])
+            links.settings, links.pick = {"brain_mode": "local", "user_title": "오빠"}, lambda **k: StockLink()
+            history.pop("azel:stock", None)
+            ctx = contextvars.copy_context()
+            ctx.run(CALL_MODE.set, "local")
+
+            async def said_by():
+                return [x async for x, *_ in respond("오늘 애플 주식 차트 보여줘", "stock", time.perf_counter(), {}, on_event)]
+            try:
+                out = ctx.run(asyncio.run, said_by())
+            finally:
+                globals().update(llm_stream=saved[0], tts=saved[1], route_lookup=saved[2])
+                gw_tools.clear()
+                gw_tools.update(saved[3])
+                links.settings, links.pick = saved[4], saved[5]
+            return out, calls, events, prompts
+        said, calls, events, prompts = stock_refusal_check()
+        assert calls and calls[0][0] == "stock_quote", calls
+        assert not any("증권사" in x for x in said) and any("271.5" in x for x in said), said
+        assert [e["card"]["kind"] for e in events if e.get("type") == "card"] == ["stock"], events
+        assert "주가, 일정처럼 도구가 있는 건 꼭 도구로" in prompts[0] and "최신 정보처럼" not in prompts[0]
+        assert REFUSED_LOOKUP.search("시세 정보를 드리기 어렵습니다.") and not REFUSED_LOOKUP.search("오늘 0.8% 올랐어.")
         assert not SCHEDULE_TURN.search("오늘 날씨 어때?") and ROUTE_TAG not in no_handover(NUDGE)
         after, heard = stall_check(held=True)
         assert after is not None and after < END_STALL_S + 0.6 and len(heard) == 1 and heard[0] > 3.4, (after, heard)
