@@ -30,6 +30,9 @@ def tgw(tmp_path, monkeypatch):
 
     async def push(title, body, **extra):
         notes.append(("push", title, body, extra))
+    async def no_watch():  # tests run fail_orphan_tasks by hand: a second, background startup pass raced them (flaky)
+        return None
+    g.fail_orphan_tasks_safe = no_watch
     g.real_place_call = g.place_call  # tests that need the real one put it back
     g.place_call, g.send_alert_push = place_call, push
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
