@@ -6,7 +6,7 @@ function newCard(t as String, w as Integer) as Object
         t: t, w: w, head: "", hl: "", sent: "", meta: "", when: "", tail: "", soon: false, now: false, name: ""
         title: "", v: [-1, -1, -1, -1], down: "", n1: "", l1: "", m1: "", n2: "", l2: "", m2: ""
         status: "", load: "", upt: "", note: "", ts: 0, dtitle: "", dsub: "", dsoon: false, facts: []
-        series: [], labels: [], unit: "", icons: [], icon: "", h: 200
+        series: [], labels: [], unit: "", icons: [], icon: "", h: 200, ticker: ""
     }
 end function
 
@@ -825,6 +825,7 @@ function stockCard(h as Object) as Object
     c.h = 232
     c.name = sv(h.name)
     c.dtitle = c.name
+    c.ticker = sv(h.ticker)  ' OK opens the stock page for it
     unlisted = false
     if Type(h.listed) = "Boolean" or Type(h.listed) = "roBoolean"
         unlisted = not h.listed

@@ -158,6 +158,20 @@ async def yahoo_price(symbol, c):
             "open": None, "at": at, "source": "야후 파이낸스"}
 
 
+async def yahoo_chart(symbol, rng, interval, client=None):
+    """Yahoo's raw chart JSON for one symbol, range and interval (the TV's stock page); LookupError for an unknown symbol, HTTPError when it fails."""
+    c = client or httpx.AsyncClient(timeout=TIMEOUT_S, headers=UA, follow_redirects=True)
+    try:
+        r = await c.get(YAHOO_CHART.format(symbol=symbol), params={"range": rng, "interval": interval})
+        if r.status_code == 404:  # Yahoo's answer for a symbol it does not list
+            raise LookupError(symbol)
+        r.raise_for_status()
+        return r.json()
+    finally:
+        if client is None:
+            await c.aclose()
+
+
 def figure(x, currency):
     return f"{x:,.0f}" if currency in ("KRW", "JPY") else f"{x:,.2f}".rstrip("0").rstrip(".")
 

@@ -1,6 +1,8 @@
 """GET /v1/tv: the Roku dashboard's read-only JSON and the separate token that opens only it."""
 import asyncio
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -657,3 +659,93 @@ def test_portfolio_tool_reads_the_holdings(gw, monkeypatch):
     assert lines[1].startswith("애플 342.56달러, ")
     assert quote.portfolio_lines([{"name": "S&P500", "listed": True, "price": 6910.39, "currency": "index", "pct": -3.7,
                                    "at": None}]) == ["S&P500 6,910.39, 3.70% 내림"]
+
+
+# ---------- the stock page ----------
+def yahoo(meta, closes, t0=1_700_000_000, step=300):
+    return {"chart": {"result": [{"meta": meta, "timestamp": [t0 + i * step for i in range(len(closes))],
+                                  "indicators": {"quote": [{"close": closes}]}}]}}
+
+
+def stock_deps(calls):
+    meta = {"regularMarketPrice": 110.0, "chartPreviousClose": 100.0, "currency": "KRW", "longName": "Samsung",
+            "regularMarketDayHigh": 112.0, "regularMarketDayLow": 99.0, "regularMarketVolume": 5000,
+            "currentTradingPeriod": {"regular": {"start": 1000, "end": 2000}}}
+
+    async def chart(sym, rng, interval):
+        calls.append((sym, rng, interval))
+        if sym.endswith(".KS") and sym.startswith("099320"):
+            raise KeyError("none")  # a KOSDAQ code: .KS has nothing
+        return yahoo(meta, [100.0, None, 105.0, 110.0] * 100 if rng != "1d" else [100.0, None, 105.0, 110.0])
+    return {"chart": chart}
+
+
+def test_stock_1d_points_baseline_and_state():
+    calls = []
+    r = asyncio.run(tv.build_stock(stock_deps(calls), "005930", "1d", now=1500))
+    assert calls == [("005930.KS", "1d", "5m")]
+    assert (r["price"], r["prev"], r["change"], r["pct"], r["base"]) == (110.0, 100.0, 10.0, 10.0, 100.0)
+    assert (r["state"], r["high"], r["low"], r["volume"], r["index"]) == ("open", 112.0, 99.0, 5000, False)
+    assert [p[1] for p in r["points"]] == [100.0, 105.0, 110.0]  # the gap (None) is dropped
+    assert asyncio.run(tv.build_stock(stock_deps([]), "005930", "1d", now=5000))["state"] == "closed"
+
+
+def test_stock_other_ranges_downsample_and_color_against_the_range_start():
+    calls = []
+    r = asyncio.run(tv.build_stock(stock_deps(calls), "AAPL", "1y"))
+    assert [c[1:] for c in calls] == [("1d", "5m"), ("1y", "1d")]
+    assert len(r["points"]) == tv.MAX_POINTS and r["points"][-1][1] == 110.0
+    assert r["base"] == 100.0 and r["pct"] == 10.0  # the header stays the day's change
+
+
+def test_stock_kosdaq_code_falls_back_to_kq_and_unknown_raises():
+    calls = []
+    asyncio.run(tv.build_stock(stock_deps(calls), "099320", "1d"))
+    assert [c[0] for c in calls] == ["099320.KS", "099320.KQ"]
+
+    async def none(*a):
+        raise KeyError("x")
+    with pytest.raises(LookupError):
+        asyncio.run(tv.build_stock({"chart": none}, "ZZZZ", "1d"))
+
+
+def test_stock_index_shows_the_level_only():
+    r = asyncio.run(tv.build_stock(stock_deps([]), "^GSPC", "1d"))
+    assert r["index"] and r["currency"] == "index" and (r["high"], r["low"], r["volume"]) == (None, None, None)
+
+
+def test_stock_us_pre_and_post_market():
+    meta = {"regularMarketPrice": 1.0, "chartPreviousClose": 1.0, "currentTradingPeriod": {
+        "pre": {"start": 0, "end": 10}, "regular": {"start": 10, "end": 20}, "post": {"start": 20, "end": 30}}}
+    assert [tv.market_state(meta, t) for t in (5, 15, 25, 40)] == ["pre", "open", "post", "closed"]
+
+
+def test_key_cache_ttl_per_key():
+    n = []
+
+    async def make():
+        n.append(1)
+        return len(n)
+    c = tv.KeyCache(cap=2)
+    assert asyncio.run(c.get("a", make, 60)) == asyncio.run(c.get("a", make, 60)) == 1
+    assert asyncio.run(c.get("a", make, 0)) == 2
+    asyncio.run(c.get("b", make, 60)); asyncio.run(c.get("c", make, 60))
+    assert len(c.items) == 2
+
+
+def test_stock_route_validates_and_serves(gw, monkeypatch):
+    g, c, _ = gw
+    calls = []
+    monkeypatch.setattr(g, "tv_deps", lambda: stock_deps(calls))
+    g.tv_stock_cache.items.clear()
+    for q in ("symbol=bad%20sym&range=1d", "symbol=AAPL&range=2d", "symbol=&range=1d"):
+        assert c.get(f"/v1/tv?detail=stock&{q}").status_code == 400, q
+    r = c.get("/v1/tv?detail=stock&symbol=aapl&range=1d")
+    assert r.status_code == 200 and r.json()["symbol"] == "AAPL" and r.json()["pct"] == 10.0
+    c.get("/v1/tv?detail=stock&symbol=AAPL&range=1d")
+    assert len(calls) == 1  # cached
+
+    async def none(*a):
+        raise KeyError("x")
+    monkeypatch.setattr(g, "tv_deps", lambda: {"chart": none})
+    assert c.get("/v1/tv?detail=stock&symbol=ZZZZ&range=7d").status_code == 404
