@@ -964,11 +964,12 @@ async def relay_card(card):
     """A gateway tool's card (built from the tool's own data, never model text) to the call, once per kind a turn."""
     sink = CALL_CARDS.get()
     if not sink or not isinstance(card, dict) or not isinstance(card.get("title"), str) \
-            or not isinstance(kind := card.get("kind"), str) or not 0 < len(kind) <= 32 or kind in sink[1]:
+            or not isinstance(kind := card.get("kind"), str) or not 0 < len(kind) <= 32 or kind in (sink[1] or ()):
         return
     if len(json.dumps(card, ensure_ascii=False).encode()) > CARD_MAX:
         return
-    sink[1].add(kind)
+    if sink[1] is not None:  # None: a holding sink (infra_read) that merges, so nothing is deduplicated yet
+        sink[1].add(kind)
     await sink[0]({"type": "card", "turn": CALL_TURN.get(), "card": card})
 
 
@@ -1404,7 +1405,18 @@ def tool_activity(name):
 async def infra_read(names, session):
     """The three infra reads at once, under their own headings, with how to answer from them."""
     lines = [TOOL_TAG + " " + json.dumps({"name": n, "args": {}}) for n in names]
+    sink, held = CALL_CARDS.get(), []
+
+    async def hold(ev):
+        held.append(ev["card"])
+    CALL_CARDS.set((hold, None) if sink else None)  # this task's context only: each read's card is held here
     got = await asyncio.gather(*(run_tool(x, session, None) for x in lines), return_exceptions=True)
+    CALL_CARDS.set(sink)
+    if held:  # one infra card a turn: the host numbers, the alert groups and the stopped services together
+        hosts = [h for c in held for h in c.get("hosts") or [] if isinstance(h, dict)]
+        down = [d for c in held for d in c.get("down") or [] if isinstance(d, str)]
+        await relay_card({"kind": "infra", "title": "서버 상태", **({"hosts": hosts} if hosts else {}),
+                          **({"down": down} if down else {})})
     parts = [f"[{INFRA_HEAD[n]}]\n{r if isinstance(r, str) else '가져오지 못했어요.'}" for n, r in zip(names, got)]
     return "\n".join(parts) + "\n" + INFRA_NOTE
 
@@ -5415,6 +5427,33 @@ if __name__ == "__main__":
                 links.pick = real_pick
             return got
         got = asyncio.run(cards_check())
+        INFRA_CARDS = {"infra_health": {"kind": "infra", "title": "서버 상태", "hosts": [{"name": "vd-spark", "up": True, "cpu_pct": 12}]},
+                       "infra_status": {"kind": "infra", "title": "서비스 상태", "down": ["nemoclaw"]},
+                       "infra_alerts": {"kind": "infra", "title": "경보", "hosts": []}}
+
+        class InfraLink:
+            async def send(self, obj):
+                await asyncio.sleep({"infra_alerts": 0, "infra_status": 0.01, "infra_health": 0.02}[obj["name"]])
+                links.queues[obj["id"]][0].put_nowait({"type": "tool_result", "result": "ok", "card": INFRA_CARDS[obj["name"]]})
+
+        async def infra_card_check():
+            """The three infra reads of one server question: one card with the hosts and the down services."""
+            got, real_pick, real_defs = [], links.pick, dict(gw_tools)
+            async def sink(ev):
+                got.append(ev)
+            links.pick = lambda **k: InfraLink()
+            gw_tools.update(defs=[{"name": n, "read_only": True} for n in INFRA_CARDS])
+            try:
+                CALL_TURN.set("t2"), CALL_CARDS.set((sink, set()))
+                await infra_read(list(INFRA_CARDS), "s")
+            finally:
+                links.pick = real_pick
+                gw_tools.clear()
+                gw_tools.update(real_defs)
+            return got
+        infra_got = asyncio.run(infra_card_check())
+        assert [e["card"] for e in infra_got] == [{"kind": "infra", "title": "서버 상태", "down": ["nemoclaw"],
+                                                   "hosts": [{"name": "vd-spark", "up": True, "cpu_pct": 12}]}], infra_got
         assert [e["card"]["kind"] for e in got] == ["agenda", "stock", "portfolio", "todo", "weather", "infra"], got
         assert all(e["type"] == "card" and e["turn"] == "t1" for e in got) and got[0]["card"] == CARDS["agenda"]
 
