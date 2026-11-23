@@ -233,7 +233,8 @@ async def quote(query, client=None, search=None):
     finally:
         if client is None:
             await c.aclose()
-    return {"spoken": spoken(p), "data": {**p, "at": p["at"].isoformat() if p.get("at") else None}}
+    return {"spoken": spoken(p), "data": {**p, "at": p["at"].isoformat() if p.get("at") else None,
+                                          "symbol": hit.get("code") or hit.get("symbol") or hit.get("ticker")}}
 
 
 HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>\^?[A-Z][A-Z0-9.]{0,6}|\d{6})\)\s*$")  # ^GSPC: an index

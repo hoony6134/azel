@@ -204,7 +204,7 @@ async def kma_forecast(p, when, key, c, now=None):
         ncst, fcst, vilage = None, None, await kma_items(c, "getVilageFcst", key, b_vil, nx, ny)
     where = re.sub(r"(광역시|특별시|특별자치시)$", "", p["name"]) or p["name"]
     return {"spoken": kma_spoken(where, when, now, ncst, fcst, vilage), "place": p, "source": "기상청",
-            "data": {"grid": [nx, ny], "ncst": ncst}}
+            "data": {"grid": [nx, ny], "ncst": ncst, "fcst": fcst, "vilage": vilage}}
 
 
 HERE = re.compile(r"^(지금\s*)?(여기|이\s*근처|근처|내\s*위치|이\s*동네)$")
@@ -231,8 +231,8 @@ async def forecast(place_name, when, home, client=None, kma_key=None, here=None,
             except (httpx.HTTPError, RuntimeError, KeyError, ValueError, TypeError, asyncio.TimeoutError) as e:
                 print("kma failed, Open-Meteo instead:", type(e).__name__, flush=True)
         r = await c.get(FORECAST_URL, params={
-            "latitude": p["lat"], "longitude": p["lon"], "timezone": "Asia/Seoul", "forecast_days": 3,
-            "current": "temperature_2m,apparent_temperature,weather_code,precipitation",
+            "latitude": p["lat"], "longitude": p["lon"], "timezone": "Asia/Seoul", "forecast_days": 3, "wind_speed_unit": "ms",
+            "current": "temperature_2m,apparent_temperature,weather_code,precipitation,relative_humidity_2m,wind_speed_10m",
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"})
         r.raise_for_status()
         d = r.json()

@@ -39,6 +39,7 @@ import late_night
 import quote as stock_quotes  # not "quote": urllib.parse.quote is used everywhere here
 import weather
 import agenda
+import cards
 import web
 import openings
 import connectors
@@ -5013,7 +5014,7 @@ bridge = tools_bridge.Bridge(
     phone_live=lambda kind, args, timeout: phone_live(kind, args, timeout),
     task_approve_default=lambda: task_approve_default(),
     set_task_approve_default=lambda v: put_settings({"task_auto_approve_default": v}),
-    agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), holdings_update=lambda add, remove: holdings_update(add, remove),
+    agenda=lambda f, t: agenda_with_rows(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), holdings_update=lambda add, remove: holdings_update(add, remove),
     portfolio=lambda: tv_quote_cache.get(tv_holdings, TV_QUOTE_S), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     gcal=lambda: google_tools.Calendar(HOME) if MODE == "full" and google_tools.status(HOME) == "connected" else None,
@@ -5083,7 +5084,7 @@ async def task_approve_default():
     return (await load_settings()).get("task_auto_approve_default") or "ask"
 
 
-async def agenda_text(f, t):
+async def agenda_text(f, t, rows=None):
     """Google Calendar and Gistra for one range, merged (agenda.py); a missing or failing source is named, not hidden."""
     import cygnus
 
@@ -5096,7 +5097,12 @@ async def agenda_text(f, t):
         if not cygnus.available():
             raise RuntimeError("Cygnus 토큰이 없어요")
         return await cygnus.call("gistra_schedule", {"from": f, "to": t})
-    return await agenda.merged(f, t, calendar, gistra)
+    return await agenda.merged(f, t, calendar, gistra, rows)
+
+
+async def agenda_with_rows(f, t):
+    rows = []
+    return await agenda_text(f, t, rows), rows
 
 
 async def quote_now(q):
@@ -5251,6 +5257,22 @@ async def mcp_server(request: Request):
     return Response(status_code=202) if out is None else JSONResponse(out)
 
 
+CARD_STOCK_S = 4  # the chart for a stock card: no longer than this before the answer goes without its points
+
+
+async def tool_card(name, r):
+    """The call's visual card for this result (cards.py); a stock card takes the TV's cached 1d chart when it comes in time."""
+    detail = None
+    sym = (r.get("data") or {}).get("symbol") if name == "stock_quote" and r["ok"] and isinstance(r.get("data"), dict) else None
+    if sym and MODE == "full" and tv.STOCK_SYMBOL.fullmatch(sym):
+        try:
+            detail = await asyncio.wait_for(tv_stock_cache.get((sym.upper(), "1d"), lambda: tv.build_stock(
+                tv_deps(), sym.upper(), "1d"), tv.STOCK_RANGES["1d"][2]), CARD_STOCK_S)
+        except (asyncio.TimeoutError, LookupError, httpx.HTTPError, KeyError, ValueError, TypeError):
+            detail = None
+    return cards.build(name, r, detail)
+
+
 async def serve_tool(m):
     """The voice server's Qwen asks for its tool list or runs a tool; an approval wait says so first."""
     current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
@@ -5265,8 +5287,9 @@ async def serve_tool(m):
         r = await bridge.run(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
                              surface="voice", on_progress=progress)
         # result: what Qwen reads; spoken and needs: what the voice fast path says and holds (ACTIONS.md §2)
+        card = await tool_card(str(m.get("name", "")), r)
         await link_send({"id": m["id"], "type": "tool_result", "result": tools_bridge.for_model(r),
-                         "is_error": not r["ok"], "spoken": r["spoken"], "needs": r["needs"]})
+                         "is_error": not r["ok"], "spoken": r["spoken"], "needs": r["needs"], **({"card": card} if card else {})})
     except Exception as e:
         print("tool over link failed:", type(e).__name__, flush=True)
         await link_send({"id": m["id"], "type": "tool_result", "result": "도구를 쓰지 못했어요.", "is_error": True})

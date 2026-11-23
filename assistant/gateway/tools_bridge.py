@@ -566,8 +566,11 @@ class Bridge:
                 text = await self.d["agenda"](f, args.get("to") or f)
             except ValueError as e:
                 raise Fail("invalid", f"{e}")
+            text, rows = text if isinstance(text, tuple) else (text, [])
             n = sum(1 for x in text.splitlines() if x.startswith("- "))
-            return (f"일정 {n}건을 확인했어요." if n else "그 기간엔 일정이 없어요."), {"text": text}, text + \
+            import cards
+            return (f"일정 {n}건을 확인했어요." if n else "그 기간엔 일정이 없어요."), \
+                {"text": text, "from": f, "to": args.get("to") or f, "items": cards.agenda_items(rows)}, text + \
                 "\n(이 목록대로만 답해: 없는 일정은 지어내지 말고, 못 읽은 곳이 있으면 짧게 그렇다고 말해.)"
         if name == "weather":
             try:
