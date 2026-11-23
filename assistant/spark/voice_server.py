@@ -302,10 +302,14 @@ def activity_note(said):
             "두세 문장으로, 브레인스토밍이면 아이디어 두세 개, 연습이면 첫 연습 문제나 첫 대사. 다음 턴에도 이어서 진행해.")
 
 
+def no_handover(text):
+    """Qwen's prompt without the hand-over tag's sentence."""
+    return re.sub(r"[^.。]*" + re.escape(ROUTE_TAG) + r"[^.。]*[.。]\s*", "", text)
+
+
 def local_prompt(text):
     """Qwen's prompt in local mode: no hand-over tag to emit (there is no Claude to hand over to)."""
-    text = re.sub(r"[^.。]*" + re.escape(ROUTE_TAG) + r"[^.。]*[.。]\s*", "", text)
-    return text + " 사용자의 일정이나 개인 정보, 최신 정보처럼 확인할 수 없는 사실은 모른다고 말해. 잡담과 네 이야기는 성격대로 편하게 해."
+    return no_handover(text) + " 사용자의 일정이나 개인 정보, 최신 정보처럼 확인할 수 없는 사실은 모른다고 말해. 잡담과 네 이야기는 성격대로 편하게 해."
 
 
 def system_prompt(name, length="normal", context="", persona="", title=""):
@@ -500,6 +504,8 @@ CALL_ORIGIN: contextvars.ContextVar = contextvars.ContextVar("call_origin", defa
 BRAIN_MODES = ("auto", "local", "claude_api", "claude_code")
 CALL_MODE: contextvars.ContextVar = contextvars.ContextVar("call_mode", default="")
 CALL_TURN: contextvars.ContextVar = contextvars.ContextVar("call_turn", default="")  # one id per user turn, for the gateway
+CALL_CARDS: contextvars.ContextVar = contextvars.ContextVar("call_cards", default=None)  # (send, kinds sent) this turn
+CARD_MAX = 32_000  # bytes of JSON; a bigger card is dropped (cards-contract.md)
 MODE_TYPES = ("ask", "tool_call", "schedule", "task")
 LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
 ORIGIN_TYPES = ("tool_call", "schedule", "task")
@@ -959,6 +965,18 @@ def clip_tool(text, name=""):
     return text if len(text) <= cap else text[:cap].rsplit("\n", 1)[0] + "\n(이후 생략)"
 
 
+async def relay_card(card):
+    """A gateway tool's card (built from the tool's own data, never model text) to the call, once per kind a turn."""
+    sink = CALL_CARDS.get()
+    if not sink or not isinstance(card, dict) or not isinstance(card.get("title"), str) \
+            or not isinstance(kind := card.get("kind"), str) or not 0 < len(kind) <= 32 or kind in sink[1]:
+        return
+    if len(json.dumps(card, ensure_ascii=False).encode()) > CARD_MAX:
+        return
+    sink[1].add(kind)
+    await sink[0]({"type": "card", "turn": CALL_TURN.get(), "card": card})
+
+
 async def gateway_tool(name, args, on_say=None):
     """One gateway tool over the link, as the text a model reads."""
     msg = await gateway_tool_msg(name, args, on_say)
@@ -981,6 +999,7 @@ async def gateway_tool_msg(name, args, on_say=None):
             if msg.get("type") == "tool_progress" and on_say and isinstance(msg.get("say"), str):
                 await on_say(msg["say"][:120])
             elif msg.get("type") in ("tool_result", "error"):
+                await relay_card(msg.get("card"))  # as soon as the data is here, before any sentence about it
                 return msg
     finally:
         links.queues.pop(rid, None)
@@ -1310,6 +1329,10 @@ ANNOUNCE = re.compile(r"(찾아|알아|확인해|검색해|살펴|조회해|점�
 # when the user's turn asked for current info or their schedule (user decision: minimal guards on no-tool chat).
 LOOKUP_VERB = re.compile(r"확인|찾아|알아보|알아봐|검색|조회|점검|살펴")
 AGENDA_WORDS = re.compile(r"일정|캘린더|스케줄|수업|마감|과제|할\s*일|브리핑")  # what the agenda prefetch already holds
+# Schedules, todos and calendar edits are answered on Qwen from the prefetched agenda and the gateway's tools
+# (agenda, gistra/planit, calendar_write with its confirm), never handed to Claude (user decision 2026-11-23).
+SCHEDULE_TURN = re.compile(AGENDA_WORDS.pattern + r"|시험|약속|회의|투두|todo|플래닛|planit|" + PLANS_ASK, re.I)
+SCHEDULE_FAILED = "일정을 지금 확인하지 못했어요. 다시 말씀해 주세요."
 LOOKUP_OBJ = re.compile(r"일정|캘린더|스케줄|수업|마감|과제|할\s*일|날씨|기온|주가|주식|환율|시세|가격|뉴스|브리핑|상태")
 
 
@@ -2318,6 +2341,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     prior = list(hist)  # earlier turns only: this utterance is added to history below and sent once, as the last turn
     bare = strip_vocative(text, name)
     CALL_TURN.set(uuid.uuid4().hex[:12])
+    CALL_CARDS.set((on_event, set()) if on_event else None)
     confirm = pending_confirm.pop(session, None)  # asked last turn: this turn answers it, yes or not
     confirm = confirm if confirm and time.time() - confirm[0] < CONFIRM_TTL_S and (
         YES.search(bare) or CONFIRM_YES.fullmatch(bare)) else None
@@ -2334,7 +2358,9 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     play = "" if sched or job or auto else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
     if play:  # a game note is terse; the persona's own register and title still hold ("너 차례!" was 반말 for 아젤)
         play += " 말투(존댓말/반말)와 호칭은 평소 네 성격대로 지키고, 사용자를 '당신'이라고 부르지 마."
-    if offline or play:
+    stay = not offline and not (sched or job or auto or confirm) and bool(SCHEDULE_TURN.search(bare)) \
+        and not USE_CLAUDE.search(bare) and not pick(MODEL_WORDS, bare)  # unless Claude was asked for by name
+    if offline or play or stay:
         to_claude = False  # local mode: Qwen answers what it can and says plainly what it can't
     sentences: asyncio.Queue = asyncio.Queue()
     thinking: list[Unthink] = []  # one filter per model stream this turn; any dropped reasoning is remembered
@@ -2343,8 +2369,8 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     fetched = {"agenda": ""}  # agenda_prefetch's block, read by both model paths
 
     async def via_claude():
-        if offline:  # never Claude in local mode: say so and offer the switch
-            await sentences.put(LOCAL_LINE)
+        if offline or stay:  # never Claude in local mode (say so, offer the switch) or for a schedule turn
+            await sentences.put(LOCAL_LINE if offline else SCHEDULE_FAILED)
             return
         route["value"] = "claude"
         if on_event:
@@ -2434,7 +2460,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 request_text = pend[1]  # "진짜 하라고": still the sleep record asked a turn ago
             wanted = matched_tool(request_text, gw_defs)
             requested = bool(needs_answer(bare) or REQUEST.search(bare) or PUSH.search(bare))
-            system = (local_prompt if offline or play else str)(system_prompt(
+            system = (local_prompt if offline or play else no_handover if stay else str)(system_prompt(
                 name, length, ctx, persona_text(persona, settings), user_title(settings, persona))) \
                 + (tool_text := gateway_tools_text(gw_defs, request_text)) + now_kst() + night_rule() + (memory_hits(await recall(bare, timings)) if ctx else "") \
                 + fetched["agenda"] + play
@@ -2661,7 +2687,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                             messages += [{"role": "assistant", "content": buf.strip()},
                                          {"role": "user", "content": f"[도구 결과]\n{result}\n\n이 결과로 방금 질문에 답해."}]
                             continue
-                        if state == "tool" and offline and rounds < 3:  # local: no Claude to hand to; answer with what came
+                        if state == "tool" and (offline or stay) and rounds < 3:  # local: no Claude to hand to; answer with what came
                             renote("도구는 이제 그만 부르고, 지금까지 받은 결과로 바로 답해. 결과가 없는 항목은 없다고 말해.")
                             continue
                         if state == "tool" or ROUTE_TAG in buf:
@@ -4024,7 +4050,7 @@ if __name__ == "__main__":
             async def fake_tts(sentence):
                 return b"", 24000
             globals().update(claude_stream=fake_claude, tts=fake_tts, FILLER_AFTER_S=0.05, NUDGE_AFTER_S=0.25)
-            return [s async for s, *_ in respond("내일 일정 알려줘", f"f{first_delay}{gap}", time.perf_counter(), {})]
+            return [s async for s, *_ in respond("클로드로 내일 일정 알려줘", f"f{first_delay}{gap}", time.perf_counter(), {})]
         real = claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S
         real_llm = llm_stream
         said = "네, 확인했어요.", "내일은 일정이 없어요."
@@ -4038,14 +4064,14 @@ if __name__ == "__main__":
                 await asyncio.sleep(5)
                 yield "늦은 답"
             globals()["claude_stream"] = slow_claude
-            gen = respond("내일 일정 알려줘", "cut", time.perf_counter(), {})
+            gen = respond("클로드로 내일 일정 알려줘", "cut", time.perf_counter(), {})
             first = asyncio.ensure_future(gen.__anext__())
             await asyncio.sleep(0.02)
             first.cancel()
             await asyncio.gather(first, return_exceptions=True)
             await gen.aclose()
         asyncio.run(cut_before_speaking())
-        assert list(history["azel:cut"]) == [{"role": "user", "content": "내일 일정 알려줘"}]  # no placeholder turn
+        assert list(history["azel:cut"]) == [{"role": "user", "content": "클로드로 내일 일정 알려줘"}]  # no placeholder turn
         assert not any("끊김" in m["content"] for h in history.values() for m in h)
         claude_stream, tts, FILLER_AFTER_S, NUDGE_AFTER_S = real
 
@@ -4059,7 +4085,7 @@ if __name__ == "__main__":
             async def fake_tts(sentence):
                 return b"", 24000
             globals()["tts"] = fake_tts
-            run = asyncio.ensure_future(collect(respond("내일 일정 알려줘", "act", time.perf_counter(), {}, on_event)))
+            run = asyncio.ensure_future(collect(respond("클로드로 내일 일정 알려줘", "act", time.perf_counter(), {}, on_event)))
             await asyncio.sleep(0.01)
             ask = a.ws.sent[-1]
             for m in [{"type": "activity", "phase": "tool_start", "tool": "mcp__claude_ai_Cygnus_MCP__gistra_today",
@@ -4108,10 +4134,10 @@ if __name__ == "__main__":
             return calls, contexts, said
         now = datetime.now(KST)
         tomorrow = late_night.day_for(1, now).isoformat()
-        calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘"))
+        calls, contexts, said = asyncio.run(agenda_check("클로드로 내일 일정 알려줘"))
         assert calls == [("agenda", {"from": late_night.day_for(0, now).isoformat(), "to": tomorrow})], calls
         assert "치과 (구글 캘린더)" in contexts[0] and "고정 정기회의" in contexts[0] and said == ["내일은 치과와 정기회의가 있어요."]
-        calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘", fail=True))
+        calls, contexts, said = asyncio.run(agenda_check("클로드로 내일 일정 알려줘", fail=True))
         assert calls and "치과" not in contexts[0] and said, (calls, said)  # agenda down: Claude still answers (its own tools)
         # one ack per turn (live 2026-11-23, "오늘 일정 알려줘"): the agenda came prefetched, Qwen opened with a promise,
         # the promise counted as a lookup still owed, the nudge made it start over with "네, 정훈님. … 안내해 드릴게요."
@@ -4344,7 +4370,7 @@ if __name__ == "__main__":
             async def fake_tts(sentence):
                 return b"", 24000
             globals().update(llm_stream=tagging_llm, claude_stream=answer_claude, tts=fake_tts, FILLER_AFTER_S=5)
-            return [s async for s, *_ in respond("회의가 무슨 요일이었더라", "late", time.perf_counter(), {})]
+            return [s async for s, *_ in respond("그 메일 무슨 요일에 왔더라", "late", time.perf_counter(), {})]
         said_late = asyncio.run(late_tag_check())
 
         async def merge_check():  # sentences that queue up during a slow synthesis go out together, within the audio sent
@@ -5367,6 +5393,92 @@ if __name__ == "__main__":
         assert second == ["일정을 지웠어요."], second
         first, second, frames = asyncio.run(confirm_check("아니 잠깐만"))
         assert not any("confirm" in f[1] for f in frames), frames  # anything but yes: the confirm id is never sent
+        CARDS = {  # one fake gateway card per kind (cards-contract.md), keyed by the tool that returns it
+            "agenda": {"kind": "agenda", "title": "내일 일정", "range_label": "내일", "items": [
+                {"start": "2026-11-24T10:00:00+09:00", "end": "2026-11-24T11:15:00+09:00", "all_day": False,
+                 "title": "컴파일러", "source": "gistra", "location": "EECS B201"}]},
+            "stock_quote": {"kind": "stock", "title": "엔비디아", "symbol": "NVDA", "price": 181.2, "change": 2.3,
+                            "change_pct": 1.29, "currency": "USD", "points": [[1763946000, 178.9], [1763946300, 181.2]],
+                            "range": "1d"},
+            "portfolio": {"kind": "portfolio", "title": "보유 종목", "items": [
+                {"symbol": "005930.KS", "name": "삼성전자", "price": 98000, "change_pct": -0.4, "spark": [98400, 98000]}]},
+            "gistra_assignments": {"kind": "todo", "title": "남은 과제", "items": [
+                {"title": "HW3", "due": "2026-11-25", "course": "컴파일러", "source": "gistra", "done": False}]},
+            "weather": {"kind": "weather", "title": "광주 날씨", "place": "광주", "now": {"temp": 4, "icon": "cloudy", "pop": 20},
+                        "hours": [{"t": "2026-11-23T15:00:00+09:00", "temp": 5, "icon": "cloudy", "pop": 20}],
+                        "days": [{"d": "2026-11-24", "min": -1, "max": 8, "icon": "sunny", "pop": 0}]},
+            "infra_health": {"kind": "infra", "title": "서버 상태", "hosts": [{"name": "vd-spark", "up": True, "cpu_pct": 12.5}],
+                             "down": ["nemoclaw"]},
+            "dup_agenda": {"kind": "agenda", "title": "또 일정", "items": []},  # the turn already has an agenda card
+            "big": {"kind": "big", "title": "x", "blob": "가" * CARD_MAX},  # over the size cap
+            "untitled": {"kind": "untitled"},  # no title
+        }
+
+        class CardLink:
+            async def send(self, obj):
+                links.queues[obj["id"]][0].put_nowait({"type": "tool_result", "result": "ok", "card": CARDS.get(obj["name"])})
+
+        async def cards_check():
+            """Each kind from a fake gateway tool_result reaches the call once, with this turn's id; bad cards never."""
+            got, real_pick = [], links.pick
+            async def sink(ev):
+                got.append(ev)
+            links.pick = lambda **k: CardLink()
+            try:
+                CALL_TURN.set("t1"), CALL_CARDS.set((sink, set()))
+                for name in [*CARDS, "no_card"]:
+                    assert (await gateway_tool_msg(name, {}))["result"] == "ok"
+                CALL_CARDS.set(None)  # no call (the /v1/chat path without on_event): nothing is sent, nothing fails
+                await gateway_tool_msg("weather", {})
+            finally:
+                links.pick = real_pick
+            return got
+        got = asyncio.run(cards_check())
+        assert [e["card"]["kind"] for e in got] == ["agenda", "stock", "portfolio", "todo", "weather", "infra"], got
+        assert all(e["type"] == "card" and e["turn"] == "t1" for e in got) and got[0]["card"] == CARDS["agenda"]
+
+        def schedule_local_check(text):
+            """brain_mode auto: a schedule turn stays on Qwen (no hand-over tag in its prompt, never Claude, the
+            prefetched agenda's card sent to the call); any other turn may still hand over."""
+            prompts, events, claude_calls = [], [], []
+
+            async def qwen(messages, max_tokens=600):
+                prompts.append(messages[0]["content"])
+                yield ROUTE_TAG  # as if Qwen tried to hand over anyway
+
+            async def claude(*a, **k):
+                claude_calls.append(a[0])
+                yield "코스피는 오늘 올랐어요."
+
+            async def on_event(ev):
+                events.append(ev)
+            saved = llm_stream, claude_stream, tts, route_lookup, dict(gw_tools), links.settings, links.pick
+            globals().update(llm_stream=qwen, claude_stream=claude, tts=lambda s, *a, **k: asyncio.sleep(0, (b"", 24000)),
+                             route_lookup=lambda *a, **k: asyncio.sleep(0, []))
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            links.settings, links.pick = {"brain_mode": "auto"}, lambda **k: CardLink()
+            ctx = contextvars.copy_context()
+            ctx.run(CALL_MODE.set, "auto")
+
+            async def said_by():
+                return [x async for x, *_ in respond(text, "sched", time.perf_counter(), {}, on_event)]
+            try:
+                out = ctx.run(asyncio.run, said_by())
+            finally:
+                globals().update(llm_stream=saved[0], claude_stream=saved[1], tts=saved[2], route_lookup=saved[3])
+                gw_tools.clear()
+                gw_tools.update(saved[4])
+                links.settings, links.pick = saved[5], saved[6]
+            return out, prompts, events, claude_calls
+        said, prompts, events, claude_calls = schedule_local_check("내일 일정 뭐야?")
+        assert said == [SCHEDULE_FAILED] and not claude_calls and prompts, (said, claude_calls)
+        assert all(ROUTE_TAG not in p for p in prompts), prompts
+        assert "[일정, 방금 확인" in prompts[0]  # the prefetched agenda is in Qwen's prompt
+        assert [e["card"]["kind"] for e in events if e.get("type") == "card"] == ["agenda"], events
+        said, prompts, events, claude_calls = schedule_local_check("오늘 코스피 어때?")
+        assert claude_calls and said == ["코스피는 오늘 올랐어요."], (said, claude_calls)  # not a schedule: may hand over
+        assert SCHEDULE_TURN.search("오늘 할 일 뭐 있어?") and SCHEDULE_TURN.search("내일 회의 지워 줘")
+        assert not SCHEDULE_TURN.search("오늘 날씨 어때?") and ROUTE_TAG not in no_handover(NUDGE)
         after, heard = stall_check(held=True)
         assert after is not None and after < END_STALL_S + 0.6 and len(heard) == 1 and heard[0] > 3.4, (after, heard)
         t = Turn(lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000))
