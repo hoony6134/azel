@@ -315,7 +315,15 @@ final class MacCall: ObservableObject {
         return true
     }
 
-    static func panelHeight(typing: Bool, approval: Bool = false) -> CGFloat { (typing ? 176 : 112) + (approval ? 30 : 0) }
+    static func panelHeight(typing: Bool, approval: Bool = false, cards: Bool = false) -> CGFloat {
+        (typing ? 176 : 112) + (approval ? 30 : 0) + (cards ? cardArea : 0)
+    }
+    static let cardArea: CGFloat = 250
+
+    /// The current turn's cards (the last line is the assistant's reply): the panel shows them below.
+    var panelCards: [ReplyCard] { Self.panelCards(log) }
+    nonisolated static func panelCards(_ log: CallLog) -> [ReplyCard] { log.lines.last.flatMap { $0.mine ? nil : $0.cards } ?? [] }
+    private var shownCards = false
 
     private var approvalWatch: Any?
     private var panelHasApproval: Bool { inCall && !ApprovalCenter.shared.pending.isEmpty }
@@ -323,7 +331,10 @@ final class MacCall: ObservableObject {
     private func resizePanel() {
         guard let p = panel else { return }
         var f = p.frame
-        f.size.height = Self.panelHeight(typing: typing, approval: panelHasApproval)   // grows upward from the bottom edge
+        let cards = inCall && !panelCards.isEmpty
+        // Typing and approvals grow upward from the bottom edge; cards grow downward from the top edge.
+        if cards != shownCards { f.origin.y -= cards ? Self.cardArea : -Self.cardArea; shownCards = cards }
+        f.size.height = Self.panelHeight(typing: typing, approval: panelHasApproval, cards: cards)
         p.setFrame(f, display: true, animate: false)
         if typing { p.makeKey() }
     }
@@ -450,6 +461,7 @@ final class MacCall: ObservableObject {
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
         }
+        if (inCall && !panelCards.isEmpty) != shownCards { resizePanel() }   // a card arrived, or the next turn began
     }
 
     /// keepPanel: leave the transcript / error on screen after the server hung up or something failed.
@@ -546,6 +558,7 @@ struct CallPanelView: View {
     private var jarState: JarState { call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : .offline }
 
     var body: some View {
+        VStack(spacing: 0) {
         HStack(spacing: Theme.m) {
             MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt,
                     tint: call.activePersona?.glaze ?? Theme.glazeCeladon).frame(width: 68, height: 68)
@@ -610,6 +623,15 @@ struct CallPanelView: View {
         }
         .padding(.horizontal, Theme.l)
         .frame(width: 460, height: 112 + (call.inCall && !approvals.pending.isEmpty ? 30 : 0))
+            // This turn's cards: the panel grows downwards for them and shrinks back on the next turn.
+            if call.inCall && !call.panelCards.isEmpty {
+                ScrollView {
+                    VStack(spacing: Theme.s) { ForEach(Array(call.panelCards.enumerated()), id: \.offset) { CardView(card: $0.element, compact: true) } }
+                        .padding(.horizontal, Theme.l).padding(.bottom, Theme.m)
+                }
+                .frame(width: 460, height: MacCall.cardArea)
+            }
+        }
         .frame(maxHeight: .infinity, alignment: .top)
         .overlay(alignment: .bottom) {
             if call.typing {

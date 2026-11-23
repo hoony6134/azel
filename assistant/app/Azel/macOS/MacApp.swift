@@ -489,6 +489,7 @@ struct MacHome: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                     .id(line.id)
+                ForEach(Array(line.cards.enumerated()), id: \.offset) { _, c in CardView(card: c) }   // under its reply
             }
             Color.clear.frame(height: 1).id(FollowScroll.bottomID)
         }

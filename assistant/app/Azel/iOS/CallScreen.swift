@@ -173,6 +173,7 @@ struct CallScreen: View {
                             .frame(maxWidth: .infinity)
                             .id(line.id)
                             .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 6)))
+                        ForEach(Array(line.cards.enumerated()), id: \.offset) { _, c in CardView(card: c) }   // under its reply
                     }
                     Color.clear.frame(height: 1).id(FollowScroll.bottomID)
                 }
