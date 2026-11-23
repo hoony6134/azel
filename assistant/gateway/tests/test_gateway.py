@@ -1921,3 +1921,19 @@ def test_api_only_gateway_never_runs_the_claude_cli(tmp_path, monkeypatch):
     assert run({"backend": "qwen", "goal": "조사해 줘"}) == ("qwen", None)  # a local choice stays local
     monkeypatch.setattr(g, "API_KEY", "")
     assert run({"backend": None, "goal": "조사해 줘"})[0] == "qwen"
+
+
+def test_a_secondary_without_voice_runs_no_link_and_no_scheduler(tmp_path, monkeypatch):
+    """BISEO_VOICE_LINK=0 (a host the ACL keeps from vd-spark): it serves, but never links or takes the scheduler."""
+    g = start(tmp_path, monkeypatch, BISEO_VOICE_LINK="0")
+    ran = []
+
+    async def link():
+        ran.append("link")
+
+    async def sched():
+        ran.append("scheduler")
+    g.voice_link, g.scheduler = link, sched
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        assert c.get("/v1/devices").status_code == 200
+    assert not g.VOICE_ON and ran == []

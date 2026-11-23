@@ -71,6 +71,9 @@ CLAUDE_OK = os.environ.get("BISEO_NO_CLAUDE", "") not in ("1", "true", "yes")
 # "api": this gateway reaches Claude only through the Messages API (asks and tasks on agent_loop), never the claude CLI
 # (no Node on a 1 GB host like deneb): the shared claude_path setting can't turn the CLI back on here.
 API_ONLY = os.environ.get("BISEO_CLAUDE_PATH", "") == "api"
+# 0: a secondary that can't reach the voice server (albireo, gienah under the ACL): no voice link, and no scheduler,
+# since every scheduled or proactive call is placed through that link
+VOICE_ON = os.environ.get("BISEO_VOICE_LINK", "1") not in ("0", "false", "no")
 # Scheduled calls fire on one gateway: the scheduler lease goes to the lowest value among live gateways.
 SCHED_PRIORITY = int(os.environ.get("BISEO_SCHEDULER_PRIORITY", os.environ.get("BISEO_PRIORITY", "10")))
 STATE_URL = os.environ.get("BISEO_STATE_URL", "http://100.64.0.10:8894")
@@ -2515,14 +2518,15 @@ async def warm_then_link():
         await asyncio.wait_for(device_tools(await fresh_devices()), PREWARM_S)
     except Exception as e:  # noqa: BLE001  a cold start is slower, never stopped
         print("prewarm incomplete:", type(e).__name__, flush=True)
-    await voice_link()
+    if VOICE_ON:
+        await voice_link()
 
 
 @asynccontextmanager
 async def lifespan(app):
     HOME.mkdir(parents=True, exist_ok=True)
     tasks = [asyncio.create_task(warm_then_link()), asyncio.create_task(reap_warm())]
-    if MODE == "full":  # scheduled jobs need personal data
+    if MODE == "full" and VOICE_ON:  # scheduled jobs need personal data and place calls through the voice link
         tasks.append(asyncio.create_task(scheduler()))
         if static_devices:
             tasks.append(asyncio.create_task(static_prober()))
