@@ -5353,7 +5353,7 @@ async def mcp_server(request: Request):
     return Response(status_code=202) if out is None else JSONResponse(out)
 
 
-CARD_STOCK_S = 4  # the chart for a stock card: no longer than this before the answer goes without its points
+CARD_STOCK_S = 1.5  # the chart for a stock card: no longer than this before the answer goes without its points
 
 
 async def tool_card(name, r):

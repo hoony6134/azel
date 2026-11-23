@@ -81,3 +81,21 @@ def test_a_korean_name_is_found_through_search_and_checked_by_sound():
     with pytest.raises(LookupError):  # Intel never answers for 테슬라: it does not sound like it
         asyncio.run(quote.quote("테슬라 주가", client([]), search=search))
     assert quote.sounds_like("엔트로픽", "anthropic") == 1 and quote.sounds_like("오픈에이아이", "dell") < quote.SOUND_MIN
+
+
+def test_naver_autocomplete_down_uses_known_names(monkeypatch):
+    Q = quote
+    """A network that times out Naver's autocomplete: well-known names still resolve, and it is skipped for a while."""
+    monkeypatch.setattr(Q, "ac_down", {"until": 0.0})
+    hits = []
+
+    def handler(req):
+        hits.append(req.url.host)
+        raise httpx.ConnectTimeout("blocked", request=req)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await Q.naver_find("SK하이닉스", c), await Q.naver_find("삼성전자", c), await Q.naver_find("토스", c)
+    a, b, none = asyncio.run(go())
+    assert a == {"name": "SK하이닉스", "code": "000660"} and b["code"] == "005930" and none is None
+    assert hits == ["ac.stock.naver.com"]  # tried once, then skipped

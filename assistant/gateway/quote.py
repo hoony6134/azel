@@ -34,10 +34,33 @@ def clean(query):
     return re.sub(r"\s+", " ", q).strip()[:60]
 
 
+# The most-asked KRX names, for when Naver's autocomplete can't be reached (a campus network times it out, 2026-11-23):
+# without it a Korean name fell to Yahoo (SK하이닉스 became an SK hynix ETF) and web search, past the voice turn's 8 s.
+KNOWN_KR = {"삼성전자": "005930", "sk하이닉스": "000660", "하이닉스": "000660", "lg에너지솔루션": "373220",
+            "삼성바이오로직스": "207940", "현대차": "005380", "현대자동차": "005380", "기아": "000270", "셀트리온": "068270",
+            "네이버": "035420", "naver": "035420", "카카오": "035720", "posco홀딩스": "005490", "포스코홀딩스": "005490",
+            "lg화학": "051910", "삼성sdi": "006400", "kb금융": "105560", "신한지주": "055550", "현대모비스": "012330",
+            "삼성물산": "028260", "한화에어로스페이스": "012450", "에코프로": "086520", "에코프로비엠": "247540",
+            "카카오뱅크": "323410", "삼성전기": "009150", "lg전자": "066570", "sk텔레콤": "017670", "kt": "030200"}
+AC_DOWN_S = 600  # after Naver's autocomplete failed to answer, skip it this long (each try cost AC_TIMEOUT_S)
+ac_down = {"until": 0.0}
+
+
+def known_kr(q):
+    code = KNOWN_KR.get(re.sub(r"\s+", "", q).lower())
+    return {"name": q, "code": code} if code else None
+
+
 async def naver_find(q, c):
+    import time
+    if time.monotonic() < ac_down["until"]:
+        return known_kr(q)
     try:
         r = await c.get(NAVER_AC, params={"q": q, "target": "stock"}, timeout=AC_TIMEOUT_S)
         items = r.json().get("items") or []
+    except (httpx.TransportError, httpx.TimeoutException):
+        ac_down["until"] = time.monotonic() + AC_DOWN_S
+        return known_kr(q)
     except (httpx.HTTPError, ValueError):
         return None
     for it in items:
