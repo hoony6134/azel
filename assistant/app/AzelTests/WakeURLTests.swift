@@ -41,35 +41,6 @@ final class WakeURLTests: XCTestCase {
         XCTAssertTrue(saved.path.hasSuffix("/Library/Application Support/Azel"))
     }
 
-    func testUtteranceIsReadOnceAndDeleted() async throws {
-        try FileManager.default.createDirectory(at: AzelFiles.folder, withIntermediateDirectories: true)
-        let pcm = Data((0..<3201).map { UInt8($0 % 251) })      // an odd byte at the end
-        try pcm.write(to: AzelFiles.utterance("u1"))
-        let got = await AzelFiles.takeUtterance("u1", appear: 0.5)
-        XCTAssertEqual(got.data?.count, 3200, "whole samples only")
-        XCTAssertNotNil(got.at, "when it appeared: the seam's cutoff")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: AzelFiles.utterance("u1").path))
-        let missing = await AzelFiles.takeUtterance("nope", appear: 0.2)
-        XCTAssertNil(missing.data)
-        XCTAssertNil(missing.at, "never appeared: the app sends all of its own held audio")
-        try Data().write(to: AzelFiles.utterance("empty"))
-        let empty = await AzelFiles.takeUtterance("empty", appear: 0.2)
-        XCTAssertNil(empty.data, "zero bytes: nobody spoke after the name")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: AzelFiles.utterance("empty").path))
-    }
-
-    func testUtteranceArrivingLateIsWaitedFor() async throws {
-        try FileManager.default.createDirectory(at: AzelFiles.folder, withIntermediateDirectories: true)
-        let url = AzelFiles.utterance("late")
-        try Data(count: 640).write(to: url.appendingPathExtension("part"))
-        Task {
-            try? await Task.sleep(nanoseconds: 700_000_000)              // longer than `appear`: the .part keeps it waiting
-            try? FileManager.default.moveItem(at: url.appendingPathExtension("part"), to: url)   // the listener finishes
-        }
-        let got = await AzelFiles.takeUtterance("late", appear: 0.3, partLimit: 3)
-        XCTAssertEqual(got.data?.count, 640)
-    }
-
     /// Voice processing starts only once the listener closed its stream (2026-11-23: 3 s main-thread
     /// stall while both held the mic); a leftover marker delays a call by `limit`, never forever.
     func testWaitsForTheListenerToReleaseTheMic() async throws {
@@ -91,29 +62,36 @@ final class WakeURLTests: XCTestCase {
         XCTAssertTrue(AzelFiles.listenerMic.exists, "the listener's marker is the listener's to remove")
     }
 
-    /// The bridge: the tail the listener recorded until our mic went live is read once and deleted; with
-    /// no listener (no marker, no files) nothing is waited for.
-    func testBridgeTailIsTakenOrSkipped() async throws {
-        let t0 = Date()
-        let none = await AzelFiles.takeTail("old", limit: 1)
-        XCTAssertNil(none.data)
-        XCTAssertLessThan(Date().timeIntervalSince(t0), 0.2, "an old listener writes no tail: no wait")
+    /// The live stream: bytes are forwarded as the listener appends them (not once at the end), whole samples
+    /// only, until `.done`; the end time is the seam for our own frames; all files are removed afterwards.
+    @MainActor func testStreamIsForwardedAsItGrows() async throws {
         try FileManager.default.createDirectory(at: AzelFiles.folder, withIntermediateDirectories: true)
-        let url = AzelFiles.folder.appendingPathComponent("wake-utterance-b1.tail")
-        try Data(count: 10).write(to: url.appendingPathExtension("part"))
-        Task {
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            try? FileManager.default.removeItem(at: url.appendingPathExtension("part"))
-            try? Data(count: 6400).write(to: url)                           // the listener stopped: 200 ms of tail
+        let url = AzelFiles.stream("s1")
+        try Data().write(to: url)
+        try Data().write(to: url.deletingPathExtension().appendingPathExtension("acked"))
+        Task.detached {
+            let h = try FileHandle(forWritingTo: url)
+            for _ in 0..<3 {                                    // three 160 ms frames, written in real time
+                try? await Task.sleep(nanoseconds: 160_000_000)
+                h.seekToEndOfFile(); h.write(Data(count: 5120))
+            }
+            h.write(Data([1]))                                  // half a sample: held back
+            try h.close()
+            try Data().write(to: url.deletingPathExtension().appendingPathExtension("done"))
         }
-        let got = await AzelFiles.takeTail("b1", limit: 2)
-        XCTAssertEqual(got.data?.count, 6400)
-        XCTAssertNotNil(got.at, "when it stopped: live frames from then on follow")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
-        XCTAssertEqual(MacCall.joined(Data([1]), Data([2, 3])), Data([1, 2, 3]))
-        XCTAssertEqual(MacCall.joined(nil, Data([2])), Data([2]))
-        XCTAssertNil(MacCall.joined(nil, nil))
+        var chunks: [Int] = []
+        let t0 = ProcessInfo.processInfo.systemUptime
+        let end = await AzelFiles.followStream("s1") { chunks.append($0.count) }
+        XCTAssertGreaterThanOrEqual(chunks.count, 3, "sent as it grew, not as one burst")
+        XCTAssertEqual(chunks.reduce(0, +), 3 * 5120, "whole samples only")
+        XCTAssertGreaterThan(end ?? 0, t0 + 0.4)
+        for ext in ["pcm", "done", "acked"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.deletingPathExtension().appendingPathExtension(ext).path), ext)
+        }
+        let none = await AzelFiles.followStream("missing", appear: 0.1) { _ in XCTFail("nothing to send") }
+        XCTAssertNil(none, "no stream: all of our own audio is sent")
     }
+
 }
 #endif
 

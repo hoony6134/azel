@@ -7,7 +7,7 @@ import Foundation
 /// - `mic-live`: the call's mic is capturing (the listener may let go of the mic);
 /// - `enrolling`: the wake-clip recorder is open (no wake detection);
 /// - `listener-mic` (the listener's): its input stream is open; it closes it during a call or enrollment;
-/// - `wake-utterance-<id>.pcm`: what the user said right after the name, PCM16LE mono 16 kHz.
+/// - `wake-stream-<id>.pcm`: what the listener hears from the wake on, growing live until our mic is live.
 enum AzelFiles {
     static var folder: URL = {
         let home = getpwuid(getuid()).flatMap { String(validatingUTF8: $0.pointee.pw_dir) } ?? NSHomeDirectory()
@@ -48,46 +48,50 @@ enum AzelFiles {
     /// App launch and quit: nothing of ours is running.
     static func clearMarkers() { [inCall, micLive, enrolling].forEach { $0.remove() } }
 
-    static func utterance(_ id: String) -> URL { folder.appendingPathComponent("wake-utterance-\(id).pcm") }
+    static func stream(_ id: String) -> URL { folder.appendingPathComponent("wake-stream-\(id).pcm") }
 
-    /// The listener's capture (claude/wake-utterance): `.pcm.part` exists while it records (it stops
-    /// at end of speech, when `mic-live` appears, or after 10 s), then it is renamed to `.pcm`; zero
-    /// bytes = nothing was said. Waits while the `.part` exists (up to `partLimit`), or `appear` for
-    /// either file to show up at all; reads the `.pcm` once and deletes both. nil = go live without it.
-    /// `at`: when the finished file appeared (system uptime), i.e. when the listener stopped capturing.
-    static func takeUtterance(_ id: String, appear: TimeInterval = 5, partLimit: TimeInterval = 12) async -> (data: Data?, at: Double?) {
-        await take(utterance(id), part: utterance(id).appendingPathExtension("part"), appear: appear, partLimit: partLimit)
-    }
-
-    /// The listener's bridge (`.tail`): what it heard after the command until the app's mic went live, so
-    /// the engine start leaves no hole. Its `.tail.part` exists while it records; an old listener writes
-    /// none, so with neither file and the listener's mic released this returns at once. `at`: when it
-    /// stopped, i.e. live frames from then on follow it.
-    static func takeTail(_ id: String, limit: TimeInterval = 1.5) async -> (data: Data?, at: Double?) {
-        let url = folder.appendingPathComponent("wake-utterance-\(id).tail")
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: url.path), !fm.fileExists(atPath: url.appendingPathExtension("part").path), !listenerMic.exists {
-            return (nil, nil)
-        }
-        return await take(url, part: url.appendingPathExtension("part"), appear: 0.5, partLimit: limit)
-    }
-
-    private static func take(_ url: URL, part: URL, appear: TimeInterval, partLimit: TimeInterval) async -> (data: Data?, at: Double?) {
-        let fm = FileManager.default
+    /// Forwards the listener's live stream (`wake-stream-<id>.pcm`, PCM16LE mono 16 kHz, appended frame by frame from
+    /// the wake on) as it grows, so the server hears one natural utterance at real-time pace, not a recorded burst
+    /// (2026-11-23: a ~10 s wait for the recording, a burst split into turns). Ends once the listener wrote
+    /// `.done` (it stops on the frame after our `mic-live`) and the rest is sent, or after `limit`; then deletes the
+    /// files. Returns when it ended (system uptime): our held live frames from then on follow it. nil = no stream
+    /// appeared within `appear` (the listener couldn't write it): send all of our own audio.
+    static func followStream(_ id: String, appear: TimeInterval = 2, limit: TimeInterval = 16,
+                             send: @MainActor (Data) -> Void) async -> Double? {
+        let url = stream(id), done = url.deletingPathExtension().appendingPathExtension("done")
         let start = Date()
-        while !fm.fileExists(atPath: url.path) {
-            let waited = Date().timeIntervalSince(start)
-            if fm.fileExists(atPath: part.path) ? waited >= partLimit : waited >= appear { break }
-            // 20 ms: the app's live mic is held (not dropped) meanwhile, and only its frames after the
-            // file appeared are sent after it, so this poll sets the seam's precision, not a gap.
+        defer { for ext in ["pcm", "done", "acked"] { try? FileManager.default.removeItem(at: url.deletingPathExtension().appendingPathExtension(ext)) } }
+        var handle: FileHandle?
+        while handle == nil {
+            handle = try? FileHandle(forReadingFrom: url)
+            if handle == nil {
+                if Date().timeIntervalSince(start) >= appear { return nil }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+        guard let handle else { return nil }
+        defer { try? handle.close() }
+        var carry = Data()   // an odd byte waits for its pair: whole 16-bit samples only
+        while true {
+            let finished = FileManager.default.fileExists(atPath: done.path) || Date().timeIntervalSince(start) >= limit
+            let chunk = carry + ((try? handle.readToEnd()) ?? Data())   // after `finished`: everything written before .done
+            let whole = chunk.count - chunk.count % 2
+            if whole > 0 { await send(chunk.prefix(whole)) }
+            carry = chunk.suffix(from: chunk.startIndex + whole)
+            if finished { return ProcessInfo.processInfo.systemUptime }
+            // 20 ms: the listener writes a 160 ms frame at a time, so this forwards at the pace it was spoken.
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        let at = fm.fileExists(atPath: url.path) ? ProcessInfo.processInfo.systemUptime : nil
-        let data = try? Data(contentsOf: url)
-        try? FileManager.default.removeItem(at: url)
-        try? FileManager.default.removeItem(at: part)
-        guard let data, data.count >= 2 else { return (nil, at) }
-        return (data.count % 2 == 0 ? data : data.dropLast(), at)   // whole 16-bit samples only
+    }
+
+    /// The listener's "네?" has played (`.acked`): our voice processing starts only after it (the 3 s stall of
+    /// 2026-11-23 coincided with that sound). Gives up after `limit`; with no stream file at all, at once.
+    static func streamAcked(_ id: String, limit: TimeInterval = 1.5) async {
+        let acked = stream(id).deletingPathExtension().appendingPathExtension("acked")
+        let start = Date()
+        while !FileManager.default.fileExists(atPath: acked.path), Date().timeIntervalSince(start) < limit {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 }
 #endif

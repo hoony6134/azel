@@ -368,70 +368,16 @@ def uid_of(url):
     return url.split("utterance=")[1]
 
 
-def test_one_breath_command_is_captured_after_the_wake_word_and_handed_over(tmp_path):
-    opened = []
-    lis, clock, played, flushed, requests = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
-    lis.run(frames(clock, [(SIL, 3), (WAKE, 1), (SIL, 1), (SPEECH, 5), (SIL, 5), (SIL, 40)]))
-    f = tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm"
-    pcm = np.frombuffer(f.read_bytes(), dtype="<i2")
-    assert f.stat().st_mode & 0o777 == 0o600
-    assert (pcm == SPEECH).sum() == 5 * FRAME           # the command, not the wake word
-    assert (pcm == WAKE).sum() == 0
-    assert played == [16000] and not any(r.url.path == '/v1/turn' for r in requests)  # the ack, no headless turn
-    assert flushed == []  # the mic is not flushed: the command being said is kept
-    assert log_lines(tmp_path)[0]["utterance"] == uid_of(opened[0])
 
 
-def test_preroll_keeps_the_frame_before_speech_starts(tmp_path):
-    opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
-    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 40)]))
-    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
-    assert len(pcm) == 6 * FRAME and (pcm[:FRAME] == WAKE).all()  # wake frame + 4 speech + 1 quiet frame (tail trimmed)
 
 
-def test_a_short_pause_mid_command_does_not_end_the_recording(tmp_path):
-    """"오늘 아침 | 컴파일러 프로젝트 관련 일정 삭제해" (2026-11-23): an 0.8 s pause mid-command was the end; now
-    only a pause of utterance_silence_ms is, and its silence is trimmed so it can't end the server's turn early."""
-    opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
-    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 5), (SPEECH, 6), (SIL, 40)]))
-    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
-    assert (pcm == SPEECH).sum() == 10 * FRAME, "both halves"
-    assert (pcm[-2 * FRAME:] == SPEECH).sum() >= FRAME, "at most one quiet frame after the last word"
 
 
-def test_utterance_file_is_empty_when_nobody_speaks(tmp_path):
-    opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
-    lis.run(frames(clock, [(WAKE, 1), (SIL, 40)]))
-    assert (tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes() == b""
 
 
-def test_capture_ends_when_the_app_mic_is_live(tmp_path):
-    opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
-
-    def stream():
-        yield from frames(clock, [(WAKE, 1), (SPEECH, 3)])
-        (tmp_path / "mic-live").write_text("")  # the app's mic is live: it hears the rest itself
-        yield from frames(clock, [(SPEECH, 5), (SIL, 40)])
-
-    lis.run(stream())
-    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
-    assert len(pcm) == 5 * FRAME  # wake frame as pre-roll + 3 speech + the frame that showed mic-live
 
 
-def test_stale_utterance_files_are_swept(tmp_path):
-    lis, *_ = make(tmp_path, handoff="app")
-    d = tmp_path / "azel"
-    d.mkdir()
-    old = d / "wake-utterance-old.pcm"
-    old.write_bytes(b"x")
-    import os
-    os.utime(old, (1, 1))
-    lis.write_utterance("new", np.zeros(4, np.int16))
-    assert not old.exists() and (d / "wake-utterance-new.pcm").exists()
 
 
 def test_detections_are_ignored_while_the_app_enrolls_but_not_when_stale(tmp_path):
@@ -456,40 +402,10 @@ def test_utterance_off_keeps_the_ack_and_the_plain_url(tmp_path):
     assert played == [16000] and opened == ["azel://wake?persona=azel"] and not (tmp_path / "azel").exists()
 
 
-def test_part_file_exists_while_capturing_and_is_renamed_when_done(tmp_path):
-    seen = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: True)
-
-    def stream():
-        yield from frames(clock, [(WAKE, 1), (SPEECH, 2)])
-        seen.append(sorted(p.name[-9:] for p in (tmp_path / "azel").iterdir()))
-        yield from frames(clock, [(SIL, 40)])
-
-    lis.run(stream())
-    assert seen == [[".pcm.part"]]
-    assert sorted(p.suffix for p in (tmp_path / "azel").iterdir()) == [".pcm", ".tail"]  # the command, then the bridge tail
 
 
-def test_unwritable_utterance_dir_hands_over_without_the_file(tmp_path, capsys):
-    blocker = tmp_path / "file"
-    blocker.write_text("")  # a file where the folder should be: mkdir fails
-    opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", utterance_dir=str(blocker / "azel"),
-                          open_url=lambda u: opened.append(u) or True)
-    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
-    assert opened == ["azel://wake?persona=azel"]  # no utterance= the app would wait for
-    assert "utterance file failed" in capsys.readouterr().out and "utterance" not in log_lines(tmp_path)[0]
 
 
-def test_ack_plays_at_once_in_one_breath_mode_and_the_command_is_still_captured(tmp_path):
-    order, opened = [], []
-    lis, clock, played, flushed, _ = make(tmp_path, handoff="app", open_url=lambda u: order.append("open") or opened.append(u) or True)
-    real = lis._play
-    lis._play = lambda pcm, sr: order.append("ack") or real(pcm, sr)
-    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 40)]))
-    assert order == ["ack", "open"]  # heard before the app is asked to open
-    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{opened[0].split('utterance=')[1]}.pcm").read_bytes(), "<i2")
-    assert (pcm == SPEECH).sum() == 4 * FRAME and flushed == []
 
 
 def test_without_a_fetched_ack_the_system_beep_plays_in_one_breath_mode(tmp_path, monkeypatch):
@@ -529,31 +445,78 @@ def test_supervise_releases_the_mic_for_a_call_and_marks_it_only_while_open(tmp_
     assert not marker.exists()
 
 
-def test_the_listener_bridges_until_the_app_mic_is_live(tmp_path):
-    """The command, then the tail up to mic-live: no hole while the app's voice processing starts."""
-    opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+def stream_of(tmp_path, url):
+    return tmp_path / "azel" / f"wake-stream-{uid_of(url)}.pcm"
+
+
+def test_a_wake_streams_everything_after_the_name_live_until_the_app_mic_is_live(tmp_path):
+    """No end-of-speech guess, no cap at 10 s, no burst: every frame lands in the file as it arrives (2026-11-23)."""
+    opened, sizes = [], []
+    lis, clock, played, flushed, requests = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
     live = tmp_path / "mic-live"
 
     def stream():
-        yield from frames(clock, [(WAKE, 1), (SPEECH, 4)])
-        yield from frames(clock, [(SIL, 7)])  # the pause that ends the command (1.1 s)
-        utt = tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm"
-        yield from frames(clock, [(SPEECH, 3)])  # talking on while the app's engine starts
-        assert utt.exists() and (tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.tail.part").exists()
-        live.write_text("")  # the app's mic is live
+        yield from frames(clock, [(SIL, 2), (WAKE, 1)])
+        for spec in [(SPEECH, 4), (SIL, 7), (SPEECH, 6)]:          # a long pause mid-command doesn't end anything
+            for f in frames(clock, [spec]):
+                yield f
+                sizes.append(stream_of(tmp_path, opened[0]).stat().st_size)   # written before the next frame is read
+        live.write_text("")                                          # the app's mic is live
         yield from frames(clock, [(SPEECH, 1), (SIL, 40)])
 
     lis.run(stream())
-    d = tmp_path / "azel"
-    tail = np.frombuffer((d / f"wake-utterance-{uid_of(opened[0])}.tail").read_bytes(), "<i2")
-    assert (tail == SPEECH).sum() == 4 * FRAME and len(tail) == 4 * FRAME, "the words after the command, up to mic-live"
-    assert not (d / f"wake-utterance-{uid_of(opened[0])}.tail.part").exists()
+    pcm = np.frombuffer(stream_of(tmp_path, opened[0]).read_bytes(), "<i2")
+    assert sizes == [i * FRAME * 2 for i in range(1, len(sizes) + 1)], "appended frame by frame, live"
+    assert (pcm == SPEECH).sum() == 11 * FRAME and len(pcm) == 18 * FRAME and (pcm == WAKE).sum() == 0
+    assert stream_of(tmp_path, opened[0]).with_suffix(".done").exists()
+    assert stream_of(tmp_path, opened[0]).stat().st_mode & 0o777 == 0o600
+    entry = log_lines(tmp_path)[0]
+    assert entry["stream_s"] == round(18 * FRAME_S, 2) and entry["vad"]["voiced"] > 0.5
+    assert not any(r.url.path == "/v1/turn" for r in requests) and flushed == []
 
 
-def test_bridge_gives_up_after_its_cap(tmp_path):
+def test_the_stream_stops_at_its_safety_cap(tmp_path):
     opened = []
-    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True, bridge_max_s=0.5)
-    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 2), (SIL, 60)]))
-    tail = (tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.tail").read_bytes()
-    assert len(tail) == 3 * FRAME * 2  # 0.5 s → 3 whole 160 ms frames of int16
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True, stream_max_s=1)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 40)]))
+    assert len(stream_of(tmp_path, opened[0]).read_bytes()) == int(1 / FRAME_S) * FRAME * 2
+    assert stream_of(tmp_path, opened[0]).with_suffix(".done").exists()
+
+
+def test_the_ack_plays_first_and_marks_when_it_has_played(tmp_path):
+    order, opened = [], []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: order.append("open") or opened.append(u) or True)
+    real = lis._play
+    lis._play = lambda pcm, sr: order.append("ack") or real(pcm, sr)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 2), (SIL, 3)]))
+    assert order == ["ack", "open"]
+    assert stream_of(tmp_path, opened[0]).with_suffix(".acked").exists(), "the app starts its voice processing after this"
+
+
+def test_stale_stream_and_old_utterance_files_are_swept(tmp_path):
+    import os
+    lis, *_ = make(tmp_path, handoff="app")
+    d = tmp_path / "azel"
+    d.mkdir()
+    for name in ["wake-stream-old.pcm", "wake-utterance-old.pcm"]:
+        (d / name).write_bytes(b"x")
+        os.utime(d / name, (1, 1))
+    assert lis.begin_stream("new")
+    assert sorted(x.name for x in d.iterdir()) == ["wake-stream-new.pcm"]
+
+
+def test_unwritable_stream_dir_hands_over_without_the_file(tmp_path, capsys):
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", utterance_dir=str(blocker / "azel"),
+                          open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 3), (SIL, 10)]))
+    assert opened == ["azel://wake?persona=azel"]
+    assert "stream file failed" in capsys.readouterr().out and "utterance" not in log_lines(tmp_path)[0]
+
+
+def test_vad_summary_per_second():
+    s = Listener.vad_summary([0.1] * 6 + [0.9] * 6 + [0.2], 0.5)
+    assert s["max_per_s"] == [0.1, 0.9, 0.2] and s["voiced"] == round(6 / 13, 2)
+
