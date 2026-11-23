@@ -32,6 +32,7 @@ def test_registry_covers_every_surface(tgw):  # noqa: F811
     names = {t["name"] for t in TB.ALL_OWN}
     assert set(TB.ACTIONS) == names  # every own tool is a registered action and the other way round
     mcp = tailnet(g).post("/v1/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
+    g.bridge.d["ssh_hosts"] = lambda: ["albireo"]  # ssh_run is listed only where an ssh key and config exist
     model_tools = {t["name"] for t in asyncio.run(g.bridge.tools("qwen"))[0]}
     import eval_actions
     for name, meta in TB.ACTIONS.items():
