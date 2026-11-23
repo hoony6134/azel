@@ -2499,10 +2499,24 @@ async def voice_link():
 
 
 # ---------- HTTP ----------
+PREWARM_S = 12
+
+
+async def warm_then_link():
+    """Settings and the daemons' tool lists first, then the voice link: the voice server asks for the tool list as
+    soon as the link is up and waits only 3 s; cold, over a relayed tailnet, the list took 3.5 s and came back empty."""
+    try:
+        await asyncio.wait_for(asyncio.gather(load_settings(), fresh_devices()), PREWARM_S)
+        await asyncio.wait_for(device_tools(await fresh_devices()), PREWARM_S)
+    except Exception as e:  # noqa: BLE001  a cold start is slower, never stopped
+        print("prewarm incomplete:", type(e).__name__, flush=True)
+    await voice_link()
+
+
 @asynccontextmanager
 async def lifespan(app):
     HOME.mkdir(parents=True, exist_ok=True)
-    tasks = [asyncio.create_task(voice_link()), asyncio.create_task(reap_warm())]
+    tasks = [asyncio.create_task(warm_then_link()), asyncio.create_task(reap_warm())]
     if MODE == "full":  # scheduled jobs need personal data
         tasks.append(asyncio.create_task(scheduler()))
         if static_devices:
