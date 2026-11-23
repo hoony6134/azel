@@ -14,7 +14,8 @@ final class WatchCall: NSObject, ObservableObject {
     @Published var error: String?
     /// Who answers this call (nil = the server's primary).
     @Published private(set) var persona: WatchPersona?
-    var displayState: String { CallClient.displayState(server: state, playing: playing) }
+    var displayState: String { CallClient.displayState(server: state, playing: playing, waiting: waiting) }
+    @Published private(set) var waiting = false
     var levels: Levels { client.audio.levels }
     /// Which part of the reply has been heard, for the caption (same as the iPhone call screen).
     func karaoke(stepped: Bool) -> (texts: [String], spoken: Double) {
@@ -39,6 +40,7 @@ final class WatchCall: NSObject, ObservableObject {
         provider.setDelegate(self, queue: nil)
         client.onEvent = { [weak self] in self?.handle($0) }
         client.onPlayback = { [weak self] in self?.playing = $0 }
+        client.onWaiting = { [weak self] in self?.waiting = $0 }
         client.onClose = { [weak self] in self?.fail($0) }
     }
 

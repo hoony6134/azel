@@ -40,7 +40,9 @@ enum Cue: CaseIterable { case working, tick, done, error, wake, ack, pulse }
 /// wait has lasted 1 s (user, 2026-11-23: was a pulse every 3 s). A wait is any silence inside an open
 /// turn: before the first reply audio, and (user, 2026-11-23) also mid-reply, when the playback queue
 /// runs dry while the next sentence is generated or a tool runs. Reply audio, a server pause, and the
-/// end of the turn (turn_done, interrupt, error, transcript, listening, hangup) stop it.
+/// end of the turn (turn_done, interrupt, error, listening, hangup) stop it. The user's transcript does
+/// not: the server sends it after `thinking` (STT finishes inside the wait), and ending the turn there
+/// silenced every heartbeat (2026-11-23).
 struct ThinkingCues {
     static let pulseAfter = 1.0, pulseEvery = 1.2
     /// After 30 s of waiting the heartbeat slows to every 2.4 s (long Claude tasks shouldn't tick like a metronome).
@@ -60,6 +62,10 @@ struct ThinkingCues {
     private(set) var tools = 0
 
     var active: Bool { since != nil }
+
+    /// A wait long enough to be felt (the heartbeat's own threshold): the UI shows thinking for it, so
+    /// the orb and the sound agree, and sub-second gaps between sentences don't flicker.
+    func waiting(now: Double) -> Bool { since.map { now - $0 >= Self.pulseAfter } ?? false }
 
     private mutating func waitFrom(_ now: Double) {
         guard since == nil, turnOpen, !playing, !paused else { return }
@@ -89,7 +95,7 @@ struct ThinkingCues {
             default:
                 endTurn()   // listening and the like
             }
-        case "interrupt", "error", "turn_done", "transcript", "hangup", "end":
+        case "interrupt", "error", "turn_done", "hangup", "end":
             endTurn()
         case "pause", "duck":
             paused = true

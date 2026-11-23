@@ -14,7 +14,9 @@ final class MacCall: ObservableObject {
     /// Reply audio still playing (the server can move on before the last of it is heard).
     @Published private(set) var playing = false
     /// The state the UI shows: 말하는 중 while reply audio is still playing.
-    var displayState: String { CallClient.displayState(server: state, playing: playing) }
+    var displayState: String { CallClient.displayState(server: state, playing: playing, waiting: waiting) }
+    /// A felt wait (tool, mid-reply gap): the orb shows thinking, in step with the heartbeat.
+    @Published private(set) var waiting = false
     /// The reply paragraph being heard (sentences, characters heard, sentence being spoken).
     func karaoke(stepped: Bool) -> (texts: [String], spoken: Double, current: Int?) {
         let k = client.karaokeState()
@@ -54,7 +56,9 @@ final class MacCall: ObservableObject {
             self.playing = playing
             if playing { fadeTask?.cancel(); drainedAt = nil } else { drainedAt = Date(); scheduleFade() }
         }
-        client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date() } }
+        // The heartbeat's twin: a shimmer plus a glow beat on the orb, only when the sound really played.
+        client.onCuePlayed = { [weak self] cue in if cue == .pulse { self?.shimmerAt = Date(); self?.pulseAt = Date() } }
+        client.onWaiting = { [weak self] in self?.waiting = $0 }
         client.onClose = { [weak self] in self?.end(error: $0, keepPanel: true) }
         client.onWarning = { [weak self] in self?.error = $0 }
     }

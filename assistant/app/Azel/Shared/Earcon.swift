@@ -26,13 +26,15 @@ enum Earcon {
                     .triangle, nil, 2000, -22, 0.300)
         case .wake:
             return ([Note(freq: 1174.66, start: 0, attack: 0.003, hold: 0, decay: 0.220)], .sine, (2.76, -20), nil, -20, 0.250)
-        // Provisional (designer to confirm): a soft single-note "들었어요" and a barely-there pulse.
+        // Provisional (designer to confirm): a soft "들었어요" and a heartbeat. Was −30 dB / 80 ms and a
+        // 110 Hz pulse at −34 dB: laptop and phone speakers barely reproduce 110 Hz, and the user heard
+        // neither on the Mac (2026-11-23). Now pitched where small speakers play and at the level of `done`.
         case .ack:
-            return ([Note(freq: 783.99, start: 0, attack: 0.004, hold: 0, decay: 0.060)], .sine, (2, -20), nil, -30, 0.080)
-        case .pulse: // a heartbeat: a soft "lub", then a lighter "dub" (small: the whole thing peaks at −34 dB)
-            return ([Note(freq: 110, start: 0, attack: 0.012, hold: 0.010, decay: 0.110),
-                     Note(freq: 98, start: 0.19, attack: 0.012, hold: 0.004, decay: 0.090)],
-                    .sine, (2, -9), nil, -34, 0.400)
+            return ([Note(freq: 783.99, start: 0, attack: 0.004, hold: 0.010, decay: 0.110)], .sine, (2, -20), nil, -24, 0.140)
+        case .pulse: // a heartbeat: a "lub", then a lighter "dub"
+            return ([Note(freq: 220, start: 0, attack: 0.010, hold: 0.010, decay: 0.110),
+                     Note(freq: 196, start: 0.19, attack: 0.010, hold: 0.004, decay: 0.090)],
+                    .sine, (2, -6), nil, -28, 0.400)
         }
     }
 

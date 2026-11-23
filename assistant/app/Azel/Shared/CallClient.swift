@@ -177,6 +177,8 @@ final class CallClient {
             reportPlayed()
             // listening: true, so the mic-loud check applies: never a heartbeat over the user's voice.
             if let cue = thinking.tick(now: now) { self.cue(cue, listening: true) }
+            let waiting = thinking.waiting(now: now)
+            if waiting != wasWaiting { wasWaiting = waiting; onWaiting?(waiting) }
         }
         // 4 s in: if everything sent so far is exact zeros, the mic path is broken; say so.
         let check = DispatchWorkItem { [weak self] in
@@ -391,9 +393,14 @@ final class CallClient {
 
     /// What the call UI shows: the server may report listening/turn_done before the reply's last
     /// audio has played, so playing audio wins over those.
-    static func displayState(server: String, playing: Bool) -> String {
-        playing && (server == "listening" || server.isEmpty) ? "speaking" : server
+    /// A felt wait inside the turn (a tool, a mid-reply gap, ThinkingCues' own threshold) shows thinking.
+    static func displayState(server: String, playing: Bool, waiting: Bool = false) -> String {
+        if playing { return server == "listening" || server.isEmpty ? "speaking" : server }
+        return waiting ? "thinking" : server
     }
+    /// ThinkingCues' wait crossed (or left) its 1 s threshold (main queue): the UI shows thinking.
+    var onWaiting: ((Bool) -> Void)?
+    private var wasWaiting = false
 
     /// Plays a work sound if the gate allows; cues that would land on the user's voice wait up to
     /// 300 ms, then drop. Main thread.
@@ -401,6 +408,7 @@ final class CallClient {
         let now = ProcessInfo.processInfo.systemUptime
         switch gate.decide(cue, now: now, listening: listening, userLoudAt: audio.levels.micLoudAt, waited: waited, enabled: Earcon.enabled) {
         case .play:
+            if cue == .ack { Log.call.notice("cue ack: engine \(self.audio.isRunning, privacy: .public)") }
             audio.playCue(cue)
             onCuePlayed?(cue)
         case .drop: break
@@ -500,6 +508,7 @@ final class CallClient {
         pulseTimer?.invalidate()
         pulseTimer = nil
         thinking = ThinkingCues()
+        if wasWaiting { wasWaiting = false; onWaiting?(false) }
         karaokeLock.lock(); karaoke = KaraokeTimeline(); karaokeLock.unlock()
         admissionLock.lock(); admission = AudioAdmission(); admissionLock.unlock()
         playedLock.lock(); played = PlayedTracker(); playedLock.unlock()

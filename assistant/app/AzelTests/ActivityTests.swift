@@ -207,8 +207,37 @@ final class MidReplyHeartbeatTests: XCTestCase {
         XCTAssertEqual(u.tick(now: 1), .pulse)
     }
 
+    /// The real order (2026-11-23 Mac call): thinking, then the user's transcript ~0.25 s later, then
+    /// tools and speech seconds later. The transcript must not end the wait: it silenced every heartbeat.
+    func testTranscriptAfterThinkingKeepsTheHeartbeat() {
+        var t = ThinkingCues()
+        XCTAssertEqual(t.event("state", value: "thinking", now: 0), .ack)
+        _ = t.event("transcript", value: nil, now: 0.25)
+        XCTAssertFalse(t.waiting(now: 0.5), "sub-second: no thinking flicker")
+        XCTAssertEqual(t.tick(now: 1.0), .pulse)
+        XCTAssertTrue(t.waiting(now: 1.0))
+        XCTAssertEqual(t.tick(now: 2.2), .pulse)
+        _ = t.event("state", value: "speaking", now: 5)
+        t.audioArrived()
+        XCTAssertFalse(t.waiting(now: 5.1))
+    }
+
+    func testFeltWaitsShowThinkingButPlayingAudioWins() {
+        XCTAssertEqual(CallClient.displayState(server: "speaking", playing: false, waiting: true), "thinking", "mid-reply gap")
+        XCTAssertEqual(CallClient.displayState(server: "speaking", playing: true, waiting: true), "speaking")
+        XCTAssertEqual(CallClient.displayState(server: "listening", playing: true), "speaking")
+        XCTAssertEqual(CallClient.displayState(server: "speaking", playing: false), "speaking")
+    }
+
+    /// Small speakers: the heartbeat's fundamental must be one they play (≥ 200 Hz), and both cues loud enough to hear.
+    func testAckAndPulseAreAudibleOnSmallSpeakers() {
+        XCTAssertGreaterThanOrEqual(Earcon.spec(.pulse).notes.map(\.freq).min()!, 190)
+        XCTAssertGreaterThanOrEqual(Earcon.spec(.pulse).peakDB, -30)
+        XCTAssertGreaterThanOrEqual(Earcon.spec(.ack).peakDB, -26)
+    }
+
     func testTurnEndsAndPausesStopIt() {
-        for end in ["turn_done", "interrupt", "error", "transcript", "hangup"] {
+        for end in ["turn_done", "interrupt", "error", "hangup"] {
             var t = replying()
             t.playback(false, now: 6)
             _ = t.event(end, value: nil, now: 6.5)
