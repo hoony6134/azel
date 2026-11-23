@@ -1739,7 +1739,7 @@ async def none_async():
     return [], {}
 
 
-async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
+async def mcp_handle(bridge, msg, persona_id=None, scope="full", on_run=None):
     """One JSON-RPC message; None for notifications. A tool outside the caller's scope is invisible in tools/list
     and refused in tools/call exactly like a tool that doesn't exist."""
     allowed = SCOPES[scope]
@@ -1763,9 +1763,11 @@ async def mcp_handle(bridge, msg, persona_id=None, scope="full"):
         p = msg.get("params") or {}
         if p.get("name") not in allowed:
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
-        r = await bridge.call(p["name"], p.get("arguments") or {}, persona_id,
-                              caller="claude_code" if scope == "full" else "external")
-        result = {"content": [{"type": "text", "text": r["content"]}], "isError": r["is_error"]}
+        run = await bridge.run(p["name"], p.get("arguments") or {}, persona_id,
+                               caller="claude_code" if scope == "full" else "external")
+        if on_run:  # the gateway's card for the call's app (claude -p's tool_end picks it up)
+            await on_run(p["name"], run)
+        result = {"content": [{"type": "text", "text": for_model(run)}], "isError": not run["ok"]}
     elif method == "ping":
         result = {}
     else:

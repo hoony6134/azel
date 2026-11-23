@@ -204,7 +204,7 @@ def test_old_proactive_settings_migrate_on_read(gw):
     p = c.get("/v1/settings").json()["proactive"]
     assert p == {"enabled": True, "morning_briefing": {"enabled": True, "time": "07:30"},
                  "deadline_check": {"enabled": False, "time": "21:00"}, "server_alerts": False,
-                 "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120,
+                 "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120, "every_minutes": 5,
                                 "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}}
     assert "quiet_hours" not in json.dumps(p) and not hasattr(g, "in_quiet_hours")
 
@@ -1053,7 +1053,7 @@ def test_autonomous_tick_only_when_enabled(gw, monkeypatch):
     assert asked == [] and g.fake.db["plog"] == []  # autonomous is off by default
     c.put("/v1/settings", json={"proactive": {"autonomous": {"enabled": True}}})
     asyncio.run(g.scheduler_tick(noon.replace(minute=7), {}))
-    assert asked == []  # only at :00 and :30
+    assert asked == []  # only on minutes divisible by every_minutes (5)
     asyncio.run(g.scheduler_tick(noon, {}))
     assert len(asked) == 1
     c.put("/v1/settings", json={"proactive": {"enabled": False}})  # master switch off
@@ -2025,3 +2025,27 @@ def test_kind_labels_are_added_once(gw, monkeypatch):
         c.portal.call(lambda: g.place_call(reason, opening="여보세요", context={"kind": kind, "label": label}))
     assert [p["context"]["label"] for p in pushed] == ["약 먹기", "리서치", "확인"]
     assert [m["context"]["label"] for m in linked if m.get("type") == "call"] == ["약 먹기", "리서치", "확인"]
+
+
+def test_autonomous_every_five_minutes_never_in_a_call_and_logs_only_changes(gw, monkeypatch):
+    """The user's rule (2026-11-23): check every every_minutes (default 5, 1-60), skip while a call is live (Qwen and
+    the call share the GPU), and log a quiet "no call" only when the signals changed."""
+    g, c, _ = gw
+    placed, asked = auto_setup(g, monkeypatch, {"call": False, "urgency": 1, "reason": "", "opening": ""})
+    c.put("/v1/settings", json={"proactive": {"autonomous": {"enabled": True}}})
+    assert c.put("/v1/settings", json={"proactive": {"autonomous": {"every_minutes": 0}}}).status_code == 400
+    assert c.put("/v1/settings", json={"proactive": {"autonomous": {"every_minutes": 61}}}).status_code == 400
+    t = datetime(2026, 11, 22, 12, 5, tzinfo=g.KST)
+    asyncio.run(g.scheduler_tick(t, {}))
+    assert len(asked) == 1  # :05 counts
+    monkeypatch.setattr(g, "live_calls", lambda: {"azel:call-1"})
+    asyncio.run(g.scheduler_tick(t.replace(minute=10), {}))
+    assert len(asked) == 1  # a call is live: skipped
+    monkeypatch.setattr(g, "live_calls", lambda: set())
+    n = len(g.fake.db["plog"])
+    asyncio.run(g.scheduler_tick(t.replace(minute=15), {}))
+    asyncio.run(g.scheduler_tick(t.replace(minute=20), {}))
+    assert len(asked) == 3 and len(g.fake.db["plog"]) == n  # nothing new: no rows
+    g.fake.db["kv"]["alerts_recent"].append({"names": "DiskFull", "at": time.time()})
+    asyncio.run(g.scheduler_tick(t.replace(minute=25), {}))
+    assert len(g.fake.db["plog"]) == n + 1  # the signals changed: logged once

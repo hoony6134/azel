@@ -388,7 +388,7 @@ device that created them.
                 "morning_briefing":{"enabled":true,"time":"08:00"},
                 "deadline_check":{"enabled":true,"time":"20:00"},
                 "server_alerts":true,
-                "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,
+                "autonomous":{"enabled":false,"max_per_day":3,"min_gap_minutes":120,"every_minutes":5,
                               "window":["08:00","23:00"],"checkpoints":["08:30","13:00","18:00"]}},
    "default_device":"macbook","device_fallback":["albireo","spark"],"assistant_name":"아젤",
    "history_days":365,"reply_length":"normal","noise_mode":"normal","personality":"","user_title":""}
@@ -424,7 +424,8 @@ device that created them.
   (`"morning_briefing":"08:00"`, `quiet_hours`, `triggers.deadline/server_down`) is migrated on read.
   `PUT` with `proactive` merges one level deep into the current values (e.g. `{"proactive":{"autonomous":
   {"enabled":true}}}`), then validates: times `HH:MM`, `window` start < end, `max_per_day` 0–10,
-  `min_gap_minutes` 0–1440, at most 6 `checkpoints`; otherwise 400.
+  `min_gap_minutes` 0–1440, `every_minutes` 1–60 (how often the autonomous check runs; default 5), at most 6
+  `checkpoints`; otherwise 400.
   `assistant_name` (default "아젤"; 1–12 Hangul/Latin letters or spaces, else 400) is the assistant's spoken
   name: the gateways use it for the VoIP push `caller` and Claude's prompts, and the voice server for
   Qwen's system prompt (built per turn from the settings pushed over the link), so a rename applies on
@@ -631,7 +632,8 @@ device that created them.
     per line) to the memory service's task context `azel-checkpoint`. About 3 runs a day. The brain
     (`assistant/brain`) merges it with other state into `azel-situation`; the decision reads
     `azel-situation`, or `azel-checkpoint` when that is missing or older than 6 h.
-  - Decision: at :00 and :30 the scheduler lease holder gathers signals without Claude (critical alerts
+  - Decision: every `every_minutes` (minute divisible by it; default 5, never while a call is live, so local Qwen
+    never competes with a call for the GPU) the scheduler lease holder gathers signals without Claude (critical alerts
     of the last 24 h, delegated device jobs finished or failed in the last 2 h via each trusted daemon's
     `list_jobs`, approvals pending > 30 min, scheduled calls missed in the last 24 h, task contexts with
     open questions, the situation note, calls of the last 12 h with what the user said and autonomous calls
