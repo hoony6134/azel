@@ -2562,7 +2562,7 @@ async def put_settings(body: dict):
         if not (isinstance(h, list) and len(h) <= 12 and all(
                 isinstance(x, str) and 0 < len(x.strip()) <= 40 and not any(ord(ch) < 32 for ch in x) for x in h)):
             raise HTTPException(400, "holdings: up to 12 names or \"name (TICKER)\", each 1-40 characters")
-        body["holdings"] = [" ".join(x.split()) for x in h]
+        body["holdings"] = await check_holdings([" ".join(x.split()) for x in h])
     if "search_backend" in body and body["search_backend"] not in ("searxng", "haiku"):
         raise HTTPException(400, "search_backend: searxng or haiku")
     if "searxng_url" in body and not (isinstance(body["searxng_url"], str)
@@ -2599,6 +2599,8 @@ async def put_settings(body: dict):
     prim["name"], prim["personality"] = s["assistant_name"], s["personality"]
     await save_settings({k: v for k, v in s.items() if k != "personality_default"})
     await link_send({"type": "settings", "value": s})
+    if "holdings" in body:
+        tv_quote_cache.value = None  # the TV and the portfolio tool show the edit at once
     return settings_view(s)
 
 
@@ -2679,6 +2681,20 @@ async def resolve_holding(name):
     url = (await load_settings()).get("searxng_url") or web.SEARXNG_URL
     async with httpx.AsyncClient(timeout=stock_quotes.TIMEOUT_S, headers=stock_quotes.UA, follow_redirects=True) as c:
         return await stock_quotes.resolve(name, c, search=lambda q: web.searxng(q, 6, url, fetch_pages=False))
+
+
+async def check_holdings(entries):
+    """PUT /v1/settings holdings: an entry already saved, or one with "(TICKER)" (a rename keeping its code), is kept as
+    sent; a new bare name is resolved like the voice tool's: one listing -> "이름 (TICKER)", none -> as typed (비상장),
+    several -> 400 naming them so the app can ask which one."""
+    saved = set((await load_settings()).get("holdings") or [])
+    fresh = [e for e in entries if e not in saved and not re.search(r"\([^)]+\)\s*$", e)]
+    hits = dict(zip(fresh, await asyncio.gather(*(resolve_holding(e) for e in fresh), return_exceptions=True)))
+    many = {e: h["candidates"] for e, h in hits.items() if isinstance(h, dict) and "candidates" in h}
+    if many:
+        raise HTTPException(400, "holdings: 여러 종목이 맞아요. 하나를 골라 \"이름 (코드)\"로 보내 주세요: " +
+                            "; ".join(f"{e} → {', '.join(c)}" for e, c in many.items()))
+    return [f"{e} ({h['ticker']})"[:40] if isinstance(h := hits.get(e), dict) and h.get("ticker") else e for e in entries]
 
 
 async def holdings_update(add, remove):
