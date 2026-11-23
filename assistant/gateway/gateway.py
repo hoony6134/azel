@@ -288,6 +288,8 @@ VOICE_BASE += ("사용자가 일을 맡기면(…해 줘, 만들어 줘, 조사�
                "정하지 않았으면 작업이 알아서 정하게 하고, 맡긴 뒤 무엇을 맡겼는지 한 문장으로 말해. ")
 VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
+    "주가·시세는 azel의 stock_quote(보유 종목은 portfolio), 날씨는 weather, 일정은 agenda로 지금 바로 확인해서 답해: "
+    "실시간 정보를 볼 수 없다거나 앱·포털에서 확인하라고 하지 마. "
     "macbook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
 # Full gateways on the Messages API path (claude_path "api", opt-in): Cygnus through our read-only bridge, no
