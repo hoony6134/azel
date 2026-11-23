@@ -359,7 +359,7 @@ def test_call_context_and_notify_change(tgw, monkeypatch):
     item, _ = c.portal.call(g.schedule_create, {"at": at, "kind": "reminder", "note": "약 먹으라고 전화해줘",
                                                 "notify": "call"}, "app")
     c.portal.call(g.attempt, g.fake.db["schedule"][item["id"]], time.time())
-    assert pushes[-1]["context"] == {"kind": "schedule", "label": "알림: 약 먹기", "id": item["id"]}
+    assert pushes[-1]["context"] == {"kind": "schedule", "label": "약 먹기", "id": item["id"]}  # the app adds "알림: "
 
 
 def test_a_brief_runs_the_task_but_the_user_sees_their_goal(tgw):
