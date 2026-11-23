@@ -913,6 +913,8 @@ asks, call_logs or schedule requests.
   Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
   `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
   schedule list). Timeout 3 s.
+  The `tools` frame (answer to `tools_list`) adds `"read_only": true|false` to each definition: true is a read with no
+  side effect, safe to call speculatively and in parallel; device tools are always false.
   A `tool_result` for agenda, stock_quote, portfolio, weather, gistra_assignments, gistra_today, planit_get_day or
   infra_health/infra_status/infra_alerts also carries `"card": {"kind","title",…}`, built by the gateway
   (gateway/cards.py) from the tool's own data, under 32 KB, fields without data left out. Kinds and fields: the cards

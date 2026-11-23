@@ -1680,6 +1680,16 @@ for _n in P.NAMES:  # PHONE_DATA.md: personal, so never external; the app reads 
     ACTIONS[_n] = {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                    "no_rest": "앱은 자기 아이폰 데이터를 직접 읽어요(모델 경로 전용).", "examples": PHONE_EXAMPLES[_n]}
 APP_ACTIONS = {n for n, m in ACTIONS.items() if "app" in m["scopes"]}
+# other sources' reads: Cygnus's curated set is all reads (a read-only PAT; writes are own actions), Google and Spotify
+# by name. A device tool is never listed: its effect is unknown, so it counts as an action.
+READ_ONLY_OTHER = {"calendar_events", "gmail_search", "gmail_read", "spotify_now_playing", "spotify_devices"}
+
+
+def read_only(name):
+    """True: no side effect, safe to call speculatively and in parallel (the voice server's lookup path)."""
+    import cygnus
+    return bool(ACTIONS.get(name, {}).get("read_only")) if name in ACTIONS else \
+        name in READ_ONLY_OTHER or (name in cygnus.TOOLS and "__" not in name)
 NOT_ON_REST = {  # tool families with no dedicated app route (ACTIONS.md §7); tailnet POST /v1/tools/call reaches them
     "device": "기기 작업은 앱에서 create_task로 맡겨요(명령 실행은 승인과 함께 모델 경로에서만).",
     "cygnus": "앱에 아직 화면이 없는 개인 조회예요.",

@@ -5278,7 +5278,9 @@ async def serve_tool(m):
     current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
     try:
         if m["type"] == "tools_list":
-            await link_send({"id": m["id"], "type": "tools", "tools": (await bridge.tools("qwen"))[0]})
+            defs = (await bridge.tools("qwen"))[0]  # read_only only on this frame: the Messages API rejects extra keys
+            await link_send({"id": m["id"], "type": "tools",
+                             "tools": [{**t, "read_only": tools_bridge.read_only(t["name"])} for t in defs]})
             return
 
         async def progress(say):
