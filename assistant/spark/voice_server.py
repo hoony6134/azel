@@ -1974,6 +1974,7 @@ async def claude_stream(text, session, model, task, personal=False, context="", 
             if ev["type"] == "activity":
                 if on_event:
                     await on_event(client_activity(ev))
+                await relay_card(ev.get("card"))  # Claude's tool result as a card, like Qwen's (once per kind a turn)
             elif ev["type"] == "text":
                 yield str(ev.get("delta", ""))
             elif ev["type"] == "error":
@@ -5603,6 +5604,29 @@ if __name__ == "__main__":
                 links.pick = real_pick
             return got
         got = asyncio.run(cards_check())
+
+        async def claude_card_check():
+            """A card on Claude's tool_end activity frame reaches the call too."""
+            sent, a = [], links.add(FakeWS())
+            links.receive(a, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
+
+            async def sink(ev):
+                sent.append(ev)
+            CALL_TURN.set("t3"), CALL_CARDS.set((sink, set()))
+            async def text():
+                return "".join([d async for d in claude_stream("애플 차트 보여줘", "s", None, "chat", on_event=sink)])
+            run = asyncio.ensure_future(text())
+            await asyncio.sleep(0.01)
+            ask = a.ws.sent[-1]
+            for m in [{"type": "activity", "phase": "tool_end", "tool": "mcp__azel__stock_quote", "card": CARDS["stock_quote"]},
+                      {"type": "text", "delta": "애플 차트 띄워 드렸어요."}, {"type": "done"}]:
+                links.receive(a, {"id": ask["id"], **m})
+            said = await run
+            links.remove(a)
+            CALL_CARDS.set(None)
+            return sent, said
+        sent, said_c = asyncio.run(claude_card_check())
+        assert [e["card"]["kind"] for e in sent if e.get("type") == "card"] == ["stock"] and said_c == "애플 차트 띄워 드렸어요.", (sent, said_c)
         class CmdLink:
             async def send(self, obj):
                 q = links.queues[obj["id"]][0]
