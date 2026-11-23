@@ -116,3 +116,33 @@ def test_a_tap_during_the_policy_check_stands(gw, monkeypatch):  # noqa: F811
                                       "cwd": "/Users/jh/dev/x"})
     assert r.status_code == 200 and r.json()["status"] == "pending"
     assert c.get(f"/v1/approvals/{r.json()['approval_id']}").json()["status"] == "rejected"
+
+
+def test_always_rule_matches_any_cwd_and_is_saved_once(gw, monkeypatch):  # noqa: F811
+    """'항상 허용' of a command is not asked again on that device (whatever directory the daemon resolved), a second
+    'always' tap saves no duplicate, and older duplicates show once and go together."""
+    g, c, _ = gw
+    c.put("/v1/settings", json={"approval_mode": "ask"})
+    post = lambda cwd: c.post("/v1/approvals", json={"device": "macbook", "tool": "run_command",  # noqa: E731
+                                                      "command": "git  status", "cwd": cwd}).json()
+    first = post("/Users/jh/dev/a")
+    assert first["status"] == "pending"
+    assert c.post(f"/v1/approvals/{first['approval_id']}", json={"decision": "always"}).json()["decision"] == "always"
+    again = post("/Users/jh/dev/b")  # another directory, spacing normalized
+    assert again["status"] == "approved" and again.get("rule_id")
+    third = post("/Users/jh")
+    assert third["status"] == "approved"
+    dup = {**g.fake.db["kv"]["approval-rules"][0], "id": "olddup1"}
+    g.fake.db["kv"]["approval-rules"].append(dup)
+    rules = c.get("/v1/approvals/rules").json()
+    assert len(rules) == 1
+    assert c.delete(f"/v1/approvals/rules/{rules[0]['id']}").status_code == 200
+    assert g.fake.db["kv"]["approval-rules"] == []
+
+
+def test_read_only_commands_never_ask_in_auto_mode(gw):  # noqa: F811
+    g, c, _ = gw
+    c.put("/v1/settings", json={"approval_mode": "auto"})
+    for cmd in ("pwd", "ls -la", "df -h", "uptime"):
+        r = c.post("/v1/approvals", json={"device": "albireo", "tool": "run_command", "command": cmd, "cwd": "/home/u"}).json()
+        assert r["status"] == "approved", cmd

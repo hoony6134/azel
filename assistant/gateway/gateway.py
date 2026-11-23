@@ -3702,6 +3702,32 @@ def is_sudo(command):
     return bool(t) and os.path.basename(t[0]).lower() == "sudo"
 
 
+STATUS_KO = {"approved": "허용된", "used": "실행된", "rejected": "거절된", "expired": "만료된"}
+
+
+def norm_command(command):
+    """A command as a rule sees it: its words, whitespace and quoting normalized."""
+    try:
+        return " ".join(shlex.split(str(command)))
+    except ValueError:
+        return " ".join(str(command).split())
+
+
+def rule_key(r):
+    """Rules match on (device, command), not cwd: the daemon's resolved directory differs between calls, so a rule
+    stored with one never matched the next ask and "항상 허용" was asked and saved again (user report 2026-11-23)."""
+    return (r.get("device"), norm_command(r.get("command") or ""))
+
+
+def dedupe_rules(rules):
+    seen, out = set(), []
+    for r in rules:
+        if rule_key(r) not in seen:
+            seen.add(rule_key(r))
+            out.append(r)
+    return out
+
+
 def always_ok(command):
     """True when an approval of `command` may become an "always" rule."""
     try:
@@ -3786,9 +3812,9 @@ async def create_approval(body: dict):
     if requester and requester.get("task_id"):
         task_approvals.setdefault(requester["task_id"], set()).add(aid)
     sudo = is_sudo(row["command"])  # from the command itself, whatever the caller says: only a tap approves it
-    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    rules = await state.get("/v1/state/kv/approval-rules") or []  # cached: a slow ruchba never stalls the daemon
     rule = None if requester and requester.get("task_id") or sudo else next(  # a task's commands always need a tap
-        (r for r in rules if (r["device"], r["command"], r.get("cwd")) == (row["device"], row["command"], row["cwd"])), None)
+        (r for r in rules if rule_key(r) == rule_key(row)), None)
     meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None,
             **({"in_roots": body["in_roots"]} if isinstance(body.get("in_roots"), bool) else {}),  # daemon's say (resolved paths)
             **({"sudo": True} if sudo else {})}
@@ -4031,16 +4057,18 @@ async def list_approvals():
 
 @app.get("/v1/approvals/rules")
 async def approval_rules():
-    return await state.call("GET", "/v1/state/kv/approval-rules") or []
+    return dedupe_rules(await state.call("GET", "/v1/state/kv/approval-rules") or [])  # older duplicates shown once
 
 
 @app.delete("/v1/approvals/rules/{rid}")
 async def approval_rule_delete(rid: str):
     rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-    keep = [r for r in rules if r["id"] != rid]
-    if len(keep) == len(rules):
+    gone = next((r for r in rules if r["id"] == rid), None)
+    if gone is None:
         raise HTTPException(404, "no such rule")
+    keep = [r for r in rules if rule_key(r) != rule_key(gone)]  # its older duplicates go with it
     await state.call("PUT", "/v1/state/kv/approval-rules", keep)
+    state.cache.pop(("/v1/state/kv/approval-rules", ()), None)
     return {"deleted": rid}
 
 
@@ -4068,10 +4096,10 @@ async def decide(aid: str, body: dict):
     decision = body.get("decision") or ("once" if body.get("approve") else "deny")
     if decision not in DECISIONS:
         raise HTTPException(400, f"decision: one of {list(DECISIONS)}")
-    row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+    row, meta = await asyncio.gather(state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}"),
+                                     approval_meta(aid))  # at once: each is a round trip to ruchba
     if row is None:
-        raise HTTPException(404, "no such approval")
-    meta = await approval_meta(aid)
+        raise HTTPException(404, "승인 요청을 찾지 못했어요. 만료됐거나 지워진 요청이에요.")
     view = approval_view(row, meta)
     if view["status"] != "pending":
         # a second tap (two devices, a double tap, a retry) with the decision already made is not a failure: the
@@ -4079,7 +4107,7 @@ async def decide(aid: str, body: dict):
         same = (view["status"] in ("approved", "used") and decision != "deny") or (view["status"] == "rejected" and decision == "deny")
         if same:
             return {"id": aid, "status": view["status"], "decision": meta.get("decision") or decision, "already": True}
-        raise HTTPException(409, f"approval is {view['status']}")
+        raise HTTPException(409, f"이미 {STATUS_KO.get(view['status'], view['status'])} 요청이에요.")
     secret = decision == "always" and is_secret((meta.get("requester") or {}).get("session"))
     sudo = is_sudo(row.get("command") or "")
     forced = decision == "always" and (secret or sudo or not always_ok(row["command"]))
@@ -4088,9 +4116,12 @@ async def decide(aid: str, body: dict):
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
     if decision == "always":
         rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-        rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "cwd": row["cwd"],
-                "created": time.time()}
-        await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
+        rule = next((r for r in rules if rule_key(r) == rule_key(row)), None)  # one rule per (device, command)
+        if rule is None:
+            rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "cwd": row["cwd"],
+                    "created": time.time()}
+            await state.call("PUT", "/v1/state/kv/approval-rules", dedupe_rules([rule, *rules])[:200])
+            state.cache.pop(("/v1/state/kv/approval-rules", ()), None)  # the next check reads the new rule
         meta["rule_id"] = rule["id"]
     meta["decision"] = decision
     if (tid := (meta.get("requester") or {}).get("task_id")) and tid in task_live:

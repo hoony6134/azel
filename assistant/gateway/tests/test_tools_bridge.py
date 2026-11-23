@@ -135,16 +135,13 @@ def test_approval_expires():
     assert r["approval"] == "expired" and "5분" in r["content"] and len(w.run) == 1
 
 
-def test_qwen_never_executes_without_an_approval_and_never_delegates():
+def test_qwen_runs_device_commands_under_the_one_policy_and_never_delegates():
+    """Qwen no longer files its own "ask every time" approval (pwd popped up on every call and "항상 허용" never held):
+    the daemon and the gateway's policy (risk.py, rules) decide, as for every model (user rule 2026-11-23)."""
     w = World()
-
-    async def approve(text):
-        aid = next(k for k in w.approvals if k.startswith("q"))
-        w.approvals[aid]["status"] = "approved"
-    r = run(w.bridge().call("macbook__run_command", {"command": "ls ~", "cwd": "/"}, caller="qwen", on_progress=approve))
-    q = next(v for k, v in w.approvals.items() if k.startswith("q"))
-    assert q["command"] == "ls ~" and q["tool"] == "run_command" and r["approval"] == "approved"
-    assert w.run == [("macbook__run_command", {"command": "ls ~", "cwd": "/", "approval_id": "q1"})]  # only after OK
+    r = run(w.bridge().call("macbook__run_command", {"command": "ls ~", "cwd": "/"}, caller="qwen"))
+    assert not [k for k in w.approvals if k.startswith("q")] and r["content"].startswith("ran")
+    assert w.run == [("macbook__run_command", {"command": "ls ~", "cwd": "/"})]
     assert run(w.bridge().call("macbook__list_dir", {"path": "~"}, caller="qwen"))["content"].startswith("ran")
     assert "create_task" in run(w.bridge().call("macbook__delegate", {"task": "x"}, caller="qwen"))["content"]
 
@@ -637,18 +634,6 @@ class QwenSpark(GrantWorld):
         if method == "POST" and path.startswith("/v1/state/approvals/") and not path.endswith("/use"):
             return {}  # the approve call
         return await super().state(method, path, body, **params)
-
-
-def test_qwen_approval_on_a_grant_device_becomes_a_grant_not_a_refusal(monkeypatch):
-    monkeypatch.setattr(TB, "APPROVAL_POLL_S", 0)
-    w = QwenSpark()
-    r = run(w.bridge().call("spark__run_command", {"command": "pwd"}, caller="qwen",
-                            where={"spark__run_command": ("http://spark", "run_command")}))
-    assert not r["is_error"] and json.loads(r["content"])["stdout"] == "done" and r["approval"] == "approved"
-    assert w.verdicts == [True] and w.audit == [("q2", {"exit_code": 0, "status": "ok"})]
-    # the row the daemon's own cwd can be spent against: /use matches device, command and cwd exactly
-    assert w.rows[1] == {"device": "vd-spark", "tool": "run_command", "command": "pwd", "cwd": "/home/u/proj"}
-    assert len(w.used) == 1 and w.used[0][1]["cwd"] == "/home/u/proj" and w.created == []  # one tap, no second ask
 
 
 def test_a_qwen_grant_for_another_directory_asks_again(monkeypatch):

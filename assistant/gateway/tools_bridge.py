@@ -676,12 +676,8 @@ class Bridge:
         url, tool = where[name]
         if caller in ("qwen", "voice") and tool == "delegate":
             raise Fail("invalid", "여러 단계 작업은 create_task로 맡겨 주세요.")
-        if caller == "qwen" and tool not in READ_TOOLS and not args.get("approval_id"):
-            # the local model never executes on its own: ask the user first, every time
-            aid = (await self.d["state"]("POST", "/v1/state/approvals", {
-                "device": name.split("__")[0], "tool": tool, "command": str(args.get("command", ""))[:500],
-                "cwd": str(args.get("cwd", ""))[:300]}))["approval_id"]
-            return await self.after_approval(name, args, aid, where, on_progress)
+        # every model, Qwen included, goes through the daemon and the one approval policy (risk.py, rules): Qwen's
+        # own "ask every time" made pwd pop up on every call and ignored "항상 허용" (user rule 2026-11-23)
         res = await self.d["run_tool"]({"id": "bridge", "name": name, "input": args}, where)
         text = str(res.get("content", ""))
         if m := PENDING_RE.search(text.replace('\\"', '"')):
