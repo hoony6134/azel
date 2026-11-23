@@ -247,6 +247,8 @@ class Bridge:
         # local mode: web_search only through the user's own SearXNG, and only while it answers
         local_no_web = await self.mode() == "local" and not await self.web_ok()
         own = [t for t in OWN_TOOLS if t["name"] != "web_search"] if local_no_web else OWN_TOOLS
+        if not self.d.get("ssh_hosts", lambda: [])():
+            own = [t for t in own if t["name"] != "ssh_run"]
         g_defs, _ = self.d.get("google", lambda: ([], None))()
         s_defs, _ = self.d.get("spotify", lambda: ([], None))()
         return [*dev_defs, *own, *cyg_defs, *g_defs, *s_defs], where
@@ -575,6 +577,13 @@ class Bridge:
                 "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
         if name == "calendar_write":
             return await self.calendar_write(args)
+        if name == "ssh_run":
+            if "ssh_run" not in self.d:
+                raise Fail("unavailable", "이 게이트웨이에는 ssh 설정이 없어요.")
+            host = str(args["host"]).strip()
+            host = {"스파크": "vd-spark", "spark": "vd-spark"}.get(host, host)
+            out = await self.d["ssh_run"](host, str(args["command"]), self.d.get("who", lambda: "")(), on_progress)
+            return out  # a device-tool-shaped result: content, is_error (and exit_code, host)
         if name == "agenda":
             today = L.day_for(0, datetime.now(KST)).isoformat()
             f = args.get("from") or today
@@ -1470,6 +1479,15 @@ FORGET = {
 MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것 목록(최근 순, 직접 기억한 것과 통화에서 자동으로 남긴 것).",
                "input_schema": {"type": "object", "additionalProperties": False, "properties": {
                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
+SSH_RUN = {
+    "name": "ssh_run",
+    "description": ("기기의 데몬 도구(<기기>__run_command)가 없거나 응답하지 않을 때만, 그 기기에서 셸 명령 한 줄을 ssh로 실행한다. "
+                    "승인 규칙은 run_command와 같다(위험한 명령과 sudo는 앱에서 허용을 받아야 하고, sudo는 sudo -n으로 실행). "
+                    "결과는 exit_code, stdout, stderr."),
+    "input_schema": {"type": "object", "properties": {
+        "host": {"type": "string", "maxLength": 40, "description": "기기 이름(예: albireo, ruchba, vd-spark)"},
+        "command": {"type": "string", "minLength": 1, "maxLength": 2000}},
+        "required": ["host", "command"], "additionalProperties": False}}
 CALENDAR_WRITE = {
     "name": "calendar_write",
     "description": (
@@ -1588,7 +1606,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
              OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, CALENDAR_WRITE, WEATHER, STOCK_QUOTE, PORTFOLIO, HOLDINGS_UPDATE, WEB_SEARCH, WEB_FETCH,
-             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
+             MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, SSH_RUN, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
 OWN_SCHEMAS = {t["name"]: t["input_schema"] for t in ALL_OWN}
@@ -1639,6 +1657,9 @@ ACTIONS = {
                     "rest": ("GET", "/v1/memories"), "examples": ({}, {"limit": 0})},
 }
 for _n, _m in {
+    "ssh_run": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                "no_rest": "기기 명령은 모델 경로에서 승인과 함께만 실행해요(앱에는 명령 실행 화면이 없어요).",
+                "examples": ({"host": "albireo", "command": "uptime"}, {"host": "albireo"})},
     "calendar_write": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
                        "no_rest": "말로 하는 일정 변경이에요(확인 질문 뒤 사용자의 대답으로만). 앱에는 캘린더 편집 화면이 없어요.",
                        "examples": ({"op": "delete", "event": "ab12cd"}, {"op": "move"})},

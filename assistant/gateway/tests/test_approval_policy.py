@@ -146,3 +146,39 @@ def test_read_only_commands_never_ask_in_auto_mode(gw):  # noqa: F811
     for cmd in ("pwd", "ls -la", "df -h", "uptime"):
         r = c.post("/v1/approvals", json={"device": "albireo", "tool": "run_command", "command": cmd, "cwd": "/home/u"}).json()
         assert r["status"] == "approved", cmd
+
+
+def test_ssh_run_goes_through_the_same_approvals_and_runs_sudo_non_interactive(gw, monkeypatch, tmp_path):  # noqa: F811
+    """ssh_run (the fallback when a daemon is down): only hosts in its own ssh config, the one policy (a safe command
+    runs, sudo always waits for a tap and runs as sudo -n), spent once and audited."""
+    import os
+    g, c, _ = gw
+    c.put("/v1/settings", json={"approval_mode": "auto"})
+    d = g.HOME / "ssh"
+    d.mkdir()
+    (d / "config").write_text("Host oci-sanjose albireo\n    HostName 1.2.3.4\n")
+    (d / "id_ed25519").write_text("k")
+    os.chmod(d / "id_ed25519", 0o600)
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text("#!/bin/sh\nfor a; do last=$a; done\necho \"ran: $last\"\n")
+    os.chmod(bin_ / "ssh", 0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    assert g.ssh_hosts() == ["oci-sanjose", "albireo"]
+    r = c.portal.call(g.ssh_run, "albireo", "uptime")
+    assert not r["is_error"] and "ran: uptime" in r["content"] and r["exit_code"] == 0
+    assert c.get("/v1/approvals/audit").json()[0]["device"] == "ssh:albireo"
+    assert g.sudo_n("cd /x && sudo systemctl restart y") == "cd /x && sudo -n systemctl restart y"
+    assert g.sudo_n("sudo -n ls") == "sudo -n ls" and g.is_sudo("ls; sudo rm x")
+
+    async def deny(text):
+        aid = next(a["id"] for a in await g.list_approvals() if a["command"].startswith("sudo -n"))
+        await g.decide(aid, {"decision": "deny"})
+    r = c.portal.call(g.ssh_run, "albireo", "sudo apt upgrade", None, deny)
+    assert r["is_error"] and "허용하지 않아서" in r["content"]
+    assert len(c.get("/v1/approvals/audit").json()) == 1  # nothing else ran
+    try:
+        c.portal.call(g.ssh_run, "nowhere", "uptime")
+        raise AssertionError("unknown host ran")
+    except g.HTTPException as e:
+        assert e.status_code == 404

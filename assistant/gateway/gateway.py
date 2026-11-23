@@ -3726,13 +3726,82 @@ def parse_requester(v):
 SUDO_ONCE = "관리자 권한(sudo) 명령은 항상 허용할 수 없어서 이번 한 번만 허용했어요."
 
 
+# ---------- ssh_run: the fallback to every host when its daemon is down or missing (user request 2026-11-23) ----------
+# A dedicated key (azel-gateway@<host>, ~/.config/biseo/ssh/id_ed25519, 0600) and an ssh config with the user's Host
+# aliases (~/.config/biseo/ssh/config). Every command goes through the same approval policy as run_command (risk.py,
+# rules, sudo always tapped and run as `sudo -n`), is spent once, audited and logged.
+SSH_DIR = HOME / "ssh"
+SSH_TIMEOUT_S, SSH_OUT_CAP = 120, 64_000
+
+
+def ssh_hosts():
+    """The Host aliases this gateway can reach, from its own ssh config (none without key and config)."""
+    cfg, key = SSH_DIR / "config", SSH_DIR / "id_ed25519"
+    if MODE != "full" or not cfg.is_file() or not key.is_file() or key.stat().st_mode & 0o077:
+        return []
+    out = []
+    for line in cfg.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].lower() == "host":
+            out += [h for h in parts[1:] if re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", h) and "*" not in h]
+    return out
+
+
+def sudo_n(command):
+    """Every sudo runs non-interactive: no password prompt can hang the run (and none is ever typed)."""
+    return re.sub(r"(^|[;&|(]\s*)((?:\S*/)?sudo)(?!\s+-n\b)(?=\s)", r"\1\2 -n", command)
+
+
+async def ssh_run(host, command, requester=None, on_progress=None):
+    if host not in ssh_hosts():
+        raise HTTPException(404, f"ssh로 갈 수 없는 기기예요: {host[:40]}")
+    command = sudo_n(command.strip())
+    device, cwd = f"ssh:{host}", "~"
+    r = await create_approval({"device": device, "tool": "ssh_run", "command": command, "cwd": cwd, "requester": requester})
+    aid, t0 = r["approval_id"], time.monotonic()
+    if r["status"] != "approved":
+        if on_progress:
+            await on_progress(f"{host}에서 '{command[:60]}' 실행을 앱에서 허용해 주세요.")
+        while True:
+            row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}") or {}
+            status = approval_view(row, await approval_meta(aid))["status"] if row else "expired"
+            if status == "approved":
+                break
+            if status in ("rejected", "expired") or time.monotonic() - t0 > tools_bridge.APPROVAL_WAIT_S:
+                return {"content": "사용자가 허용하지 않아서 실행하지 않았어요.", "is_error": True, "approval": status}
+            await asyncio.sleep(tools_bridge.APPROVAL_POLL_S)
+    try:  # spend it once, centrally, like a daemon does
+        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}/use",
+                         {"device": device, "command": command, "cwd": cwd, "window_s": APPROVED_RUN_S})
+    except HTTPException:
+        return {"content": "허용이 이미 쓰였거나 오래돼서 실행하지 않았어요.", "is_error": True}
+    argv = ["ssh", "-F", str(SSH_DIR / "config"), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", f"UserKnownHostsFile={SSH_DIR / 'known_hosts'}", "-o", "StrictHostKeyChecking=accept-new", host, "--", command]
+    print(f"ssh_run {host}: {command[:200]!r} (approval {aid})", flush=True)
+    proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), SSH_TIMEOUT_S)
+        res = {"status": "ok", "exit_code": proc.returncode, "stdout": out.decode(errors="replace")[-SSH_OUT_CAP:],
+               "stderr": err.decode(errors="replace")[-SSH_OUT_CAP:]}
+        if proc.returncode == 255 and not out:
+            res["status"] = "unreachable"  # ssh's own failure: no connection, refused key, unknown host
+    except asyncio.TimeoutError:
+        proc.kill()
+        res = {"status": "timeout", "timeout_s": SSH_TIMEOUT_S}
+    print(f"ssh_run {host}: exit={res.get('exit_code')} status={res['status']}", flush=True)
+    try:
+        await approval_ran(aid, {"exit_code": res.get("exit_code"), "status": res["status"]})
+    except Exception as e:  # noqa: BLE001  the audit never fails the run
+        print("ssh_run audit not recorded:", type(e).__name__, flush=True)
+    return {"content": json.dumps(res, ensure_ascii=False, indent=2), "is_error": res["status"] != "ok",
+            "exit_code": res.get("exit_code"), "host": host}
+
+
 def is_sudo(command):
     """A command the daemon runs as `sudo -n …`: never auto-approved, never "always", and the push says so (PM 2026-11-23)."""
-    try:
-        t = shlex.split(command)
-    except ValueError:
-        return False
-    return bool(t) and os.path.basename(t[0]).lower() == "sudo"
+    # anywhere, not just first: an ssh_run command is a shell line ("cd /x && sudo rm …")
+    return bool(re.search(r"(^|[;&|(])\s*(\S*/)?sudo(\s|$)", str(command)))
 
 
 STATUS_KO = {"approved": "허용된", "used": "실행된", "rejected": "거절된", "expired": "만료된"}
@@ -3763,6 +3832,8 @@ def dedupe_rules(rules):
 
 def always_ok(command):
     """True when an approval of `command` may become an "always" rule."""
+    if re.search(r"[;&|`$()<>\n]", str(command)):  # a shell line (ssh_run) never becomes a standing rule
+        return False
     try:
         t = shlex.split(command)
     except ValueError:
@@ -5266,7 +5337,9 @@ bridge = tools_bridge.Bridge(
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
     gcal=lambda: google_tools.Calendar(HOME) if MODE == "full" and google_tools.status(HOME) == "connected" else None,
     turn=lambda: turn_ctx.get(),
-    spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
+    spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None),
+    ssh_hosts=lambda: ssh_hosts(),
+    ssh_run=lambda host, command, who, on_progress=None: ssh_run(host, command, who or None, on_progress))
 
 
 async def none():
