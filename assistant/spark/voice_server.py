@@ -502,6 +502,10 @@ CALL_ORIGIN: contextvars.ContextVar = contextvars.ContextVar("call_origin", defa
 # /v1/call?mode=, else the shared setting; the app can switch it mid-call. Link requests carry it to the gateway.
 BRAIN_MODES = ("auto", "local", "claude_api", "claude_code")
 CALL_MODE: contextvars.ContextVar = contextvars.ContextVar("call_mode", default="")
+# The call's own state dict: its "mode" is what the app's badge shows right now. A turn copies CALL_MODE when it starts;
+# the hand-off re-reads this, so a switch to local mid-turn still never reaches Claude (live 2026-11-23: 로컬 badge
+# with "Claude에게 물어보는 중").
+CALL_LIVE: contextvars.ContextVar = contextvars.ContextVar("call_live", default=None)
 CALL_TURN: contextvars.ContextVar = contextvars.ContextVar("call_turn", default="")  # one id per user turn, for the gateway
 CALL_CARDS: contextvars.ContextVar = contextvars.ContextVar("call_cards", default=None)  # (send, kinds sent) this turn
 CARD_MAX = 32_000  # bytes of JSON; a bigger card is dropped (cards-contract.md)
@@ -2354,8 +2358,9 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     fetched = {"agenda": ""}  # agenda_prefetch's block, read by both model paths
 
     async def via_claude():
-        if offline or stay:  # never Claude in local mode (say so, offer the switch) or for a schedule turn
-            await sentences.put(LOCAL_LINE if offline else SCHEDULE_FAILED)
+        offline_now = offline or (CALL_LIVE.get() or {}).get("mode") == "local"  # switched to local mid-turn
+        if offline_now or stay:  # never Claude in local mode (say so, offer the switch) or for a schedule turn
+            await sentences.put(LOCAL_LINE if offline_now else SCHEDULE_FAILED)
             return
         route["value"] = "claude"
         if on_event:
@@ -3198,6 +3203,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
     # this call's brain mode: ?mode=, else the shared setting; replies spawned later copy the current value
     current["mode"] = mode if mode in BRAIN_MODES else (links.settings.get("brain_mode") or "auto")
     CALL_MODE.set(current["mode"])
+    CALL_LIVE.set(current)
 
     async def log(ev):
         """The call log, unless secret. A call made secret midway keeps only its (text-free) end."""
@@ -5195,6 +5201,29 @@ if __name__ == "__main__":
             globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
             return out, prompts
         said, prompts = local_mode_check()
+        def switched_check():
+            """The turn started in auto; the app switched the call to local before the hand-off: never Claude."""
+            live = {"mode": "auto"}
+
+            async def qwen(messages, max_tokens=600):
+                live["mode"] = "local"  # the mode frame arrives while Qwen is answering
+                yield ROUTE_TAG
+
+            async def claude(*a, **k):
+                raise AssertionError("Claude after a switch to local")
+                yield ""
+            globals().update(llm_stream=qwen, claude_stream=claude, tts=lambda s, *a, **k: asyncio.sleep(0, (b"", 24000)))
+            ctx = contextvars.copy_context()
+            ctx.run(CALL_MODE.set, "auto")
+            ctx.run(CALL_LIVE.set, live)
+
+            async def said_by():
+                return [x async for x, *_ in respond("양자역학 설명해 줘", "sw", time.perf_counter(), {})]
+            try:
+                return ctx.run(asyncio.run, said_by())
+            finally:
+                globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1])
+        assert switched_check() == [LOCAL_LINE]
         assert said == [LOCAL_LINE] and prompts and all(ROUTE_TAG not in p for p in prompts), (said, prompts)
         assert ROUTE_TAG not in local_prompt(NUDGE) and ROUTE_TAG in NUDGE
 
