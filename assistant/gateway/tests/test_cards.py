@@ -149,3 +149,37 @@ def test_serve_tool_attaches_the_card(gw, monkeypatch):  # noqa: F811
                                 "items": [{"symbol": "AAPL", "name": "애플", "price": 1.0, "change_pct": 0.5}]}
     asyncio.run(g.serve_tool({"id": "t2", "type": "tool_call", "name": "web_search", "args": {}}))
     assert "card" not in sent[-1]
+
+
+def test_ask_path_tool_end_carries_the_card(gw, monkeypatch):  # noqa: F811
+    """Claude turns show cards too: the API path's tool_end carries the gateway's card, and claude -p's tool_end the
+    card our MCP server built (azel tools) or one from the text (Cygnus todo/infra tools)."""
+    g, c, _ = gw
+    g.private_api_key = None
+
+    async def fake_ask(key, model, system, text, defs, run):
+        b = {"id": "toolu_9", "name": "portfolio", "input": {}}
+        yield "tool_call", b
+        out = await run("portfolio", {})
+        yield "tool_done", {"type": "tool_result", "tool_use_id": "toolu_9", "content": out, "duration_ms": 5}
+        yield "text", "보유 종목이에요.\n"
+        yield "done", {"input_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                       "output_tokens": 1, "cost_usd": 0.0}
+
+    async def holdings():
+        return [{"name": "애플", "ticker": "AAPL", "price": 1.0, "pct": 0.5}]
+    monkeypatch.setattr(g.claude_api, "ask", fake_ask)
+    monkeypatch.setattr(g, "API_KEY", "sk-test")
+    monkeypatch.setattr(g.claude_api, "cygnus_bridge", lambda home: ([], None))
+    monkeypatch.setattr(g.bridge, "d", {**g.bridge.d, "portfolio": holdings})
+    lines = [json.loads(x) for x in c.post("/v1/ask", json={"text": "내 주식", "session": "s", "path": "api",
+                                                            "model": "haiku"}).text.splitlines() if x]
+    end = next(e for e in lines if e.get("phase") == "tool_end")
+    assert end["call_id"] == "toolu_9" and end["card"]["kind"] == "portfolio" and end["card"]["items"][0]["symbol"] == "AAPL"
+    # claude -p: an azel tool's card from the MCP run, a Cygnus tool's from its text
+    token = g.requester_ctx.set("ask:s9")
+    g.mcp_cards[("ask:s9", "weather")] = [{"kind": "weather", "title": "광주 날씨"}]
+    assert g.ask_card("mcp__azel__weather", "", False)["kind"] == "weather" and g.ask_card("mcp__azel__weather", "", False) is None
+    infra = "As of 2026-11-23 14:00 KST\n✓ fawaris [cygnus] cpu 5% · mem 50% · disk 29% · load 0.2/4 · uptime 24d"
+    assert g.ask_card("mcp__claude_ai_Cygnus_MCP__infra_health", infra, False)["hosts"][0]["name"] == "fawaris"
+    g.requester_ctx.reset(token)

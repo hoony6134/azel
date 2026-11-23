@@ -296,6 +296,9 @@ VOICE_STYLE = VOICE_BASE + (
     "사용자 데이터는 Cygnus MCP(메모리, GISTRA, Planit, 인프라), 캘린더, 메일 도구로 확인해. "
     "주가·시세는 azel의 stock_quote(보유 종목은 portfolio), 날씨는 weather, 일정은 agenda로 지금 바로 확인해서 답해: "
     "실시간 정보를 볼 수 없다거나 앱·포털에서 확인하라고 하지 마. "
+    "사용자의 앱 화면에는 도구 결과가 카드로 떠: 주가는 실시간 차트(기간 전환 가능), 일정, 할 일, 날씨, 서버 상태. '차트 보여줘', "
+    "'보여줘', '띄워줘'라고 하면 맞는 도구(주가는 stock_quote)를 불러서 카드를 띄우고, '애플 차트 띄워 드렸어요. 지금 …달러, …% "
+    "올랐어요.'처럼 짧게 말해. 화면에 보여 줄 수 없다거나 폰·PC에서 보라고 하지 마. "
     "macbook이나 서버에서 할 일은 등록된 기기 MCP 도구로 해. 위험한 명령이 승인 대기면 앱에서 승인해 달라고 말해."
 )
 # Full gateways on the Messages API path (claude_path "api", opt-in): Cygnus through our read-only bridge, no
@@ -935,6 +938,23 @@ def redact(text):
     return out
 
 
+mcp_cards: dict = {}  # (requester, azel tool) -> cards the gateway's MCP server built while claude -p ran it
+
+
+def ask_card(name, text, is_error):
+    """The card for a claude -p tool_end: an azel tool's card from our own MCP run, a Cygnus todo/infra tool's from its
+    text (claude.ai's connector runs it, not us)."""
+    if is_error:
+        return None
+    short = str(name).rsplit("__", 1)[-1]
+    if str(name).startswith("mcp__azel__"):
+        q = mcp_cards.get((requester_ctx.get(), short)) or []
+        return q.pop(0) if q else None
+    if short in cards.TODO_TITLES or short.startswith("infra_"):
+        return cards.build(short, tools_bridge.result(True, text))
+    return None
+
+
 def mcp_tool_name(name):
     """mcp__albireo__run_command -> albireo__run_command (the device part is the host); others unchanged."""
     parts = str(name).split("__")
@@ -1049,9 +1069,11 @@ async def ask_claude_code(text, model, session):
                             x.get("text", "") for x in res if isinstance(x, dict)) if isinstance(res, list) else ""
                         output, code = tool_output(text)
                         t0 = started.pop(tid, None)
-                        yield activity("tool_end", open_tools.pop(tid), call_id=tid, ok=not block.get("is_error"),
+                        name = open_tools.pop(tid)
+                        yield activity("tool_end", name, call_id=tid, ok=not block.get("is_error"),
                                        exit_code=code, output=output[-8000:], truncated=len(output) > 8000 or None,
-                                       duration_ms=round((time.monotonic() - t0) * 1000) if t0 else None)
+                                       duration_ms=round((time.monotonic() - t0) * 1000) if t0 else None,
+                                       card=ask_card(name, text, block.get("is_error")))
             elif e.get("type") == "rate_limit_event":
                 note_quota(e)
             elif e.get("type") == "result":
@@ -1286,9 +1308,9 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
     done: dict = {}  # (name, args) -> the bridge's full answer, for the activity detail
 
     async def run(name, args):
-        r = await bridge.call(name, args, current_persona.get(), caller="voice", where=where)
+        r = await bridge.run(name, args, current_persona.get(), caller="voice", where=where)
         done[(name, json.dumps(args, sort_keys=True, ensure_ascii=False))] = r
-        return r["content"]
+        return tools_bridge.for_model(r)
     calls: dict = {}  # tool_use id -> (name, args)
     system = name_prompt(settings) + (FULL_API_STYLE if google_status() != "connected" else FULL_API_STYLE.replace(
         "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해.", GOOGLE_STYLE)) + device_prompt(settings, devices)
@@ -1304,11 +1326,12 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
                            host=tool_host(v["name"], v.get("input")))
         elif kind == "tool_done":
             name, args = calls.pop(v["tool_use_id"], ("", {}))
-            r = done.pop((name, json.dumps(args, sort_keys=True, ensure_ascii=False)), {})
-            output, code = tool_output(r.get("raw", v.get("content")), r.get("exit_code"))
-            yield activity("tool_end", name, call_id=v["tool_use_id"], ok=not v.get("is_error") and not r.get("is_error"),
+            r = done.pop((name, json.dumps(args, sort_keys=True, ensure_ascii=False)), None)
+            output, code = tool_output((r or {}).get("_raw", v.get("content")), (r or {}).get("_exit_code"))
+            yield activity("tool_end", name, call_id=v["tool_use_id"], ok=not v.get("is_error") and bool((r or {}).get("ok", True)),
                            duration_ms=v.get("duration_ms"), exit_code=code, output=output[-8000:],
-                           truncated=len(output) > 8000 or None, task_id=r.get("task_id"), host=r.get("host"))
+                           truncated=len(output) > 8000 or None, task_id=(r or {}).get("_task_id"),
+                           host=(r or {}).get("_host"), card=await tool_card(name, r) if r else None)
         else:
             yield {"model": model, "path": "api", "input_tokens": v["input_tokens"] + v["cache_read_input_tokens"]
                    + v["cache_creation_input_tokens"], "output_tokens": v["output_tokens"], "cost_usd": v["cost_usd"]}
@@ -5701,7 +5724,13 @@ async def mcp_server(request: Request):
     if scope == "full" and REQUESTER_RE.fullmatch(req := request.headers.get("x-azel-requester", "")):
         requester_ctx.set(req)
         turn_ctx.set(last_turn.get(req, ""))
-    out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope)
+    async def stash_card(name, r):
+        if scope == "full" and (card := await tool_card(name, r)):
+            q = mcp_cards.setdefault((requester_ctx.get(), name), [])
+            q.append(card)
+            del q[:-4]
+    out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope,
+                                        on_run=stash_card)
     return Response(status_code=202) if out is None else JSONResponse(out)
 
 
