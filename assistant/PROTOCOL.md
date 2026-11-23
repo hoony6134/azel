@@ -913,6 +913,10 @@ asks, call_logs or schedule requests.
   Tools: `search_memory{query}` (records `note`+`transcript`), `add_todo{text}` / `done_todo{text}` (context
   `azel-todos`), `device_status{}`, `situation{}`. The voice server runs `scheduled_calls{}` itself (section 1b
   schedule list). Timeout 3 s.
+  A `tool_result` for agenda, stock_quote, portfolio, weather, gistra_assignments, gistra_today, planit_get_day or
+  infra_health/infra_status/infra_alerts also carries `"card": {"kind","title",…}`, built by the gateway
+  (gateway/cards.py) from the tool's own data, under 32 KB, fields without data left out. Kinds and fields: the cards
+  contract in the shared session notes (cards-contract.md). No card when the tool failed or its output can't be read.
   Cygnus tools (when the brain has a Cygnus PAT, `~/.config/biseo/cygnus_pat`, 0600, read-only): the brain's hello adds
   `"tools": [names]` (the voice server then forwards exactly those names, else the five above), and each persona's
   block lists them. Curated read-only set, arguments validated by the brain: `gistra_today{date?}`,

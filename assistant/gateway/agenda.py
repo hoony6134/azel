@@ -92,9 +92,10 @@ def render(rows, f, t, notes=()):
     return "\n".join(x for x in out if x).strip()
 
 
-async def merged(f, t, calendar, gistra):
+async def merged(f, t, calendar, gistra, rows=None):
     """calendar(f, t) -> rows {day, start, end, title, where} and gistra(f, t) -> gistra_schedule text, both run at
-    once; either may raise (expired grant, no token, network). Returns the text a model reads."""
+    once; either may raise (expired grant, no token, network). Returns the text a model reads; a `rows` list gets the
+    merged rows too (the voice card)."""
     f, t = span(f, t)
 
     async def one(fn):
@@ -115,7 +116,10 @@ async def merged(f, t, calendar, gistra):
         g = ""
     if len(notes) == 2:
         return render([], f, t, ["일정을 지금 확인할 수 없어요. 구글 캘린더도 Gistra도 읽지 못했어요. 일정을 짐작해서 말하지 마."])
-    return render(merge(c, parse_gistra(g, f, t)), f, t, notes)
+    out = merge(c, parse_gistra(g, f, t))
+    if rows is not None:
+        rows.extend(out)
+    return render(out, f, t, notes)
 
 
 def _why(e):
