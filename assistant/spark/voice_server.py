@@ -63,8 +63,9 @@ ROUTE_TAG = "[CLAUDE]"
 # Conversation, not dictation: what Qwen does with a proposal or a passing remark (user report: "끝말 입기 하자" got only
 # "네, 끝말잇기 하자." back).
 AGENCY = ("사용자의 말을 그대로 따라 하거나 '네, ~하자'로만 끝내지 마. 게임, 퀴즈, 이야기, 연습처럼 같이 하자는 말이면 바로 "
-          "시작해서 네 첫 수를 두고, 다음 턴에도 이어서 진행해. 음성 인식이 틀린 말('끝말 입기')은 뜻으로 알아들어. 잡담에는 "
-          "질문이나 생각, 성격에 맞는 가벼운 농담을 하나 보태.")
+          "시작해서 네 첫 수를 두고, 다음 턴에도 이어서 진행해. 끝말잇기, 스무고개, 퀴즈는 game 도구로 시작하고 끝내. 이야기면 "
+          "첫 장면을 두세 문장으로, 브레인스토밍이면 아이디어 두세 개, 연습이면 첫 연습 문제나 첫 대사로 이번 답에서 바로 시작해. "
+          "음성 인식이 틀린 말('끝말 입기')은 뜻으로 알아들어. 잡담에는 질문이나 생각, 성격에 맞는 가벼운 농담을 하나 보태.")
 
 # reply_length (shared setting, the app exposes it): how long answers run. The short first clause stays for latency.
 LENGTH_STYLE = {
@@ -171,12 +172,7 @@ def dueum(syl):
     return chr(0xAC00 + lead * 588 + vowel * 28 + tail)
 
 
-WORD_CHAIN_START = re.compile(r"끝\s*말\s*(잇|입|이|있|익|읽|잊)\s*기")
-TWENTY_START = re.compile(r"스무\s*고개")
-QUIZ_START = re.compile(r"퀴즈|문제\s*(하나\s*)?(내|줘)|수수께끼|심심")
 GAME_STOP = re.compile(r"그만|졌어|항복|끝내자|안 ?할래|이제 됐어|다른 거 하자")
-ACTIVITY = re.compile(r"게임|놀이|(이야기|얘기)\s*(해|들려)\s*(줘|줄래)|브레인\s*스토밍|아이디어\s*(내|좀)|"
-                      r"연습\s*(하자|해|시켜)|말\s*상대")
 # A game in progress, per history key. The server keeps what must not drift (the chain's last word and used words,
 # the twenty-questions answer and count, the quiz's answer); Qwen only says it in the persona's voice.
 games: dict[str, dict] = {}
@@ -228,37 +224,53 @@ async def quiz_pick(done):
         return None
 
 
-async def play_note(hkey, said):
-    """This turn of a game (끝말잇기, 스무고개, 퀴즈), started or continued: the note for Qwen's prompt, or ""."""
-    game = games.get(hkey)
-    if game and GAME_STOP.search(said):
-        games.pop(hkey, None)
-        return "\n[놀이] 사용자가 그만하자고 했어. 즐거웠다고 짧게 마무리해. 문제나 낱말은 더 내지 마."
-    if game is None and WORD_CHAIN_START.search(said):
+GAME_TOOL = {"name": "game", "description": "끝말잇기(chain), 스무고개(twenty), 퀴즈(quiz)를 시작(start)하거나 끝낸다(stop). "
+             "심심하다고 하면 quiz. 진행 중인 놀이의 차례는 서버가 심판하니, 놀이 중에는 부르지 말고 그만할 때만 stop.",
+             "input_schema": {"type": "object", "properties": {
+                 "action": {"type": "string", "enum": ["start", "stop"]},
+                 "kind": {"type": "string", "enum": ["chain", "twenty", "quiz"]}}, "required": ["action"]}}
+GAME_STOP_NOTE = "사용자가 그만하자고 했어. 즐거웠다고 짧게 마무리해. 문제나 낱말은 더 내지 마."
+
+
+async def game_tool(hkey, args):
+    """The game tool: Qwen starts or stops a game; the state it starts is kept here, per history key."""
+    action, kind = args.get("action"), args.get("kind")
+    if action == "stop":
+        return GAME_STOP_NOTE if games.pop(hkey, None) else "진행 중인 놀이가 없어요."
+    if action != "start" or kind not in ("chain", "twenty", "quiz"):
+        return "action은 start 또는 stop, kind는 chain, twenty, quiz 중 하나예요."
+    games.pop(hkey, None)
+    if kind == "chain":
         first = await chain_pick("", [])
         if not first:
-            return ""
+            return "지금은 끝말잇기를 시작하지 못했어요."
         games[hkey] = {"kind": "chain", "last": first, "used": [first]}
-        return (f"\n[끝말잇기] 사용자가 끝말잇기를 하자고 했어(음성 인식이 '끝말 입기'처럼 틀려도 끝말잇기야). 따라 말하지 "
-                f"말고 바로 시작해: 네 첫 낱말은 '{first}'야. 이 낱말을 작은따옴표로 감싸 말하고 사용자 차례라고 짧게 알려.")
-    if game is None and TWENTY_START.search(said):
+        return (f"[끝말잇기] 따라 말하지 말고 바로 시작해: 네 첫 낱말은 '{first}'야. 이 낱말을 작은따옴표로 감싸 말하고 "
+                "사용자 차례라고 짧게 알려.")
+    if kind == "twenty":
         secret = re.findall(r"[가-힣]{2,}", await qwen_line(
             "스무고개 정답으로 쓸 흔한 동물이나 사물 하나를 한 낱말로만 출력해.", max_tokens=20))
         if not secret:
-            return ""
+            return "지금은 스무고개를 시작하지 못했어요."
         games[hkey] = {"kind": "twenty", "secret": secret[0], "asked": 0}
-        return (f"\n[스무고개] 네가 정답을 '{secret[0]}'(으)로 정했어. 절대 말하지 마. '제가 하나 정했어요. 스무 번 안에 "
+        return (f"[스무고개] 네가 정답을 '{secret[0]}'(으)로 정했어. 절대 말하지 마. '제가 하나 정했어요. 스무 번 안에 "
                 "맞혀 보세요. 첫 질문 해 주세요.'처럼 시작해.")
-    if game is None and QUIZ_START.search(said):
-        qa = await quiz_pick([])
-        if not qa:
-            return ""
-        games[hkey] = {"kind": "quiz", "q": qa[0], "a": qa[1], "done": [qa[0]], "right": 0}
-        lead = "심심해하니 퀴즈로 놀자고 짧게 말하고, " if "심심" in said else ""
-        return (f"\n[퀴즈] {lead}이 문제를 그대로 내: \"{qa[0]}\" 그리고 '정답은요?'로 물어. 정답('{qa[1]}')은 "
-                "말하지 마. 되묻지 말고 이번에 바로 문제를 내.")
+    qa = await quiz_pick([])
+    if not qa:
+        return "지금은 퀴즈를 시작하지 못했어요."
+    games[hkey] = {"kind": "quiz", "q": qa[0], "a": qa[1], "done": [qa[0]], "right": 0}
+    return (f"[퀴즈] 사용자가 심심하다고 했으면 퀴즈로 놀자고 짧게 말하고, 이 문제를 그대로 내: \"{qa[0]}\" 그리고 "
+            f"'정답은요?'로 물어. 정답('{qa[1]}')은 말하지 마. 되묻지 말고 이번에 바로 문제를 내.")
+
+
+async def play_note(hkey, said):
+    """A game in progress (started with the game tool): the referee's note for this turn's move, or ""."""
+    game = games.get(hkey)
     if game is None:
         return ""
+    if GAME_STOP.search(said):  # "그만" is the player quitting, never a chain word
+        games.pop(hkey, None)
+        return "\n[놀이] " + GAME_STOP_NOTE
     if game["kind"] == "chain":
         word = chain_word(said)
         if err := chain_error(game["last"], word, game["used"]):
@@ -292,14 +304,6 @@ async def play_note(hkey, said):
         return note + " 그리고 퀴즈를 마무리해."
     game.update(q=nxt[0], a=nxt[1], done=[*game["done"], nxt[0]])
     return note + f" 그다음 새 문제를 그대로 내: \"{nxt[0]}\" 정답('{nxt[1]}')은 말하지 마."
-
-
-def activity_note(said):
-    """Other proposals (이야기, 브레인스토밍, 연습…): Qwen starts them now instead of echoing or handing over."""
-    if not ACTIVITY.search(said):
-        return ""
-    return ("\n[활동] 사용자가 같이 뭘 하자고 해. 따라 말하지 말고, 되묻지도 말고, 이번 답에서 바로 시작해: 이야기면 첫 장면을 "
-            "두세 문장으로, 브레인스토밍이면 아이디어 두세 개, 연습이면 첫 연습 문제나 첫 대사. 다음 턴에도 이어서 진행해.")
 
 
 def no_handover(text):
@@ -847,7 +851,7 @@ GRAM_STOP = {"해줘", "알려", "려줘", "확인", "인해", "줘요", "어요
              "마나"}
 TOOL_MATCH_MIN = 6.0  # a request this close to one tool's description is that tool's job (small talk stays under ~3)
 SHORTLIST = 8  # tools described in full each turn, by relevance; the rest by name (any of them may still be called)
-CORE_TOOLS = ("call_user", "create_task", "memory_recall", "web_search", "weather", "agenda", "stock_quote")
+CORE_TOOLS = ("call_user", "create_task", "memory_recall", "web_search", "weather", "agenda", "stock_quote", "game")
 _tool_index: dict = {"key": None}
 
 
@@ -1007,6 +1011,8 @@ async def run_tool(raw, session, on_say=None):
         return "도구 호출 형식이 틀렸어요."
     if name == "scheduled_calls":
         return await schedule_reply("", "list", session)
+    if name == GAME_TOOL["name"]:  # served here: the game's state lives with the conversation
+        return await game_tool(CALL_ORIGIN.get() or session, args)
     if name in {t["name"] for t in gw_tools["defs"]} and name not in links.brain_tools():
         try:
             msg = await gateway_tool_msg(name, args, on_say)
@@ -2317,7 +2323,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     to_claude, model = (False, None) if sched or job or auto or confirm else pre_route(
         bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
     offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local" or bool(CLAUDE_NO.search(bare))
-    play = "" if sched or job or auto else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
+    play = "" if sched or job or auto else await play_note(hkey, bare)  # Qwen plays, no hand-over
     if play:  # a game note is terse; the persona's own register and title still hold ("너 차례!" was 반말 for 아젤)
         play += " 말투(존댓말/반말)와 호칭은 평소 네 성격대로 지키고, 사용자를 '당신'이라고 부르지 마."
     stay = not offline and not (sched or job or auto or confirm) and bool(SCHEDULE_TURN.search(bare)) \
@@ -2414,7 +2420,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
             if to_claude:
                 return await via_claude()
             length = reply_length(settings)
-            gw_defs = await gateway_tools()  # devices, call_user, create_task through the gateway
+            gw_defs = [*await gateway_tools(), GAME_TOOL]  # devices, call_user, create_task through the gateway; game here
             pend = pending_lookup.get(hkey)
             request_text = bare
             if pend and time.time() - pend[0] < 600 and (PUSH.search(bare) or not matched_tool(bare, gw_defs)) \
@@ -5116,7 +5122,8 @@ if __name__ == "__main__":
                 return next(script)
             globals()["qwen_line"] = fake_line
             games.clear()
-            n = [asyncio.run(play_note("g:1", "끝말 입기 하자"))]  # the STT slip from the user's report
+            assert not asyncio.run(play_note("g:1", "끝말 입기 하자"))  # no game yet: starting one is Qwen's tool call
+            n = [asyncio.run(run_tool(TOOL_TAG + ' {"name": "game", "args": {"action": "start", "kind": "chain"}}', "g:1"))]
             assert games["g:1"]["last"] == "사과" and "'사과'" in n[0]
             n.append(asyncio.run(play_note("g:1", "과일이요")))  # Qwen's "바나나" is refused, "일기" taken
             assert "'일기'" in n[1] and "바나나" not in n[1] and games["g:1"]["last"] == "일기"
@@ -5126,22 +5133,24 @@ if __name__ == "__main__":
             n.append(asyncio.run(play_note("g:1", "사력")))  # 력 -> 역 (두음법칙): Qwen's "역도" is accepted
             assert "'역도'" in n[3] and games["g:1"]["last"] == "역도"
             assert "마무리" in asyncio.run(play_note("g:1", "아 졌어 그만")) and "g:1" not in games
-            assert asyncio.run(play_note("g:2", "스무고개 하자")) and games["g:2"]["secret"] == "고양이"
+            assert asyncio.run(game_tool("g:2", {"action": "start", "kind": "twenty"})) and games["g:2"]["secret"] == "고양이"
             assert "남은 질문은 19개" in asyncio.run(play_note("g:2", "동물이야?"))
             assert "맞혔어" in asyncio.run(play_note("g:2", "혹시 고양이?")) and "g:2" not in games
-            q = asyncio.run(play_note("g:3", "심심해"))
-            assert "한국의 수도는?" in q and "서울" in q and "심심해하니" in q
+            q = asyncio.run(game_tool("g:3", {"action": "start", "kind": "quiz"}))
+            assert "한국의 수도는?" in q and "서울" in q and "심심" in q
             a2 = asyncio.run(play_note("g:3", "서울"))
             assert "'서울'" in a2 and "물의 화학식은?" in a2 and games["g:3"]["a"] == "H2O"
+            assert asyncio.run(game_tool("g:3", {"action": "stop"})) == GAME_STOP_NOTE and "g:3" not in games
+            assert "없어요" in asyncio.run(game_tool("g:3", {"action": "stop"}))
+            assert "kind는" in asyncio.run(game_tool("g:3", {"action": "start", "kind": "chess"})) and "g:3" not in games
             globals()["qwen_line"] = real_qwen_line
         real_qwen_line = qwen_line
         play_check()
         games.clear()
         assert [dueum(x) for x in "력리뉴락라름나사"] == ["역", "이", "유", "낙", "나", "늠", None, None]
-        for said in ("이야기 들려줘", "브레인스토밍 하자", "게임하자"):
-            assert activity_note(said), said
-        assert not activity_note("오늘 날씨 어때?") and not asyncio.run(play_note("g:9", "끝까지 말해 봐"))
-        assert "따라 하거나" in system_prompt("아젤") and ROUTE_TAG not in local_prompt(system_prompt("아젤") + activity_note("게임하자"))
+        assert not asyncio.run(play_note("g:9", "끝까지 말해 봐"))
+        assert "따라 하거나" in system_prompt("아젤") and "game 도구" in system_prompt("아젤") and "브레인스토밍" in system_prompt("아젤")
+        assert "- game(action, kind):" in gateway_tools_text([{"name": "web_search", "description": "검색"}, GAME_TOOL], "심심해")
         def local_mode_check():
             """Local mode: Qwen has no hand-over tag, and anything that would go to Claude gets the can't-do line."""
             prompts = []
