@@ -83,6 +83,8 @@ struct CallLog: Equatable {
             replyOpen = false
         case "turn_done":
             replyOpen = false
+            // A silent turn (a card, no spoken reply): the cards still show, on an empty reply line.
+            if !pendingCards.isEmpty { lines.append(ReplyCard.line(pendingCards)); pendingCards = [] }
         default: break
         }
     }

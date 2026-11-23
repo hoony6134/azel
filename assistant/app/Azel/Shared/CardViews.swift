@@ -158,7 +158,7 @@ struct SourceTag: View {
     let source: String?
     var body: some View {
         if let source {
-            Text(["gistra": "Gistra", "google": "Google", "reminders": "미리알림"][source] ?? source)
+            Text(["gistra": "Gistra", "google": "Google", "planit": "Planit", "reminders": "미리알림"][source] ?? source)
                 .font(.caption2.weight(.semibold))
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background((source == "gistra" ? Theme.indigo : Theme.celadon).opacity(0.15), in: Capsule())
