@@ -506,6 +506,12 @@ CALL_MODE: contextvars.ContextVar = contextvars.ContextVar("call_mode", default=
 # the hand-off re-reads this, so a switch to local mid-turn still never reaches Claude (live 2026-11-23: 로컬 badge
 # with "Claude에게 물어보는 중").
 CALL_LIVE: contextvars.ContextVar = contextvars.ContextVar("call_live", default=None)
+LOCAL_BRIEFING = "로컬 모드라서 지금은 브리핑을 준비하지 못했어요."
+
+
+def local_now():
+    """This call is in local mode right now (as the app's badge shows): nothing may reach Claude."""
+    return "local" in (CALL_MODE.get(), (CALL_LIVE.get() or {}).get("mode"))
 CALL_TURN: contextvars.ContextVar = contextvars.ContextVar("call_turn", default="")  # one id per user turn, for the gateway
 CALL_CARDS: contextvars.ContextVar = contextvars.ContextVar("call_cards", default=None)  # (send, kinds sent) this turn
 CARD_MAX = 32_000  # bytes of JSON; a bigger card is dropped (cards-contract.md)
@@ -1894,6 +1900,9 @@ async def briefing_sentences(session, name, on_event, persona="", title=""):
         for s in split_ready(last_claude_briefing[1], final=True)[0]:  # asked again soon: no second Claude run
             yield s
         return
+    elif local_now():  # no situation note and no Claude in local mode: say so
+        yield LOCAL_BRIEFING
+        return
     else:
         yield FILLER
         await on_event(dict(ROUTING))
@@ -2162,6 +2171,8 @@ async def auto_reply(text, action, key):
 
 
 async def task_reply(text, notify):
+    if local_now():  # a background task runs on Claude: never in local mode
+        return LOCAL_LINE
     dev = next((v for k, v in _DEV.items() if re.search(k, text, re.I)), None)
     msg = {"type": "task", "goal": text, "notify": notify, "persona": (CALL_PERSONA.get() or {}).get("id"),
            **({"device": dev} if dev else {}), **({"when": "overnight"} if OVERNIGHT.search(text) else {})}
@@ -2358,7 +2369,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     fetched = {"agenda": ""}  # agenda_prefetch's block, read by both model paths
 
     async def via_claude():
-        offline_now = offline or (CALL_LIVE.get() or {}).get("mode") == "local"  # switched to local mid-turn
+        offline_now = offline or local_now()  # also switched to local mid-turn
         if offline_now or stay:  # never Claude in local mode (say so, offer the switch) or for a schedule turn
             await sentences.put(LOCAL_LINE if offline_now else SCHEDULE_FAILED)
             return
@@ -3540,7 +3551,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             timings["total_ms"] = ms(t0)
             queued = max(0, round((current["play_end"] - time.monotonic()) * 1000))  # still to play when generation ended
             await until_played()
-            await send({"type": "turn_done", "timings": timings, "audio_ends_in_ms": queued})
+            await send({"type": "turn_done", "timings": timings, "audio_ends_in_ms": queued,
+                        "brain": "claude" if turn["route"] == "claude" else "local"})  # who actually answered
         except asyncio.CancelledError:
             turn["interrupted"] = True
             # Hung up or cut in: history and the call log keep only what the phone played, marked as cut off, so
@@ -4784,6 +4796,7 @@ if __name__ == "__main__":
                     if not m.get("text"):
                         continue
                     if (f := json.loads(m["text"]))["type"] == "turn_done":
+                        assert f["brain"] == "local", f  # the typed turn was Qwen's: turn_done says who answered
                         break
                     frames.append(f)
                 w.send_text(json.dumps({"type": "hangup"}))
@@ -5224,6 +5237,21 @@ if __name__ == "__main__":
             finally:
                 globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1])
         assert switched_check() == [LOCAL_LINE]
+
+        async def local_briefing():  # no situation note in local mode: a Korean line, never Claude
+            async def claude(*a, **k):
+                raise AssertionError("Claude briefing in local mode")
+                yield ""
+            globals()["claude_stream"] = claude
+            CALL_MODE.set("local")
+            try:
+                return [x async for x in briefing_sentences("azel:b", "아젤", lambda ev: asyncio.sleep(0))]
+            finally:
+                globals()["claude_stream"] = real[0]
+        assert asyncio.run(local_briefing()) == [LOCAL_BRIEFING]
+        CALL_MODE.set("local")
+        assert asyncio.run(task_reply("맥북 다운로드 폴더 정리해 줘", "call")) == LOCAL_LINE  # never sent to the gateway
+        CALL_MODE.set("")
         assert said == [LOCAL_LINE] and prompts and all(ROUTE_TAG not in p for p in prompts), (said, prompts)
         assert ROUTE_TAG not in local_prompt(NUDGE) and ROUTE_TAG in NUDGE
 
