@@ -1,0 +1,20 @@
+# systemd user unit. Install: cp to ~/.config/systemd/user/, then
+# systemctl --user daemon-reload && systemctl --user enable --now a1bot
+[Unit]
+Description=Always Free A1 launcher (OCI Chuncheon)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!%h/.local/state/a1bot/DONE
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/a1bot/bot.py run
+Restart=on-failure
+RestartSec=300
+# exit 3 = free-tier guard refused; retrying would not change that
+RestartPreventExitStatus=3
+Nice=10
+CPUQuota=10%
+MemoryMax=200M
+
+[Install]
+WantedBy=default.target
