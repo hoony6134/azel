@@ -538,9 +538,9 @@ struct SettingsScreen<Extra: View>: View {
     private var statusCard: some View {
         Card("상태", trailing: AnyView(Button("새로고침") { Task { await model.refresh() } }.font(.subheadline).tint(Theme.celadon))) {
             if let s = model.status {
-                statusRow("spark", s.spark.ok, s.spark.ms)
-                statusRow("게이트웨이", s.gateway.ok, s.gateway.ms)
-                ForEach(s.devices, id: \.name) { statusRow(DeviceID.normalize($0.name), $0.ok, $0.ms) }
+                statusRow("spark", s.spark.ok ? .ok : .down, s.spark.ms)
+                statusRow("게이트웨이", s.gateway.ok ? .ok : .down, s.gateway.ms)
+                ForEach(s.devices, id: \.name) { statusRow(DeviceID.normalize($0.name), $0.health, $0.latency) }
             } else if let e = model.statusError {
                 Text(FriendlyError.describe(e).title).foregroundStyle(Theme.danger)
             } else {
@@ -549,15 +549,16 @@ struct SettingsScreen<Extra: View>: View {
         }
     }
 
-    private func statusRow(_ name: String, _ ok: Bool, _ ms: Double?) -> some View {
+    private func statusRow(_ name: String, _ health: DeviceHealth, _ ms: Double?) -> some View {
         HStack {
-            StatusDot(ok: ok)
+            HealthDot(health: health)
             Text(name).foregroundStyle(Theme.text)
+            if health == .slow { Text("느림").font(.caption.weight(.semibold)).foregroundStyle(Theme.amber) }
             Spacer()
             Text(ms.map { "\(Int($0)) ms" } ?? "-").font(.body.monospacedDigit()).foregroundStyle(Theme.text2)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(name), \(ok ? "정상" : "장애")" + (ms.map { ", \(Int($0))밀리초" } ?? ""))
+        .accessibilityLabel("\(name), \(health.label)" + (ms.map { ", \(Int($0))밀리초" } ?? ""))
     }
 
     // Settings cards
