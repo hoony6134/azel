@@ -3723,6 +3723,18 @@ def approval_view(row, meta, now=None):
                if forced else {})}
 
 
+async def approve_first(aid):
+    """Approve a row the policy cleared. False when the user decided it first (409): the classifier takes a few
+    seconds and the app shows the row at once, so a tap can win; then that decision stands, never an error."""
+    try:
+        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
+        return True
+    except HTTPException as e:
+        if e.status_code != 409:
+            raise
+        return False
+
+
 @app.post("/v1/approvals")
 async def create_approval(body: dict):
     row = {k: str(body.get(k) or "") for k in ("device", "tool", "command", "cwd")}
@@ -3743,8 +3755,9 @@ async def create_approval(body: dict):
     meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None,
             **({"in_roots": body["in_roots"]} if isinstance(body.get("in_roots"), bool) else {}),  # daemon's say (resolved paths)
             **({"sudo": True} if sudo else {})}
+    if rule and not await approve_first(aid):
+        return {"approval_id": aid, "status": "pending"}  # the user's tap came first: the caller reads that decision
     if rule:  # an "always" rule: approved on the spot, still audited when it runs
-        await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
         meta.update(decision="rule", rule_id=rule["id"])
         await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
         return {"approval_id": aid, "status": "approved", "rule_id": rule["id"]}
@@ -3754,8 +3767,9 @@ async def create_approval(body: dict):
                                                   row["device"], qwen=qwen_classify,
                                                   haiku=None if await brain_mode() == "local" else haiku_classify)
         print(f"approval policy: {tier} by {stage} on {row['device']}: {row['command'][:80]!r}", flush=True)
+        if tier == risk.SAFE and not await approve_first(aid):
+            return {"approval_id": aid, "status": "pending"}  # tapped while the model was deciding: the tap stands
         if tier == risk.SAFE:
-            await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
             meta.update(decision="auto", stage=f"policy:{stage}")
             await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
             return {"approval_id": aid, "status": "approved", "auto": True}
@@ -3764,8 +3778,9 @@ async def create_approval(body: dict):
         tier, stage = await risk.classify(row["command"], row["cwd"], row["device"], qwen=qwen_classify,
                                           haiku=None if await brain_mode() == "local" else haiku_classify)
         print(f"auto-approve: {tier} by {stage} on {row['device']} (grant {grant['id']})", flush=True)
+        if tier == risk.SAFE and not await approve_first(aid):
+            return {"approval_id": aid, "status": "pending"}
         if tier == risk.SAFE:
-            await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": True})
             meta.update(decision="auto", grant_id=grant["id"], stage=stage)
             await state.call("PUT", f"/v1/state/kv/approval-{aid}", meta)
             await grant_audit(grant, {"at": now, "device": row["device"], "command": row["command"][:200], "stage": stage})

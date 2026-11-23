@@ -97,3 +97,22 @@ def test_recent_calls_answer_what_a_missed_call_was_about(gw):  # noqa: F811
     r = asyncio.run(g.bridge.run("recent_calls", {}, caller="qwen"))
     assert r["ok"] and "토론지 확인 (못 받음)" in r["spoken"] and "작업 끝남 (받음)" in r["spoken"]
     assert r["spoken"].index("작업 끝남") < r["spoken"].index("토론지")  # newest first
+
+
+def test_a_tap_during_the_policy_check_stands(gw, monkeypatch):  # noqa: F811
+    """The model takes seconds and the app shows the row at once: if the user decides first, the policy's approve
+    is not an error (it was a 409 that failed the daemon's command), and the user's decision is what counts."""
+    g, c, _ = gw
+    c.put("/v1/settings", json={"approval_mode": "auto"})
+
+    async def tap_then_safe(system, user):  # runs on the app's loop: the user's tap goes through the route function
+        rows = await g.list_approvals()
+        aid = next(a["id"] for a in rows if a["command"] == "rm build.log")
+        await g.decide(aid, {"decision": "deny"})
+        return {"tier": "safe", "confidence": 0.95}
+    monkeypatch.setattr(g, "qwen_classify", tap_then_safe)
+    monkeypatch.setattr(g, "haiku_classify", tap_then_safe)
+    r = c.post("/v1/approvals", json={"device": "macbook", "tool": "run_command", "command": "rm build.log",
+                                      "cwd": "/Users/jh/dev/x"})
+    assert r.status_code == 200 and r.json()["status"] == "pending"
+    assert c.get(f"/v1/approvals/{r.json()['approval_id']}").json()["status"] == "rejected"
