@@ -364,8 +364,8 @@ def test_monitors_parse_the_whole_status_page():
     restic = edge1["services"][1]
     assert restic["type"] == "push" and restic["ms"] is None and restic["last_down"] == "2026-10-31 05:00"
     assert edge1["services"][8]["name"] == "ntfy-relay · edge1 (Kuma 알림 경로)"  # a name with its own ` · ` and parens
-    claw = next(s for g in groups for s in g["services"] if s["name"].startswith("Vuja De claw"))
-    assert claw == {"name": "Vuja De claw (NemoClaw)", "type": "http", "state": "down", "uptime": 2.85, "ms": None,
+    claw = next(s for g in groups for s in g["services"] if s["name"].startswith("GPU claw"))
+    assert claw == {"name": "GPU claw (Svc)", "type": "http", "state": "down", "uptime": 2.85, "ms": None,
                     "last_down": None}
     assert all(s["state"] != "unknown" for g in groups for s in g["services"])  # every real line understood
     assert sum(len(g["services"]) for g in groups) == 51  # every ✓/✗ line of the capture
