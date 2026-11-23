@@ -3,7 +3,7 @@ and Gistra (Cygnus gistra_schedule: classes, exams, assignments, todos, meetings
 
 Rows are merged by day and time; a calendar event that Gistra also lists (same day, same start, same title) is
 dropped, since Gistra's line says more (its kind: 수업, 과제, 회의 ...). Calendar lines carry their calendar's name
-("(대회 일정)", the primary as "(기본 캘린더)").
+("(대회 일정)", the primary as "(기본 캘린더)") and its handle "[ev:ab12cd]" for calendar_write; Gistra lines have none.
 A source that fails is named in one short line; the other still answers. Nothing is ever made up.
 """
 import asyncio
@@ -63,7 +63,8 @@ def merge(cal, gis):
         return any(g["day"] == c["day"] and g["start"] == c["start"] and _norm(c["title"]) and
                    _norm(c["title"]) in _norm(g["text"]) for g in gis)
     rows = gis + [{**c, "text": c["title"] + (f" @ {c['where']}" if c.get("where") else "")
-                   + f" ({c.get('cal') or '기본 캘린더'})", "src": "calendar"} for c in cal if not dup(c)]
+                   + f" ({c.get('cal') or '기본 캘린더'})" + (f" [ev:{c['ref']}]" if c.get("ref") else ""),
+                   "src": "calendar"} for c in cal if not dup(c)]
     return sorted(rows, key=lambda r: (r["day"], r["start"] or "", r["src"] != "gistra"))
 
 

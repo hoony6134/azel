@@ -42,6 +42,7 @@ CASES = {
     "web_search": ("오늘 광주 날씨 어때?", "model"),
     "web_fetch": ("https://example.com 이 페이지에 뭐라고 써 있어?", "model"),
     "agenda": ("이번 주 일정 뭐 있어?", "model"),
+    "calendar_write": ("내일 오후 3시에 치과 일정 추가해줘", "model"),
     "weather": ("내일 서울 날씨 어때?", "model"),
     "stock_quote": ("삼성전자 주가 얼마야?", "model"),
     "holdings_update": ("보유 목록에 SOS랩 추가해줘", "model"),

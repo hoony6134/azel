@@ -10,6 +10,9 @@ Tools:
   - call_user: ring the user now (refused while a call is up) or at a time (a scheduled call). At most CALL_CAP a day.
   - create_task: background work (/v1/tasks), notifying by call, push or not at all when it ends or needs approval.
   - the read-only Cygnus tools (assistant/brain/cygnus.py through claude_api.cygnus_bridge).
+  - calendar_write: Google Calendar create/update/delete, always in two steps the gateway enforces: the first call
+    changes nothing and answers a read-back with a pending id; only {confirm: id} from the same run, in a later user
+    turn, within CAL_CONFIRM_S, once, does it.
 
 The gateway wires it with its own functions (Bridge(...)), so this module holds the rules, not the plumbing.
 """
@@ -18,6 +21,7 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -182,7 +186,7 @@ SIDE_EFFECTS = {"call_user": "전화 예약", "schedule_create": "예약", "sche
 TAINT_S = 600
 
 
-TASK_NEVER = {"create_task", "web_task", "end_call", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send",
+TASK_NEVER = {"calendar_write", "create_task", "web_task", "end_call", "call_user", "schedule_create", "schedule_update", "schedule_cancel", "notify_send",
               "auto_approve"}
 AUTO_APPROVE = {
     "name": "auto_approve",
@@ -204,7 +208,7 @@ END_CALL = {
 }
 AUTO_Q = "이번 통화 동안 위험하지 않은 명령은 묻지 않고 바로 실행할게요. 지우기나 설치 같은 건 여전히 여쭤볼게요. 맞죠?"
 SECRET_LINE = "시크릿 모드라서 저장하는 일은 못 해요. 시크릿을 끄고 할까요?"
-STORING = {"remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task", "web_task"}
+STORING = {"calendar_write", "remember", "forget", "schedule_create", "schedule_update", "schedule_cancel", "create_task", "web_task"}
 
 
 def stores(name, args):
@@ -226,6 +230,7 @@ class Bridge:
         self.auto_asked = {}  # run id -> when auto_approve's read-back was asked (confirmed only counts after it)
         self.confirming = {}  # run id -> when a confirm/clarify question went out (end_call waits for the answer)
         self.task_asked = {}  # run id -> when create_task asked how approvals should go
+        self.cal_pending = {}  # pending id -> {who, turn, at, args, plan}: calendar_write's read-backs awaiting a yes
 
     # ---------- listing ----------
     async def tools(self, caller="api"):
@@ -242,6 +247,153 @@ class Bridge:
         g_defs, _ = self.d.get("google", lambda: ([], None))()
         s_defs, _ = self.d.get("spotify", lambda: ([], None))()
         return [*dev_defs, *own, *cyg_defs, *g_defs, *s_defs], where
+
+    # ---------- Google Calendar writes: read back, then a yes in the user's next turn ----------
+    async def calendar_write(self, args):
+        cal = self.d.get("gcal", lambda: None)()
+        if cal is None:
+            raise Fail("unavailable", "여기서는 구글 캘린더에 연결돼 있지 않아요.")
+        if not cal.can_write():
+            raise Fail("unavailable", "구글 캘린더 쓰기 권한이 아직 없어요. 맥에서 Google을 쓰기 권한으로 다시 연결해야 해요.")
+        now = time.monotonic()
+        self.cal_pending = {k: v for k, v in self.cal_pending.items() if now - v["at"] < CAL_CONFIRM_S}
+        who, turn = self.d.get("who", lambda: "")(), self.d.get("turn", lambda: "")()
+        try:
+            if args.get("confirm"):
+                return await self.cal_confirm(cal, args, who, turn, now)
+            plan, say = await self.cal_plan(cal, args)
+        except Exception as e:  # noqa: BLE001  Google's errors, in words
+            raise cal_fail(e)
+        pid = secrets.token_hex(4)
+        self.cal_pending[pid] = {"who": who, "turn": turn, "at": now, "args": dict(args), "plan": plan}
+        raise Need("confirm", say, f"아직 아무것도 바꾸지 않았어요(pending_id={pid}). 사용자에게 \"{say}\"라고 묻고 이번 답은 "
+                                   f"거기서 끝내. 사용자가 다음 말에서 분명히 그러라고 하면(응, 네, 좋아, 그래) calendar_write에 "
+                                   f"confirm=\"{pid}\"만 보내. 아니라고 하거나 다른 말을 하면 취소된 거야: 다시 부르지 마. 2분이 "
+                                   "지나면 저절로 취소돼.", resend={"confirm": pid})
+
+    async def cal_confirm(self, cal, args, who, turn, now):
+        pid = args["confirm"]
+        p = self.cal_pending.get(pid)
+        if not p or p["who"] != who:
+            raise Fail("not_found", "확인을 기다리는 일정 변경이 없어요(2분이 지났거나 이미 했어요). 처음부터 다시 확인할게요.")
+        if turn == p["turn"] and (turn or now - p["at"] < CAL_GAP_S):  # no turn ids on this path: time apart instead
+            raise Fail("invalid", "사용자의 대답을 듣기 전에는 할 수 없어요. 확인 질문을 하고, 다음 말에서 그러라고 하면 보내.")
+        del self.cal_pending[pid]  # single use, whatever happens next
+        if any(p["args"].get(k) != v for k, v in args.items() if k != "confirm"):  # resent args must be the same
+            raise Fail("invalid", "확인받은 내용과 달라요. 바뀐 내용으로 다시 확인받아야 해요.")
+        plan = p["plan"]
+        try:
+            out = await cal.api(plan["method"], plan["path"], plan.get("body"), plan.get("params"))
+        except Exception as e:  # noqa: BLE001
+            raise cal_fail(e)
+        data = {"op": plan["op"], "_audit": plan["audit"]}
+        if plan["op"] == "create" and out.get("id"):
+            data["event"] = cal.ref_of(plan["cal_id"], out["id"])
+            data["_audit"] += f" ev:{data['event']}"
+        return {"create": "캘린더에 추가했어요.", "update": "일정을 바꿨어요.", "delete": "일정을 지웠어요."}[plan["op"]], data
+
+    async def cal_plan(self, cal, a):
+        """(what to send Google, the read-back) for one create/update/delete; nothing is sent here but reads."""
+        op = a.get("op")
+        if op not in ("create", "update", "delete"):
+            raise Fail("invalid", "op은 create, update, delete 중 하나예요.")
+        notify = "all" if a.get("notify_attendees") else "none"
+        if op == "create":
+            if not str(a.get("title") or "").strip() or not a.get("start"):
+                raise Fail("invalid", "일정 제목과 시작 시각(또는 날짜)이 필요해요.")
+            cal_id, cal_name = await self.cal_pick(cal, a.get("calendar"))
+            s, e, day = cal_span(a["start"], a.get("end"))
+            body = {"summary": a["title"].strip(), **cal_body(s, e, day),
+                    **({"location": a["location"]} if a.get("location") else {}),
+                    **({"description": a["notes"]} if a.get("notes") else {})}
+            where = f" 장소는 {a['location']}." if a.get("location") else ""
+            say = f"{when_ko(s, e, day, self.now())} '{body['summary']}' 일정을 {cal_name}에 추가할까요?{where}"
+            return {"op": op, "method": "POST", "path": f"/calendars/{qid(cal_id)}/events", "body": body,
+                    "params": {"sendUpdates": "none"}, "cal_id": cal_id, "audit": f"create {qid(cal_id)[:40]}"}, say
+        cal_id, ev_id = await self.cal_target(cal, a)
+        cur = await cal.api("GET", f"/calendars/{qid(cal_id)}/events/{qid(ev_id)}")
+        if cur.get("status") == "cancelled":
+            raise Fail("not_found", "그 일정은 이미 지워졌어요.")
+        s0, e0, day0 = ev_span(cur)
+        title = str(cur.get("summary") or "(제목 없음)")[:60]
+        head = f"{when_ko(s0, e0, day0, self.now())} '{title}' 일정을"
+        rec = cur.get("recurringEventId")
+        series = bool(rec) and a.get("recurring") == "all"
+        target = rec if series else ev_id
+        notes = []
+        if rec:
+            notes.append("반복 일정 전체에 적용돼요." if series else "반복 일정이라 이번 한 번만 바꿔요."
+                         if op == "update" else "반복 일정이라 이번 한 번만 지워요. 전체를 지우려면 말씀해 주세요.")
+        others = [x for x in cur.get("attendees") or [] if not x.get("self") and not x.get("resource")]
+        if others:
+            notes.append(f"참석자 {len(others)}명이 있는 일정이에요. " +
+                         ("참석자들에게도 알림이 가요." if notify == "all" else "참석자에게 알림은 보내지 않아요."))
+        tail = (" " + " ".join(notes)) if notes else ""
+        path = f"/calendars/{qid(cal_id)}/events/{qid(target)}"
+        plan = {"op": op, "path": path, "params": {"sendUpdates": notify}, "cal_id": cal_id,
+                "audit": f"{op} ev:{cal.ref_of(cal_id, ev_id)}{' series' if series else ''}"}
+        if op == "delete":
+            return {**plan, "method": "DELETE"}, f"{head} 지울까요?{tail}"
+        body, changes = {}, []
+        if str(a.get("title") or "").strip():
+            body["summary"] = a["title"].strip()
+            changes.append(f"제목을 '{body['summary']}'{ro(body['summary'])}")
+        if a.get("start") or a.get("end"):
+            if series:
+                raise Fail("invalid", "반복 일정 전체의 시간은 아직 바꿀 수 없어요. 이번 한 번만 바꿀까요?")
+            if a.get("start"):
+                s, e, day = cal_span(a["start"], a.get("end"))
+                if not a.get("end") and not day and not day0:  # moved: same length as before
+                    e = s + (e0 - s0)
+            else:
+                s, e, day = cal_span(s0.isoformat() if day0 else f"{s0:%Y-%m-%dT%H:%M}", a["end"])
+            body.update(cal_body(s, e, day))
+            w = when_ko(s, e, day, self.now())
+            changes.append(f"시간을 {w}{ro(w)}")
+        if "location" in a:
+            body["location"] = a["location"]
+            changes.append(f"장소를 {a['location']}{ro(a['location'])}" if a["location"] else "장소를 비우고")
+        if a.get("notes"):
+            body["description"] = a["notes"]
+            changes.append("메모를 새 내용으로")
+        if not body:
+            raise Fail("invalid", "무엇을 바꿀지 알려 주세요(제목, 시간, 장소, 메모).")
+        return {**plan, "method": "PATCH", "body": body}, f"{head[:-1]}의 {', '.join(changes)} 바꿀까요?{tail}"
+
+    async def cal_target(self, cal, a):
+        """(calendar id, event id) from agenda's [ev:ref], or the one event on `date` whose title has `match`."""
+        gistra = "Gistra 일정(수업·과제·시험·회의)은 아직 여기서 바꿀 수 없어요."
+        if a.get("event"):
+            hit = cal.target(a["event"])
+            if not hit:
+                raise Fail("not_found", f"그 일정을 못 찾았어요. 구글 캘린더 일정이면 agenda로 다시 확인해 주세요. {gistra}")
+            return hit
+        if not (a.get("date") and str(a.get("match") or "").strip()):
+            raise Fail("invalid", "어느 일정인지 event(agenda의 [ev:…])나 date와 match(제목 일부)로 알려 주세요.")
+        m = re.sub(r"\s+", "", a["match"]).lower()
+        rows = [r for r in await cal.day(a["date"]) if r.get("ref") and m in re.sub(r"\s+", "", r["title"]).lower()]
+        if not rows:
+            raise Fail("not_found", f"{a['date']}에 '{a['match']}' 구글 캘린더 일정이 없어요. {gistra}")
+        if len(rows) > 1:  # never guess
+            labels = [f"{r['day'].month}월 {r['day'].day}일 {r['start'] or '종일'} {r['title']}" for r in rows[:5]]
+            q = f"'{a['match']}' 일정이 {len(rows)}개 있어요. 어느 거요? " + ", ".join(labels)
+            raise Need("choose", q, f"아직 아무것도 바꾸지 않았어요. 사용자에게 '{q}'라고 묻고, 고른 일정의 event로 다시 불러: " +
+                       "; ".join(f"{lb} = {r['ref']}" for lb, r in zip(labels, rows)),
+                       options=[{"label": lb, "event": r["ref"]} for lb, r in zip(labels, rows)])
+        return cal.target(rows[0]["ref"])
+
+    async def cal_pick(self, cal, name):
+        if not str(name or "").strip() or str(name).strip() in ("기본", "기본 캘린더", "primary"):
+            return "primary", "기본 캘린더"
+        cals = await cal.calendars()
+        n = re.sub(r"\s+", "", name).lower()
+        exact = [c for c in cals if re.sub(r"\s+", "", c["name"] or "").lower() == n]
+        hits = exact or [c for c in cals if n in re.sub(r"\s+", "", c["name"] or "").lower()]
+        if len(hits) != 1:
+            names = ", ".join(c["name"] for c in cals[:8] if c["name"])
+            raise Fail("not_found" if not hits else "invalid",
+                       f"'{name}' 캘린더를 {'못 찾았어요' if not hits else '하나로 못 골랐어요'}. 쓸 수 있는 캘린더: {names}")
+        return hits[0]["id"], hits[0]["name"]
 
     # ---------- one call ----------
     async def call(self, name, args, persona_id=None, caller="api", on_progress=None, where=None):
@@ -289,6 +441,8 @@ class Bridge:
                 r = result(True, out[0], data=out[1])
                 if len(out) > 2:
                     r["_model"] = out[2]
+                if isinstance(out[1], dict) and out[1].get("_audit"):  # what was done, for the actions log
+                    r["_audit"] = out[1].pop("_audit")
             else:
                 r = result(True, out)
         except Need as e:
@@ -314,10 +468,11 @@ class Bridge:
         try:
             day = self.now().strftime("%Y-%m-%d")
             rows = await self.d["state"]("GET", f"/v1/state/kv/actions-{day}") or []
-            target = next((str(args[k])[:40] for k in ("id",) if args.get(k)), None)
+            target = next((str(args[k])[:40] for k in ("id", "event", "confirm") if args.get(k)), None)
             rows.append({"at": time.time(), "action": str(name)[:60], "surface": surface, "caller": caller,
                          "persona": persona_id, "ok": r["ok"], "needs": (r["needs"] or {}).get("kind"),
-                         "error": (r["error"] or {}).get("code"), "target": target})
+                         "error": (r["error"] or {}).get("code"), "target": target,
+                         **({"detail": r["_audit"]} if r.get("_audit") else {})})
             await self.d["state"]("PUT", f"/v1/state/kv/actions-{day}", rows[-500:])
         except Exception:  # noqa: BLE001  the audit never fails an action
             pass
@@ -402,6 +557,8 @@ class Bridge:
             return (lead + first)[:220], r, lead + (r["text"] or "찾은 결과가 없어요.") + (f"\n출처: {src}" if src else "") + \
                 f"\n(답할 때 '{site or '출처'} 기준으로'처럼 사이트 이름만 짧게 말하고 URL은 읽지 마. 같은 걸 다시 검색하지 " \
                 "말고 이 결과로 답해: 숫자에 날짜가 붙어 있으면 그 날짜 기준이라고 함께 말하고, 결과에 없으면 모른다고 해.)"
+        if name == "calendar_write":
+            return await self.calendar_write(args)
         if name == "agenda":
             today = L.day_for(0, datetime.now(KST)).isoformat()
             f = args.get("from") or today
@@ -1113,6 +1270,94 @@ def public(r):
     return {k: r[k] for k in ("ok", "spoken", "data", "needs", "error")}
 
 
+CAL_CONFIRM_S = 120  # a read-back is good this long, once
+CAL_GAP_S = 3  # a path that sends no turn id: the yes must come at least this long after the question
+DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+MIN_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+
+def qid(s):
+    from urllib.parse import quote
+    return quote(str(s), safe="@.")
+
+
+def cal_span(start, end=None):
+    """(start, end, all_day) from 'YYYY-MM-DD' (all day, end inclusive) or 'YYYY-MM-DDTHH:MM' KST (end: +1 h)."""
+    start, end = str(start or ""), str(end or "") or None
+    try:
+        if DAY_RE.fullmatch(start):
+            s = datetime.fromisoformat(start).date()
+            if end and not DAY_RE.fullmatch(end):
+                raise ValueError
+            e = datetime.fromisoformat(end).date() if end else s
+            if e < s or (e - s).days > 31:
+                raise ValueError
+            return s, e, True
+        if not MIN_RE.fullmatch(start) or (end and not MIN_RE.fullmatch(end)):
+            raise ValueError
+        s = datetime.fromisoformat(start).replace(tzinfo=KST)
+        e = datetime.fromisoformat(end).replace(tzinfo=KST) if end else s + timedelta(hours=1)
+        if not timedelta(0) < e - s <= timedelta(days=7):
+            raise ValueError
+        return s, e, False
+    except ValueError:
+        raise Fail("invalid", "시각은 'YYYY-MM-DDTHH:MM'(KST), 종일 일정은 'YYYY-MM-DD'로 주세요. 끝은 시작보다 뒤여야 해요.")
+
+
+def ro(word):
+    """으로 after a final consonant other than ㄹ, else 로 (the last Hangul syllable; quotes and spaces skipped)."""
+    ch = next((c for c in reversed(str(word)) if "가" <= c <= "힣"), "")
+    return "으로" if ch and (ord(ch) - 0xAC00) % 28 not in (0, 8) else "로"
+
+
+def cal_body(s, e, day):
+    if day:  # Google's all-day end is exclusive
+        return {"start": {"date": s.isoformat()}, "end": {"date": (e + timedelta(days=1)).isoformat()}}
+    return {"start": {"dateTime": s.isoformat(), "timeZone": "Asia/Seoul"},
+            "end": {"dateTime": e.isoformat(), "timeZone": "Asia/Seoul"}}
+
+
+def ev_span(ev):
+    s, e = ev.get("start") or {}, ev.get("end") or {}
+    if "dateTime" in s:
+        return (datetime.fromisoformat(s["dateTime"]).astimezone(KST),
+                datetime.fromisoformat(e.get("dateTime") or s["dateTime"]).astimezone(KST), False)
+    sd = datetime.fromisoformat(s["date"]).date()
+    ed = datetime.fromisoformat(e["date"]).date() - timedelta(days=1) if e.get("date") else sd
+    return sd, max(sd, ed), True
+
+
+def when_ko(s, e, day, now):
+    """'내일 오후 3시~4시', '11월 24일(화) 종일', '12월 1일(화)부터 3일(목)까지 종일': what the user hears."""
+    def date(d):
+        rel = {0: "오늘", 1: "내일", 2: "모레"}.get((d - now.date()).days)
+        txt = rel or f"{d.month}월 {d.day}일({'월화수목금토일'[d.weekday()]})"
+        return (f"{d.year}년 " if d.year != now.year and not rel else "") + txt
+
+    def hm(t):
+        return f"{'오전' if t.hour < 12 else '오후'} {t.hour % 12 or 12}시" + (f" {t.minute}분" if t.minute else "")
+    if day:
+        return f"{date(s)} 종일" if s == e else f"{date(s)}부터 {date(e)}까지 종일"
+    if s.date() == e.date():
+        end = hm(e)
+        return f"{date(s.date())} {hm(s)}~{end[3:] if end[:2] == hm(s)[:2] else end}"
+    return f"{date(s.date())} {hm(s)}부터 {date(e.date())} {hm(e)}까지"
+
+
+def cal_fail(e):
+    """A Google error as the Fail a model reads (Need and Fail pass through)."""
+    if isinstance(e, (Need, Fail)):
+        return e
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if type(e).__name__ == "Expired":
+        return Fail("unavailable", "Google 연결이 만료됐어요. 앱에서 'Google 다시 연결'을 눌러 주세요.")
+    if code in (404, 410):
+        return Fail("not_found", "그 일정을 구글 캘린더에서 못 찾았어요. 이미 지워졌을 수 있어요.")
+    if code == 403:
+        return Fail("unavailable", "구글 캘린더가 이 변경을 허락하지 않았어요(권한이 없는 캘린더이거나 쓰기 권한이 없어요).")
+    return Fail("failed", f"지금은 구글 캘린더를 바꿀 수 없어요. ({type(e).__name__})")
+
+
 def for_model(r):
     """What a model reads back: the hint when the user must answer, else the spoken text (or a fuller model text)."""
     return r.get("_model") or r["spoken"]
@@ -1210,6 +1455,30 @@ FORGET = {
 MEMORY_LIST = {"name": "memory_list", "description": "아젤이 기억하는 것 목록(최근 순, 직접 기억한 것과 통화에서 자동으로 남긴 것).",
                "input_schema": {"type": "object", "additionalProperties": False, "properties": {
                    "limit": {"type": "integer", "minimum": 1, "maximum": 200}}}}
+CALENDAR_WRITE = {
+    "name": "calendar_write",
+    "description": (
+        "구글 캘린더 일정 추가(create)·변경(update)·삭제(delete). 언제나 두 단계: 먼저 op와 내용으로 부르면 아무것도 바꾸지 "
+        "않고 확인 질문과 pending_id를 돌려준다. 그 질문을 그대로 사용자에게 하고 답을 기다려. 사용자가 다음 말에서 분명히 "
+        "그러라고 하면 그때만 confirm=pending_id 하나로 다시 불러 실행한다. 다른 대답이면 취소(다시 부르지 마). 바꾸거나 지울 "
+        "일정은 agenda 목록 줄 끝의 [ev:…](event) 또는 date+match(제목 일부)로 고른다. 여러 개면 도구가 어느 것인지 묻는다: "
+        "짐작하지 마. Gistra 일정([ev:]가 없는 줄: 수업·과제·시험·회의)은 못 바꾼다. 시각은 KST 'YYYY-MM-DDTHH:MM', 종일 "
+        "일정은 'YYYY-MM-DD'. 끝을 안 말하면 비워 둬(1시간, 변경이면 길이 그대로). 반복 일정은 사용자가 '전부'라고 할 때만 "
+        "recurring=all. 참석자 알림은 사용자가 보내라고 할 때만 notify_attendees=true."),
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "op": {"type": "string", "enum": ["create", "update", "delete"]},
+        "confirm": {"type": "string", "pattern": "^[0-9a-f]{8}$", "description": "확인 질문에 사용자가 그러라고 한 뒤에만"},
+        "event": {"type": "string", "pattern": "^(ev:)?[0-9a-f]{6}$"},
+        "date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "match": {"type": "string", "maxLength": 60},
+        "title": {"type": "string", "maxLength": 100},
+        "start": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}(T\\d{2}:\\d{2})?$"},
+        "end": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}(T\\d{2}:\\d{2})?$"},
+        "calendar": {"type": "string", "maxLength": 40, "description": "캘린더 이름. 비우면 기본 캘린더"},
+        "location": {"type": "string", "maxLength": 100},
+        "notes": {"type": "string", "maxLength": 500},
+        "recurring": {"type": "string", "enum": ["this", "all"]},
+        "notify_attendees": {"type": "boolean"}}}}
 AGENDA = {
     "name": "agenda",
     "description": ("사용자 일정: 구글 캘린더와 Gistra(수업·시험·과제·할 일·회의·학사)를 합친 날짜별 목록. '오늘 일정', '내일 뭐 "
@@ -1303,7 +1572,7 @@ SCHEDULE_CREATE = {"name": "schedule_create",
                    "description": "예약 전화를 만든다(지금 거는 건 call_user). 인자와 확인 규칙은 call_user와 같고 시각이 꼭 있어야 한다.",
                    "input_schema": CALL_USER["input_schema"]}
 OWN_TOOLS = (CALL_USER, SCHEDULE_LIST, SCHEDULE_CANCEL, SCHEDULE_UPDATE, CREATE_TASK, TASK_STATUS, TASK_CANCEL,
-             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, WEATHER, STOCK_QUOTE, PORTFOLIO, HOLDINGS_UPDATE, WEB_SEARCH, WEB_FETCH,
+             OVERNIGHT_LIST, RECENT_CALLS, APPROVAL_STATUS, MEMORY_RECALL, PEOPLE_LOOKUP, REMEMBER, FORGET, MEMORY_LIST, AGENDA, CALENDAR_WRITE, WEATHER, STOCK_QUOTE, PORTFOLIO, HOLDINGS_UPDATE, WEB_SEARCH, WEB_FETCH,
              MUSIC_PLAY, MUSIC_CONTROL, HOME_SCENE, AUTO_APPROVE, WEB_TASK, *P.TOOLS, END_CALL)
 CYGNUS_WRAPPED = {"memory_recall", "gistra_people"}  # reached through memory_recall / people_lookup, not on their own
 ALL_OWN = (*OWN_TOOLS, SCHEDULE_CREATE)  # schedule_create is not in model tool lists: call_user covers it there
@@ -1355,6 +1624,9 @@ ACTIONS = {
                     "rest": ("GET", "/v1/memories"), "examples": ({}, {"limit": 0})},
 }
 for _n, _m in {
+    "calendar_write": {"read_only": False, "scopes": ("internal", "qwen"), "rest": None,
+                       "no_rest": "말로 하는 일정 변경이에요(확인 질문 뒤 사용자의 대답으로만). 앱에는 캘린더 편집 화면이 없어요.",
+                       "examples": ({"op": "delete", "event": "ab12cd"}, {"op": "move"})},
     "agenda": {"read_only": True, "scopes": ("internal", "qwen"), "rest": None,
                "no_rest": "앱은 캘린더와 Gistra를 직접 보여 줘요(모델 경로 전용).",
                "examples": ({"from": "2026-11-23", "to": "2026-11-29"}, {"from": "2026-11-23", "to": "2027-03-01"})},

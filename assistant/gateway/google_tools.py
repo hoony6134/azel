@@ -15,6 +15,8 @@ Tools (results trimmed: no attachments, capped bodies, no HTML):
   calendar_events {from, to}   events in the user's selected calendars, YYYY-MM-DD, at most 62 days
   gmail_search {query, max}    message ids with date, sender, subject and snippet (max ≤ 10)
   gmail_read {id}              one message's headers and plain text (≤ 3000 chars)
+Calendar writes go through tools_bridge.calendar_write (a read-back the user confirms first) with `Calendar` below; they
+need the calendar_write scope set.
 """
 import asyncio
 import base64
@@ -45,7 +47,10 @@ SCOPE_SETS = {
 CAL = "https://www.googleapis.com/calendar/v3"
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 BODY_CHARS, MAX_RESULT = 3000, 4000
-_access: dict = {"token": None, "exp": 0.0}
+_access: dict = {"token": None, "exp": 0.0, "grant": None}
+WRITE_SCOPES = {"https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar"}
+REFS: dict = {}  # short ref -> (calendar id, event id): what agenda lines show as [ev:ref], what calendar_write takes
+REFS_MAX = 5000
 
 
 class Expired(Exception):
@@ -145,10 +150,11 @@ def consent(home, scope_set="read", open_browser=True, timeout_s=300):
 
 # ---------- access tokens ----------
 async def access_token(home, client=None):
-    if _access["token"] and time.time() < _access["exp"] - 60:
-        return _access["token"]
     c, grant_path = _client(home), _paths(home)[1]
     g = json.loads(grant_path.read_text())
+    # a re-consent (new scopes) from the CLI writes a new grant: its token, not the cached one
+    if _access["token"] and time.time() < _access["exp"] - 60 and _access["grant"] == g.get("created"):
+        return _access["token"]
     if g.get("expired"):
         raise Expired()
     http = client or httpx.AsyncClient(timeout=20)
@@ -163,7 +169,7 @@ async def access_token(home, client=None):
         raise Expired()
     r.raise_for_status()
     t = r.json()
-    _access.update(token=t["access_token"], exp=time.time() + float(t.get("expires_in", 3600)))
+    _access.update(token=t["access_token"], exp=time.time() + float(t.get("expires_in", 3600)), grant=g.get("created"))
     return _access["token"]
 
 
@@ -314,7 +320,8 @@ async def _event_rows(http, h, a):
                 if (key, title) in seen:  # the same event in two calendars: once
                     continue
                 seen.add((key, title))
-                rows.append({**row, "key": key, "title": title, "where": loc, "cal": _cal_name(c)})
+                rows.append({**row, "key": key, "title": title, "where": loc, "cal": _cal_name(c),
+                             "ref": ref_of(c["id"], e["id"]) if e.get("id") else None})
     return sorted(rows, key=lambda r: r["key"]), missed
 
 
@@ -339,6 +346,69 @@ async def events(home, f, t, client=None):
     finally:
         if client is None:
             await http.aclose()
+
+
+def ref_of(cal_id, event_id):
+    """A short stable handle for one event (6 hex), remembered so calendar_write can find it again."""
+    r = hashlib.sha1(f"{cal_id}\n{event_id}".encode()).hexdigest()[:6]
+    REFS.pop(r, None)
+    REFS[r] = (cal_id, event_id)
+    while len(REFS) > REFS_MAX:
+        REFS.pop(next(iter(REFS)))
+    return r
+
+
+def can_write(home):
+    try:
+        return bool(WRITE_SCOPES & set(json.loads(_paths(home)[1].read_text()).get("scopes") or []))
+    except (OSError, ValueError):
+        return False
+
+
+class Calendar:
+    """What calendar_write needs, bound to this host's grant. Raises Expired and httpx errors (the bridge words them)."""
+
+    def __init__(self, home, client=None):
+        self.home, self.client = home, client
+
+    def can_write(self):
+        return can_write(self.home)
+
+    @staticmethod
+    def target(ref):
+        return REFS.get(str(ref or "").removeprefix("ev:"))
+
+    @staticmethod
+    def ref_of(cal_id, event_id):
+        return ref_of(cal_id, event_id)
+
+    async def api(self, method, path, body=None, params=None):
+        http = self.client or httpx.AsyncClient(timeout=15)
+        try:
+            token = await access_token(self.home, http)
+            r = await http.request(method, CAL + path, headers={"Authorization": f"Bearer {token}"}, json=body,
+                                   params=params)
+            r.raise_for_status()
+            return r.json() if r.content else {}
+        finally:
+            if self.client is None:
+                await http.aclose()
+
+    async def day(self, d):
+        return (await events(self.home, d, d, client=self.client))[0]
+
+    async def calendars(self):
+        """Calendars the user can write to: [{id, name, primary}]."""
+        http = self.client or httpx.AsyncClient(timeout=15)
+        try:
+            token = await access_token(self.home, http)
+            items = await _paged(http, f"{CAL}/users/me/calendarList", {"Authorization": f"Bearer {token}"},
+                                 {"minAccessRole": "writer", "showHidden": "true", "maxResults": 250})
+        finally:
+            if self.client is None:
+                await http.aclose()
+        return [{"id": c["id"], "name": "기본 캘린더" if c.get("primary") else _cal_name(c), "primary": bool(c.get("primary"))}
+                for c in items if c.get("id") and not c.get("deleted")]
 
 
 async def _search(http, h, a):
