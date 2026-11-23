@@ -606,35 +606,41 @@ struct CallPanelView: View {
         VStack(spacing: 0) {
         HStack(spacing: Theme.m) {
             MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt,
-                    tint: call.activePersona?.glaze ?? Theme.glazeCeladon).frame(width: 68, height: 68)
+                    tint: call.activePersona?.glaze ?? Theme.glazeCeladon, muted: call.muted).frame(width: 68, height: 68)
                 .contentShape(Circle())
                 .onTapGesture { call.interrupt() }
                 .brainModeMenu(current: call.brainMode) { call.chooseBrain($0) }
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
-            VStack(alignment: .leading, spacing: 2) {
-                let user = call.lines.last { $0.mine }?.text
-                // Only this turn's reply: once the user spoke again the previous answer gives way to 생각 중
-                // (2026-11-23: the panel kept the old reply and looked like it was still listening).
-                let reply = call.lines.last.flatMap { $0.mine ? nil : $0 }
-                if let error = call.error {
-                    Text(error).font(.footnote).foregroundStyle(Theme.danger).lineLimit(2)
-                } else if reply == nil && (user == nil || jarState == .thinking) {   // mid-reply the orb and activity line show it
-                    Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
-                }
-                if let current = call.activity.current {
-                    // §13.4: the activity line replaces the transcript while a step runs.
-                    HStack(spacing: Theme.xs) {
+            // Rows stack without overlap (2026-11-23: the activity line was drawn over the scrolled reply):
+            // the header, the user's line and an approval keep their own height; the reply gets what is left,
+            // clipped, with a soft top edge.
+            let reply = call.lines.last.flatMap { $0.mine ? nil : $0 }
+            let user = call.lines.last { $0.mine }
+            PanelColumn {
+                HStack(spacing: Theme.xs) {
+                    if let error = call.error {
+                        Text(error).font(.footnote).foregroundStyle(Theme.danger).lineLimit(2)
+                    } else if let current = call.activity.current {
+                        // §13.4: the activity line replaces the transcript while a step runs.
                         Image(systemName: current.glyph).font(.system(size: 13)).foregroundStyle(Theme.indigo)
-                        Text(current.label).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text)
+                        Text(current.label).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(1)
                         if !call.activity.done.isEmpty { Text("· ✓\(call.activity.done.count)").font(.footnote).foregroundStyle(Theme.text3) }
+                    } else if reply == nil && (user == nil || jarState == .thinking) {   // mid-reply the orb shows it
+                        Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }
-                    .lineLimit(1)
-                    .accessibilityElement(children: .combine)
-                } else if let u = call.lines.last(where: { $0.mine }) {
-                    TypedCaption.text(u).font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
+                    if call.muted { MutedChip() }
+                }
+                .accessibilityElement(children: .combine)
+                if call.activity.current == nil, let u = user {
+                    TypedCaption.text(u).font(.footnote).foregroundStyle(Theme.text2).lineLimit(reply == nil ? 2 : 1)
                         .accessibilityLabel(u.typed == true ? "입력: \(u.text)" : u.text)
                 }
-                if let reply { PanelReply(call: call, reply: reply) }
+                if let reply {
+                    PanelReply(call: call, reply: reply)
+                        .layoutValue(key: PanelColumn.Flexible.self, value: true)
+                        .clipped()
+                        .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.12)], startPoint: .top, endPoint: .bottom))
+                }
                 if let a = approvals.pending.first { PanelApprovalRow(request: a, secret: call.secret) { call.decideApproval(a, $0) } }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -827,5 +833,46 @@ struct PanelCardsView: View {
         .frame(width: 460)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+}
+
+/// The panel's text column: rows top to bottom with a small gap, never overlapping. Fixed rows take their
+/// natural height; the row marked `Flexible` (the reply) gets exactly what is left and must clip itself.
+struct PanelColumn: Layout {
+    var spacing: CGFloat = 2
+    struct Flexible: LayoutValueKey { static let defaultValue = false }
+
+    /// Heights per row: fixed rows as measured, the flexible one the rest (never below 0); with no
+    /// flexible row, fixed rows are cut from the bottom so they still fit.
+    static func heights(_ natural: [CGFloat], flexible: Int?, available: CGFloat, spacing: CGFloat) -> [CGFloat] {
+        guard !natural.isEmpty else { return [] }
+        var out = natural
+        let gaps = spacing * CGFloat(natural.count - 1)
+        let fixed = natural.enumerated().filter { $0.offset != flexible }.reduce(0) { $0 + $1.element }
+        if let f = flexible { out[f] = max(0, min(natural[f], available - gaps - fixed)) }
+        var used = out.reduce(0, +) + gaps
+        for i in out.indices.reversed() where used > available {   // still too tall: trim from the bottom
+            let cut = min(out[i], used - available)
+            out[i] -= cut; used -= cut
+        }
+        return out
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let w = proposal.width ?? 300
+        let natural = subviews.map { $0.sizeThatFits(ProposedViewSize(width: w, height: nil)).height }
+        let total = natural.reduce(0, +) + spacing * CGFloat(max(0, subviews.count - 1))
+        return CGSize(width: w, height: min(total, proposal.height ?? total))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let natural = subviews.map { $0.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil)).height }
+        let flexible = subviews.firstIndex { $0[Flexible.self] }
+        let hs = Self.heights(natural, flexible: flexible, available: bounds.height, spacing: spacing)
+        var y = bounds.minY
+        for (i, v) in subviews.enumerated() {
+            v.place(at: CGPoint(x: bounds.minX, y: y), anchor: .topLeading, proposal: ProposedViewSize(width: bounds.width, height: hs[i]))
+            y += hs[i] + spacing
+        }
     }
 }

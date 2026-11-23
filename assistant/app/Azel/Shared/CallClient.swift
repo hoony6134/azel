@@ -49,7 +49,7 @@ final class CallClient {
         return nil
     }
     /// Read on the audio thread; set from the main thread.
-    var muted = false
+    var muted = false { didSet { audio.meterMic = !muted } }
     /// Hold: no mic goes up, playback pauses, the recording pauses. The socket stays open.
     var held = false {
         didSet { if held != oldValue { playback.held = held; applyGate() } }

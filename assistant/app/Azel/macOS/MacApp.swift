@@ -401,10 +401,13 @@ struct MacHome: View {
                                 Text(p.name).font(.headline).foregroundStyle(Theme.text)
                             }
                         }
-                        Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
+                        HStack(spacing: Theme.s) {
+                            Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
+                            if call.muted { MutedChip() }
+                        }
                     }
                     MoonJar(state: jarState, levels: call.levels, ripple: call.interruptedAt, surge: call.surgeAt, pulse: call.pulseAt, shimmerAt: call.shimmerAt,
-                            tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon)
+                            tint: (call.activePersona ?? PersonaModel.shared.selected)?.glaze ?? Theme.glazeCeladon, muted: call.muted)
                         .contentShape(Rectangle())
                         .onTapGesture { call.interrupt() }
                         .accessibilityHint(jarState == .speaking ? "두 번 탭하면 말을 끊습니다" : "")

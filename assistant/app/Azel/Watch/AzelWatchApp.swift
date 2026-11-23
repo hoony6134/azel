@@ -111,8 +111,9 @@ struct WatchCallScreen: View {
                 HStack(spacing: Theme.xs) {
                     Text(call.persona?.name ?? name).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text)
                     Text(jar.spokenLabel).font(.footnote).foregroundStyle(jar.color)
+                    if call.muted { Image(systemName: "mic.slash.fill").font(.footnote).foregroundStyle(Theme.amber).accessibilityLabel("음소거됨") }
                 }
-                MoonJar(state: jar, levels: call.levels, tint: tint)
+                MoonJar(state: jar, levels: call.levels, tint: tint, muted: call.muted)
                     .frame(width: 64, height: 64)
                     .padding(.vertical, Theme.xs)
                 if let line = call.log.lines.last {

@@ -102,6 +102,7 @@ final class Levels: @unchecked Sendable {
     }
     func update(out buffer: AVAudioPCMBuffer) { update(\._out, buffer) }
     func reset() { lock.lock(); _mic = 0; _out = 0; _loudAt = -.infinity; _speechAt = -.infinity; lock.unlock() }
+    func resetMic() { lock.lock(); _mic = 0; _loudAt = -.infinity; _speechAt = -.infinity; lock.unlock() }
 
     private func update(_ key: ReferenceWritableKeyPath<Levels, Float>, _ buffer: AVAudioPCMBuffer) {
         let target = Self.level(rms: Self.rms(buffer))
@@ -122,6 +123,8 @@ final class AudioIO {
     private var scheduledSamples = 0 // reply samples scheduled since the last flush (24 kHz)
     private var pausedAt: Double?    // playback paused: the clock stands still
     let levels = Levels()
+    /// Off while muted: the mic is neither metered nor shown (the orb, the "user is talking" gate).
+    var meterMic = true { didSet { if !meterMic { levels.resetMic() } } }
     var onMic: ((Data) -> Void)?
     /// The hardware route or format changed under a running engine (AirPods in or out, a picked
     /// route, 48 kHz → 16 kHz HFP). The engine has stopped itself; the owner restarts it. Main queue.
@@ -244,7 +247,7 @@ final class AudioIO {
         }
         Log.call.info("mic \(format.channelCount, privacy: .public) ch \(format.sampleRate, privacy: .public) Hz, voice processing \(input.isVoiceProcessingEnabled, privacy: .public), agc \(input.isVoiceProcessingAGCEnabled, privacy: .public)")
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.levels.update(mic: buffer)
+            if self?.meterMic != false { self?.levels.update(mic: buffer) }   // muted: no mic level at all
             if let one = PCM.firstChannel(buffer), let data = PCM.pcm16Data(from: one, converter: converter) { self?.onMic?(data) }
         }
         let mixer = engine.mainMixerNode

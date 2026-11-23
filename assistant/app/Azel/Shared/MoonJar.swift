@@ -151,6 +151,12 @@ enum JarPath {
         }
     }
 
+    /// What drives the orb: the reply or the heartbeat cue while speaking or thinking, the mic otherwise,
+    /// and nothing from the mic while muted.
+    static func level(_ s: JarState, mic: Double, out: Double, muted: Bool) -> Double {
+        s == .speaking || s == .thinking ? out : muted ? 0 : mic
+    }
+
     static func shimmer(at t: Double) -> Double? {
         let slot = (t / 10).rounded(.down)
         let r = (sin(slot * 12.9898) * 43_758.5453).truncatingRemainder(dividingBy: 1)
@@ -182,6 +188,9 @@ struct MoonJar: View {
     var tint: Color = Theme.glazeCeladon
     /// Breath amplitude (mini orbs breathe at 0.5).
     var breathAmplitude: Double = 1
+    /// The user muted the call: dimmed and desaturated, and the mic never moves it (reply audio and the
+    /// heartbeat still do: they aren't the mic).
+    var muted = false
     @AppStorage(AssistantName.key) private var name = AssistantName.fallback
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var phase
@@ -218,12 +227,15 @@ struct MoonJar: View {
             .offset(x: -pad, y: -pad)
             .allowsHitTesting(false)
         }
+        .saturation(muted ? 0.2 : 1)   // muted: dimmed and desaturated
+        .opacity(muted ? 0.7 : 1)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: muted)
         .onChange(of: state) { old, _ in previous = old; changedAt = Date() }
         .onAppear { visible = true }
         .onDisappear { visible = false }
         .accessibilityElement()
         .accessibilityLabel(name)
-        .accessibilityValue(state.spokenLabel)
+        .accessibilityValue(muted ? "음소거됨, \(state.spokenLabel)" : state.spokenLabel)
         .accessibilityAddTraits(.updatesFrequently)
     }
 
@@ -233,7 +245,7 @@ struct MoonJar: View {
         return Canvas { ctx, _ in
                 let mix = JarPath.smoothstep(now.timeIntervalSince(changedAt) / 0.45)
                 // The glow follows the sound: the reply while speaking, the heartbeat cue while thinking, the mic otherwise.
-                let level = Double(state == .speaking || state == .thinking ? levels.out : levels.mic)
+                let level = JarPath.level(state, mic: Double(levels.mic), out: Double(levels.out), muted: muted)
                 let R = min(frame.width, frame.height) * 0.34
                 let center = CGPoint(x: frame.midX, y: frame.minY + frame.height * (state == .speaking ? 0.44 : 0.5))
                 var ctx = ctx
@@ -285,7 +297,7 @@ struct MoonJar: View {
         let box = path.boundingRect
         // 1. soft glow
         if let glow = s.glow(tint) {
-            var strength = JarPath.glowStrength(s, level: level, calm: calm)
+            var strength = JarPath.glowStrength(s, level: level, calm: calm || (muted && s == .listening))
             if s == .idle { strength = JarPath.idleGlow(t, calm: calm).opacity }
             strength += boost.1
             ctx.drawLayer { g in
@@ -360,5 +372,17 @@ struct GlazeBackground: View {
         }
         .animation(Theme.state, value: state)
         .ignoresSafeArea()
+    }
+}
+
+/// "음소거" next to the state label on every call screen.
+struct MutedChip: View {
+    var body: some View {
+        Label("음소거", systemImage: "mic.slash.fill")
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Theme.amber.opacity(0.18), in: Capsule())
+            .foregroundStyle(Theme.amber)
+            .accessibilityLabel("음소거됨")
     }
 }
