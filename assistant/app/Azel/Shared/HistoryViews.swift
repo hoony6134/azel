@@ -233,13 +233,16 @@ struct HistoryList: View {
                 OfflineBanner(since: since) { Task { await model.refresh() } }.listRowBackground(Color.clear).listRowSeparator(.hidden)
             }
             if model.offlineSearch { Text("오프라인이라 제목만 찾아요").font(.footnote).foregroundStyle(Theme.text3) }
-            ForEach(Array(sections.enumerated()), id: \.element.0) { index, section in
+            ForEach(Array(sections.enumerated()), id: \.element.0) { _, section in
                 Section {
-                    ForEach(section.1) { item in row(item) }
+                    ForEach(section.1) { item in
+                        // The next page loads when the LAST ROW appears (2026-11-23: keyed on the last day section,
+                        // a page within one day never re-triggered and the list stopped early).
+                        row(item).onAppear { if item.id == model.items.last?.id { Task { await model.loadMore() } } }
+                    }
                 } header: {
                     Text(section.0).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text2).accessibilityAddTraits(.isHeader)
                 }
-                .onAppear { if index == sections.count - 1 { Task { await model.loadMore() } } }
             }
         }
         #if os(iOS)
