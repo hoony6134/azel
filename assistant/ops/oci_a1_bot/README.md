@@ -16,6 +16,14 @@ Deploy: `scp bot.py a1bot ubuntu@sadr:~/a1bot/`, unit to `~/.config/systemd/user
 `systemctl --user daemon-reload && systemctl --user enable --now a1bot`.
 Logs: `journalctl --user -u a1bot`, `~/.local/state/a1bot/a1bot.log`.
 
+## Limit-watch mode
+
+The free tenancy has A1 availability 0 and cannot file a limit request, so the bot first only watches: every
+~60 min it reads `standard-a1-core-count`/`-memory-count` availability and logs one line, with no launch call.
+When availability appears it sends one ntfy ("A1 한도가 생겼어요, 생성 시도 시작") and switches to the launch loop,
+launching the largest shape that fits the limit and the free-tier caps (e.g. 1/6) and saying so on success.
+`a1bot status` shows mode, last check, limit and attempts.
+
 ## kepler bootstrap and notifications
 
 - `kepler-init.sh` is passed as cloud-init `user_data` (deneb's public keys prepended as `KEYS`) and can be
