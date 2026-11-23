@@ -29,9 +29,19 @@ final class ToolRunTests: XCTestCase {
         XCTAssertFalse(run.finished)
         store.apply(try ev(#"{"type":"activity","phase":"tool_end","call_id":"c1","exit_code":0,"ok":true,"duration_ms":2100,"output":"IGNORED tail"}"#))
         XCTAssertTrue(run.finished); XCTAssertEqual(run.ok, true); XCTAssertEqual(run.durationMs, 2100)
-        XCTAssertEqual(run.text, "cc a.c\ncc b.c\nld", "the streamed output wins over the end's tail")
+        XCTAssertEqual(run.text, "IGNORED tail", "untruncated end output is the whole output: it replaces the stream")
         store.apply(try ev(#"{"type":"activity","phase":"tool_output","call_id":"other","output":"x"}"#))   // unknown run: ignored
         XCTAssertEqual(store.runs.count, 1)
+    }
+
+    /// Streamed chunks can skip a stretch (more than 2 KB in half a second); tool_end's last 8 KB fixes the tail.
+    func testTheEndOutputRepairsASkippedStretch() {
+        let streamed = ["line 1", "line 2", "line 3", "line 7", "line 8"]          // 4–6 were skipped
+        let end = "ne 5\nline 6\nline 7\nline 8\nline 9"                          // last 8 KB, starts mid-line
+        XCTAssertEqual(ToolRun.reconcile(streamed: streamed, end: end, endIsWhole: false),
+                       ["line 1", "line 2", "line 3", "ne 5", "line 6", "line 7", "line 8", "line 9"])
+        XCTAssertEqual(ToolRun.reconcile(streamed: ["a b c d"], end: "zzzz\nyyyy", endIsWhole: false), ["a b c d", "⋯", "zzzz", "yyyy"], "no anchor")
+        XCTAssertEqual(ToolRun.reconcile(streamed: ["x"], end: "x\ny", endIsWhole: true), ["x", "y"])
     }
 
     func testEndOutputIsUsedWhenNothingStreamedAndFailuresShowTheCode() throws {

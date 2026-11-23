@@ -42,13 +42,45 @@ final class ToolRun: ObservableObject, Identifiable {
         add(chunk)
     }
 
-    /// tool_end. Its `output` (the last ~8 KB) is used only when nothing streamed.
+    /// tool_end. Its `output` (stdout+stderr, the last 8 KB when `truncated`) is authoritative: streamed chunks can
+    /// skip a stretch when more than 2 KB came within half a second, so the streamed tail is replaced by it.
     func finish(ok: Bool?, exitCode: Int?, durationMs: Double?, output: String?, truncated: Bool?) {
-        if !streamed, let output, !output.isEmpty { add(output); if truncated == true { clipped = true } }
+        if let output, !output.isEmpty {
+            if !streamed {
+                add(output); if truncated == true { clipped = true }
+            } else {
+                setLines(Self.reconcile(streamed: lines.map(\.text), end: output, endIsWhole: truncated != true && !clipped))
+                if truncated == true { clipped = true }
+            }
+        }
         self.ok = ok ?? exitCode.map { $0 == 0 }
         self.exitCode = exitCode
         self.durationMs = durationMs ?? Date().timeIntervalSince(started) * 1000
         finished = true
+    }
+
+    /// The streamed lines with their tail replaced by the end output: the whole output when it is complete;
+    /// else aligned on a line of the end output found in the stream (skipping its first, possibly partial,
+    /// line); with no anchor, the end output alone after a gap marker.
+    static func reconcile(streamed: [String], end: String, endIsWhole: Bool) -> [String] {
+        let endLines = end.components(separatedBy: "\n")
+        if endIsWhole { return endLines }
+        for (k, anchor) in endLines.enumerated().dropFirst() where anchor.count >= 4 {
+            if let j = streamed.lastIndex(of: anchor) {
+                var head = Array(streamed[..<j]), tail = endLines
+                let before = endLines[..<k]
+                while let last = head.last, before.contains(last) { head.removeLast() }   // lines the end repeats
+                if let last = head.last, let first = tail.first, !first.isEmpty, last.hasSuffix(first) { tail.removeFirst() }   // its partial first line
+                return head + tail
+            }
+        }
+        return (streamed.isEmpty ? [] : streamed + ["⋯"]) + endLines
+    }
+
+    private func setLines(_ texts: [String]) {
+        lines = texts.map { t in defer { nextLine += 1 }; return Line(id: nextLine, text: t) }
+        bytes = texts.reduce(0) { $0 + $1.utf8.count + 1 }
+        while bytes > Self.cap, lines.count > 1 { bytes -= lines[0].text.utf8.count + 1; lines.removeFirst(); clipped = true }
     }
 
     private func add(_ chunk: String) {
