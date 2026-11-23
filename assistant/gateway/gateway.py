@@ -3899,8 +3899,9 @@ async def ssh_run(host, command, requester=None, on_progress=None):
                          {"device": device, "command": command, "cwd": cwd, "window_s": APPROVED_RUN_S})
     except HTTPException:
         return {"content": "허용이 이미 쓰였거나 오래돼서 실행하지 않았어요.", "is_error": True}
+    # host keys only from the seeded known_hosts (no accept-new), for every hop: ProxyJump's own ssh reads the config
     argv = ["ssh", "-F", str(SSH_DIR / "config"), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", f"UserKnownHostsFile={SSH_DIR / 'known_hosts'}", "-o", "StrictHostKeyChecking=accept-new", host, "--", command]
+            "-o", f"UserKnownHostsFile={SSH_DIR / 'known_hosts'}", "-o", "StrictHostKeyChecking=yes", host, "--", command]
     print(f"ssh_run {host}: {command[:200]!r} (approval {aid})", flush=True)
     proc = await asyncio.create_subprocess_exec(*argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE)
