@@ -11,6 +11,8 @@ struct CallLine: Identifiable, Codable, Equatable {
     var typed: Bool? = nil
     /// Cards the server attached to this reply's turn, shown under it (not saved).
     var cards: [ReplyCard] = []
+    /// The server's reply_id for this reply (from reply_start): cards carry it.
+    var replyId: Int? = nil
 
     private enum CodingKeys: String, CodingKey { case id, mine, text, route, interrupted, typed }
 }
@@ -22,6 +24,8 @@ struct CallLog: Equatable {
     private var replyOpen = false
     /// Cards that arrived before their turn's reply text: they join the reply line when it starts.
     private var pendingCards: [ReplyCard] = []
+    /// The reply_id of the reply in progress (`reply_start`).
+    private var replyId: Int?
     /// A typed line waiting for the server's echo (if it sends one), so it shows once.
     private var pendingTyped: String?
 
@@ -70,12 +74,19 @@ struct CallLog: Equatable {
                 lines[i].text += " " + t
                 lines[i].route = event.route ?? lines[i].route
             } else {
-                lines.append(CallLine(mine: false, text: t, route: event.route, cards: pendingCards))
+                lines.append(CallLine(mine: false, text: t, route: event.route, cards: pendingCards, replyId: replyId))
                 pendingCards = []
                 replyOpen = true
             }
+        case "reply_start":
+            replyId = event.reply_id
         case "card":
             guard let card = event.card else { return }   // unknown kind
+            // The server tags a card with its reply's reply_id (it usually comes before reply_start): that reply's line.
+            if let rid = event.reply_id {
+                if let i = lines.lastIndex(where: { !$0.mine && $0.replyId == rid }) { lines[i].cards.append(card) } else { pendingCards.append(card) }
+                return
+            }
             // This turn's reply already started (the last line is the assistant's): under it; else wait for it.
             if let i = lines.indices.last, !lines[i].mine { lines[i].cards.append(card) } else { pendingCards.append(card) }
         case "interrupt":

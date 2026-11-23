@@ -6,7 +6,7 @@ import Foundation
 enum ReplyCard: Equatable {
     case stock(Stock)
     case portfolio([Holding])
-    case agenda([Event])
+    case agenda([Event], label: String?)
     case todo([Todo])
     case weather(Weather)
     case infra(Infra)
@@ -52,7 +52,7 @@ enum ReplyCard: Equatable {
                 guard let title = i.str("title") else { return nil }
                 return Event(start: i.date("start"), end: i.date("end"), allDay: i.bool("all_day") ?? (i.str("start")?.count == 10),
                              title: title, source: i.str("source"), calendar: i.str("calendar"), location: i.str("location"))
-            }.sorted { ($0.start ?? .distantFuture) < ($1.start ?? .distantFuture) })
+            }.sorted { ($0.start ?? .distantFuture) < ($1.start ?? .distantFuture) }, label: j.str("range_label"))
         case "todo":
             self = .todo(j.list("items").compactMap { i in
                 guard let title = i.str("title") else { return nil }
@@ -114,7 +114,7 @@ enum ReplyCard: Equatable {
         case .portfolio(let items):
             let up = items.filter { ($0.pct ?? 0) > 0 }.count
             return "내 종목 \(items.count)개 · 오른 종목 \(up)개"
-        case .agenda(let items):
+        case .agenda(let items, _):
             let next = items.first { ($0.start ?? .distantPast) >= now && !$0.allDay }
             let head = "일정 \(items.count)개"
             guard let next, let start = next.start else { return head }

@@ -16,7 +16,7 @@ final class CardTests: XCTestCase {
         XCTAssertEqual(items.count, 2); XCTAssertEqual(items[0].spark, [1, 2, 3]); XCTAssertFalse(items[1].listed)
 
         let a = try event(#"{"type":"card","card":{"kind":"agenda","items":[{"start":"2026-11-23T19:00:00+09:00","title":"저녁","source":"google","calendar":"개인"},{"start":"2026-11-23T14:00:00+09:00","end":"2026-11-23T15:15:00+09:00","title":"컴파일러","source":"gistra","calendar":"수업"},{"start":"2026-11-23","title":"종일 행사"}]}}"#)
-        guard case .agenda(let ev)? = a.card else { return XCTFail("agenda") }
+        guard case .agenda(let ev, _)? = a.card else { return XCTFail("agenda") }
         XCTAssertEqual(ev.map(\.title).first, "종일 행사", "sorted by start")
         XCTAssertTrue(ev[0].allDay); XCTAssertEqual(ev[1].title, "컴파일러"); XCTAssertEqual(ev[1].source, "gistra")
 
@@ -113,6 +113,27 @@ final class CardTests: XCTestCase {
         log.apply(CallEvent(type: "card", card: i))
         log.apply(CallEvent(type: "turn_done"))
         XCTAssertEqual(log.lines.last?.cards.count, 1, "a silent turn's card still shows")
+    }
+
+    /// The gateway's cards (cards.py) carry reply_id: a card attaches to that reply even when it arrives
+    /// before reply_start, after a short ack sentence, or on a typed turn; several kinds keep arrival order.
+    func testCardsAttachByReplyId() throws {
+        let agenda = try XCTUnwrap(ReplyCard(json: ["kind": "agenda", "title": "일정", "range_label": "내일",
+                                                    "items": [["title": "컴파일러", "start": "2026-11-24T10:00:00+09:00", "source": "gistra"]]]))
+        let todo = try XCTUnwrap(ReplyCard(json: ["kind": "todo", "title": "할 일", "items": [["title": "과제", "due": "2026-11-25", "source": "planit"]]]))
+        guard case .agenda(_, let label) = agenda else { return XCTFail() }
+        XCTAssertEqual(label, "내일")
+        var log = CallLog()
+        log.apply(CallEvent(type: "reply_start", replyId: 4))
+        log.apply(CallEvent(type: "reply", text: "지난 답"))
+        log.apply(CallEvent(type: "turn_done"))
+        log.typed("내일 일정이랑 할 일")                                   // a typed turn: no transcript
+        log.apply(CallEvent(type: "card", card: agenda, replyId: 5))      // before reply_start
+        log.apply(CallEvent(type: "reply_start", replyId: 5))
+        log.apply(CallEvent(type: "reply", text: "네, 바로 볼게요."))       // the ack sentence
+        log.apply(CallEvent(type: "card", card: todo, replyId: 5))        // after it
+        XCTAssertEqual(log.lines.last?.cards, [agenda, todo], "arrival order, on reply 5")
+        XCTAssertEqual(log.lines.first?.cards, [], "not on the previous reply")
     }
 
     func testWatchSummaries() throws {

@@ -12,7 +12,7 @@ struct CardView: View {
             switch card {
             case .stock(let s): StockCardView(initial: s, compact: compact)
             case .portfolio(let items): PortfolioCardView(items: items)
-            case .agenda(let items): AgendaCardView(items: items)
+            case .agenda(let items, let label): AgendaCardView(items: items, label: label)
             case .todo(let items): TodoCardView(items: items)
             case .weather(let w): WeatherCardView(w: w, compact: compact)
             case .infra(let i): InfraCardView(infra: i)
@@ -169,10 +169,12 @@ struct SourceTag: View {
 
 struct AgendaCardView: View {
     let items: [ReplyCard.Event]
+    var label: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.s) {
-            Text(items.isEmpty ? "일정 없음" : "일정 \(items.count)개").font(.headline).foregroundStyle(Theme.text)
+            Text([label, items.isEmpty ? "일정 없음" : "일정 \(items.count)개"].compactMap { $0 }.joined(separator: " · "))
+                .font(.headline).foregroundStyle(Theme.text)
             ForEach(Array(items.enumerated()), id: \.offset) { i, e in
                 HStack(alignment: .top, spacing: Theme.s) {
                     VStack(spacing: 0) {

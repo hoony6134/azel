@@ -341,7 +341,9 @@ final class MacCall: ObservableObject {
         shownCards = cards
         guard let p = panel, p.isVisible, !cards.isEmpty else {
             if let w = cardWindow, w.isVisible {
-                NSAnimationContext.runAnimationGroup({ $0.duration = 0.18; w.animator().alphaValue = 0 }) { MainActor.assumeIsolated { w.orderOut(nil) } }
+                NSAnimationContext.runAnimationGroup({ $0.duration = 0.18; w.animator().alphaValue = 0 }) {
+                    MainActor.assumeIsolated { w.parent?.removeChildWindow(w); w.orderOut(nil) }
+                }
             }
             return
         }
@@ -359,6 +361,8 @@ final class MacCall: ObservableObject {
         let height = min(host.fittingSize.height, Self.cardMaxHeight)
         let frame = Self.cardFrame(panel: p.frame, height: height, screen: p.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? p.frame)
         if !w.isVisible { w.alphaValue = 0; w.setFrame(frame.offsetBy(dx: 0, dy: frame.minY >= p.frame.maxY ? -6 : 6), display: false) }
+        // A child of the panel: it moves with the panel when the user drags it.
+        if w.parent !== p { w.parent?.removeChildWindow(w); p.addChildWindow(w, ordered: .above) }
         w.orderFront(nil)
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2

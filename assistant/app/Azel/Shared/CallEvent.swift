@@ -30,8 +30,8 @@ struct CallEvent: Decodable, Equatable {
         case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at, card
     }
 
-    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil, card: ReplyCard? = nil) {
-        self.type = type; self.value = value; self.text = text; self.route = route; self.card = card
+    init(type: String, value: String? = nil, text: String? = nil, route: String? = nil, card: ReplyCard? = nil, replyId: Int? = nil) {
+        self.type = type; self.value = value; self.text = text; self.route = route; self.card = card; self.reply_id = replyId
     }
 
     /// Field by field and tolerant: one odd field never drops the whole frame.
