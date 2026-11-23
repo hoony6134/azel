@@ -68,8 +68,11 @@ struct CallEvent: Decodable, Equatable {
             duration_ms = try? c.decodeIfPresent(Double.self, forKey: .duration_ms)
             truncated = try? c.decodeIfPresent(Bool.self, forKey: .truncated)
             if let v = (try? c.decodeIfPresent(AnyJSON.self, forKey: .input))?.value {
-                input = (v as? String) ?? ((try? JSONSerialization.data(withJSONObject: v, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]))
-                    .flatMap { String(data: $0, encoding: .utf8) })
+                // A command line stays as is; JSON args (an object, or compact JSON text) are pretty-printed.
+                let object: Any? = (v as? String).flatMap { t in t.hasPrefix("{") || t.hasPrefix("[") ? try? JSONSerialization.jsonObject(with: Data(t.utf8)) : nil }
+                    ?? (v is String ? nil : v)
+                input = object.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) }
+                    .flatMap { String(data: $0, encoding: .utf8) } ?? (v as? String)
             }
         }
         if type == "card", let obj = (try? c.decodeIfPresent(AnyJSON.self, forKey: .card))?.value as? [String: Any] { card = ReplyCard(json: obj) }

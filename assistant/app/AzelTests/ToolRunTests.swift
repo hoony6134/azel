@@ -11,6 +11,10 @@ final class ToolRunTests: XCTestCase {
         let j = try ev(#"{"type":"activity","phase":"tool_start","call_id":7,"tool":"gcal_list","input":{"from":"2026-11-24","to":"2026-11-24"}}"#)
         XCTAssertEqual(j.call_id, "7", "a numeric id too")
         XCTAssertTrue(j.input?.contains("\"from\" : \"2026-11-24\"") == true, "JSON input pretty-printed: \(j.input ?? "")")
+        let compact = try ev(#"{"type":"activity","phase":"tool_start","call_id":"c2","tool":"web_fetch","input":"{\"url\":\"https://a.b/c\"}"}"#)
+        XCTAssertEqual(compact.input, "{\n  \"url\" : \"https://a.b/c\"\n}", "compact JSON text (the contract) pretty-printed")
+        let notJSON = try ev(#"{"type":"activity","phase":"tool_start","call_id":"c3","tool":"run_command","input":"{ echo hi; }"}"#)
+        XCTAssertEqual(notJSON.input, "{ echo hi; }", "a command that only looks like JSON stays as is")
         let e = try ev(#"{"type":"activity","phase":"tool_end","call_id":"c1","exit_code":2,"ok":false,"duration_ms":1530,"output":"err","truncated":true,"task_id":"t9"}"#)
         XCTAssertEqual(e.exit_code, 2); XCTAssertEqual(e.ok, false); XCTAssertEqual(e.duration_ms, 1530); XCTAssertEqual(e.truncated, true)
     }
