@@ -119,3 +119,20 @@ enum LegacyText {
         return out.isEmpty ? nil : out
     }
 }
+
+#if !os(watchOS)
+import SwiftUI
+
+/// A user line as the call screens show it: a keyboard glyph before a typed line. The glyph is a Text
+/// built from an Image and joined to the line's text, never interpolated into a String: in a String an
+/// Image becomes its debug description (2026-11-23: "Image(provider: …) 오늘 애플 주식 차트 보…" on the Mac
+/// panel). The transcript string itself is never decorated; it is what was sent.
+enum TypedCaption {
+    static func glyph(_ line: CallLine) -> String? { line.typed == true ? "keyboard" : nil }
+
+    static func text(_ line: CallLine) -> Text {
+        guard let g = glyph(line) else { return Text(line.text) }
+        return Text(Image(systemName: g)) + Text(" " + line.text)
+    }
+}
+#endif
