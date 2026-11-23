@@ -307,12 +307,34 @@ final class MacCall: ObservableObject {
 
     /// A key typed while the panel is key: opens the field with that character. Space and
     /// control keys keep their meaning (mute, Esc).
-    func typeKey(_ chars: String) -> Bool {
-        guard canType, !typing, let c = chars.unicodeScalars.first,
-              !CharacterSet.whitespacesAndNewlines.contains(c), !CharacterSet.controlCharacters.contains(c) else { return false }
-        typedDraft = chars
-        typing = true
+    /// The keystroke is not put into the draft: the field opens, takes focus on the next run-loop turn,
+    /// and the same key event is replayed into it, so the input method composes it ("ㅇ"+"ㅗ" → "오"). Was:
+    /// the character went into the draft and the field never became first responder (focus was asked for
+    /// before it was in the window), so every later key hit the panel and was lost (2026-11-23).
+    func typeKey(_ event: NSEvent) -> Bool {
+        guard canType, let chars = event.characters, Self.opensTyping(chars) else { return false }
+        pendingKey = event
+        if !typing { typedDraft = ""; typing = true }
+        focusRequest &+= 1   // the view focuses the field; then the key is replayed into it
         return true
+    }
+
+    nonisolated static func opensTyping(_ chars: String) -> Bool {
+        guard let c = chars.unicodeScalars.first else { return false }
+        return !CharacterSet.whitespacesAndNewlines.contains(c) && !CharacterSet.controlCharacters.contains(c)
+    }
+
+    /// Bumped to ask the panel view to focus its text field.
+    @Published private(set) var focusRequest = 0
+    private var pendingKey: NSEvent?
+
+    /// Called once the field has focus: the waiting key goes into its field editor (a few tries while the
+    /// field installs; if it never gets focus, the plain characters go into the draft instead of being lost).
+    func replayPendingKey(tries: Int = 6) {
+        guard let e = pendingKey, let p = panel else { return }
+        if KeyReplay.deliver(e, in: p) { pendingKey = nil; return }
+        guard tries > 0 else { typedDraft += e.characters ?? ""; pendingKey = nil; return }
+        DispatchQueue.main.async { [weak self] in self?.replayPendingKey(tries: tries - 1) }
     }
 
     static func panelHeight(typing: Bool, approval: Bool = false) -> CGFloat { (typing ? 176 : 112) + (approval ? 30 : 0) }
@@ -348,7 +370,7 @@ final class MacCall: ObservableObject {
             return
         }
         if cardWindow == nil {
-            let w = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            let w = CardWindow(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             w.isFloatingPanel = true; w.level = p.level; w.backgroundColor = .clear; w.isOpaque = false; w.hasShadow = true
             w.hidesOnDeactivate = false; w.isReleasedWhenClosed = false; w.collectionBehavior = p.collectionBehavior
             let host = NSHostingView(rootView: PanelCardsView(cards: cards))
@@ -583,9 +605,10 @@ final class MacCall: ObservableObject {
 final class CallPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     /// Typing on the focused panel opens the text field (when the server takes typed turns).
+    /// Reaches here only when no text field has focus: opens (or re-focuses) the typing field with this key.
     override func keyDown(with event: NSEvent) {
         let handled = event.modifierFlags.intersection([.command, .control, .option]).isEmpty
-            && MainActor.assumeIsolated { MacCall.shared.typeKey(event.characters ?? "") }
+            && MainActor.assumeIsolated { MacCall.shared.typeKey(event) }
         if !handled { super.keyDown(with: event) }
     }
     override func cancelOperation(_ sender: Any?) { MainActor.assumeIsolated { MacCall.shared.hangUp() } }
@@ -601,6 +624,14 @@ struct CallPanelView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var jarState: JarState { call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : .offline }
+
+    /// On the next run-loop turn (the field is in the window by then): focus it, then hand it the key.
+    private func focusThenReplay() {
+        DispatchQueue.main.async {
+            typingFocus = true
+            DispatchQueue.main.async { call.replayPendingKey() }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -681,8 +712,9 @@ struct CallPanelView: View {
             if call.typing {
                 CallTypingField(text: $call.typedDraft, focus: $typingFocus, send: { call.sendTyped($0, speak: $1) },
                                 close: { call.typing = false })
+                    .onChange(of: call.focusRequest) { focusThenReplay() }
                     .padding(.horizontal, Theme.l).padding(.bottom, Theme.m)
-                    .onAppear { typingFocus = true }
+                    .onAppear { focusThenReplay() }
             }
         }
         .frame(width: 460, height: MacCall.panelHeight(typing: call.typing, approval: call.inCall && !approvals.pending.isEmpty))
@@ -874,5 +906,21 @@ struct PanelColumn: Layout {
             v.place(at: CGPoint(x: bounds.minX, y: y), anchor: .topLeading, proposal: ProposedViewSize(width: bounds.width, height: hs[i]))
             y += hs[i] + spacing
         }
+    }
+}
+
+/// The card window above the panel never takes key or main status: typing stays in the panel's field.
+final class CardWindow: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Hands a key event to the window's focused text field editor (an NSTextView), which runs it through the
+/// input method like a real keystroke. false when no text field has focus.
+enum KeyReplay {
+    @MainActor static func deliver(_ event: NSEvent, in window: NSWindow) -> Bool {
+        guard let editor = window.firstResponder as? NSTextView else { return false }
+        editor.keyDown(with: event)
+        return true
     }
 }

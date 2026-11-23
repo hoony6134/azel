@@ -78,7 +78,9 @@ final class TypedTurnTests: XCTestCase {
     #if os(macOS)
     @MainActor func testPanelKeysOpenTheFieldOnlyWhenTypingIsSupported() {
         let call = MacCall.shared
-        XCTAssertFalse(call.typeKey("a"), "server without text: keys pass through")
+        let a = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                                 characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)!
+        XCTAssertFalse(call.typeKey(a), "server without text: keys pass through")
         XCTAssertEqual(MacCall.panelHeight(typing: false), 112)
         XCTAssertGreaterThan(MacCall.panelHeight(typing: true), 112)
     }
