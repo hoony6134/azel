@@ -120,7 +120,7 @@ DEFAULTS = {
     # "먼저 전화하기": proactive calls. User-created scheduled calls are not proactive and always fire.
     "proactive": {"enabled": True, "morning_briefing": {"enabled": True, "time": "08:00"},
                   "deadline_check": {"enabled": True, "time": "20:00"}, "server_alerts": True,
-                  "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120,
+                  "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120, "every_minutes": 5,
                                  "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}},
     "default_device": "macbook", "device_fallback": ["albireo", "vd-spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
@@ -606,8 +606,9 @@ def check_proactive(p):
         if isinstance(a["window"], list) and isinstance(a["checkpoints"], list) else [None]
     ok = ok and all(isinstance(t, str) and HM_RE.fullmatch(t) for t in times) and len(a["window"]) == 2 \
         and len(a["checkpoints"]) <= 6 and a["window"][0] < a["window"][1]
-    ok = ok and all(isinstance(a[k], int) and not isinstance(a[k], bool) for k in ("max_per_day", "min_gap_minutes")) \
-        and 0 <= a["max_per_day"] <= 10 and 0 <= a["min_gap_minutes"] <= 1440
+    ok = ok and all(isinstance(a[k], int) and not isinstance(a[k], bool) for k in ("max_per_day", "min_gap_minutes",
+                                                                                     "every_minutes")) \
+        and 0 <= a["max_per_day"] <= 10 and 0 <= a["min_gap_minutes"] <= 1440 and 1 <= a["every_minutes"] <= 60
     if not ok:
         raise HTTPException(400, "proactive: see PROTOCOL.md section 3 for the shape")
 
@@ -1722,7 +1723,9 @@ async def scheduler_tick(now, fired):
     try:  # scheduled calls: only the scheduler lease holder fires (renewed every tick, lowest priority wins)
         if await take_lease("scheduler", 150, SCHED_PRIORITY):
             await fire_scheduled(now.timestamp())
-            if now.minute in (0, 30) and p["enabled"] and p["autonomous"]["enabled"]:
+            # every `every_minutes` (local Qwen, free); never while a call is live: Qwen would compete with it for the GPU
+            if p["enabled"] and p["autonomous"]["enabled"] and now.minute % p["autonomous"]["every_minutes"] == 0 \
+                    and not live_calls():
                 await autonomous_tick(now, p["autonomous"])
     except StateDown:
         pass
@@ -2096,11 +2099,18 @@ def guard(decision, now, called_recent, a):
     return None
 
 
+autonomous_seen = {"hash": None}  # the signals of the last logged tick
+
+
 async def autonomous_tick(now_dt, a):
-    """Every 30 min on the scheduler lease holder: signals → local Qwen → guardrails → maybe a call. Every
-    decision is logged, called or not, so the user can see why it called or didn't."""
+    """Every `every_minutes` on the scheduler lease holder: signals → local Qwen → guardrails → maybe a call. Logged
+    when it calls, when a rule blocks it, or when the signals changed since the last logged tick (not 288 rows a day
+    of "nothing new")."""
     now = now_dt.timestamp()
     signals = await gather_signals(now)
+    stable = re.sub(r"\(?-?\d+\s*(?:분|시간|일)\s*(?:전|후|뒤)\)?", "", json.dumps(signals, sort_keys=True, ensure_ascii=False,
+                                                                       default=str))  # "(-12분 전)" moves every tick
+    sig = hashlib.sha256(stable.encode()).hexdigest()
     decision = await qwen_decide(signals, now)
     recent = await state.call("GET", "/v1/state/proactive_log", since=now - 86400, called="true")
     if not isinstance(recent, list):  # unreadable history = unknown cap and gap: fail closed, no call
@@ -2115,8 +2125,11 @@ async def autonomous_tick(now_dt, a):
         await state.call("POST", "/v1/state/proactive_log", entry)
         await place_call("autonomous", decision["opening"] or decision["reason"], call_id=entry["call_id"],
                          context={"kind": "autonomous", "label": decision["reason"]})
+        autonomous_seen["hash"] = sig
         return entry
-    await state.call("POST", "/v1/state/proactive_log", entry)
+    if blocked != "no_call" or sig != autonomous_seen["hash"]:
+        await state.call("POST", "/v1/state/proactive_log", entry)
+        autonomous_seen["hash"] = sig
     return entry
 
 
