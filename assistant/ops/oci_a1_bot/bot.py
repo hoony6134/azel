@@ -21,6 +21,7 @@ NAME, REF_NAME = "kepler", "main-amd"  # new instance name; instance whose subne
 FREE_OCPUS, FREE_MEM, FREE_STORAGE = 2, 12, 200  # Always Free caps (A1 total, boot+block GB)
 BOOT_WANT, BOOT_MIN = 50, 47
 BASE_S, JITTER_S, BACKOFF_MAX_S = 60, 20, 900
+WATCH_S, WATCH_JITTER_S = 3600, 300  # limit check interval while A1 availability is 0
 NTFY_URL, NTFY_TOKEN = "http://100.64.0.6:8090/infra", Path.home() / ".ntfy_token"  # same path the old a1bot used
 CALL_URL, AZEL_TOKEN = "https://azel.scian.xyz/v1/calls", Path.home() / ".config/azel/token"
 INIT = Path(__file__).with_name("kepler-init.sh")
@@ -31,15 +32,22 @@ LIVE = ("PROVISIONING", "AVAILABLE", "RESTORING", "CREATING_IMAGE", "STARTING", 
 log = logging.getLogger("a1bot")
 
 
-def guard(a1_ocpus, a1_mem, storage_gb, boot_gb):
-    """Return (ok, reason) for launching OCPUS/MEM_GB/boot_gb on top of what already exists."""
-    if a1_ocpus + OCPUS > FREE_OCPUS:
-        return False, f"OCPU {a1_ocpus}+{OCPUS} > {FREE_OCPUS}"
-    if a1_mem + MEM_GB > FREE_MEM:
-        return False, f"memory {a1_mem}+{MEM_GB} > {FREE_MEM}"
+def guard(a1_ocpus, a1_mem, storage_gb, boot_gb, ocpus=OCPUS, mem=MEM_GB):
+    """Return (ok, reason) for launching ocpus/mem/boot_gb on top of what already exists."""
+    if a1_ocpus + ocpus > FREE_OCPUS:
+        return False, f"OCPU {a1_ocpus}+{ocpus} > {FREE_OCPUS}"
+    if a1_mem + mem > FREE_MEM:
+        return False, f"memory {a1_mem}+{mem} > {FREE_MEM}"
     if storage_gb + boot_gb > FREE_STORAGE:
         return False, f"storage {storage_gb}+{boot_gb} > {FREE_STORAGE}"
     return True, "ok"
+
+
+def fit(avail_cores, avail_mem, a1_ocpus, a1_mem):
+    """Largest (ocpus, mem) that the tenancy limit and the free-tier caps both allow; None if under 1 OCPU."""
+    o = min(OCPUS, FREE_OCPUS - a1_ocpus, int(avail_cores))
+    m = min(MEM_GB, FREE_MEM - a1_mem, int(avail_mem), o * 6)
+    return (o, m) if o >= 1 and m >= o else None
 
 
 def boot_size(storage_gb):
@@ -54,6 +62,8 @@ def selfcheck():
     assert not guard(1, 6, 0, 50)[0] and not guard(0, 1, 0, 50)[0]  # any existing A1 blocks 2/12
     assert boot_size(94) == 50 and boot_size(153) == 47 and boot_size(154) is None
     assert boot_size(100) == 50 and boot_size(0) == 50
+    assert fit(0, 0, 0, 0) is None and fit(4, 24, 0, 0) == (2, 12) and fit(1, 6, 0, 0) == (1, 6)
+    assert fit(2, 12, 1, 6) == (1, 6) and fit(2, 12, 2, 12) is None and fit(2, 3, 0, 0) == (2, 3)
     print("selfcheck ok")
 
 
@@ -85,6 +95,7 @@ def status():
     if DONE.exists():
         print("DONE:", DONE.read_text().strip())
     up = time.time() - s.get("started", s["first_started"])
+    print(f"mode {s.get('mode', '-')}; last check {s.get('last_check', '-')}; limit cores {s.get('limit_cores', '-')} mem {s.get('limit_mem', '-')}")
     print(f"attempts {s['attempts']} (capacity {s['capacity']}, throttled {s['throttled']}, other errors {s['errors']})")
     print(f"last attempt: {s.get('last_at', '-')} fd={s.get('last_fd', '-')}")
     print(f"last error: {s.get('last_error', '-')}")
@@ -127,6 +138,13 @@ class Oci:
                     store += v.size_in_gbs
         return ocpus, mem, store
 
+    def limits(self):
+        """Available A1 cores and memory GB in the AD (tenancy limit minus use)."""
+        ad = self.ident.list_availability_domains(self.tenancy).data[0].name
+        lim = self.oci.limits.LimitsClient(self.cfg)
+        g = lambda n: lim.get_resource_availability("compute", n, self.tenancy, availability_domain=ad).data.available
+        return g("standard-a1-core-count"), g("standard-a1-memory-count")
+
     def reference(self):
         """Subnet, AD and authorized keys of the REF_NAME instance (searched in every compartment)."""
         o = self.oci
@@ -146,11 +164,11 @@ class Oci:
                 return im
         raise SystemExit("no Ubuntu 24.04 aarch64 image found")
 
-    def launch(self, ref, subnet, keys, image_id, boot_gb, fd):
+    def launch(self, ref, subnet, keys, image_id, boot_gb, fd, ocpus, mem):
         m = self.oci.core.models
         d = m.LaunchInstanceDetails(
             compartment_id=ref.compartment_id, availability_domain=ref.availability_domain, fault_domain=fd,
-            display_name=NAME, shape=SHAPE, shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=OCPUS, memory_in_gbs=MEM_GB),
+            display_name=NAME, shape=SHAPE, shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=mem),
             source_details=m.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=boot_gb),
             create_vnic_details=m.CreateVnicDetails(subnet_id=subnet, assign_public_ip=True),
             metadata={"ssh_authorized_keys": keys, "user_data": user_data(keys)})
@@ -202,8 +220,11 @@ def dry_run():
     print(f"ssh keys    {len(key_summary(keys))}: {key_summary(keys)}")
     print(f"existing    A1 {ocpus} OCPU / {mem} GB; boot+block storage {store} GB of {FREE_STORAGE}")
     print(f"boot volume {boot} GB (remainder {FREE_STORAGE - store}, want {BOOT_WANT}, min {BOOT_MIN})")
-    ok, why = guard(ocpus, mem, store, boot or 0) if boot else (False, "storage remainder < 47 GB")
-    print(f"launch      {SHAPE} {OCPUS} OCPU / {MEM_GB} GB '{NAME}' public IP -> guard: {'PASS' if ok else 'FAIL ' + why}")
+    cores, lmem = c.limits()
+    sh = fit(cores, lmem, ocpus, mem) or (OCPUS, MEM_GB)
+    print(f"A1 limit    available {cores} cores / {lmem} GB -> {'would launch ' + str(sh) if fit(cores, lmem, ocpus, mem) else 'watch mode (no launch)'}")
+    ok, why = guard(ocpus, mem, store, boot or 0, *sh) if boot else (False, "storage remainder < 47 GB")
+    print(f"launch      {SHAPE} {sh[0]} OCPU / {sh[1]} GB '{NAME}' public IP -> guard: {'PASS' if ok else 'FAIL ' + why}")
     print(f"cloud-init  kepler-init.sh {len(base64.b64decode(user_data(keys)))} bytes (oracle limit 32768)")
     try:
         print(f"azel token  {AZEL_TOKEN} mode {oct(AZEL_TOKEN.stat().st_mode & 0o777)} size {AZEL_TOKEN.stat().st_size}")
@@ -232,19 +253,12 @@ def post(url, body, headers, retries=3):
     return "network error"
 
 
-def notify(ip, boot):
-    """ntfy first, then the Azel call; each tried regardless of the other; only statuses are logged."""
-    info = f"kepler: {ip}, 2 OCPU / 12 GB / {boot} GB"
-    try:
-        tok = NTFY_TOKEN.read_text().strip()
-        title = "=?UTF-8?B?%s?=" % base64.b64encode("kepler 생성됨".encode()).decode()
-        r = post(NTFY_URL, info.encode(), {"Authorization": f"Bearer {tok}", "Title": title, "Priority": "high", "Tags": "rocket"})
-    except OSError:
-        r = "no token"
+def ntfy(title, body):
+    r = ntfy("kepler 생성됨", info)
     log.info("ntfy: %s", r)
     try:
         tok = AZEL_TOKEN.read_text().strip()
-        reason = f"춘천 A1 서버 kepler가 만들어졌어요. 공인 IP {ip}, 2 OCPU 12GB."[:200]
+        reason = f"춘천 A1 서버 kepler가 만들어졌어요. 공인 IP {ip}, {ocpus} OCPU {mem}GB.{small}"[:200]
         r = post(CALL_URL, json.dumps({"reason": reason}).encode(),
                  {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
     except OSError:
@@ -264,22 +278,37 @@ def run():
     bad = 0  # consecutive auth/lookup errors
     while True:
         fd = fds[st["attempts"] % len(fds)]
-        st["attempts"] += 1
-        st["last_at"], st["last_fd"] = time.strftime("%F %T"), fd or "none"
         try:
             ref, subnet, keys, im, ocpus, mem, store, boot = resolve(c)
-            ok, why = guard(ocpus, mem, store, boot or 0) if boot else (False, f"storage remainder {FREE_STORAGE - store} GB < {BOOT_MIN}")
+            cores, lmem = c.limits()
+            shape = fit(cores, lmem, ocpus, mem)
+            st.update(last_check=time.strftime("%F %T"), limit_cores=cores, limit_mem=lmem)
+            if not shape:
+                st["mode"] = "watch"
+                wait = WATCH_S + random.uniform(0, WATCH_JITTER_S)
+                log.info("watch: A1 available %s cores / %s GB (in use %s/%s); no launch; next check in %ds", cores, lmem, ocpus, mem, wait)
+                save_state(st)
+                time.sleep(wait)
+                continue
+            if st.get("mode") != "launch":
+                st["mode"] = "launch"
+                if not st.get("limit_notified"):
+                    st["limit_notified"] = True
+                    log.info("ntfy: %s", ntfy("A1 한도 생김", "A1 한도가 생겼어요, 생성 시도 시작"))
+            st["attempts"] += 1
+            st["last_at"], st["last_fd"] = time.strftime("%F %T"), fd or "none"
+            ok, why = guard(ocpus, mem, store, boot or 0, *shape) if boot else (False, f"storage remainder {FREE_STORAGE - store} GB < {BOOT_MIN}")
             if not ok:
                 log.info("STOP guard: %s", why)
                 st["last_error"] = "guard: " + why
                 save_state(st)
                 return 3  # not retried by on-failure? exit code 3 is a failure -> see unit (RestartPreventExitStatus=3)
-            inst = c.launch(ref, subnet, keys, im.id, boot, fd)
+            inst = c.launch(ref, subnet, keys, im.id, boot, fd, *shape)
             ip = c.public_ip(inst)
             DONE.write_text(f"{inst.id} {ip} {time.strftime('%F %T')}\n")
             log.info("SUCCESS %s ip %s", inst.id, ip)
             print(f"instance {inst.id}\npublic ip {ip}")
-            notify(ip, boot)
+            notify(ip, boot, *shape)
             save_state(st)
             return 0
         except c.oci.exceptions.ServiceError as e:
