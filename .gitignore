@@ -25,3 +25,6 @@ assistant/client/bench/questions/
 token
 
 .DS_Store
+
+# PM working notes, never tracked
+.claude/
