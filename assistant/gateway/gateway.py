@@ -2754,8 +2754,27 @@ async def reap_warm():
 
 
 app = FastAPI(title="azel-gateway", lifespan=lifespan, dependencies=[Depends(auth)])
-if MODE == "full":  # wake-word enrollment (wake_enroll.py): the user's own clips stay on jh devices
+WAKE_URL = os.environ.get("BISEO_WAKE_URL", "").rstrip("/")  # the Mac gateway, where the clips and the trainer live
+if MODE == "full" and not WAKE_URL:  # wake-word enrollment (wake_enroll.py): the user's own clips stay on jh devices
     app.include_router(wake_enroll.router)
+
+
+@app.api_route("/v1/wake/{rest:path}", methods=["GET", "POST", "DELETE"])
+async def wake_proxy(request: Request, rest: str):
+    """On a gateway without the wake trainer (deneb): the Mac's answer, or a clear 503, never an empty "none" that
+    reads like the 40 recorded clips were lost."""
+    if not WAKE_URL:
+        raise HTTPException(404, "Not Found")
+    try:
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.request(request.method, f"{WAKE_URL}/v1/wake/{rest}", params=dict(request.query_params),
+                                content=await request.body(),
+                                headers={"Authorization": f"Bearer {TOKEN}",
+                                         **({"content-type": request.headers["content-type"]}
+                                            if "content-type" in request.headers else {})})
+    except httpx.HTTPError:
+        raise HTTPException(503, "호출어 학습은 맥북에서만 돼요. 지금 맥북 게이트웨이에 연결할 수 없어요.")
+    return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
 
 
 @app.exception_handler(StateDown)

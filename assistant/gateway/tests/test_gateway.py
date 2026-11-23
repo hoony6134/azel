@@ -2049,3 +2049,17 @@ def test_autonomous_every_five_minutes_never_in_a_call_and_logs_only_changes(gw,
     g.fake.db["kv"]["alerts_recent"].append({"names": "DiskFull", "at": time.time()})
     asyncio.run(g.scheduler_tick(t.replace(minute=25), {}))
     assert len(g.fake.db["plog"]) == n + 1  # the signals changed: logged once
+
+
+def test_wake_on_a_gateway_without_the_trainer_goes_to_the_mac(tmp_path, monkeypatch):
+    """deneb has no clips or trainer: /v1/wake/* is the Mac's answer, or a clear 503, never an empty "none"."""
+    g = start(tmp_path, monkeypatch, BISEO_WAKE_URL="http://127.0.0.1:9")
+    with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
+        r = c.get("/v1/wake/enroll")
+        assert r.status_code == 503 and "맥북에서만" in r.json()["detail"]
+
+        async def mac(self, method, url, **kw):
+            assert url == "http://127.0.0.1:9/v1/wake/enroll" and kw["headers"]["Authorization"] == "Bearer t0k"
+            return httpx.Response(200, json={"clips": 40, "status": "ready"}, headers={"content-type": "application/json"})
+        monkeypatch.setattr(httpx.AsyncClient, "request", mac)
+        assert c.get("/v1/wake/enroll").json() == {"clips": 40, "status": "ready"}

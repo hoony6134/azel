@@ -18,7 +18,7 @@ TIMEOUT_S = 6
 AC_TIMEOUT_S = 2  # the name lookup: a stalled one must not eat a voice turn's 8 s, Yahoo and search come after it
 UA = {"User-Agent": "Mozilla/5.0 (compatible; azel-quote)"}
 KST = timezone(timedelta(hours=9))
-CURRENCY = {"KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "CNY": "위안", "HKD": "홍콩달러", "GBP": "파운드"}
+CURRENCY = {"index": "포인트", "KRW": "원", "USD": "달러", "JPY": "엔", "EUR": "유로", "CNY": "위안", "HKD": "홍콩달러", "GBP": "파운드"}
 KINDS = ("EQUITY", "ETF")
 NOT_FOUND = "상장된 종목을 찾지 못했어요. 비상장 회사이거나 이름이 다를 수 있어요."
 RETRY = " 한글 이름으로 못 찾았으면 영어 이름이나 티커로 한 번 더 찾아봐(예: Anthropic, NVDA)."
@@ -249,6 +249,11 @@ async def quote(query, client=None, search=None, holdings=()):
     try:
         if rate := await fx(str(query), c):
             return rate
+        sym = index_of(q) or (q.strip().upper() if TICKER_INDEX.fullmatch(q.strip()) else None)
+        if sym:  # an index, by name or ^ticker, before any search ("나스닥" was a 102-dollar fund): points, not money
+            p = await yahoo_price(sym, c)
+            p.update(name=INDEX_NAMES.get(sym, p.get("name") or sym), currency="index", what="지수")
+            return {"spoken": spoken(p), "data": {**p, "at": p["at"].isoformat() if p.get("at") else None, "symbol": sym}}
         hit = known_hit(q, holdings)
         if not hit and re.search(r"[가-힣]", q):
             hit = await naver_find(q, c)
@@ -279,7 +284,10 @@ HOLDING = re.compile(r"^(?P<name>.*?)\s*\((?P<tick>\^?[A-Z][A-Z0-9.]{0,6}|\d{6})
 # Market indices by the names people say; their Yahoo symbols start with ^ and have no currency (points)
 INDEX = {"s&p500": "^GSPC", "sp500": "^GSPC", "에스앤피500": "^GSPC", "s&p": "^GSPC", "코스피": "^KS11", "kospi": "^KS11",
          "코스닥": "^KQ11", "kosdaq": "^KQ11", "나스닥": "^IXIC", "nasdaq": "^IXIC", "나스닥종합": "^IXIC",
-         "다우": "^DJI", "다우존스": "^DJI", "dow": "^DJI", "dowjones": "^DJI"}
+         "다우": "^DJI", "다우존스": "^DJI", "dow": "^DJI", "dowjones": "^DJI", "에스앤피": "^GSPC",
+         "s&p500지수": "^GSPC", "nasdaqcomposite": "^IXIC", "다우산업": "^DJI"}
+INDEX_NAMES = {"^GSPC": "S&P 500", "^IXIC": "나스닥 종합", "^DJI": "다우존스", "^KS11": "코스피", "^KQ11": "코스닥"}
+TICKER_INDEX = re.compile(r"\^[A-Za-z0-9.]{2,10}")
 
 
 def index_of(name):
