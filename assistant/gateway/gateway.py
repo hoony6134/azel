@@ -2750,17 +2750,41 @@ async def usage():
                 "equivalent_usd": round(sum(r["cost_usd"] for r in cc), 4), "quota": quota_view()}}}
 
 
-async def probe(url, token=False):
+async def probe(url, token=False, timeout=3):
     """Reachability only. The token goes along only when asked (a trusted daemon); health routes need none."""
     t = time.perf_counter()
     headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}"} if token else {})
     try:
         # Headers only: an MCP endpoint may answer GET with a stream that never ends.
-        async with httpx.AsyncClient(timeout=3) as c, c.stream("GET", url, headers=headers) as r:
+        async with httpx.AsyncClient(timeout=timeout) as c, c.stream("GET", url, headers=headers) as r:
             ok = r.status_code < 500
         return {"ok": ok, "ms": round((time.perf_counter() - t) * 1000)}
     except httpx.HTTPError:
         return {"ok": False, "ms": None}
+
+
+DEVICE_PROBE_S, DEVICE_SLOW_MS, DEVICE_PROBE_TTL_S = 8, 2000, 30
+device_probes: dict = {}  # url -> (monotonic, {ok, ms, status, latency_ms})
+
+
+async def probe_device(url, token):
+    """The user's rule (2026-11-23): "ok" answered within 2 s, "slow" answered later, "down" no answer in 8 s or a
+    connection error. Judged by the answer only, never by last_seen."""
+    p = await probe(url, token, timeout=DEVICE_PROBE_S)
+    status = "down" if not p["ok"] else "slow" if p["ms"] > DEVICE_SLOW_MS else "ok"
+    out = {**p, "status": status, "latency_ms": p["ms"]}
+    device_probes[url] = (time.monotonic(), out)
+    return out
+
+
+async def device_probe(url, token):
+    """The last probe at once (refreshed in the background after 30 s), so /v1/status stays fast; the first waits."""
+    hit = device_probes.get(url)
+    if hit is None:
+        return await probe_device(url, token)
+    if time.monotonic() - hit[0] > DEVICE_PROBE_TTL_S:
+        state.background(("probe", url), lambda: probe_device(url, token))
+    return hit[1]
 
 
 tv_cache, tv_cache2 = tv.Cache(), tv.Cache()
@@ -2951,7 +2975,7 @@ async def tv_get(v: int = 1, detail: str | None = None, symbol: str = "", range:
 async def status():
     devs = with_static(await state.get("/v1/state/devices", list(local_devices.values())))
     probes = await asyncio.gather(probe(f"{VOICE_URL}/health"), probe(f"{TTS_URL}/health"),
-                                  probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
+                                  probe(f"{STATE_URL}/health"), *[device_probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
             "google": google_status(),  # connected | expired (the app shows "Google 다시 연결") | none

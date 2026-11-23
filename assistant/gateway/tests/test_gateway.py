@@ -585,7 +585,7 @@ def test_limited_writer_cannot_steer_full_gateways(gw, monkeypatch):
     assert "mcp__macbook" in args and "mcp__evil" not in args  # never handed to claude -p, never gets the token
     probed = []
 
-    async def fake_probe(url, token=False):
+    async def fake_probe(url, token=False, timeout=3):
         probed.append((url, token))
         return {"ok": True, "ms": 1}
     monkeypatch.setattr(g, "probe", fake_probe)
@@ -1959,3 +1959,19 @@ def test_push_register_answers_fast_when_ruchba_is_slow(gw, monkeypatch):
     while "slowtok" not in g.fake.db["push"] and time.monotonic() < end:
         time.sleep(0.2)
     assert "slowtok" in g.fake.db["push"] and not g.push_pending
+
+
+def test_device_status_is_ok_slow_or_down_by_the_answer(gw, monkeypatch):
+    """/v1/status devices[]: ok within 2 s, slow when it answers later, down on no answer; cached 30 s."""
+    g, c, _ = gw
+    calls = []
+
+    async def probe(url, token=False, timeout=3):
+        calls.append((url, timeout))
+        return {"ok": "dead" not in url, "ms": 2500 if "slow" in url else 40 if "dead" not in url else None}
+    monkeypatch.setattr(g, "probe", probe)
+    out = {u: asyncio.run(g.probe_device(u, False)) for u in ("http://fast/mcp", "http://slow/mcp", "http://dead/mcp")}
+    assert [out[u]["status"] for u in out] == ["ok", "slow", "down"]
+    assert out["http://slow/mcp"]["latency_ms"] == 2500 and all(t == g.DEVICE_PROBE_S for _, t in calls)
+    n = len(calls)
+    assert asyncio.run(g.device_probe("http://fast/mcp", False))["status"] == "ok" and len(calls) == n  # cached
