@@ -433,9 +433,10 @@ device that created them.
   in display order (add, remove, rename and reorder are all just a new list). Each entry is `"이름 (CODE)"` or a bare
   name, 1–40 characters, no control characters, at most 12; otherwise 400. An entry already saved, or one with a
   `(CODE)` (a rename that keeps its code), is stored as sent and never looked up again. A new bare name is resolved
-  like the voice tool: one listing → saved as `"이름 (CODE)"`; none → saved as typed (비상장); several → 400 with
-  `detail` naming the candidates (`삼성 → 삼성전자 (005930), 삼성SDI (006400)`) and nothing saved, so the app asks
-  which one and sends `"이름 (CODE)"`. The response's `holdings` is what was saved; the TV and `portfolio` show it at once.
+  like the voice tool: one listing → saved as `"이름 (CODE)"`; none → saved as typed (비상장); several → saved bare and
+  listed in the response's `candidates` (`{"삼성": ["삼성전자 (005930)", "삼성SDI (006400)"]}`, `{}` when none), so the
+  app asks which one and PUTs again with `"이름 (CODE)"`. The response's `holdings` is what was saved; the TV and
+  `portfolio` show it at once.
 - Connectors: which MCP servers a full gateway's Claude runs load (warm or one-shot). Shared setting `connectors`
   (also writable as part of `PUT /v1/settings`):
   ```json

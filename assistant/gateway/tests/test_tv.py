@@ -552,9 +552,10 @@ def test_holdings_setting(gw, monkeypatch):
     asked.clear()
     r = c.put("/v1/settings", json={"holdings": ["Apple (AAPL)", "카카오 (035720)", "토스"]})  # rename only: no lookup
     assert r.status_code == 200 and r.json()["holdings"] == ["Apple (AAPL)", "카카오 (035720)", "토스"] and asked == []
-    r = c.put("/v1/settings", json={"holdings": ["삼성"]})
-    assert r.status_code == 400 and "삼성SDI (006400)" in r.json()["detail"]  # several: the app asks which one
-    assert c.get("/v1/settings").json()["holdings"][0] == "Apple (AAPL)"  # nothing saved
+    assert r.json()["candidates"] == {}
+    r = c.put("/v1/settings", json={"holdings": ["Apple (AAPL)", "삼성"]})  # several: saved bare, the app asks which
+    assert r.status_code == 200 and r.json()["holdings"] == ["Apple (AAPL)", "삼성"]
+    assert r.json()["candidates"] == {"삼성": ["삼성전자 (005930)", "삼성SDI (006400)"]}
     for bad in ("애플", [""], ["x" * 41], ["a\nb"], ["a"] * 13):
         assert c.put("/v1/settings", json={"holdings": bad}).status_code == 400, bad
 
@@ -583,6 +584,11 @@ def test_holdings_update_by_voice(gw, monkeypatch):
     before = c.get("/v1/settings").json()["holdings"]
     r = asyncio.run(g.bridge.run("holdings_update", {"add": ["삼성"]}, caller="qwen"))  # only candidates: nothing saved
     assert c.get("/v1/settings").json()["holdings"] == before and "지금" not in r["spoken"]
+    answers["에스오에스랩"] = {"ticker": "464080", "name": "에스오에스랩"}
+    n = len(c.get("/v1/settings").json()["holdings"])
+    asyncio.run(g.bridge.run("holdings_update", {"add": ["에스오에스랩"]}, caller="qwen"))
+    got = c.get("/v1/settings").json()["holdings"]  # a new name for a listing already held renames it, no duplicate
+    assert "에스오에스랩 (464080)" in got and not any(x.startswith("SOS랩") for x in got) and len(got) == n
     assert not asyncio.run(g.bridge.run("holdings_update", {}, caller="qwen"))["ok"]
     big = [f"종목{i} (00000{i % 10})" for i in range(12)]
     assert asyncio.run(g.bridge.run("holdings_update", {"add": big}, caller="qwen"))["error"]["code"] == "invalid"
