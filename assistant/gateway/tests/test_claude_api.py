@@ -45,7 +45,7 @@ def test_tool_loop_caches_the_prefix_and_counts_cost():
         return "- 11월 22일 23:00 토론지"
     tools = [{"name": "gistra_today", "description": "x", "input_schema": {"type": "object"}}]
     out = collect(A.ask("k", "haiku", "SYSTEM", "내일 뭐 있어?", tools, run_tool, client=client))
-    assert ("tool", "gistra_today") in out and ("text", "내일은 토론지 마감이 있어요.\n") in out
+    assert any(k == "tool_call" and v["name"] == "gistra_today" for k, v in out) and ("text", "내일은 토론지 마감이 있어요.\n") in out
     done = out[-1][1]
     assert done["input_tokens"] == 400 and done["cache_read_input_tokens"] == 1500 and done["output_tokens"] == 50
     want = (400 * 0.10 + 1500 * 0.10 * 1.25 + 1500 * 0.01 + 50 * 0.50) / 1e6

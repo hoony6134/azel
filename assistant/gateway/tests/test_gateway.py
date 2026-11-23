@@ -153,14 +153,23 @@ def test_assistant_name(gw, monkeypatch):
         assert c.put("/v1/settings", json={"assistant_name": name}).status_code == 200
 
 
-def test_tool_activity_without_arguments(gw):
+def test_tool_activity_detail(gw):
+    """The tool-activity contract (2026-11-23): a call_id ties start and end; the start carries the streamed input, the
+    end ok, output and duration, all redacted at the source."""
     g, c, _ = gw
     ev = events(c.post("/v1/ask", json={"text": "도구 써서 오늘 수업 알려줘"}))
     acts = [e for e in ev if e["type"] == "activity"]
     tool = {"tool": "mcp__claude_ai_Cygnus_MCP__gistra_today", "label": "학사 일정 확인 중", "kind": "schedule",
-            "route": "claude"}
-    assert acts == [{"type": "activity", "phase": "tool_start", **tool}, {"type": "activity", "phase": "tool_end", **tool}]
-    assert "SECRET" not in json.dumps(ev)  # neither the arguments nor the result
+            "route": "claude", "call_id": "toolu_1"}
+    assert acts[0] == {"type": "activity", "phase": "tool_start", **tool, "input": '{"q":"SECRET-ARG"}'}
+    end = acts[1]
+    assert {k: end[k] for k in tool} == tool and end["phase"] == "tool_end" and end["ok"] is True
+    assert end["output"] == "SECRET-RESULT" and isinstance(end["duration_ms"], int)
+    red = g.redact("TOKEN=abc123 Authorization: Bearer xyz https://a.b/c?key=v sk-ant-abcdefghijk "
+                   "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----")
+    for secret in ("abc123", "xyz", "key=v", "sk-ant-abcdefghijk", "AAAA"):
+        assert secret not in red, secret
+    assert g.tool_host(g.mcp_tool_name("mcp__albireo__run_command"), {}) == "albireo"
     assert "".join(e["delta"] for e in ev if e["type"] == "text").strip() == "네, 확인했어요."
 
 

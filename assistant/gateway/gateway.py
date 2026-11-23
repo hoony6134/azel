@@ -901,10 +901,72 @@ def tool_label(name):
     return tool_info(name)[0]
 
 
-def activity(phase, tool=""):
-    """Progress event for the app. Only the tool's name, label and kind: arguments and results stay private."""
+def activity(phase, tool="", **detail):
+    """Progress event for the app: the tool's name, label and kind, plus (tool-activity contract) its call_id, the
+    redacted input and output, host, exit code and duration when known."""
     label, kind = ("생각 중", "generic") if phase == "thinking" else tool_info(tool)
-    return {"type": "activity", "phase": phase, "tool": tool, "label": label, "kind": kind, "route": "claude"}
+    return {"type": "activity", "phase": phase, "tool": tool, "label": label, "kind": kind, "route": "claude",
+            **{k: v for k, v in detail.items() if v is not None}}
+
+
+# ---------- tool activity detail (shared notes tool-activity-contract.md): redacted at the source ----------
+REDACT = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+    re.compile(r"(?i)(authorization:\s*(?:bearer\s+|basic\s+)?|bearer\s+)\S+"),
+    re.compile(r"(?i)\b([\w-]*(?:token|secret|password|passwd|api[_-]?key|key))(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"),
+    re.compile(r"(https?://[^\s?#]+)\?[^\s#]+"),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_\w{20,}|xox[abposr]-[\w-]{8,}|"
+               r"AKIA[0-9A-Z]{16}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,})"),
+]
+OUTPUT_CAP, INPUT_CAP = 64_000, 2_000
+
+
+def redact(text):
+    out = str(text)
+    for i, pat in enumerate(REDACT):
+        if i == 2:
+            out = pat.sub(lambda m: m.group(1) + m.group(2) + "«redacted»", out)
+        elif i == 1:
+            out = pat.sub(lambda m: m.group(1) + "«redacted»", out)
+        elif i == 3:
+            out = pat.sub(lambda m: m.group(1) + "?«redacted»", out)
+        else:
+            out = pat.sub("«redacted»", out)
+    return out
+
+
+def mcp_tool_name(name):
+    """mcp__albireo__run_command -> albireo__run_command (the device part is the host); others unchanged."""
+    parts = str(name).split("__")
+    return "__".join(parts[1:]) if len(parts) >= 3 and parts[0] == "mcp" and parts[1] not in ("azel",) \
+        and not parts[1].startswith("claude_ai") else str(name)
+
+
+def tool_host(name, args):
+    if "__" in str(name) and not str(name).startswith("mcp__"):  # a device tool (dev__tool); connectors have no host
+        return DEVICE_ALIASES.get(name.split("__")[0], name.split("__")[0])
+    a = args if isinstance(args, dict) else {}
+    return a.get("host") or a.get("device") or None
+
+
+def tool_input(name, args):
+    a = args if isinstance(args, dict) else {}
+    text = a["command"] if isinstance(a.get("command"), str) else json.dumps(a, ensure_ascii=False, separators=(",", ":"))
+    text = redact(text)
+    return text if len(text) <= INPUT_CAP else text[:INPUT_CAP] + "…"
+
+
+def tool_output(raw, exit_code=None):
+    """(output, exit_code): a command's stdout+stderr (the daemon's or ssh_run's JSON), else the text itself."""
+    text = str(raw or "")
+    try:
+        j = json.loads(text)
+    except ValueError:
+        j = None
+    if isinstance(j, dict) and ("stdout" in j or "stderr" in j):
+        text = (str(j.get("stdout") or "") + str(j.get("stderr") or "")) or str(j.get("status") or "")
+        exit_code = j.get("exit_code") if isinstance(j.get("exit_code"), int) else exit_code
+    return redact(text)[-OUTPUT_CAP:], exit_code
 
 
 async def ask_claude_code(text, model, session):
@@ -935,6 +997,9 @@ async def ask_claude_code(text, model, session):
         source = proc.stdout
     final = {"model": model, "path": "claude_code"}
     open_tools: dict[str, str] = {}  # tool_use id -> name, until its result comes back
+    started: dict[str, float] = {}  # tool_use id -> when it started
+    streaming: dict = {}  # content block index -> the tool_use whose input is streaming in
+    announced: set = set()  # tool_use ids whose tool_start went out
     try:
         async for raw in source:
             try:
@@ -946,16 +1011,47 @@ async def ask_claude_code(text, model, session):
                 if ev.get("type") == "content_block_delta" and ev["delta"].get("type") == "text_delta":
                     yield ev["delta"]["text"]
                 elif ev.get("type") == "message_stop":
+                    for b in [streaming.pop(i) for i in list(streaming)]:  # a block whose stop never came
+                        try:
+                            args = json.loads(b["json"] or "{}")
+                        except ValueError:
+                            args = {}
+                        announced.add(b["id"])
+                        yield activity("tool_start", b["name"], call_id=b["id"] or None, input=tool_input(b["name"], args),
+                                       host=tool_host(mcp_tool_name(b["name"]), args))
                     yield "\n"  # turns between tool calls are separate utterances
                 elif ev.get("type") == "content_block_start" and ev["content_block"].get("type") == "tool_use":
                     block = ev["content_block"]
                     open_tools[block.get("id", "")] = block.get("name", "")
-                    yield activity("tool_start", block.get("name", ""))
+                    started[block.get("id", "")] = time.monotonic()
+                    streaming[ev.get("index")] = {"id": block.get("id", ""), "name": block.get("name", ""), "json": ""}
+                elif ev.get("type") == "content_block_delta" and ev["delta"].get("type") == "input_json_delta" \
+                        and ev.get("index") in streaming:
+                    streaming[ev["index"]]["json"] += ev["delta"].get("partial_json", "")
+                elif ev.get("type") == "content_block_stop" and ev.get("index") in streaming:
+                    b = streaming.pop(ev["index"])  # the input is complete: the tool starts now
+                    try:
+                        args = json.loads(b["json"] or "{}")
+                    except ValueError:
+                        args = {}
+                    announced.add(b["id"])
+                    yield activity("tool_start", b["name"], call_id=b["id"] or None, input=tool_input(b["name"], args),
+                                   host=tool_host(mcp_tool_name(b["name"]), args))
             elif e.get("type") == "user":  # tool results come back as a user message
                 content = e.get("message", {}).get("content")
                 for block in content if isinstance(content, list) else []:
                     if block.get("type") == "tool_result" and block.get("tool_use_id") in open_tools:
-                        yield activity("tool_end", open_tools.pop(block["tool_use_id"]))
+                        tid = block["tool_use_id"]
+                        if tid not in announced:  # its input never streamed: still a start before the end
+                            yield activity("tool_start", open_tools[tid], call_id=tid)
+                        res = block.get("content")
+                        text = res if isinstance(res, str) else "".join(
+                            x.get("text", "") for x in res if isinstance(x, dict)) if isinstance(res, list) else ""
+                        output, code = tool_output(text)
+                        t0 = started.pop(tid, None)
+                        yield activity("tool_end", open_tools.pop(tid), call_id=tid, ok=not block.get("is_error"),
+                                       exit_code=code, output=output[-8000:], truncated=len(output) > 8000 or None,
+                                       duration_ms=round((time.monotonic() - t0) * 1000) if t0 else None)
             elif e.get("type") == "rate_limit_event":
                 note_quota(e)
             elif e.get("type") == "result":
@@ -1187,16 +1283,32 @@ async def ask_api_full(text, model, settings, devices, dev_tools, where):
     """A full gateway's Messages API turn: Cygnus bridge tools plus the devices' tools, stable cached prefix."""
     defs, where = await bridge.tools("voice")  # devices (no delegate), call_user, create_task, Cygnus
 
+    done: dict = {}  # (name, args) -> the bridge's full answer, for the activity detail
+
     async def run(name, args):
-        return (await bridge.call(name, args, current_persona.get(), caller="voice", where=where))["content"]
+        r = await bridge.call(name, args, current_persona.get(), caller="voice", where=where)
+        done[(name, json.dumps(args, sort_keys=True, ensure_ascii=False))] = r
+        return r["content"]
+    calls: dict = {}  # tool_use id -> (name, args)
     system = name_prompt(settings) + (FULL_API_STYLE if google_status() != "connected" else FULL_API_STYLE.replace(
         "메일과 캘린더는 이 경로에서 볼 수 없으니 그렇게 말해.", GOOGLE_STYLE)) + device_prompt(settings, devices)
     yield activity("thinking")
     async for kind, v in claude_api.ask(API_KEY, model, system, text, defs, run):
         if kind == "text":
             yield strip_marks(v)
-        elif kind == "tool":
+        elif kind == "tool":  # a name only (older shape)
             yield activity("tool_start", v)
+        elif kind == "tool_call":
+            calls[v["id"]] = (v["name"], v.get("input") or {})
+            yield activity("tool_start", v["name"], call_id=v["id"], input=tool_input(v["name"], v.get("input")),
+                           host=tool_host(v["name"], v.get("input")))
+        elif kind == "tool_done":
+            name, args = calls.pop(v["tool_use_id"], ("", {}))
+            r = done.pop((name, json.dumps(args, sort_keys=True, ensure_ascii=False)), {})
+            output, code = tool_output(r.get("raw", v.get("content")), r.get("exit_code"))
+            yield activity("tool_end", name, call_id=v["tool_use_id"], ok=not v.get("is_error") and not r.get("is_error"),
+                           duration_ms=v.get("duration_ms"), exit_code=code, output=output[-8000:],
+                           truncated=len(output) > 8000 or None, task_id=r.get("task_id"), host=r.get("host"))
         else:
             yield {"model": model, "path": "api", "input_tokens": v["input_tokens"] + v["cache_read_input_tokens"]
                    + v["cache_creation_input_tokens"], "output_tokens": v["output_tokens"], "cost_usd": v["cost_usd"]}
@@ -5614,9 +5726,14 @@ async def serve_tool(m):
         r = await bridge.run(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
                              surface="voice", on_progress=progress)
         # result: what Qwen reads; spoken and needs: what the voice fast path says and holds (ACTIONS.md §2)
-        card = await tool_card(str(m.get("name", "")), r)
+        name = str(m.get("name", ""))
+        card = await tool_card(name, r)
+        output, code = tool_output(r.get("_raw") if r.get("_raw") is not None else tools_bridge.for_model(r), r.get("_exit_code"))
+        extra = {"output": output, "exit_code": code, "host": r.get("_host") or tool_host(name, m.get("args")),
+                 "task_id": r.get("_task_id"), "card": card}
         await link_send({"id": m["id"], "type": "tool_result", "result": tools_bridge.for_model(r),
-                         "is_error": not r["ok"], "spoken": r["spoken"], "needs": r["needs"], **({"card": card} if card else {})})
+                         "is_error": not r["ok"], "spoken": r["spoken"], "needs": r["needs"],
+                         **{k: v for k, v in extra.items() if v is not None}})
     except Exception as e:
         print("tool over link failed:", type(e).__name__, flush=True)
         await link_send({"id": m["id"], "type": "tool_result", "result": "도구를 쓰지 못했어요.", "is_error": True})

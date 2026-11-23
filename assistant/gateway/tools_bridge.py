@@ -405,7 +405,8 @@ class Bridge:
         """The model-facing shape of run(): {"content", "is_error", "waited_s"[, "approval"]}."""
         r = await self.run(name, args, persona_id, caller, on_progress=on_progress, where=where)
         out = {"content": for_model(r), "is_error": not r["ok"], "waited_s": r.get("_waited", 0)}
-        return out | ({"approval": r["_approval"]} if r.get("_approval") else {})
+        detail = {k: r["_" + k] for k in ("raw", "exit_code", "host", "task_id") if r.get("_" + k) is not None}
+        return out | ({"approval": r["_approval"]} if r.get("_approval") else {}) | detail
 
     async def run(self, name, args, persona_id=None, caller="api", surface="tool", on_progress=None, where=None):
         """Every action, every surface: {"ok", "spoken", "data", "needs", "error"} (ACTIONS.md §2), audited once."""
@@ -442,10 +443,13 @@ class Bridge:
                            error={"code": "failed", "message": out["content"][:300]} if out["is_error"] else None)
                 r.update({k: out[k] for k in ("waited_s", "approval") if k in out and out[k]})
                 r["_waited"], r["_approval"] = out.get("waited_s", 0), out.get("approval")
+                r["_raw"], r["_exit_code"], r["_host"] = out["content"], out.get("exit_code"), out.get("host")  # activity
             elif isinstance(out, tuple):
                 r = result(True, out[0], data=out[1])
                 if len(out) > 2:
                     r["_model"] = out[2]
+                if name in ("create_task", "web_task") and isinstance(out[1], dict) and out[1].get("id"):
+                    r["_task_id"] = out[1]["id"]  # the app opens /v1/tasks/{id} from the activity row
                 if isinstance(out[1], dict) and out[1].get("_audit"):  # what was done, for the actions log
                     r["_audit"] = out[1].pop("_audit")
             else:
