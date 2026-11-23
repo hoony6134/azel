@@ -3504,6 +3504,8 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if ev.get("phase") in ("tool_start", "thinking"):
                 turn["activity"].append({"label": ev.get("label", ""), "kind": ev.get("kind", "generic"),
                                          "at": time.time()})
+            if ev.get("type") == "card":
+                ev = {**ev, "reply_id": gen}  # the app shows the card under this reply (reply_start's id)
             await send(ev)
         try:
             await send({"type": "state", "value": "thinking"})
