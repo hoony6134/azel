@@ -538,7 +538,7 @@ struct SettingsScreen<Extra: View>: View {
     private var statusCard: some View {
         Card("상태", trailing: AnyView(Button("새로고침") { Task { await model.refresh() } }.font(.subheadline).tint(Theme.celadon))) {
             if let s = model.status {
-                statusRow("spark", s.spark.ok ? .ok : .down, s.spark.ms)
+                statusRow("음성 서버", s.spark.ok ? .ok : .down, s.spark.ms)   // top-level "spark" is the voice server, not a device
                 statusRow("게이트웨이", s.gateway.ok ? .ok : .down, s.gateway.ms)
                 ForEach(s.devices, id: \.name) { statusRow(DeviceID.normalize($0.name), $0.health, $0.latency) }
             } else if let e = model.statusError {

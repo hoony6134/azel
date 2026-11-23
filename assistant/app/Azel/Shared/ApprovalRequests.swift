@@ -95,8 +95,11 @@ enum ApprovalAPI {
     /// a secret call becomes once).
     @discardableResult
     static func decide(_ id: String, _ d: ApprovalDecision) async throws -> String? {
-        forcedNote(try await Gateway.send("POST", "/v1/approvals/" + escape(id), json: body(d)))
+        forcedNote(try await Gateway.send("POST", "/v1/approvals/" + escape(id), json: body(d), explain: explain))
     }
+
+    /// The gateway explains these in Korean (unknown approval, already decided, the device unreachable).
+    static let explain: Set<Int> = [404, 409, 502]
 
     static func forcedNote(_ data: Data) -> String? {
         guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], (o["forced_once"] as? Bool) == true else { return nil }
@@ -109,7 +112,7 @@ enum ApprovalAPI {
     }
 
     static func get(_ id: String) async throws -> ApprovalRequest? {
-        let json = try JSONSerialization.jsonObject(with: try await Gateway.send("GET", "/v1/approvals/" + escape(id)))
+        let json = try JSONSerialization.jsonObject(with: try await Gateway.send("GET", "/v1/approvals/" + escape(id), explain: explain))
         return (json as? [String: Any]).map(ApprovalRequest.init)
     }
 
