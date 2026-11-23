@@ -132,7 +132,7 @@ final class AudioIO {
         engine.connect(cuePlayer, to: engine.mainMixerNode, format: PCM.speakerFormat)
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             guard let self, self.started else { return }
-            Log.call.info("audio route changed: restarting the engine")
+            Log.call.notice("audio route changed: restarting the engine (queued reply audio is dropped)")
             self.onConfigurationChange?()
         }
     }
@@ -201,6 +201,7 @@ final class AudioIO {
     /// iOS: call after CallKit activated the audio session.
     func start() throws {
         started = true   // from here on stop() has something to undo, even if start throws
+        playbackReported = false
         guard Self.hardware else { fakeRunning = true; return }
         let input = engine.inputNode
         #if os(macOS)
@@ -242,6 +243,18 @@ final class AudioIO {
     }
 
     private var started = false
+    /// The first reply audio since start or flush is logged once: proof that playback really began (2026-11-23: a
+    /// wake call's reply was scheduled and then dropped by engine restarts, and nothing in the log showed it).
+    private var playbackReported = false
+
+    private var outputName: String {
+        #if os(macOS)
+        guard let id = outputDevice ?? AudioDevices.defaultID(input: false) else { return "?" }
+        return AudioDevices.name(id) ?? "device \(id)"
+        #else
+        return AVAudioSession.sharedInstance().currentRoute.outputs.first?.portName ?? "?"
+        #endif
+    }
     private var duckTimer: DispatchSourceTimer?
 
     /// Cue ducking on the main queue at 30 Hz: −8 dB in ~30 ms while speech plays, back in ~150 ms.
@@ -265,8 +278,16 @@ final class AudioIO {
     }
 
     func play(_ pcm16: Data) {
-        guard isRunning, let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
+        guard isRunning else {
+            if !playbackReported { playbackReported = true; Log.call.notice("reply audio dropped: engine not running") }
+            return
+        }
+        guard let buf = PCM.floatBuffer(fromPCM16: pcm16) else { return }
         if Self.hardware { player.scheduleBuffer(buf) }
+        if !playbackReported {
+            playbackReported = true
+            Log.call.notice("playback: engine \(self.isRunning, privacy: .public), player \(Self.hardware ? self.player.isPlaying : true, privacy: .public), output \(self.outputName, privacy: .public)")
+        }
         let now = ProcessInfo.processInfo.systemUptime
         speechLock.lock()
         speechEnd = max(speechEnd, pausedAt ?? now) + Double(buf.frameLength) / buf.format.sampleRate
@@ -276,6 +297,7 @@ final class AudioIO {
 
     /// `interrupt`: stop() drops every scheduled buffer; play() makes the node ready for the next reply.
     func flush() {
+        playbackReported = false
         player.volume = 1.0   // a ducked reply that was cut: the next one is at full volume
         player.stop()
         cuePlayer.stop() // interrupt silences cues too

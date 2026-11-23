@@ -35,6 +35,8 @@ enum AudioDevices {
         return list(input: input).first { $0.uid == uid }?.id
     }
 
+    static func name(_ id: AudioDeviceID) -> String? { string(id, kAudioObjectPropertyName) }
+
     private static func channels(_ id: AudioDeviceID, input: Bool) -> Int {
         var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration,
                                               mScope: input ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,

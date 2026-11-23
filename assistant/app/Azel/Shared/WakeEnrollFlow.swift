@@ -188,8 +188,21 @@ final class WakeEnrollModel: ObservableObject {
         try? AVAudioSession.sharedInstance().setCategory(.record, mode: .measurement)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
+        listening = true
+        #if os(macOS)
+        // Like a call: the wake listener closes its stream for enrollment; record only once it has.
+        Task { [weak self] in
+            _ = await AzelFiles.listenerReleased()
+            guard let self, self.listening, case .recording(i) = self.step else { return }
+            self.startRecording(i)
+        }
+        #else
+        startRecording(i)
+        #endif
+    }
+
+    private func startRecording(_ i: Int) {
         do {
-            listening = true
             try recorder.record { [weak self] clip in
                 guard let self else { return }
                 listening = false
