@@ -2063,3 +2063,39 @@ def test_wake_on_a_gateway_without_the_trainer_goes_to_the_mac(tmp_path, monkeyp
             return httpx.Response(200, json={"clips": 40, "status": "ready"}, headers={"content-type": "application/json"})
         monkeypatch.setattr(httpx.AsyncClient, "request", mac)
         assert c.get("/v1/wake/enroll").json() == {"clips": 40, "status": "ready"}
+
+
+def test_chat_store_threads_and_messages(gw, monkeypatch):
+    """chat-contract.md: threads and their messages in shared state, seq per thread, paging, truncate, delete."""
+    g, c, _ = gw
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+    monkeypatch.setattr(g, "link_send", capture)
+
+    def op(**m):
+        c.portal.call(g.serve_chat_store, {"id": "r", "type": "chat_store", **m})
+        return sent[-1]
+    t = op(op="create", persona="azel")["thread"]
+    assert t["title"] == "새 대화" and t["last"] == ""
+    r = op(op="append", thread=t["id"], messages=[{"role": "user", "text": "애플 주가?", "at": 1.0},
+                                                  {"role": "assistant", "text": "342달러예요.", "brain": "claude",
+                                                   "cards": [{"kind": "stock", "title": "애플"}], "secret": "x"}])
+    assert [m["seq"] for m in r["items"]] == [1, 2] and r["thread"]["last"] == "342달러예요."
+    assert "secret" not in r["items"][1] and r["items"][1]["cards"][0]["kind"] == "stock"
+    op(op="append", thread=t["id"], messages=[{"role": "user", "text": f"q{i}"} for i in range(3)])
+    page = op(op="messages", thread=t["id"], limit=2)
+    assert [m["seq"] for m in page["items"]] == [4, 5] and page["more"]
+    older = op(op="messages", thread=t["id"], limit=10, before=4)
+    assert [m["seq"] for m in older["items"]] == [1, 2, 3] and not older["more"]
+    assert op(op="truncate", thread=t["id"], from_seq=3)["thread"]["last"] == "342달러예요."
+    assert op(op="append", thread=t["id"], messages=[{"role": "user", "text": "다시"}])["items"][0]["seq"] == 6
+    assert op(op="rename", thread=t["id"], title="주식")["thread"]["title"] == "주식"
+    assert [x["id"] for x in op(op="list", limit=10)["items"]] == [t["id"]]
+    assert op(op="append", thread=t["id"], messages=[{"role": "robot", "text": "x"}])["code"] == "invalid"
+    assert op(op="messages", thread="000000000000")["code"] == "not_found"
+    assert op(op="create", origin_session="azel:secret-1")["code"] == "secret"
+    assert op(op="delete", thread=t["id"]) == {"id": "r", "type": "chat_store", "ok": True}
+    assert op(op="list")["items"] == [] and g.fake.db["kv"]["chat-msg-" + t["id"]]["items"] == []  # the text is gone

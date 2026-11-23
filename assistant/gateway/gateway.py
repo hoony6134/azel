@@ -1991,6 +1991,130 @@ async def situation_note(now):
     return ""
 
 
+# ---------- text chat threads (shared notes chat-contract.md, "Gateway link"): stored in ruchba's kv ----------
+# chat-threads: [Thread]; chat-msg-<id>: {"next_seq", "items": [Message]}. Reads use the slow-path cache, writes go
+# through (one at a time) and refresh it. Owner only; never a secret session's.
+CHAT_THREADS = "/v1/state/kv/chat-threads"
+CHAT_MAX_THREADS, CHAT_MAX_MESSAGES, CHAT_TEXT_MAX = 500, 5000, 20_000
+chat_lock: dict = {}  # event loop -> lock
+THREAD_ID = re.compile(r"[0-9a-f]{12}")
+
+
+class ChatError(Exception):
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code, self.text = code, text
+
+
+def chat_msg_key(tid):
+    return f"/v1/state/kv/chat-msg-{tid}"
+
+
+async def chat_read(path, default):
+    v = await state.get(path)
+    return copy.deepcopy(v) if v is not None else default
+
+
+async def chat_write(path, value):
+    await state.call("PUT", path, value)
+    state.cache[(path, ())] = copy.deepcopy(value)  # the next cached read sees it, even while ruchba is slow
+
+
+def chat_message(m, seq):
+    if not isinstance(m, dict) or m.get("role") not in ("user", "assistant") or not isinstance(m.get("text"), str):
+        raise ChatError("invalid", "message: role user|assistant and text required")
+    out = {"id": uuid.uuid4().hex[:12], "seq": seq, "role": m["role"], "text": m["text"][:CHAT_TEXT_MAX],
+           "at": m["at"] if isinstance(m.get("at"), (int, float)) and not isinstance(m.get("at"), bool) else time.time()}
+    if m.get("brain") in ("local", "claude"):
+        out["brain"] = m["brain"]
+    if isinstance(m.get("cards"), list):
+        cards_ = [c for c in m["cards"][:8] if isinstance(c, dict) and len(json.dumps(c, ensure_ascii=False)) <= 32_000]
+        out["cards"] = cards_
+    if isinstance(m.get("activity"), list):
+        out["activity"] = [{k: a.get(k) for k in ("tool", "label", "ok") if k in a} for a in m["activity"][:50]
+                           if isinstance(a, dict)]
+    if m.get("stopped") is True:
+        out["stopped"] = True
+    return out
+
+
+async def chat_store(m):
+    """One chat_store op: {"ok": true, ...} or ChatError."""
+    if MODE != "full":
+        raise ChatError("unavailable", "대화 저장은 주 게이트웨이에서만 돼요.")
+    if is_secret(origin_of(m)) or is_secret(m.get("session")):
+        raise ChatError("secret", "비밀 대화는 저장하지 않아요.")
+    op, now = m.get("op"), time.time()
+    if op not in ("list", "create", "rename", "delete", "messages", "append", "truncate"):
+        raise ChatError("invalid", "op: list|create|rename|delete|messages|append|truncate")
+    limit = max(1, min(int(m.get("limit") or 50), 200)) if isinstance(m.get("limit"), (int, float, type(None))) else 50
+    if op == "list":
+        threads = sorted(await chat_read(CHAT_THREADS, []), key=lambda t: -t["updated_at"])
+        if isinstance(m.get("before"), (int, float)):
+            threads = [t for t in threads if t["updated_at"] < m["before"]]
+        return {"ok": True, "items": threads[:limit], "more": len(threads) > limit}
+    tid = m.get("thread")
+    if op != "create" and not (isinstance(tid, str) and THREAD_ID.fullmatch(tid)):
+        raise ChatError("invalid", "thread: a thread id")
+    loop = asyncio.get_running_loop()
+    async with chat_lock.setdefault(loop, asyncio.Lock()):  # read-modify-write, one at a time
+        threads = await chat_read(CHAT_THREADS, [])
+        thread = next((t for t in threads if t["id"] == tid), None)
+        if op != "create" and thread is None:
+            raise ChatError("not_found", "그 대화를 찾지 못했어요.")
+        if op == "create":
+            title = str(m.get("title") or "").strip()[:80] or "새 대화"
+            thread = {"id": uuid.uuid4().hex[:12], "title": title, "created_at": now, "updated_at": now,
+                      "persona": str(m.get("persona") or "")[:32] or None, "last": ""}
+            await chat_write(CHAT_THREADS, [thread, *threads][:CHAT_MAX_THREADS])
+            return {"ok": True, "thread": thread}
+        if op == "rename":
+            title = str(m.get("title") or "").strip()[:80]
+            if not title:
+                raise ChatError("invalid", "title required")
+            thread.update(title=title, updated_at=now)
+            await chat_write(CHAT_THREADS, threads)
+            return {"ok": True, "thread": thread}
+        if op == "delete":
+            await chat_write(chat_msg_key(tid), {"next_seq": 1, "items": [], "deleted": now})  # kv has no DELETE
+            await chat_write(CHAT_THREADS, [t for t in threads if t["id"] != tid])
+            return {"ok": True}
+        box = await chat_read(chat_msg_key(tid), {"next_seq": 1, "items": []})
+        if op == "messages":
+            items = box["items"]
+            if isinstance(m.get("before"), (int, float)):
+                items = [x for x in items if x["seq"] < m["before"]]
+            return {"ok": True, "items": items[-limit:], "more": len(items) > limit}
+        if op == "append":
+            new = m.get("messages")
+            if not isinstance(new, list) or not 1 <= len(new) <= 20:
+                raise ChatError("invalid", "messages: 1-20 messages")
+            added = []
+            for x in new:
+                added.append(chat_message(x, box["next_seq"]))
+                box["next_seq"] += 1
+            box["items"] = (box["items"] + added)[-CHAT_MAX_MESSAGES:]
+        else:  # truncate
+            if not isinstance(m.get("from_seq"), int) or isinstance(m.get("from_seq"), bool):
+                raise ChatError("invalid", "from_seq: an int")
+            box["items"], added = [x for x in box["items"] if x["seq"] < m["from_seq"]], None
+        await chat_write(chat_msg_key(tid), box)
+        last = box["items"][-1]["text"][:80] if box["items"] else ""
+        thread.update(updated_at=now, last=last)
+        await chat_write(CHAT_THREADS, threads)
+        return {"ok": True, "thread": thread, **({"items": added} if added is not None else {})}
+
+
+async def serve_chat_store(m):
+    try:
+        out = await chat_store(m)
+    except ChatError as e:
+        out = {"ok": False, "code": e.code, "text": e.text}
+    except (StateDown, HTTPException) as e:
+        out = {"ok": False, "code": "unavailable", "text": f"지금은 대화를 저장할 수 없어요({type(e).__name__})."}
+    await link_send({"id": m["id"], "type": "chat_store", **out})
+
+
 async def serve_history_turns(m):
     """A past call's turns for the voice server ("이어서 통화" in the app's call list). Full gateways only."""
     turns = []
@@ -2620,6 +2744,8 @@ async def handle_link(ws):
             tasks[m["id"]] = served(serve_tool(m), m)
         elif m.get("type") == "phone_result" and (f := phone_pending.get(m.get("id"))) and not f.done():
             f.set_result(m)
+        elif m.get("type") == "chat_store" and isinstance(m.get("id"), str):
+            tasks[m["id"]] = served(serve_chat_store(m), m)
         elif m.get("type") == "history_turns" and isinstance(m.get("id"), str):
             tasks[m["id"]] = asyncio.create_task(serve_history_turns(m))
         elif m.get("type") == "briefing_context" and isinstance(m.get("id"), str):
