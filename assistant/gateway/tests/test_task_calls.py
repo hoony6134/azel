@@ -280,7 +280,7 @@ def test_the_voip_push_always_carries_a_context_label(tmp_path, monkeypatch):
         asyncio.run(g.place_call("morning_briefing", "좋은 아침이에요."))
         asyncio.run(g.place_call("task", "끝났어요.", context={"kind": "task", "id": "abcabcabcabc", "label": "경쟁사 조사"}))
     assert pushes[0]["context"] == {"kind": "morning_briefing", "label": "아침 브리핑"}
-    assert pushes[1]["context"] == {"kind": "task", "id": "abcabcabcabc", "label": "작업 완료: 경쟁사 조사"}
+    assert pushes[1]["context"] == {"kind": "task", "id": "abcabcabcabc", "label": "경쟁사 조사"}  # bare: the app adds "작업: "
 
 
 def test_a_delegated_job_keeps_the_task_running_until_it_ends(tgw, monkeypatch):

@@ -1580,6 +1580,13 @@ CALL_LABELS = {"morning_briefing": "아침 브리핑", "deadline": "마감 알�
                "task_approval": "승인 필요", "overnight_report": "밤사이 작업"}
 LABEL_PREFIX = {"task": "작업 완료: ", "reminder": "알림: "}
 LABEL_MAX = 14
+KIND_LABEL = re.compile(r"^\s*(?:(?:알림|리마인더|작업\s*완료|작업|전화|예약)\s*[:：]\s*)+")
+
+
+def bare_label(text):
+    """A purpose without any kind label in front ("알림: 알림: 회의" -> "회의"): stored and sent bare, so the one place
+    that renders it (call_label here, CallContext.reason in the app) adds its label exactly once."""
+    return KIND_LABEL.sub("", re.sub(r"\s+", " ", strip_marks(str(text or ""))).strip())
 
 
 def call_label(reason, hint=""):
@@ -1587,7 +1594,7 @@ def call_label(reason, hint=""):
     approvals; "작업 완료: …" / "알림: …" from the purpose; otherwise the reason. At most LABEL_MAX characters."""
     if reason in CALL_LABELS:
         return CALL_LABELS[reason]
-    text = LABEL_PREFIX.get(reason, "") + re.sub(r"\s+", " ", strip_marks(str(hint or reason or ""))).strip()
+    text = LABEL_PREFIX.get(reason, "") + bare_label(hint or reason or "")
     return text if len(text) <= LABEL_MAX else text[:LABEL_MAX - 1].rstrip() + "…"
 
 
@@ -1605,6 +1612,8 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
     if extra:  # e.g. the overnight report after the briefing: said as written, never left to a model
         opening = f"{opening or ''} {extra}".strip()
     call_id = call_id or uuid.uuid4().hex
+    if context and context.get("label"):  # stored and relayed bare: whoever renders it adds the kind label once
+        context = {**context, "label": bare_label(context["label"]) or context["label"]}
     if (context or {}).get("kind") == "task" and (context or {}).get("id") and reason == "task":
         call_task[call_id] = context["id"]  # its follow-up instructions continue that task
     origin_session = origin_session if origin_session is not None else (origin_ctx.get() or None)  # call_user now
@@ -1623,7 +1632,10 @@ async def place_call(reason, opening=None, call_id=None, persona_id=None, origin
                      **({"detail": detail[:4000]} if detail else {})})  # what follow-up questions are answered from
     kind = (context or {}).get("kind") or ("task" if reason.startswith("task") else
                                            "schedule" if reason in ("wake", "reminder") else reason)
-    caller_ctx = {**(context or {}), "kind": kind, "label": call_label(reason, (context or {}).get("label"))}
+    # the bare purpose: the app's CallContext.reason adds its own "알림: " / "작업: " (it was added twice)
+    bare = bare_label((context or {}).get("label") or "")
+    caller_ctx = {**(context or {}), "kind": kind,
+                  "label": bare if kind in ("task", "schedule", "reminder") and bare else call_label(reason, bare)}
     push = await send_voip_push({"call_id": call_id, "reason": reason, "caller": persona["name"],  # every call is labeled
                                  "persona": persona["id"], "context": caller_ctx})
     return {"call_id": call_id, **push}
@@ -5005,7 +5017,8 @@ async def task_notify(t, approval=False):
             title = user_title(settings, persona)
             opening = task_summary(t, title) if approval else await task_briefing(t, title)
             origin = t.get("origin_session")
-            context = {"kind": "task", "id": t["id"], "label": openings.purpose_rule(t["goal"]) or t["goal"][:30]}
+            context = {"kind": "task", "id": t["id"],
+                       "label": bare_label(openings.purpose_rule(t["goal"]) or t["goal"][:30])}
             detail = f"목표: {t['goal'][:300]}\n결과: {(t.get('result') or t.get('error') or '')[:3000]}"
             if origin and origin in live_calls():
                 if await announce_in_call(origin, opening, detail, context):

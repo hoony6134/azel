@@ -350,9 +350,9 @@ def test_call_context_and_notify_change(tgw, monkeypatch):
     assert g.task_live[tid]["notify"] == "call"  # the runner's own copy changed
     asyncio.run(g.task_notify({**g.task_live[tid], "status": "done", "result": "끝"}))  # as the runner would at the end
     ctx = pushes[-1]["context"]
-    assert ctx["kind"] == "task" and ctx["id"] == tid and ctx["label"].startswith("작업 완료: ") and "해줘" not in ctx["label"]
+    assert ctx["kind"] == "task" and ctx["id"] == tid and not ctx["label"].startswith(("작업", "알림")) and "해줘" not in ctx["label"]
     chip = [f for f in frames if f.get("type") == "call"][-1]["context"]  # the call screen's chip: the purpose itself
-    assert chip["id"] == tid and "과제" in chip["label"] and len(ctx["label"]) <= 14
+    assert chip["id"] == tid and "과제" in chip["label"]  # the app clips the rendered line to 14
     c.post(f"/v1/tasks/{tid}/cancel")
     assert c.patch(f"/v1/tasks/{tid}", json={"notify": "push"}).status_code == 409  # finished: nothing to change
     at = (g.datetime.now(g.KST) + g.timedelta(hours=1)).replace(microsecond=0).isoformat()
