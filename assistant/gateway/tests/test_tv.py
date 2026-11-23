@@ -356,14 +356,14 @@ def test_no_display_field_starts_with_a_symbol():
 
 def test_monitors_parse_the_whole_status_page():
     groups = tv.parse_monitors((FIX / "tv_infra_status.txt").read_text())
-    assert [g["node"] for g in groups][:3] == ["deneb", "sadr", "albireo"] and groups[-1]["node"] == "external"
-    deneb = groups[0]
-    assert deneb["role"] == "Public Edge · Identity" and len(deneb["services"]) == 9
-    assert deneb["services"][0] == {"name": "Nginx Proxy Manager", "type": "http", "state": "up", "uptime": 100.0,
+    assert [g["node"] for g in groups][:3] == ["edge1", "core1", "exit1"] and groups[-1]["node"] == "external"
+    edge1 = groups[0]
+    assert edge1["role"] == "Public Edge · Identity" and len(edge1["services"]) == 9
+    assert edge1["services"][0] == {"name": "Nginx Proxy Manager", "type": "http", "state": "up", "uptime": 100.0,
                                     "ms": 15, "last_down": None}
-    restic = deneb["services"][1]
+    restic = edge1["services"][1]
     assert restic["type"] == "push" and restic["ms"] is None and restic["last_down"] == "2026-10-31 05:00"
-    assert deneb["services"][8]["name"] == "ntfy-relay · deneb (Kuma 알림 경로)"  # a name with its own ` · ` and parens
+    assert edge1["services"][8]["name"] == "ntfy-relay · edge1 (Kuma 알림 경로)"  # a name with its own ` · ` and parens
     claw = next(s for g in groups for s in g["services"] if s["name"].startswith("Vuja De claw"))
     assert claw == {"name": "Vuja De claw (NemoClaw)", "type": "http", "state": "down", "uptime": 2.85, "ms": None,
                     "last_down": None}
@@ -381,8 +381,8 @@ def test_infra_detail_joins_hosts_and_their_services():
 
     out = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: True, "infra_raw": raw}, NOW))
     assert ("infra_status", {"problems_only": False}) in asked  # the full page, not only problems
-    spark = next(h for h in out["hosts"] if h["name"] == "vd-spark")
-    assert spark["role"] == "Vuja De GPU" and spark["services"] == 4 and spark["services_down"] == 1
+    spark = next(h for h in out["hosts"] if h["name"] == "gpu-spark")
+    assert spark["role"] == "GPU Lab" and spark["services"] == 4 and spark["services_down"] == 1
     assert spark["temp"] == 62 and spark["status"] == "ok" and out["asof"] == "03:15" and out["alerts"] == []
     assert len(out["hosts"]) == 8 and len(out["groups"]) == 9  # 8 nodes + external sites
     off = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: False}, NOW))
@@ -408,7 +408,7 @@ def test_tasks_detail_from_real_rows():
     assert a["step"] == "spark에서 명령 실행 중" and a["started"].endswith("+09:00")
     assert len(out["recent"]) == 10 and out["approvals"] == 1
     first = out["recent"][0]
-    assert first["status"] == "done" and first["result"] == "대표님, 스파크에서 네모클로 서비스 재시작을 마쳤고 정상으로 확인했습니다."
+    assert first["status"] == "done" and first["result"] == "정훈님, 요청한 작업을 마쳤고 정상으로 확인했습니다."
     cancelled = next(r for r in out["recent"] if r["status"] == "cancelled")
     assert cancelled["result"] == "취소됐어요."  # a failure shows its error, not the half-written result
     failed = next(r for r in out["recent"] if r["status"] == "failed")
@@ -465,9 +465,9 @@ def test_weather_card_falls_back_to_recorded_open_meteo():
 def test_history_from_recorded_infra_query():
     cpu = tv.parse_history((FIX / "tv_history_cpu.txt").read_text())
     mem = tv.parse_history((FIX / "tv_history_mem.txt").read_text())
-    assert set(cpu) == set(mem) and len(cpu) == 8 and "vd-spark" in cpu
+    assert set(cpu) == set(mem) and len(cpu) == 8 and "gpu-spark" in cpu
     assert all(len(v) == 8 and None not in v and all(0 <= x <= 100 for x in v) for v in [*cpu.values(), *mem.values()])
-    assert mem["deneb"][0] == 71  # `{ago="21",node="deneb"} 71`: the oldest point comes first
+    assert mem["edge1"][0] == 71  # `{ago="21",node="edge1"} 71`: the oldest point comes first
     q = tv.history_query("mem")
     assert len(q) <= 2000 and q.count("offset") == 14 and '"ago", "0"' in q  # infra_query's limit; 7 offsets × 2 selectors
 
@@ -483,8 +483,8 @@ def test_infra_detail_carries_24h_history():
         return mem if "MemAvailable" in q else cpu
 
     out = asyncio.run(tv.build_infra_detail({"infra_ok": lambda: True, "infra_raw": raw, "query": query}, NOW))
-    deneb = next(h for h in out["hosts"] if h["name"] == "deneb")
-    assert len(deneb["cpu_24h"]) == 8 and deneb["mem_24h"][0] == 71
+    edge1 = next(h for h in out["hosts"] if h["name"] == "edge1")
+    assert len(edge1["cpu_24h"]) == 8 and edge1["mem_24h"][0] == 71
 
 
 def quote_transport():
