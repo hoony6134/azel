@@ -589,7 +589,9 @@ def test_limited_writer_cannot_steer_full_gateways(gw, monkeypatch):
         probed.append((url, token))
         return {"ok": True, "ms": 1}
     monkeypatch.setattr(g, "probe", fake_probe)
-    c.get("/v1/status")
+    assert c.get("/v1/status").json()["calls"] == 0
+    g.call_warm_keys["log9"], g.call_started["log9"] = "azel:call-9", time.time()  # a call in progress
+    assert c.get("/v1/status").json()["calls"] == 1
     assert ("http://evil/mcp", False) in probed and ("http://100.64.0.8:8893/mcp", True) in probed
     assert all(not tok for url, tok in probed if url.endswith("/health"))  # health checks carry no token
 

@@ -2826,6 +2826,7 @@ async def status():
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
             "google": google_status(),  # connected | expired (the app shows "Google 다시 연결") | none
+            "calls": len(live_calls()),  # calls in progress (a count, no keys): a restart now would drop them
             "devices": [{"id": d["id"], "name": d["name"], "limited": bool(d.get("limited")), **p,
                          "fresh": time.time() - d["last_seen"] < DEVICE_FRESH_S} for d, p in zip(devs, probes[3:])]}
 
