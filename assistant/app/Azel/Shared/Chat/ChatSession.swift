@@ -34,6 +34,9 @@ final class ChatSession: ObservableObject {
 
     var busy: Bool { transcript.busy }
 
+    /// A reopened thread's past messages (the server resumes its context on the same session).
+    func restore(_ t: ChatTranscript) { if transcript.messages.isEmpty { transcript = t } }
+
     // MARK: user actions
 
     func send(_ raw: String) {

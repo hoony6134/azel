@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import Azel
 
 final class ChatTranscriptTests: XCTestCase {
@@ -118,5 +119,40 @@ final class ChatPlumbingTests: XCTestCase {
         let blocks = ChatMarkdown.parse("목록:\n- 하나\n- 둘\n\n```swift\nlet x")
         XCTAssertEqual(blocks.count, 3)
         if case .code(let lang, let text) = blocks.last { XCTAssertEqual(lang, "swift"); XCTAssertEqual(text, "let x") } else { XCTFail("open fence is code") }
+    }
+}
+
+/// Renders a sample conversation's rows (light and dark) for review; writes PNGs only when asked.
+@MainActor
+final class ChatRenderTests: XCTestCase {
+    func testRowsRender() throws {
+        let session = ChatSession(session: "chat-render")
+        var t = ChatTranscript()
+        t.send("내일 일정이랑 할 일 알려줘")
+        t.apply(CallEvent(type: "card", card: CardSamples.agenda, replyId: 1))
+        t.apply(CallEvent(type: "reply_start", replyId: 1))
+        let md = "내일은 **두 가지** 일정이 있어요.\n\n1. 10:00 컴파일러 수업\n2. 19:00 저녁 약속\n\n| 과목 | 마감 |\n|---|---|\n| 컴파일러 | D-2 |\n\n```swift\nlet ready = true\n```"
+        t.apply(CallEvent(type: "reply_delta", text: md, replyId: 1))
+        t.apply(CallEvent(type: "turn_done"))
+        session.restore(t)
+        let folder = AzelFiles.folder.appendingPathComponent("card-previews")
+        let write = FileManager.default.fileExists(atPath: AzelFiles.folder.appendingPathComponent("card-previews.request").path)
+        if write { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        for scheme in [ColorScheme.light, .dark] {
+            let view = VStack(alignment: .leading, spacing: 16) {
+                ForEach(session.transcript.messages) { m in
+                    ChatMessageRow(message: m, session: session, isLast: m.id == session.transcript.messages.last?.id,
+                                   isLastUser: m.role == .user)
+                }
+            }
+            .padding(16).frame(width: 560).background(Theme.bg).environment(\.colorScheme, scheme)
+            let r = ImageRenderer(content: view); r.scale = 2
+            let image = try XCTUnwrap(r.cgImage)
+            XCTAssertGreaterThan(image.height, 300)
+            if write {
+                try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?
+                    .write(to: folder.appendingPathComponent("chat-\(scheme == .dark ? "dark" : "light").png"))
+            }
+        }
     }
 }
