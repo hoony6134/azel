@@ -389,13 +389,8 @@ MODEL_WORDS = {"opus": rf"(오퍼스|opus){_USE}", "sonnet": rf"(소넷|sonnet){
                "nim": rf"(엔비디아|nvidia|\bnim){_USE}"}  # NVIDIA NIM on a full gateway (gateway/nim.py)
 USE_CLAUDE = re.compile(rf"(클로드|claude){_USE}|(클로드|claude)(가|이)\s*(해|답|풀|찾|봐|알아)", re.I)
 # "클로드는 쓰지마", "클로드 말고 네가 해": this turn stays on the local model, whatever else it says.
-LOCAL_FIRST = os.environ.get("LOCAL_FIRST", "1") != "0"  # see pre_route
 CLAUDE_NO = re.compile(r"(클로드|claude)\s*(는|은|를|도|가|이)?\s*(쓰지|쓰면|부르지|호출하지|빼고|없이|말고|안 ?써|안 ?불러|필요 ?없)"
                        r"|(로컬|네가|니가|너가)\s*(로|만|혼자)?\s*(해|처리|답)", re.I)
-# Needs live data or a device: straight to Claude without asking Qwen (Qwen would guess).
-NEEDS_CLAUDE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집|서버|디스크|GPU|메모리 사용"
-                          r"|spark|ruchba|albireo|gienah|deneb|macbook"
-                          r"|스파크|루크바|알비레오|기에나|데네브", re.I)  # Korean: how Whisper spells the spoken names
 # Personal data only full-mode gateways may touch (same list as the gateway's PERSONAL).
 # "내일 내가 해야 될 일", "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘": the user's own plans, said without 일정/할 일
 PLANS_ASK = (r"해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게) ?(뭐|있|정리|알려)"
@@ -721,14 +716,10 @@ BRAIN_FRESH_S = 900  # an older context block is ignored (the brain pushes one a
 RECALL_WAIT_S = 0.4  # per-turn memory retrieval may delay the answer this much at most
 TOOL_WAIT_S = 3.0  # a slow brain never stalls a turn
 TOOL_TAG = "[TOOL]"
-MEMORY_CUE = re.compile(r"아까|지난번|저번에|예전에|전에 (내가|우리|네가)|했었|했던|라고 했|물어봤")
 BRAIN_TOOLS = ("search_memory", "add_todo", "done_todo", "device_status", "situation")  # a brain without a tool list
 TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
-# With the brain's read-only server tools, a status question stays local; doing something on a server does not.
+# Live data a web search answers (weather, news, prices).
 WEB_LIVE = re.compile(r"날씨|비 ?와|눈 ?와|뉴스|환율|주가|시세|가격|코인|비트코인|이더리움|주식|증시|코스피|나스닥|검색|찾아(서|줘|봐)|맛집")
-STATUS_Q = re.compile(r"괜찮|상태|살아 ?있|켜져|꺼졌|다운|죽었|문제|경보|알림|이상|느려|디스크|용량|온도|메모리")
-DEVICE_Q = re.compile(r"(맥북|macbook|기기|노트북|컴퓨터).{0,6}(켜져|꺼져|꺼졌|연결|살아|온라인|오프라인)", re.I)
-SERVER_ACTION = re.compile(r"재시작|재부팅|리부트|고쳐|켜 ?줘|꺼 ?줘|지워|삭제|정리해|로그|배포|실행|돌려|설치")
 
 
 def _take_context(self, session, value, persona=None):
@@ -1273,41 +1264,12 @@ def pick(table, text):
     return next((k for k, pat in table.items() if re.search(pat, text, re.I)), None)
 
 
-def pre_route_keywords(text, settings, local=False, tools=()):
-    """(straight to Claude?, model) decided by keywords and settings, before any LLM call.
-
-    local=True (the brain's context is in Qwen's prompt): personal questions go to Qwen first, which answers from
-    the context or its tools, or hands over with the routing tag."""
-    forced_model = pick(MODEL_WORDS, text)
-    default = settings.get("default_model", "auto")
-    model = forced_model or (default if default in MODEL_WORDS else None)
-    if local:  # "아까 날씨 물어봤을 때 뭐라 했지?" is memory, not live data: Qwen decides
-        # "서버 괜찮아?", "스파크는?" (a short follow-up), "맥북 켜져 있어?": a status question the brain's tools
-        # answer (infra_health for servers, device_status for devices). Doing something there still goes to Claude.
-        status = (STATUS_Q.search(text) or len(text.strip()) <= 10) and not SERVER_ACTION.search(text) \
-            and not WEB_LIVE.search(text)
-        server_status = status and "infra_health" in tools
-        device_status = status and "device_status" in tools and DEVICE_Q.search(text)
-        live = NEEDS_CLAUDE.search(text) and not MEMORY_CUE.search(text) and not server_status and not device_status \
-            and not ("web_search" in tools and WEB_LIVE.search(text))  # weather, news, prices: Qwen searches
-        task = pick({k: v for k, v in TASK_WORDS.items() if k != "schedule"}, text)
-        keywords = USE_CLAUDE.search(text) or live or (task and not device_status)
-    else:
-        # a personal word alone ("할 일이 많아.") is talk, not a request for the data: only a question or ask goes
-        personal = re.search(PLANS_ASK, text) or (PERSONAL.search(text) and QUESTION.search(text))
-        task = pick(TASK_WORDS, text)
-        keywords = USE_CLAUDE.search(text) or personal or NEEDS_CLAUDE.search(text) or (task and (task != "schedule" or personal))
-    return bool(forced_model) or default in MODEL_WORDS or bool(keywords), model
-
-
 def pre_route(text, settings, local=False, tools=()):
     """(straight to Claude?, model) before any LLM call. Local first (user decision 2026-11-23): only a model or Claude
     the user asked for by name, or a default model set in the settings, goes straight to Claude. Everything else
     (schedules, weather, prices, servers, devices, files) starts on Qwen with its tools; Qwen hands over with the routing
     tag when it truly can't, and the claim/promise guards in respond() hand over when it says it did what no tool did.
     `local` and `tools` are kept for the callers: the answer no longer depends on them."""
-    if not LOCAL_FIRST:  # LOCAL_FIRST=0: the keyword routing from before, no redeploy needed to go back
-        return pre_route_keywords(text, settings, local, tools)
     forced_model = pick(MODEL_WORDS, text)
     default = settings.get("default_model", "auto")
     model = forced_model or (default if default in MODEL_WORDS else None)
@@ -3773,16 +3735,15 @@ if __name__ == "__main__":
         assert barge_verdict("아니 잠깐만 그거 말고", 1.0, _VT(), "오늘 일정은 두 건이에요.") == "interrupt"
         assert all(HOLD.fullmatch(x) for x in ("잠깐만", "잠깐만요.", "음…", "아, 잠시만", "생각 좀 해볼게", "기다려 줘", "그러니까"))
         assert not any(HOLD.fullmatch(x) for x in ("잠깐만 일정 알려줘", "음 그래서 뭐 했지", "기다려 주셔서 감사해요", "아니 그거 말고"))
-        # the checks below exercise the keyword routing (LOCAL_FIRST=0); the local-first rules are checked right here
-        LOCAL_FIRST = True
+        # local first: only a model or Claude asked for by name, or a default model, goes straight to Claude
         for ask in ("오늘 일정 뭐야?", "광주 날씨 어때?", "삼성전자 주가 알려줘", "서버 괜찮아?", "스파크 재시작해 줘",
-                    "맥북 다운로드 폴더에 파일 넣어 줘", "오늘 해야 될 일정 브리핑 해줘", "내가 가진 주식 오늘 알려줘"):
+                    "맥북 다운로드 폴더에 파일 넣어 줘", "오늘 해야 될 일정 브리핑 해줘", "내가 가진 주식 오늘 알려줘",
+                    "비트코인 가격 알려줘", "레포 빌드 에러 고쳐 줘", "맥북 켜져 있어?"):
             assert pre_route(ask, {}) == (False, None), ask  # local first: Qwen has its tools, and hands over itself
         assert pre_route("클로드로 해 줘", {})[0] and pre_route("오퍼스로 풀어 줘", {}) == (True, "opus")  # asked by name
         assert pre_route("안녕", {"default_model": "sonnet"}) == (True, "sonnet")  # a default set in the settings
         assert not pre_route("스파크 재시동이죠 클로드는 쓰지마", {})[0] and CLAUDE_NO.search("클로드 말고 네가 해")
         assert not CLAUDE_NO.search("클로드로 해 줘") and not CLAUDE_NO.search("오늘 일정 알려줘")
-        LOCAL_FIRST = False
         def nomode(f):  # state frames carry the call's brain mode and secret flag; most checks don't care
             return {k: v for k, v in f.items() if k not in ("mode", "secret", "auto")} if isinstance(f, dict) else f
         assert split_ready("안녕하세요. 오늘", False) == (["안녕하세요."], "오늘")
@@ -4191,9 +4152,6 @@ if __name__ == "__main__":
         assert clip_tool(month, "agenda").endswith("(이후 생략)") and len(clip_tool(month, "agenda")) > 5000
         assert clip_tool(month, "web_search").endswith("(이후 생략)") and len(clip_tool(month, "web_search")) <= 2010
         assert clip_tool("짧은 결과", "agenda") == "짧은 결과"
-        for live in ("비트코인 가격 알려줘", "코스피 얼마야?", "이더리움 지금 얼마야", "아이폰 가격 얼마야?"):
-            assert pre_route(live, {})[0] and pre_route(live, {}, local=True)[0], live  # live prices: Claude
-        assert not pre_route("38500원을 세 명이 나누면 얼마야?", {})[0]  # arithmetic stays on Qwen
         # the title: the call's first reply only, and only when the model left it out; nothing else is rewritten
         assert Address("대표님", "h1", False)("아저씨, 오늘은 쉬세요.") == "아저씨, 오늘은 쉬세요."
         assert Address("오빠", "h4", False)("오빠, 밥 먹었어?") == "오빠, 밥 먹었어?"
@@ -4213,8 +4171,6 @@ if __name__ == "__main__":
         assert stub("아, 그거!") and stub("오빠, 아, 그거!", "오빠") and stub("네.") and not stub("오, 좋아! 카레 먹자.")
         assert not stub("세 개야.") and not stub("아, 카페 로고 의뢰야.")
         assert stub("아, 미안.") and not stub("아, 미안. 나 그래픽 디자이너야.")
-        for ask in ("오늘 광주 날씨 어때?", "비트코인 시세 알려줘"):  # with the gateway's web_search: Qwen answers
-            assert not pre_route(ask, {}, local=True, tools=("web_search",))[0] and pre_route(ask, {}, local=True)[0], ask
         assert korean_only("기상청 기준으로 맑아요 (https://www.weather.go.kr/w/index.do).") == "기상청 기준으로 맑아요."
         assert korean_only("자세한 건 www.example.com 참고하세요.") == "자세한 건 참고하세요."
         for ask in ("내가 좋아하는 커피 뭐였지?", "내 주변 사람 누구 있어?", "내가 좋아하는 커피 기억해 줘", "지도교수님 누구야?"):
@@ -4342,7 +4298,7 @@ if __name__ == "__main__":
         # 2026-11-21 23:35 call: "내일 내가 해야 될 일도 정리해줘" reached Qwen, which made up two plans
         for ask in ("내일 내가 해야 될 일도 정리해줘", "알았어 고마워. 그리고 내일 내가 해야 될 일들도 좀 정리해줘.",
                     "오늘 뭐 해야 돼?", "이번 주 계획 정리해 줘", "토요일에 뭐 있어?"):
-            assert pre_route(ask, {})[0] and PERSONAL.search(ask) and pick(TASK_WORDS, ask) == "schedule", ask
+            assert PERSONAL.search(ask) and pick(TASK_WORDS, ask) == "schedule", ask
         for chat in ("오늘 날씨 좋다", "뭐 해?", "해야 될 말이 있어"):
             assert not PERSONAL.search(chat), chat
         said, _ = asyncio.run(ack_check(["내일 일정은 두 건이에요. 오전 열 시에 팀 회의, 오후 세 시에 프로젝트 마감이에요."],
@@ -4361,7 +4317,7 @@ if __name__ == "__main__":
         assert grounded("회의는 지금 확인이 안 돼요.", "") and not grounded("오늘 수업이 세 개 있어요.", "")
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
 
-        async def late_tag_check():  # Qwen starts answering, then emits the tag: Claude takes over, the tag is never spoken
+        async def late_tag_check():  # Qwen answers, then emits the tag: the answer stands, the tag is never spoken
             async def tagging_llm(messages, max_tokens=600):
                 for d in ["수요", "일이요. [CL", "AUDE]"]:
                     yield d
@@ -4392,7 +4348,7 @@ if __name__ == "__main__":
         assert merged[0] == "첫 문장은 이렇게 말해요." and len(merged) < 5, merged
         assert " ".join(merged) == "첫 문장은 이렇게 말해요. 두 번째 문장이에요. 세 번째 문장이에요. 네 번째 문장도 있어요. 마지막 문장입니다."
         globals().update(llm_stream=real_llm, claude_stream=real[0], tts=real[1], FILLER_AFTER_S=real[2])
-        assert not any("CLA" in s or "[" in s for s in said_late) and said_late[-1] == "정확히 확인해 보니 목요일이에요.", said_late
+        assert said_late == ["수요일이요."], said_late  # already answered: the late tag is dropped, never spoken
         async def prefetch_check():  # the opening is synthesized when the call message arrives, not on connect
             spoken = []
 
@@ -5858,7 +5814,7 @@ if __name__ == "__main__":
         def hangup_check():
             """A Claude turn is running when the caller hangs up: the ask is cancelled over the link."""
             async def stt(audio):
-                return "맥북 서버 상태 자세히 봐 줘"
+                return "클로드로 맥북 서버 상태 자세히 봐 줘"
             from fastapi.testclient import TestClient
             globals().update(transcribe=stt, SileroVoiceActivityDetector=lambda: (lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000)))
             gw_ws = FakeWS()
@@ -6001,17 +5957,6 @@ if __name__ == "__main__":
             links.receive(lim, {"type": "hello", "device": "x", "mode": "full", "role": "brain"})
             assert not lim.brain  # a link_limited token cannot pose as the brain
             links.remove(lim)
-            assert pre_route("오늘 일정 뭐야?", {})[0] and not pre_route("오늘 일정 뭐야?", {}, local=True)[0]
-            infra = {"infra_health", "gistra_today"}
-            assert not pre_route("서버 괜찮아?", {}, local=True, tools=infra)[0] and pre_route("서버 괜찮아?", {}, local=True)[0]
-            assert not pre_route("스파크 디스크 용량 어때?", {}, local=True, tools=infra)[0]
-            assert pre_route("스파크 재시작해 줘", {}, local=True, tools=infra)[0]  # an action: still Claude
-            assert not pre_route("스파크는?", {}, local=True, tools=infra)[0]  # a short status follow-up
-            assert not pre_route("맥북 켜져 있어?", {}, local=True, tools={"device_status"})[0]
-            assert pre_route("맥북 파일 정리해 줘", {}, local=True, tools={"device_status", "infra_health"})[0]
-            assert pre_route("맥북 켜져 있어?", {}, local=True, tools=())[0]  # no device tool: as before
-            assert pre_route("서버 상태 검색해 줘", {}, local=True, tools=infra)[0]
-            assert pre_route("날씨 어때?", {}, local=True)[0] and not pre_route("아까 날씨 물어봤을 때 뭐라 했어?", {}, local=True)[0] and pre_route("레포 빌드 에러 고쳐 줘", {}, local=True)[0]
             assert [tag_state(h) for h in ("[TO", "[TOOL] {", "[C")] == ["maybe", "tool", "maybe"]
             prompts = []
 
