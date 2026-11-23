@@ -447,20 +447,32 @@ final class CallClient {
 
     /// The route changed under the engine: restart it once (a restart can itself post a change).
     private func routeChanged() {
-        guard socket != nil, routeGate.shouldRestart(now: ProcessInfo.processInfo.systemUptime) else { return }
         #if os(macOS)
-        restartAudioInBackground { [weak self] in self?.onWarning?("오디오 장치를 바꾸지 못했어요") }
+        // No time gate here: the debounce plus "only a stopped engine restarts" stop a storm, and a gate
+        // could swallow the one change that really stopped the engine.
+        guard socket != nil else { return }
+        // Changes come in bursts while a device settles: act once, after it has been quiet for a moment.
+        routeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.restartAudioInBackground { [weak self] in self?.onWarning?("오디오 장치를 바꾸지 못했어요") }
+        }
+        routeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.routeSettle, execute: work)
         #else
+        guard socket != nil, routeGate.shouldRestart(now: ProcessInfo.processInfo.systemUptime) else { return }
         do { try restartAudio() } catch { onWarning?("오디오 장치를 바꾸지 못했어요") }
         #endif
     }
 
     #if os(macOS)
+    private var routeWork: DispatchWorkItem?
+    static let routeSettle = 0.3
+
     /// macOS: the restart runs on AudioIO's queue; `failed` on main, only while this call is still up.
-    func restartAudioInBackground(failed: @escaping () -> Void) {
+    func restartAudioInBackground(force: Bool = false, failed: @escaping () -> Void) {
         guard let task = socket else { return }
         routeGate.restarted(now: ProcessInfo.processInfo.systemUptime)
-        audio.restartInBackground { [weak self] error in
+        audio.restartInBackground(force: force) { [weak self] error in
             guard let self, task === self.socket, !(error is AudioIO.Cancelled) else { return }
             if error != nil { return failed() }
             if held { audio.pause() }
@@ -482,6 +494,9 @@ final class CallClient {
         micHoldLock.lock(); micHold = nil; micHoldLock.unlock()
         _ = beginCall()            // the old socket's late frames are dropped from here on
         silenceCheck?.cancel()
+        #if os(macOS)
+        routeWork?.cancel(); routeWork = nil
+        #endif
         pulseTimer?.invalidate()
         pulseTimer = nil
         thinking = ThinkingCues()

@@ -132,7 +132,7 @@ final class AudioIO {
         engine.connect(cuePlayer, to: engine.mainMixerNode, format: PCM.speakerFormat)
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             guard let self, self.started else { return }
-            Log.call.notice("audio route changed: restarting the engine (queued reply audio is dropped)")
+            Log.call.info("audio route changed")
             self.onConfigurationChange?()
         }
     }
@@ -182,17 +182,28 @@ final class AudioIO {
     }
 
     /// The route or device changed: stop and start again on the engine queue; `done` on main.
-    func restartInBackground(_ done: @escaping (Error?) -> Void) {
+    /// `force`: the user picked another device, so restart even though the engine runs.
+    func restartInBackground(force: Bool = false, _ done: @escaping (Error?) -> Void) {
         let gen = currentGeneration
         engineQueue.async { [self] in
             var failure: Error?
-            if gen != currentGeneration { failure = Cancelled() } else {
+            if gen != currentGeneration { failure = Cancelled() } else if isRunning && !force {
+                // Voice processing reconfigures the device while it starts, which posts a change even
+                // though the engine is fine. Restarting anyway posted the next one: a restart every
+                // ~1 s with no mic frames for the whole call (2026-11-23). Only a stopped engine restarts.
+                Log.call.notice("audio route changed: engine still running, no restart")
+            } else {
+                Log.call.notice("audio restart: engine \(force ? "on a device change" : "stopped"), restarting (queued reply audio is dropped)")
+                restarts += 1
                 stopEngine()
                 do { try start() } catch { failure = error }
             }
             DispatchQueue.main.async { done(failure) }
         }
     }
+
+    /// Restarts actually done (tests).
+    private(set) var restarts = 0
 
     /// Waits for queued engine work (tests).
     func drainEngineQueue() { engineQueue.sync {} }

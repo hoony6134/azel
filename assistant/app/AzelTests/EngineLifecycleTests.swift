@@ -49,6 +49,7 @@ final class EngineLifecycleTests: XCTestCase {
         audio.restartInBackground { error in XCTAssertNil(error); restarted.fulfill() }
         wait(for: [restarted], timeout: 2)
         XCTAssertTrue(audio.isRunning)
+        XCTAssertEqual(audio.restarts, 0, "a change while the engine runs restarts nothing (2026-11-23 restart storm)")
         audio.stop()
         audio.drainEngineQueue()
         XCTAssertFalse(audio.isRunning)
@@ -59,6 +60,19 @@ final class EngineLifecycleTests: XCTestCase {
         wait(for: [ended], timeout: 2)
         audio.drainEngineQueue()
         XCTAssertFalse(audio.isRunning)
+    }
+
+    /// A change that really stopped the engine restarts it.
+    func testStoppedEngineRestarts() {
+        let audio = AudioIO()
+        try? audio.start()
+        audio.stop()
+        let done = expectation(description: "restarted")
+        audio.restartInBackground { error in XCTAssertNil(error); done.fulfill() }
+        wait(for: [done], timeout: 2)
+        XCTAssertEqual(audio.restarts, 1)
+        XCTAssertTrue(audio.isRunning)
+        audio.stop()
     }
     #endif
 

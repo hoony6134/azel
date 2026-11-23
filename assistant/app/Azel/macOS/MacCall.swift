@@ -345,7 +345,7 @@ final class MacCall: ObservableObject {
         UserDefaults.standard.set(outputUID, forKey: "outputDevice")
         applyDevices()
         guard inCall else { return }
-        client.restartAudioInBackground { [weak self] in
+        client.restartAudioInBackground(force: true) { [weak self] in
             self?.end(error: CallClient.StartError.audio.localizedDescription, keepPanel: true)
         }
     }
