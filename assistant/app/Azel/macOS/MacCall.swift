@@ -194,14 +194,16 @@ final class MacCall: ObservableObject {
     /// The listener's recording of what followed the name; sent before the live mic.
     private var pendingUtterance: String?
 
-    /// Waits for the listener's recording (wake) and for the listener to close its mic, then starts the
-    /// engine off the main thread. Two processes on the mic made voice processing block main for 3 s and
-    /// rebuild over and over (2026-11-23). The utterance goes out once audio is up, ahead of the live mic.
+    /// Waits for the listener's recording (wake) or for the listener to close its mic (other calls), then
+    /// starts the engine off the main thread. On a wake the listener keeps recording until our mic is live
+    /// (its bridge tail), so the ~0.9 s engine start is no hole; it only reads the mic meanwhile, plays
+    /// nothing, and the engine restarts only when really stopped, so the 3 s stall and the restart storm of
+    /// 2026-11-23 (two processes plus restarting on every change) don't come back.
     private func startAudio(utterance id: String?, mode: String?, secret: Bool) {
         let call = connectedAt
         Task { [weak self] in
             let got: (data: Data?, at: Double?) = if let id { await AzelFiles.takeUtterance(id) } else { (nil, nil) }
-            let released = await AzelFiles.listenerReleased()
+            let released = id != nil ? true : await AzelFiles.listenerReleased()
             guard let self, self.inCall, self.connectedAt == call else { return }
             // The socket opens once the recording is known (see callIntent); its handshake overlaps the engine start.
             do {
@@ -209,18 +211,38 @@ final class MacCall: ObservableObject {
                                      persona: self.activePersona?.id, mode: mode, secret: secret)
             } catch { return self.end(error: error.localizedDescription, keepPanel: true) }
             if !released { Log.call.notice("listener still holds the mic; starting anyway") }
-            self.client.markTiming("listener_off")
+            self.client.markTiming(id != nil ? "engine_start" : "listener_off")
             self.client.startAudio { [weak self] error in
                 guard let self else { return }
                 if let error { return self.end(error: error.localizedDescription, keepPanel: true) }
-                AzelFiles.micLive.create()
-                if id != nil {
-                    self.client.releaseMic(first: got.data, cutoff: got.at)
-                    self.client.markTiming(got.data == nil ? "utterance_none" : "utterance_sent")
-                    if let d = got.data { Log.call.notice("wake utterance \(d.count / 32) ms") }
-                }
+                AzelFiles.micLive.create()   // the listener's bridge stops on its next frame
+                if let id { self.sendRecorded(id, utterance: got) }
                 if self.pttCall || self.talking { self.client.cue(.wake, listening: false) }
             }
+        }
+    }
+
+    /// The command, then the bridge tail, then the held live frames from when the listener stopped: one
+    /// continuous stream with no hole (live frames before the stop are dropped as already covered).
+    private func sendRecorded(_ id: String, utterance got: (data: Data?, at: Double?)) {
+        let call = connectedAt
+        Task { [weak self] in
+            let tail = await AzelFiles.takeTail(id)
+            guard let self, self.inCall, self.connectedAt == call else { return }
+            self.client.markTiming("listener_off")
+            let first = Self.joined(got.data, tail.data)
+            self.client.releaseMic(first: first, cutoff: tail.at ?? got.at)
+            self.client.markTiming(first == nil ? "utterance_none" : "utterance_sent")
+            Log.call.notice("wake hand-off: command \((got.data?.count ?? 0) / 32, privacy: .public) ms + bridge \((tail.data?.count ?? 0) / 32, privacy: .public) ms")
+        }
+    }
+
+    nonisolated static func joined(_ a: Data?, _ b: Data?) -> Data? {
+        switch (a, b) {
+        case let (a?, b?): return a + b
+        case let (a?, nil): return a
+        case let (nil, b?): return b
+        default: return nil
         }
     }
 

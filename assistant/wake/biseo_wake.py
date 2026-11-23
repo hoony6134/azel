@@ -71,7 +71,11 @@ DEFAULTS = {
     # The pause that ends a one-breath command. The turn's own silence_ms (600) cut "오늘 아침 | 컴파일러 프로젝트
     # 관련 일정 삭제해" after "오늘 아침" (2026-11-23), and what followed fell into the ~0.9 s before the app's mic
     # was up. Korean commands pause mid-sentence; the trailing silence is trimmed off the recording anyway.
-    "utterance_silence_ms": 1100,  # audio kept from before the first voiced frame (the wake word's tail edge)
+    "utterance_silence_ms": 1100,
+    # After the command the listener keeps recording until the app's mic is live (mic-live), at most this long,
+    # and hands that tail over in wake-utterance-<id>.tail: the ~0.9 s the app's voice processing takes to start
+    # was a hole where words were lost (2026-11-23). Only the listener reads the mic until then.
+    "bridge_max_s": 4,  # audio kept from before the first voiced frame (the wake word's tail edge)
     "enrolling_path": "~/Library/Application Support/Azel/enrolling",  # the app's wake-clip recording screen
     "enrolling_stale_s": 1800,
     # Exists while this listener's input stream is open. The app waits for it to go before starting voice
@@ -219,6 +223,7 @@ class Listener:
                 pcm = self.capture_utterance(frames, ring)  # always written, empty when nobody spoke: the app waits for it
                 entry["utterance"], entry["utterance_s"] = uid, round(len(pcm) / SR, 2)
                 self.write_utterance(uid, pcm)
+                self.bridge(uid, frames)
             if opened:
                 self.deaf_until = self.clock() + self.cfg["handoff_ignore_s"]
             else:  # no headless fallback in app mode: the app answers, or nobody does
@@ -271,6 +276,30 @@ class Listener:
         if silent > 1:  # keep one quiet frame: the pause that ended it would end the server's turn too (500 ms)
             speech = speech[:len(speech) - (silent - 1)]
         return np.concatenate(speech) if speech else np.zeros(0, dtype=np.int16)
+
+    def bridge(self, uid, frames):
+        """Keep recording after the command until the app's mic is live (or bridge_max_s), then hand the tail
+        over as wake-utterance-<uid>.tail (its .part exists meanwhile so the app knows one is coming)."""
+        d, _, final = self.utterance_paths(uid)
+        part, tail = final.with_suffix(".tail.part"), final.with_suffix(".tail")
+        live = Path(self.cfg["mic_live_path"]).expanduser()
+        out, cap = [], int(self.cfg["bridge_max_s"] / FRAME_S)
+        try:
+            part.touch(mode=0o600)
+        except OSError:
+            return
+        if not live.exists():  # the capture may already have ended on mic-live: then there is nothing to bridge
+            for n, frame in enumerate(frames, 1):
+                out.append(frame)
+                if live.exists() or n >= cap:
+                    break
+        pcm = np.concatenate(out) if out else np.zeros(0, dtype=np.int16)
+        try:
+            with open(part, "wb") as f:
+                f.write(pcm.astype("<i2").tobytes())
+            os.replace(part, tail)
+        except OSError as e:
+            print(f"bridge tail failed ({type(e).__name__}: {e})", flush=True)
 
     def utterance_paths(self, uid):
         d = Path(self.cfg["utterance_dir"]).expanduser()
@@ -517,7 +546,10 @@ class Mic:
         peak = 0
         with self.stream:
             for n in itertools.count(1):
-                frame = self.q.get()
+                try:  # a stalled stream (another app reconfiguring the device) must not hang the bridge
+                    frame = self.q.get(timeout=1)
+                except queue.Empty:
+                    frame = np.zeros(FRAME, dtype=np.int16)
                 peak = max(peak, int(np.abs(frame).max()))
                 if n == 20 and peak == 0:  # macOS hands a process without mic permission pure zeros
                     print("WARNING: microphone is silent; check System Settings > Privacy & Security"

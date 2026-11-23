@@ -467,7 +467,7 @@ def test_part_file_exists_while_capturing_and_is_renamed_when_done(tmp_path):
 
     lis.run(stream())
     assert seen == [[".pcm.part"]]
-    assert [p.suffix for p in (tmp_path / "azel").iterdir()] == [".pcm"]
+    assert sorted(p.suffix for p in (tmp_path / "azel").iterdir()) == [".pcm", ".tail"]  # the command, then the bridge tail
 
 
 def test_unwritable_utterance_dir_hands_over_without_the_file(tmp_path, capsys):
@@ -527,3 +527,33 @@ def test_supervise_releases_the_mic_for_a_call_and_marks_it_only_while_open(tmp_
     assert seen == [True, True] and all(m.closed for m in mics)
     assert slept[:3] == [(lis.cfg["busy_check_s"], False)] * 3  # released (marker gone) for the whole call
     assert not marker.exists()
+
+
+def test_the_listener_bridges_until_the_app_mic_is_live(tmp_path):
+    """The command, then the tail up to mic-live: no hole while the app's voice processing starts."""
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+    live = tmp_path / "mic-live"
+
+    def stream():
+        yield from frames(clock, [(WAKE, 1), (SPEECH, 4)])
+        yield from frames(clock, [(SIL, 7)])  # the pause that ends the command (1.1 s)
+        utt = tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm"
+        yield from frames(clock, [(SPEECH, 3)])  # talking on while the app's engine starts
+        assert utt.exists() and (tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.tail.part").exists()
+        live.write_text("")  # the app's mic is live
+        yield from frames(clock, [(SPEECH, 1), (SIL, 40)])
+
+    lis.run(stream())
+    d = tmp_path / "azel"
+    tail = np.frombuffer((d / f"wake-utterance-{uid_of(opened[0])}.tail").read_bytes(), "<i2")
+    assert (tail == SPEECH).sum() == 4 * FRAME and len(tail) == 4 * FRAME, "the words after the command, up to mic-live"
+    assert not (d / f"wake-utterance-{uid_of(opened[0])}.tail.part").exists()
+
+
+def test_bridge_gives_up_after_its_cap(tmp_path):
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True, bridge_max_s=0.5)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 2), (SIL, 60)]))
+    tail = (tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.tail").read_bytes()
+    assert len(tail) == 3 * FRAME * 2  # 0.5 s → 3 whole 160 ms frames of int16

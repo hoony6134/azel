@@ -90,6 +90,30 @@ final class WakeURLTests: XCTestCase {
         AzelFiles.clearMarkers()
         XCTAssertTrue(AzelFiles.listenerMic.exists, "the listener's marker is the listener's to remove")
     }
+
+    /// The bridge: the tail the listener recorded until our mic went live is read once and deleted; with
+    /// no listener (no marker, no files) nothing is waited for.
+    func testBridgeTailIsTakenOrSkipped() async throws {
+        let t0 = Date()
+        let none = await AzelFiles.takeTail("old", limit: 1)
+        XCTAssertNil(none.data)
+        XCTAssertLessThan(Date().timeIntervalSince(t0), 0.2, "an old listener writes no tail: no wait")
+        try FileManager.default.createDirectory(at: AzelFiles.folder, withIntermediateDirectories: true)
+        let url = AzelFiles.folder.appendingPathComponent("wake-utterance-b1.tail")
+        try Data(count: 10).write(to: url.appendingPathExtension("part"))
+        Task {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? FileManager.default.removeItem(at: url.appendingPathExtension("part"))
+            try? Data(count: 6400).write(to: url)                           // the listener stopped: 200 ms of tail
+        }
+        let got = await AzelFiles.takeTail("b1", limit: 2)
+        XCTAssertEqual(got.data?.count, 6400)
+        XCTAssertNotNil(got.at, "when it stopped: live frames from then on follow")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(MacCall.joined(Data([1]), Data([2, 3])), Data([1, 2, 3]))
+        XCTAssertEqual(MacCall.joined(nil, Data([2])), Data([2]))
+        XCTAssertNil(MacCall.joined(nil, nil))
+    }
 }
 #endif
 
