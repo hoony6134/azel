@@ -228,6 +228,8 @@ struct SettingsScreen<Extra: View>: View {
     @State private var showProactiveLog = false
     @ObservedObject private var personas = PersonaModel.shared
     @State private var showConnectors = false
+    @State private var showHoldings = false
+    @StateObject private var holdings = HoldingsModel()
     @State private var nameDraft = AssistantName.current
     @State private var nameError: String?
     @State private var titleDraft = ""
@@ -270,6 +272,34 @@ struct SettingsScreen<Extra: View>: View {
                             #if os(macOS)
                             .frame(width: 560, height: 640)
                             #endif
+                    }
+                }
+                Card("보유 종목") {
+                    Button { showHoldings = true } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("내 종목").foregroundStyle(Theme.text)
+                                Text("이름 바꾸기·추가·삭제").font(.footnote).foregroundStyle(Theme.text3)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(Theme.text3)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(isPresented: $showHoldings) {
+                        NavigationStack {
+                            HoldingsView(model: holdings)
+                                .toolbar {
+                                    ToolbarItem(placement: .cancellationAction) { Button("닫기") { showHoldings = false } }
+                                    #if os(iOS)
+                                    ToolbarItem(placement: .primaryAction) { EditButton() }
+                                    #endif
+                                }
+                        }
+                        #if os(macOS)
+                        .frame(width: 520, height: 600)
+                        #endif
                     }
                 }
                 if memory.available == true {
