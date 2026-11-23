@@ -1361,10 +1361,11 @@ RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일�
 # ---------- tool-first for read-only lookups (PM decision 2026-11-23): before Qwen answers, a short Qwen call decides
 # whether the words need data from a read-only tool. If so the tool runs first and Qwen answers from its result, so a
 # lookup no longer depends on Qwen choosing to call one mid-answer. Action tools keep the [TOOL] path.
-# shortcut: the read-only set is named here (the gateway's tool list carries no read_only flag); add it there if this drifts
-READ_ONLY = re.compile(r"^(infra_|phone_|gistra_|planit_get|planit_search|calendar_(?!write)|gmail_)|^(agenda|weather|stock_quote|portfolio|"
-                       r"memory_recall|memory_list|people_lookup|web_search|web_fetch|recent_calls|schedule_list|"
-                       r"task_status|overnight_list|approval_status)$")
+def read_only(name):
+    """The gateway's flag on its tools frame: no side effect, safe to call speculatively. A tool without it is an action."""
+    return any(t["name"] == name and t.get("read_only") is True for t in gw_tools["defs"])
+
+
 ROUTE_S = 4.0  # the decision (~0.8 s alone, slower beside Qwen's own answer on the shared GPU); then as before
 LOOKUP_S = 8.0  # the lookup itself; past this, it is said that it failed
 ROUTE_SYSTEM = ("너는 음성 비서의 조회 판단기야. 사용자의 마지막 말에 답하려면 아래 읽기 도구로 지금 데이터를 봐야 하는지 정해. "
@@ -2480,7 +2481,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     job = asyncio.create_task(infra_read(infra, session))
                 else:
                     job = asyncio.create_task(run_tool(line, session, on_say))
-                if "__" in name or not READ_ONLY.search(name):  # device tools and actions: their own wait
+                if "__" in name or not read_only(name):  # device tools and actions: their own wait
                     return await job
                 if not (await asyncio.wait({job}, timeout=LOOKUP_SLOW_S))[0] and not acked:
                     acked.append(1)
@@ -2523,7 +2524,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 await sentences.put(s)
 
             # tool-first: the decision runs beside Qwen's own first answer, which is held (not spoken) until it is in
-            ro_tools = [t for t in gw_defs if "__" not in t["name"] and READ_ONLY.search(t["name"])]
+            ro_tools = [t for t in gw_defs if "__" not in t["name"] and t.get("read_only") is True]
             first_stream = None
             # every turn but a bare "응"/"고마워": "네모클로 응답 안 한대" is a statement and still needs the data
             if ro_tools and not play and not TRIVIAL.fullmatch(bare.strip()):
@@ -4093,7 +4094,7 @@ if __name__ == "__main__":
                 return b"", 24000
             saved = gateway_tool, claude_stream, tts, dict(gw_tools)
             globals().update(gateway_tool=fake_gw_tool, claude_stream=fake_claude, tts=fake_tts)
-            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "read_only": True, "description": "일정"}])
             try:
                 said = [s async for s, *_ in respond(ask, f"ag{len(ask)}{fail}", time.perf_counter(), {})]
             finally:
@@ -4133,7 +4134,7 @@ if __name__ == "__main__":
             saved = llm_stream, gateway_tool, tts, route_lookup, dict(gw_tools), links.settings
             globals().update(llm_stream=restarting_llm, gateway_tool=fake_gw_tool, tts=lambda s: asyncio.sleep(0, (b"", 24000)),
                              route_lookup=no_route)
-            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "read_only": True, "description": "일정"}])
             links.settings = {"user_title": "정훈님", "brain_mode": "local"}  # live: answered on Qwen
             history.pop("azel:oneack", None)
             try:
@@ -5150,7 +5151,7 @@ if __name__ == "__main__":
         assert [dueum(x) for x in "력리뉴락라름나사"] == ["역", "이", "유", "낙", "나", "늠", None, None]
         assert not asyncio.run(play_note("g:9", "끝까지 말해 봐"))
         assert "따라 하거나" in system_prompt("아젤") and "game 도구" in system_prompt("아젤") and "브레인스토밍" in system_prompt("아젤")
-        assert "- game(action, kind):" in gateway_tools_text([{"name": "web_search", "description": "검색"}, GAME_TOOL], "심심해")
+        assert "- game(action, kind):" in gateway_tools_text([{"name": "web_search", "read_only": True, "description": "검색"}, GAME_TOOL], "심심해")
         def local_mode_check():
             """Local mode: Qwen has no hand-over tag, and anything that would go to Claude gets the can't-do line."""
             prompts = []
@@ -5310,12 +5311,17 @@ if __name__ == "__main__":
             for out in (NATIVE_TAG + "calendar_write 지워</tool_call>", NATIVE_TAG + '["agenda"]</tool_call>'):
                 globals()["client"] = RouterSays(out)
                 assert asyncio.run(route_lookup("어떤 컴파일러 프로젝트 일정이 미리 알림 캘린더에 있는데 그거 지워", [],
-                                                [{"name": "agenda", "description": "일정"}])) is None, out
+                                                [{"name": "agenda", "read_only": True, "description": "일정"}])) is None, out
         finally:
             globals()["client"] = saved_client
         assert failed_turn_check() == TURN_FAILED  # any other error: a short Korean line, never the exception
         # calendar_write changes things: never read-only, so never offered to the tool-first router (live 2026-11-23)
-        assert not READ_ONLY.search("calendar_write") and READ_ONLY.search("calendar_list") and action_tool("calendar_write")
+        saved_defs = list(gw_tools["defs"])
+        gw_tools["defs"] = [{"name": "calendar_write", "read_only": False}, {"name": "calendar_events", "read_only": True},
+                            {"name": "macbook__run_command"}]
+        assert not read_only("calendar_write") and read_only("calendar_events") and action_tool("calendar_write")
+        assert not read_only("macbook__run_command") and not read_only("nope")  # no flag, or unknown: an action
+        gw_tools["defs"] = saved_defs
 
         async def confirm_check(answer):
             """Qwen calls calendar_write, the gateway reads back and waits; the next turn answers. Gateway frames out."""
@@ -5422,7 +5428,7 @@ if __name__ == "__main__":
             saved = llm_stream, claude_stream, tts, route_lookup, dict(gw_tools), links.settings, links.pick
             globals().update(llm_stream=qwen, claude_stream=claude, tts=lambda s, *a, **k: asyncio.sleep(0, (b"", 24000)),
                              route_lookup=lambda *a, **k: asyncio.sleep(0, []))
-            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "read_only": True, "description": "일정"}])
             links.settings, links.pick = {"brain_mode": "auto"}, lambda **k: CardLink()
             ctx = contextvars.copy_context()
             ctx.run(CALL_MODE.set, "auto")
@@ -6009,8 +6015,8 @@ if __name__ == "__main__":
             async def fake_run_tool(raw, session, on_say=None):
                 ran.append(json.loads(raw[len(TOOL_TAG):]))
                 return "앤트로픽은 비상장 회사라 주가가 없어요(네이버 기준)."
-            gw_tools.update(at=time.time(), defs=[{"name": "web_search", "description": "검색"},
-                                                  {"name": "weather", "description": "날씨"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "web_search", "read_only": True, "description": "검색"},
+                                                  {"name": "weather", "read_only": True, "description": "날씨"}])
             globals()["run_tool"] = fake_run_tool
 
             def announcer(then):
@@ -6085,8 +6091,8 @@ if __name__ == "__main__":
             async def local_run(text):
                 CALL_MODE.set("local")
                 return [x async for x, *_ in respond(text, "brief", time.perf_counter(), {})]
-            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"},
-                                                  {"name": "web_search", "description": "검색"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "read_only": True, "description": "일정"},
+                                                  {"name": "web_search", "read_only": True, "description": "검색"}])
             prefetch_down = False  # the fast path: the merged schedule is in Qwen's prompt before it says a word
             ann.clear(), ran.clear()
             globals()["llm_stream"] = announcer(["내일 열 시 반에 컴파일러 수업이 있어요."])
@@ -6105,7 +6111,7 @@ if __name__ == "__main__":
             globals()["llm_stream"] = announcer([promise, promise])
             said = asyncio.run(local_run(ask))
             assert said[-1] == LOOKUP_FAILED and ran == [], said  # said plainly, never back to listening in silence
-            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "read_only": True, "description": "일정"}])
             ann.clear(), ran.clear()  # a native call after the words is a tool call, not a promise
             globals()["llm_stream"] = announcer(['확인할게요. <tool_call>{"name": "agenda", "arguments": {}}</tool_call>',
                                                  "내일은 수업이 하나 있어요."])
@@ -6157,7 +6163,7 @@ if __name__ == "__main__":
             # tool-first (live 2026-11-23 03:13, "야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐"): the read-only lookup runs before
             # Qwen answers; a promise is never said; a slow lookup gets an ack, then a plain failure sentence
             global route_lookup, LOOKUP_SLOW_S, LOOKUP_S
-            infra = {"name": "infra_health", "description": "서버·인프라 상태", "input_schema": {"type": "object", "properties": {}}}
+            infra = {"name": "infra_health", "read_only": True, "description": "서버·인프라 상태", "input_schema": {"type": "object", "properties": {}}}
             gw_tools.update(at=time.time(), defs=[infra, {"name": "call_user", "description": "전화"}])
             routed = []
 
@@ -6191,7 +6197,7 @@ if __name__ == "__main__":
             route_lookup = no_route
             # live 2026-11-23 03:14: "확인해 봤는데 모두 정상" with no tool while NemoClaw was down. A server question
             # reads all three infra tools; the answer sees the down service; a checked result with no tool is never said
-            infra_all = [{"name": n, "description": n, "input_schema": {"type": "object", "properties": {}}}
+            infra_all = [{"name": n, "read_only": True, "description": n, "input_schema": {"type": "object", "properties": {}}}
                          for n in ("infra_health", "infra_status", "infra_alerts")]
             gw_tools.update(at=time.time(), defs=infra_all)
             canned = {"infra_health": "deneb CPU 12%", "infra_status": "멈춤: Vuja De claw (NemoClaw) http, vd-spark, 03:02부터",
@@ -6239,8 +6245,8 @@ if __name__ == "__main__":
             said = [x for x, *_ in asyncio.run(lrun("내가 갖고 있는 주식 보유 현황 알려줘", "tf8"))]
             assert said[-1] == "애플, 토스, 엔비디아, 삼성전자, SK하이닉스예요." and LEAD_NOTE in ann[1][0]["content"], said
             # "내 주식 얼마나 올랐어?" (live 2026-11-23): memory first, then one quote per holding, all at once
-            gw_tools.update(at=time.time(), defs=[{"name": "memory_recall", "description": "기억"},
-                                                  {"name": "stock_quote", "description": "주가"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "memory_recall", "read_only": True, "description": "기억"},
+                                                  {"name": "stock_quote", "read_only": True, "description": "주가"}])
             hold = "[아젤 기억 2026-11-23] 사용자는 애플, 토스, 엔비디아, 삼성전자, SK하이닉스 주식을 보유하고 있다."
             quotes = {"AAPL": "애플 342.56달러, -1.90%", "NVDA": "엔비디아 125.53달러, -14.01%", "005930": "삼성전자 180,900원, -8.13%",
                       "000660": "SK하이닉스 412,000원, -5.20%", "토스": "상장된 종목을 찾지 못했어요."}
@@ -6261,9 +6267,9 @@ if __name__ == "__main__":
             prompt = " ".join(m["content"] for m in ann[0])
             assert all(v in prompt for v in quotes.values()) and "빠짐없이" in prompt, prompt[-400:]
             # with the gateway's portfolio tool (the holdings setting): that one call, no memory, no router
-            gw_tools.update(at=time.time(), defs=[{"name": "memory_recall", "description": "기억"},
-                                                  {"name": "stock_quote", "description": "주가"},
-                                                  {"name": "portfolio", "description": "보유 종목 시세"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "memory_recall", "read_only": True, "description": "기억"},
+                                                  {"name": "stock_quote", "read_only": True, "description": "주가"},
+                                                  {"name": "portfolio", "read_only": True, "description": "보유 종목 시세"}])
 
             async def pf_tool(raw, session, on_say=None):
                 d = json.loads(raw[len(TOOL_TAG):])
@@ -6387,7 +6393,7 @@ if __name__ == "__main__":
             ws = ToolGatewayWS()
             gw = ws.lk = links.add(ws)
             links.receive(gw, {"type": "hello", "device": "macbook", "mode": "full", "priority": 1})
-            gw_tools.update(at=time.time(), defs=[{"name": "call_user"}, {"name": "schedule_list"}])
+            gw_tools.update(at=time.time(), defs=[{"name": "call_user"}, {"name": "schedule_list", "read_only": True}])
             sat8 = datetime(2026, 11, 21, 8, 0, tzinfo=KST)
             said = asyncio.run(schedule_reply("내일 10시에 깨워 줘", "create", "st", sat8))
             sent = [m for m in ws.sent if m.get("type") in ("tool_call", "schedule")]
