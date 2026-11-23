@@ -140,7 +140,27 @@ struct AppSettings: Codable, Equatable {
 
 struct ServerStatus: Decodable {
     struct Health: Decodable { var ok: Bool; var ms: Double? }
-    struct Device: Decodable { var name: String; var ok: Bool; var ms: Double? }
+    struct Device: Decodable {
+        var name: String; var ok: Bool; var ms: Double?
+        /// Registered recently (last_seen within the gateway's freshness window).
+        var fresh: Bool?
+        /// When the gateway decides itself: ok | slow | down, and the probe time.
+        var status: String?
+        var latency_ms: Double?
+
+        /// Three states (2026-11-23: albireo and ruchba were red while healthy; their relayed path is slower
+        /// than the probe's timeout): the gateway's `status` if it sends one; else a failed probe of a device
+        /// that registered recently is slow, not down.
+        var health: DeviceHealth {
+            switch status {
+            case "ok": return .ok
+            case "slow": return .slow
+            case "down": return .down
+            default: return ok ? .ok : fresh == true ? .slow : .down
+            }
+        }
+        var latency: Double? { latency_ms ?? ms }
+    }
     var spark: Health
     var gateway: Health
     var devices: [Device]

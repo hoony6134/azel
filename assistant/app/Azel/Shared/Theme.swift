@@ -127,6 +127,19 @@ struct StatusDot: View {
     var body: some View { Circle().fill(ok ? Theme.celadon : Theme.danger).frame(width: 8, height: 8) }
 }
 
+enum DeviceHealth: Equatable {
+    case ok, slow, down
+    var label: String { switch self { case .ok: return "정상"; case .slow: return "느림"; case .down: return "장애" } }
+}
+
+/// Green / amber (느림) / red device health.
+struct HealthDot: View {
+    let health: DeviceHealth
+    var body: some View {
+        Circle().fill(health == .ok ? Theme.celadon : health == .slow ? Theme.amber : Theme.danger).frame(width: 8, height: 8)
+    }
+}
+
 /// §10 pattern: small offline jar, title, one sentence, optional action, raw error under "자세히".
 struct EmptyState: View {
     let title: String
