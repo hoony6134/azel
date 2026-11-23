@@ -1918,5 +1918,6 @@ def test_api_only_gateway_never_runs_the_claude_cli(tmp_path, monkeypatch):
     run = lambda spec: asyncio.run(g.task_backend_for(spec, settings))  # noqa: E731
     assert run({"backend": "claude_code", "goal": "레포 고쳐 줘"})[0] == "claude_api"
     assert run({"backend": None, "goal": "메일 정리해 줘"}) == ("claude_api", None)
+    assert run({"backend": "qwen", "goal": "조사해 줘"}) == ("qwen", None)  # a local choice stays local
     monkeypatch.setattr(g, "API_KEY", "")
     assert run({"backend": None, "goal": "조사해 줘"})[0] == "qwen"

@@ -4250,6 +4250,8 @@ async def task_backend_for(spec, settings):
         return "qwen", None  # never a paid or Claude backend in local mode, not even as a fallback
     want = {"claude_api": "claude_api", "claude_code": "claude_code"}.get(mode) or spec["backend"] or \
         settings.get("task_backend", "claude_api")
+    if API_ONLY and want in ("qwen", "nim"):
+        return want, None
     if API_ONLY:  # no claude CLI here: the API, else Qwen (device-local Claude Code goes through that device's daemon)
         why = "이 게이트웨이에는 Claude Code가 없어 API로 했어요." if want == "claude_code" else None
         if not API_KEY:
