@@ -45,7 +45,7 @@ enum ReplyCard: Equatable {
             self = .portfolio(j.list("items").compactMap { i in
                 guard let name = i.str("name") else { return nil }
                 return Holding(name: name, symbol: i.str("symbol") ?? i.str("ticker"), price: i.num("price"), change: i.num("change"),
-                               pct: i.num("pct"), spark: i.nums("spark"), listed: i.bool("listed") ?? true)
+                               pct: i.num("change_pct") ?? i.num("pct"), spark: i.nums("spark"), listed: i.bool("listed") ?? true)
             })
         case "agenda":
             self = .agenda(j.list("items").compactMap { i in
@@ -60,16 +60,29 @@ enum ReplyCard: Equatable {
                             source: i.str("source"), done: i.bool("done") ?? false)
             }.sorted { ($0.due ?? .distantFuture) < ($1.due ?? .distantFuture) })
         case "weather":
-            self = .weather(Weather(place: j.str("place"), sky: j.str("sky"), icon: j.str("icon"), now: j.num("now"), high: j.num("high"),
-                                    low: j.num("low"), pop: j.num("pop"),
-                                    hourly: j.list("hourly").prefix(12).map { Weather.Hour(h: $0.str("h") ?? "", t: $0.num("t"), pop: $0.num("pop"), icon: $0.str("icon")) },
-                                    daily: j.list("daily").prefix(5).map { Weather.Day(date: $0.date("date"), high: $0.num("high"), low: $0.num("low"), pop: $0.num("pop"), icon: $0.str("icon")) }))
+            // The contract: now {temp, sky, icon, pop}, hours [{t ISO, temp, icon, pop}], days [{d, min, max, icon, pop}].
+            // The TV's flat shape (now: number, hourly/daily) is read too.
+            let now = (j.raw["now"] as? [String: Any]).map(JSON.init)
+            let days = j.list("days").isEmpty ? j.list("daily") : j.list("days")
+            let today = days.first
+            self = .weather(Weather(place: j.str("place"), sky: now?.str("sky") ?? j.str("sky"), icon: now?.str("icon") ?? j.str("icon"),
+                                    now: now?.num("temp") ?? j.num("now"), high: j.num("high") ?? today?.num("max"),
+                                    low: j.num("low") ?? today?.num("min"), pop: now?.num("pop") ?? j.num("pop"),
+                                    hourly: (j.list("hours").isEmpty ? j.list("hourly") : j.list("hours")).prefix(12).map { h in
+                                        Weather.Hour(h: h.str("h") ?? h.date("t").map(Self.hour) ?? "", t: h.num("temp") ?? h.num("t"),
+                                                     pop: h.num("pop"), icon: h.str("icon"))
+                                    },
+                                    daily: days.prefix(5).map { d in
+                                        Weather.Day(date: d.date("d") ?? d.date("date"), high: d.num("max") ?? d.num("high"),
+                                                    low: d.num("min") ?? d.num("low"), pop: d.num("pop"), icon: d.str("icon"))
+                                    }))
         case "infra":
             self = .infra(Infra(hosts: j.list("hosts").compactMap { h in
                 guard let name = h.str("name") else { return nil }
                 return Infra.Host(name: name, up: h.bool("up") ?? true, cpu: h.num("cpu_pct") ?? h.num("cpu"), gpu: h.num("gpu_pct") ?? h.num("gpu"),
                                   mem: h.num("mem_pct") ?? h.num("mem"), disk: h.num("disk_pct") ?? h.num("disk"), temp: h.num("temp_c") ?? h.num("temp"))
-            }, alerts: j.list("alerts").compactMap { $0.str("summary") ?? $0.str("name") } + j.strs("alerts"),
+            }, alerts: j.list("hosts").flatMap { h in h.strs("alerts").map { "\(h.str("name") ?? ""): \($0)" } }
+                + j.list("alerts").compactMap { $0.str("summary") ?? $0.str("name") } + j.strs("alerts"),
                down: j.strs("down") + j.list("down").compactMap { $0.str("name") }))
         default:
             return nil   // unknown kinds are ignored
@@ -83,11 +96,15 @@ enum ReplyCard: Equatable {
             guard p.count >= 2, let t = JSON.number(p[0]), let v = JSON.number(p[1]) else { return nil }
             return Stock.Point(t: t, v: v)
         }
-        return Stock(symbol: symbol, name: j.str("name") ?? symbol, price: j.num("price"), change: j.num("change"), pct: j.num("pct"),
+        return Stock(symbol: symbol, name: j.str("name") ?? j.str("title") ?? symbol, price: j.num("price"), change: j.num("change"),
+                     pct: j.num("change_pct") ?? j.num("pct"),
                      prevClose: j.num("prev_close") ?? j.num("prev"), high: j.num("high"), low: j.num("low"), volume: j.num("volume"),
-                     state: j.str("state"), currency: j.str("currency"), range: j.str("range") ?? "1d",
+                     state: j.str("market_state") ?? j.str("state"), currency: j.str("currency"), range: j.str("range") ?? "1d",
                      isIndex: j.bool("is_index") ?? j.bool("index") ?? symbol.hasPrefix("^"), points: points)
     }
+
+    /// The reply line for cards that came in a turn without a spoken reply.
+    static func line(_ cards: [ReplyCard]) -> CallLine { CallLine(mine: false, text: "", cards: cards) }
 
     /// One line for the Watch (no charts): "삼성전자 72,300 +1.2%", "오늘 일정 3개 · 다음 14:00 수업", "GPU 92% vf-spark".
     func summary(now: Date = Date()) -> String {
@@ -126,6 +143,10 @@ enum ReplyCard: Equatable {
         return f.string(from: v as NSNumber) ?? "\(v)"
     }
     static func pct(_ v: Double) -> String { String(format: "%@%.1f%%", v > 0 ? "+" : "", v) }
+    static func hour(_ d: Date) -> String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "ko_KR"); f.dateFormat = "HH"
+        return f.string(from: d)
+    }
     static func time(_ d: Date) -> String {
         let f = DateFormatter(); f.locale = Locale(identifier: "ko_KR"); f.dateFormat = "HH:mm"
         return f.string(from: d)

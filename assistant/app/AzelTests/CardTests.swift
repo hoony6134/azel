@@ -68,16 +68,51 @@ final class CardTests: XCTestCase {
         XCTAssertEqual(log.lines[1].cards.count, 2, "they stay under their own reply")
     }
 
-    /// The panel grows by the card area only while the current turn's reply has cards.
-    @MainActor func testPanelExpandsForCardsAndCollapses() throws {
-        XCTAssertEqual(MacCall.panelHeight(typing: false, cards: true) - MacCall.panelHeight(typing: false), MacCall.cardArea)
-        XCTAssertEqual(MacCall.panelHeight(typing: false, approval: true, cards: true), 112 + 30 + MacCall.cardArea)
+    /// The card window floats just above the panel (the panel never moves), flips below when there's no
+    /// room, and goes on the next turn.
+    @MainActor func testCardWindowSitsAboveThePanelAndFlips() throws {
+        let screen = NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let low = NSRect(x: 490, y: 80, width: 460, height: 112)
+        let above = MacCall.cardFrame(panel: low, height: 200, screen: screen)
+        XCTAssertEqual(above.minY, low.maxY + MacCall.cardGap)
+        XCTAssertEqual(above.minX, low.minX); XCTAssertEqual(above.width, low.width)
+        let high = NSRect(x: 490, y: 760, width: 460, height: 112)
+        let below = MacCall.cardFrame(panel: high, height: 200, screen: screen)
+        XCTAssertEqual(below.maxY, high.minY - MacCall.cardGap, "no room above: below")
+        let tall = MacCall.cardFrame(panel: NSRect(x: 0, y: 300, width: 460, height: 112), height: 700, screen: screen)
+        XCTAssertLessThanOrEqual(tall.maxY, screen.maxY, "neither fits: kept on screen")
         var log = CallLog()
         log.apply(CallEvent(type: "reply", text: "삼성전자는…"))
         log.apply(CallEvent(type: "card", card: try XCTUnwrap(CardSamples.stock)))
-        XCTAssertFalse(MacCall.panelCards(log).isEmpty, "expands")
+        XCTAssertFalse(MacCall.panelCards(log).isEmpty, "shown")
         log.apply(CallEvent(type: "transcript", text: "다음"))
-        XCTAssertTrue(MacCall.panelCards(log).isEmpty, "collapses on the next turn")
+        XCTAssertTrue(MacCall.panelCards(log).isEmpty, "gone on the next turn")
+    }
+
+    /// The final contract's shapes (cards-contract.md): weather now{} / hours[t] / days[d], change_pct,
+    /// market_state, per-host alerts, a card in a silent turn.
+    func testFinalContractShapes() throws {
+        let w = ReplyCard(json: ["kind": "weather", "title": "광주 날씨", "place": "광주",
+                                 "now": ["temp": 7.4, "sky": "흐림", "icon": "overcast", "pop": 30],
+                                 "hours": [["t": "2026-11-23T15:00:00+09:00", "temp": 8, "icon": "rain", "pop": 60]],
+                                 "days": [["d": "2026-11-23", "min": 2, "max": 11, "icon": "overcast", "pop": 30]]])
+        guard case .weather(let wx)? = w else { return XCTFail("weather") }
+        XCTAssertEqual(wx.now, 7.4); XCTAssertEqual(wx.icon, "overcast"); XCTAssertEqual(wx.high, 11); XCTAssertEqual(wx.low, 2)
+        XCTAssertEqual(wx.hourly.first?.h, "15"); XCTAssertEqual(wx.hourly.first?.t, 8); XCTAssertEqual(wx.daily.first?.high, 11)
+        let s = ReplyCard(json: ["kind": "stock", "title": "삼성전자", "symbol": "005930", "price": 72300, "change_pct": 1.19, "market_state": "closed"])
+        guard case .stock(let st)? = s else { return XCTFail("stock") }
+        XCTAssertEqual(st.pct, 1.19); XCTAssertEqual(st.state, "closed"); XCTAssertEqual(st.name, "삼성전자")
+        let p = ReplyCard(json: ["kind": "portfolio", "title": "내 종목", "items": [["symbol": "NVDA", "name": "엔비디아", "change_pct": -0.8]]])
+        guard case .portfolio(let items)? = p else { return XCTFail("portfolio") }
+        XCTAssertEqual(items.first?.pct, -0.8)
+        let i = ReplyCard(json: ["kind": "infra", "title": "서버", "hosts": [["name": "vf-spark", "up": true, "alerts": ["GPU 높음"]]]])
+        guard case .infra(let inf)? = i else { return XCTFail("infra") }
+        XCTAssertEqual(inf.alerts, ["vf-spark: GPU 높음"])
+        var log = CallLog()
+        log.apply(CallEvent(type: "transcript", text: "서버 상태"))
+        log.apply(CallEvent(type: "card", card: i))
+        log.apply(CallEvent(type: "turn_done"))
+        XCTAssertEqual(log.lines.last?.cards.count, 1, "a silent turn's card still shows")
     }
 
     func testWatchSummaries() throws {

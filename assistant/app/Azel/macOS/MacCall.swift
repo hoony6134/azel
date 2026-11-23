@@ -315,15 +315,57 @@ final class MacCall: ObservableObject {
         return true
     }
 
-    static func panelHeight(typing: Bool, approval: Bool = false, cards: Bool = false) -> CGFloat {
-        (typing ? 176 : 112) + (approval ? 30 : 0) + (cards ? cardArea : 0)
-    }
-    static let cardArea: CGFloat = 250
+    static func panelHeight(typing: Bool, approval: Bool = false) -> CGFloat { (typing ? 176 : 112) + (approval ? 30 : 0) }
 
     /// The current turn's cards (the last line is the assistant's reply): the panel shows them below.
     var panelCards: [ReplyCard] { Self.panelCards(log) }
     nonisolated static func panelCards(_ log: CallLog) -> [ReplyCard] { log.lines.last.flatMap { $0.mine ? nil : $0.cards } ?? [] }
-    private var shownCards = false
+    /// The turn's cards float in their own window just above the panel (user, 2026-11-23: "약간 위쪽에 뜨게"),
+    /// so the panel itself never moves; below it when there's no room above.
+    private var cardWindow: NSPanel?
+    private var cardHost: NSHostingView<PanelCardsView>?
+    private var shownCards: [ReplyCard] = []
+    static let cardGap: CGFloat = 8, cardMaxHeight: CGFloat = 340
+
+    /// Where the card window goes: above the panel with a gap, else below it, kept inside the screen.
+    nonisolated static func cardFrame(panel: NSRect, height: CGFloat, screen: NSRect) -> NSRect {
+        let above = NSRect(x: panel.minX, y: panel.maxY + cardGap, width: panel.width, height: height)
+        if above.maxY <= screen.maxY { return above }
+        let below = NSRect(x: panel.minX, y: panel.minY - cardGap - height, width: panel.width, height: height)
+        return below.minY >= screen.minY ? below : above.offsetBy(dx: 0, dy: screen.maxY - above.maxY)
+    }
+
+    private func updateCardWindow() {
+        let cards = inCall ? panelCards : []
+        guard cards != shownCards else { return }
+        shownCards = cards
+        guard let p = panel, p.isVisible, !cards.isEmpty else {
+            if let w = cardWindow, w.isVisible {
+                NSAnimationContext.runAnimationGroup({ $0.duration = 0.18; w.animator().alphaValue = 0 }) { MainActor.assumeIsolated { w.orderOut(nil) } }
+            }
+            return
+        }
+        if cardWindow == nil {
+            let w = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            w.isFloatingPanel = true; w.level = p.level; w.backgroundColor = .clear; w.isOpaque = false; w.hasShadow = true
+            w.hidesOnDeactivate = false; w.isReleasedWhenClosed = false; w.collectionBehavior = p.collectionBehavior
+            let host = NSHostingView(rootView: PanelCardsView(cards: cards))
+            w.contentView = host
+            cardWindow = w; cardHost = host
+        }
+        guard let w = cardWindow, let host = cardHost else { return }
+        host.rootView = PanelCardsView(cards: cards)
+        host.frame.size.width = p.frame.width
+        let height = min(host.fittingSize.height, Self.cardMaxHeight)
+        let frame = Self.cardFrame(panel: p.frame, height: height, screen: p.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? p.frame)
+        if !w.isVisible { w.alphaValue = 0; w.setFrame(frame.offsetBy(dx: 0, dy: frame.minY >= p.frame.maxY ? -6 : 6), display: false) }
+        w.orderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2
+            w.animator().setFrame(frame, display: true)
+            w.animator().alphaValue = 1
+        }
+    }
 
     private var approvalWatch: Any?
     private var panelHasApproval: Bool { inCall && !ApprovalCenter.shared.pending.isEmpty }
@@ -331,11 +373,9 @@ final class MacCall: ObservableObject {
     private func resizePanel() {
         guard let p = panel else { return }
         var f = p.frame
-        let cards = inCall && !panelCards.isEmpty
-        // Typing and approvals grow upward from the bottom edge; cards grow downward from the top edge.
-        if cards != shownCards { f.origin.y -= cards ? Self.cardArea : -Self.cardArea; shownCards = cards }
-        f.size.height = Self.panelHeight(typing: typing, approval: panelHasApproval, cards: cards)
+        f.size.height = Self.panelHeight(typing: typing, approval: panelHasApproval)   // grows upward from the bottom edge
         p.setFrame(f, display: true, animate: false)
+        if cardWindow?.isVisible == true { shownCards = []; updateCardWindow() }   // stay anchored to the panel's top edge
         if typing { p.makeKey() }
     }
 
@@ -461,7 +501,7 @@ final class MacCall: ObservableObject {
         case "interrupt": log.apply(event); interruptedAt = Date()
         default: log.apply(event)
         }
-        if (inCall && !panelCards.isEmpty) != shownCards { resizePanel() }   // a card arrived, or the next turn began
+        updateCardWindow()   // a card arrived, or the next turn began
     }
 
     /// keepPanel: leave the transcript / error on screen after the server hung up or something failed.
@@ -492,6 +532,7 @@ final class MacCall: ObservableObject {
         typedDraft = ""
         fadeTask?.cancel(); idleTask?.cancel()
         if !keepPanel { panel?.orderOut(nil) }
+        updateCardWindow()   // the call ended: the cards go
         resizePanel()
     }
 
@@ -623,14 +664,6 @@ struct CallPanelView: View {
         }
         .padding(.horizontal, Theme.l)
         .frame(width: 460, height: 112 + (call.inCall && !approvals.pending.isEmpty ? 30 : 0))
-            // This turn's cards: the panel grows downwards for them and shrinks back on the next turn.
-            if call.inCall && !call.panelCards.isEmpty {
-                ScrollView {
-                    VStack(spacing: Theme.s) { ForEach(Array(call.panelCards.enumerated()), id: \.offset) { CardView(card: $0.element, compact: true) } }
-                        .padding(.horizontal, Theme.l).padding(.bottom, Theme.m)
-                }
-                .frame(width: 460, height: MacCall.cardArea)
-            }
         }
         .frame(maxHeight: .infinity, alignment: .top)
         .overlay(alignment: .bottom) {
@@ -770,5 +803,24 @@ struct PanelApprovalRow: View {
         .buttonStyle(.borderless)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("승인 필요: \(secret ? "" : request.command)")
+    }
+}
+
+/// The card window's content: this turn's cards, compact, on the panel's material.
+struct PanelCardsView: View {
+    let cards: [ReplyCard]
+    private var stack: some View {
+        VStack(spacing: Theme.s) { ForEach(Array(cards.enumerated()), id: \.offset) { CardView(card: $0.element, compact: true) } }
+            .padding(Theme.s)
+    }
+    var body: some View {
+        // Its natural height (so the window can size to it), scrolling only past the cap.
+        ViewThatFits(in: .vertical) {
+            stack
+            ScrollView { stack }.frame(height: MacCall.cardMaxHeight)
+        }
+        .frame(width: 460)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 }
