@@ -32,6 +32,10 @@ final class MacCall: ObservableObject {
     @Published var error: String?
     /// What the assistant is doing this turn (DESIGN §13) and the jar's surge/pulse moments.
     @Published private(set) var activity = ActivityLog()
+    /// This call's tool runs (command, host, input, live output) for the detail view.
+    let runs = ToolRunStore()
+    /// The activity line was tapped: what it opens.
+    @Published var runTarget: ToolRunTarget?
     @Published private(set) var surgeAt: Date?
     @Published private(set) var pulseAt: Date?
     /// The thinking pulse's visual twin: a shimmer across the orb.
@@ -249,6 +253,7 @@ final class MacCall: ObservableObject {
         activeSession = session ?? Session.current("mac")
         log = CallLog()
         activity = ActivityLog()
+        runs.reset(); runTarget = nil
         state = ""
         error = nil
         client.beginTimingIfIdle(pttCall || talking ? "hotkey" : "start")
@@ -504,6 +509,7 @@ final class MacCall: ObservableObject {
             }
         }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
+        runs.apply(event)
         scheduleIdle()
         switch event.type {
         case "turn_done": turnDone = true; scheduleFade()
@@ -652,10 +658,26 @@ struct CallPanelView: View {
                     if let error = call.error {
                         Text(error).font(.footnote).foregroundStyle(Theme.danger).lineLimit(2)
                     } else if let current = call.activity.current {
-                        // §13.4: the activity line replaces the transcript while a step runs.
-                        Image(systemName: current.glyph).font(.system(size: 13)).foregroundStyle(Theme.indigo)
-                        Text(current.label).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(1)
-                        if !call.activity.done.isEmpty { Text("· ✓\(call.activity.done.count)").font(.footnote).foregroundStyle(Theme.text3) }
+                        // §13.4: the activity line replaces the transcript while a step runs; a tap shows the command.
+                        Button { call.runTarget = call.activity.tapTarget(call.runs) } label: {
+                            HStack(spacing: Theme.xs) {
+                                Image(systemName: current.glyph).font(.system(size: 13)).foregroundStyle(Theme.indigo)
+                                Text(current.label).font(.footnote.weight(.semibold)).foregroundStyle(Theme.text).lineLimit(1)
+                                if let host = call.runs.run(current.callId)?.host { Text(host).font(.caption2).foregroundStyle(Theme.text3) }
+                                if !call.activity.done.isEmpty { Text("· ✓\(call.activity.done.count)").font(.footnote).foregroundStyle(Theme.text3) }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("실행 내용 보기")
+                        .toolRuns(call.runs, target: $call.runTarget)
+                    } else if !call.runs.runs.isEmpty, reply != nil {
+                        // finished steps stay reachable: a small ✓ chip opens the list
+                        Button { call.runTarget = .list } label: {
+                            Label("✓\(call.runs.runs.count)", systemImage: "terminal").font(.caption2).foregroundStyle(Theme.text3)
+                        }
+                        .buttonStyle(.plain).accessibilityLabel("실행한 도구 \(call.runs.runs.count)개")
+                        .toolRuns(call.runs, target: $call.runTarget)
                     } else if reply == nil && (user == nil || jarState == .thinking) {   // mid-reply the orb shows it
                         Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                     }

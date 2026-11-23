@@ -23,11 +23,22 @@ struct CallEvent: Decodable, Equatable {
     var flag: Bool?
     /// `card`: a visual card for the reply (nil for an unknown kind).
     var card: ReplyCard?
+    /// Tool runs (`activity` tool_start / tool_output / tool_end): which call, where, what went in and out.
+    var call_id: String?
+    var host: String?
+    var input: String?        // a command line, or the tool's JSON arguments pretty-printed
+    var output: String?       // tool_output: the chunk; tool_end: the last ~8 KB
+    var exit_code: Int?
+    var ok: Bool?
+    var duration_ms: Double?
+    var truncated: Bool?
+    var task_id: String?
 
     struct Context: Decodable, Equatable { var kind: String?; var label: String?; var id: String? }
 
     private enum CodingKeys: String, CodingKey {
         case type, value, text, route, message, phase, label, tool, kind, reply_id, mode, context, caps, reason, secret, auto, expires_at, card
+        case call_id, host, input, output, chunk, exit_code, ok, duration_ms, truncated, task_id
     }
 
     init(type: String, value: String? = nil, text: String? = nil, route: String? = nil, card: ReplyCard? = nil, replyId: Int? = nil) {
@@ -48,6 +59,19 @@ struct CallEvent: Decodable, Equatable {
         secret = try? c.decodeIfPresent(Bool.self, forKey: .secret)
         auto = try? c.decodeIfPresent(Bool.self, forKey: .auto)
         expires_at = try? c.decodeIfPresent(Double.self, forKey: .expires_at)
+        if type == "activity" {
+            call_id = str(.call_id) ?? (try? c.decodeIfPresent(Int.self, forKey: .call_id)).flatMap { $0.map(String.init) }
+            host = str(.host); task_id = str(.task_id)
+            output = str(.output) ?? str(.chunk)
+            exit_code = try? c.decodeIfPresent(Int.self, forKey: .exit_code)
+            ok = try? c.decodeIfPresent(Bool.self, forKey: .ok)
+            duration_ms = try? c.decodeIfPresent(Double.self, forKey: .duration_ms)
+            truncated = try? c.decodeIfPresent(Bool.self, forKey: .truncated)
+            if let v = (try? c.decodeIfPresent(AnyJSON.self, forKey: .input))?.value {
+                input = (v as? String) ?? ((try? JSONSerialization.data(withJSONObject: v, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]))
+                    .flatMap { String(data: $0, encoding: .utf8) })
+            }
+        }
         if type == "card", let obj = (try? c.decodeIfPresent(AnyJSON.self, forKey: .card))?.value as? [String: Any] { card = ReplyCard(json: obj) }
     }
 }
