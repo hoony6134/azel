@@ -537,11 +537,24 @@ def test_build2_adds_weather_and_holdings():
     assert asyncio.run(tv.build2(deps2(), NOW))["weather"] is None  # a gateway without them: null parts
 
 
-def test_holdings_setting(gw):
+def test_holdings_setting(gw, monkeypatch):
     g, c, _ = gw
+    asked = []
+
+    async def resolve(name):
+        asked.append(name)
+        return {"카카오": {"ticker": "035720", "name": "카카오"}, "토스": None,
+                "삼성": {"candidates": ["삼성전자 (005930)", "삼성SDI (006400)"]}}[name]
+    monkeypatch.setattr(g, "resolve_holding", resolve)
     assert c.get("/v1/settings").json()["holdings"][2] == "삼성전자 (005930)"
-    r = c.put("/v1/settings", json={"holdings": ["  애플   (AAPL) ", "카카오"]})
-    assert r.status_code == 200 and c.get("/v1/settings").json()["holdings"] == ["애플 (AAPL)", "카카오"]
+    r = c.put("/v1/settings", json={"holdings": ["  애플   (AAPL) ", "카카오", "토스"]})  # a new bare name is resolved
+    assert r.status_code == 200 and c.get("/v1/settings").json()["holdings"] == ["애플 (AAPL)", "카카오 (035720)", "토스"]
+    asked.clear()
+    r = c.put("/v1/settings", json={"holdings": ["Apple (AAPL)", "카카오 (035720)", "토스"]})  # rename only: no lookup
+    assert r.status_code == 200 and r.json()["holdings"] == ["Apple (AAPL)", "카카오 (035720)", "토스"] and asked == []
+    r = c.put("/v1/settings", json={"holdings": ["삼성"]})
+    assert r.status_code == 400 and "삼성SDI (006400)" in r.json()["detail"]  # several: the app asks which one
+    assert c.get("/v1/settings").json()["holdings"][0] == "Apple (AAPL)"  # nothing saved
     for bad in ("애플", [""], ["x" * 41], ["a\nb"], ["a"] * 13):
         assert c.put("/v1/settings", json={"holdings": bad}).status_code == 400, bad
 
