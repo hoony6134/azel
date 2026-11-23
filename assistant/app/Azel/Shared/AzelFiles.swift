@@ -56,7 +56,23 @@ enum AzelFiles {
     /// either file to show up at all; reads the `.pcm` once and deletes both. nil = go live without it.
     /// `at`: when the finished file appeared (system uptime), i.e. when the listener stopped capturing.
     static func takeUtterance(_ id: String, appear: TimeInterval = 5, partLimit: TimeInterval = 12) async -> (data: Data?, at: Double?) {
-        let url = utterance(id), part = url.appendingPathExtension("part")
+        await take(utterance(id), part: utterance(id).appendingPathExtension("part"), appear: appear, partLimit: partLimit)
+    }
+
+    /// The listener's bridge (`.tail`): what it heard after the command until the app's mic went live, so
+    /// the engine start leaves no hole. Its `.tail.part` exists while it records; an old listener writes
+    /// none, so with neither file and the listener's mic released this returns at once. `at`: when it
+    /// stopped, i.e. live frames from then on follow it.
+    static func takeTail(_ id: String, limit: TimeInterval = 1.5) async -> (data: Data?, at: Double?) {
+        let url = folder.appendingPathComponent("wake-utterance-\(id).tail")
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path), !fm.fileExists(atPath: url.appendingPathExtension("part").path), !listenerMic.exists {
+            return (nil, nil)
+        }
+        return await take(url, part: url.appendingPathExtension("part"), appear: 0.5, partLimit: limit)
+    }
+
+    private static func take(_ url: URL, part: URL, appear: TimeInterval, partLimit: TimeInterval) async -> (data: Data?, at: Double?) {
         let fm = FileManager.default
         let start = Date()
         while !fm.fileExists(atPath: url.path) {
