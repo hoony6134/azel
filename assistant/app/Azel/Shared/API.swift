@@ -187,9 +187,9 @@ enum GatewayError: LocalizedError {
 }
 
 enum Gateway {
-    static func send(_ method: String, _ path: String, json: Any? = nil) async throws -> Data {
+    static func send(_ method: String, _ path: String, json: Any? = nil, timeout: TimeInterval = 15) async throws -> Data {
         guard let url = URL(string: Config.gatewayURL + path) else { throw URLError(.badURL) }
-        var req = URLRequest(url: url, timeoutInterval: 15)
+        var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
         req.setValue("Bearer \(Config.token ?? "")", forHTTPHeaderField: "Authorization")
         if let json {

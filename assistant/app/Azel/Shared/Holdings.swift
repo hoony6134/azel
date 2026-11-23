@@ -40,10 +40,11 @@ struct Holding: Equatable, Identifiable {
 }
 
 /// Reads and edits `holdings` (user, 2026-11-23: rename 'SOS랩' → '에스오에스랩' by voice made a duplicate or
-/// nothing, and the app had no editor). Rename, remove and reorder write the whole list with
-/// `PUT /v1/settings`, codes kept. Adding a name without a code goes through `POST /v1/holdings`, where
-/// the gateway resolves the ticker; an older gateway without it gets the bare name.
-/// Every change shows at once and rolls back with a message if the save fails.
+/// nothing, and the app had no editor). Every edit is the whole list in display order through
+/// `PUT /v1/settings {"holdings": [...]}` (contract with the gateway, 2026-11-23): entries with a code
+/// or already saved are stored as sent, a new bare name is resolved there (one listing → "이름 (CODE)",
+/// none → bare, several → bare plus `candidates`). The answer's `holdings` is what was saved, so it
+/// replaces the list. Every change shows at once and rolls back with a message if the save fails.
 @MainActor
 final class HoldingsModel: ObservableObject {
     @Published private(set) var items: [Holding] = []
@@ -77,30 +78,25 @@ final class HoldingsModel: ObservableObject {
         await save(next)
     }
 
-    /// "이름 (CODE)" is stored as typed; a bare name is resolved by the gateway.
+    /// "이름 (CODE)" is stored as typed; a bare name is resolved by the gateway (a few seconds).
     func add(_ text: String) async {
         let h = Holding(entry: text)
         guard !h.name.isEmpty else { return }
-        if h.code != nil { return await save(items.filter { Self.key($0) != Self.key(h) } + [h]) }
-        let before = items
-        items.append(h)                      // optimistic: the bare name, the code arrives with the answer
-        adding = true
+        adding = h.code == nil
         defer { adding = false }
-        do {
-            let data = try await Gateway.send("POST", "/v1/holdings", json: ["add": [h.name], "remove": [String]()])
-            apply(added: h.name, response: try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:], before: before)
-        } catch GatewayError.http(404) {
-            items = before                   // an older gateway: no resolver, store the bare name (비상장)
-            await save(before.filter { Self.key($0) != Self.key(h) } + [h])
-        } catch {
-            items = before
-            self.error = "추가하지 못했어요: \(FriendlyError.describe(error).title)"
-        }
+        await save(items.filter { Self.key($0) != Self.key(h) } + [h])
     }
 
-    func apply(added name: String, response: [String: Any], before: [Holding]) {
-        if let list = response["holdings"] as? [String] { items = list.map(Holding.init(entry:)) } else { items = before }
-        if let options = (response["candidates"] as? [String: Any])?[name] as? [String], !options.isEmpty {
+    /// The candidate the user picked replaces the bare name, in place.
+    func pick(_ name: String, option: String) async {
+        let code = Holding(entry: option).code
+        await save(items.map { $0.code == nil && Self.key($0) == Self.key(Holding(name: name, code: nil)) ? Holding(name: name, code: code) : $0 })
+    }
+
+    /// The PUT answer: its `holdings` is what was saved (codes added); `candidates` asks the user.
+    func apply(response: [String: Any], sent: [Holding]) {
+        items = (response["holdings"] as? [String]).map { $0.map(Holding.init(entry:)) } ?? sent
+        if let (name, options) = (response["candidates"] as? [String: [String]])?.first(where: { !$0.value.isEmpty }) {
             choice = (name, options)
         }
     }
@@ -110,7 +106,9 @@ final class HoldingsModel: ObservableObject {
         let before = items
         items = next
         do {
-            _ = try await Gateway.send("PUT", "/v1/settings", json: ["holdings": next.map(\.entry)])
+            // A new name may be looked up on the server (Naver, Yahoo, search): allow ~20 s.
+            let data = try await Gateway.send("PUT", "/v1/settings", json: ["holdings": next.map(\.entry)], timeout: 20)
+            apply(response: (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:], sent: next)
             error = nil
         } catch {
             items = before
@@ -184,8 +182,8 @@ struct HoldingsView: View {
         }
         .confirmationDialog("어느 종목인가요?", isPresented: Binding(get: { model.choice != nil }, set: { if !$0 { model.choice = nil } }),
                             presenting: model.choice) { c in
-            // The user's own name with the picked listing's code.
-            ForEach(c.options, id: \.self) { o in Button(o) { Task { await model.add("\(c.name) (\(Holding(entry: o).code ?? o))") } } }
+            // The user's own name with the picked listing's code, in place of the bare entry.
+            ForEach(c.options, id: \.self) { o in Button(o) { Task { await model.pick(c.name, option: o) } } }
         }
     }
 

@@ -25,15 +25,18 @@ final class HoldingsTests: XCTestCase {
         XCTAssertNotNil(Holding.problem([Holding(name: String(repeating: "가", count: 35), code: "123456")]))
     }
 
-    /// POST /v1/holdings answer: the resolved list replaces the optimistic one; candidates ask the user.
-    @MainActor func testAddShowsTheResolvedCodeOrAsks() {
+    /// The PUT answer: the saved list (codes resolved) replaces the optimistic one; candidates ask the user.
+    @MainActor func testSaveShowsTheResolvedCodeOrAsks() {
         let m = HoldingsModel()
-        m.apply(added: "에스오에스랩", response: ["holdings": ["애플 (AAPL)", "에스오에스랩 (464080)"]], before: [])
+        let sent = [Holding(entry: "애플 (AAPL)"), Holding(entry: "에스오에스랩")]
+        m.apply(response: ["holdings": ["애플 (AAPL)", "에스오에스랩 (464080)"], "candidates": [String: [String]]()], sent: sent)
         XCTAssertEqual(m.items.last?.code, "464080")
         XCTAssertNil(m.choice)
-        m.apply(added: "삼성", response: ["holdings": ["애플 (AAPL)"], "candidates": ["삼성": ["삼성전자 (005930)", "삼성SDI (006400)"]]],
-                before: [Holding(entry: "애플 (AAPL)")])
+        m.apply(response: ["holdings": ["애플 (AAPL)", "삼성"], "candidates": ["삼성": ["삼성전자 (005930)", "삼성SDI (006400)"]]], sent: sent)
+        XCTAssertEqual(m.choice?.name, "삼성")
         XCTAssertEqual(m.choice?.options.count, 2)
-        XCTAssertEqual(m.items.map(\.entry), ["애플 (AAPL)"])
+        XCTAssertEqual(m.items.map(\.entry), ["애플 (AAPL)", "삼성"], "saved bare until the user picks")
+        m.apply(response: [:], sent: sent)
+        XCTAssertEqual(m.items, sent, "an answer without holdings keeps what was sent")
     }
 }
