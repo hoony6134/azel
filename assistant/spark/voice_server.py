@@ -67,6 +67,13 @@ AGENCY = ("사용자의 말을 그대로 따라 하거나 '네, ~하자'로만 �
           "첫 장면을 두세 문장으로, 브레인스토밍이면 아이디어 두세 개, 연습이면 첫 연습 문제나 첫 대사로 이번 답에서 바로 시작해. "
           "음성 인식이 틀린 말('끝말 입기')은 뜻으로 알아들어. 잡담에는 질문이나 생각, 성격에 맞는 가벼운 농담을 하나 보태.")
 
+# The app shows a card for what a lookup returns (cards-contract.md). Live 2026-11-23: "오늘 애플 주식 차트 보여줘" got
+# "차트는 음성으로 보여드릴 수 없어요" and no lookup, so no card.
+CARDS_LINE = ("사용자의 앱 화면에는 도구 결과가 카드로 떠: 주가는 실시간 차트(기간 전환 가능), 일정, 할 일, 날씨, 서버 상태. "
+              "'차트 보여줘', '보여줘', '띄워줘'라고 하면 맞는 도구(주가는 stock_quote)를 불러서 카드를 띄우고, "
+              "'애플 차트 띄워 드렸어요. 지금 …달러, …% 올랐어요.'처럼 짧게 말해. 화면에 보여 줄 수 없다거나 폰·PC에서 "
+              "보라고 하지 마.")
+
 # reply_length (shared setting, the app exposes it): how long answers run. The short first clause stays for latency.
 LENGTH_STYLE = {
     "brief": "짧게 한두 문장으로 요점만 말해.",
@@ -324,7 +331,7 @@ def system_prompt(name, length="normal", context="", persona="", title=""):
     body = SYSTEM_BODY if not context else SYSTEM_BODY.split("중요:")[0] + BRAIN_BODY
     return f"너는 사용자의 개인 비서 '{name}'야. " + (character_line(name, persona, title) if persona else
                                                    f"사용자를 '{title}'(이)라고 부른다. " if title else "") + body + " " \
-        + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) \
+        + LENGTH_STYLE.get(length, LENGTH_STYLE["normal"]) + " " + CARDS_LINE \
         + (f"\n\n참고할 상황:\n{context}" if context else "")
 
 
@@ -1452,7 +1459,9 @@ WEATHER_Q = re.compile(r"날씨|기온|몇\s*도|비\s*(와|올|오)|눈\s*(와|
 # "시세 정보를 드리기 어렵습니다", "증권사 앱에서 확인하는 게 빨라" (live 2026-11-23, typed stock questions on both
 # personas): a refusal to look up what a tool answers. Held like a guess; the lookup runs instead.
 REFUSED_LOOKUP = re.compile(r"(드리기|알려\s*드리기|확인하기|제공하기|보여\s*드리기|찾기)\s*(가\s*)?어렵|확인할\s*수\s*(가\s*)?없|"
-                            r"알\s*수\s*(가\s*)?없|실시간.{0,12}(못|없|어렵|않)|(앱|사이트|증권사|포털|검색).{0,14}(확인|보시|보는|찾아\s*보)")
+                            r"알\s*수\s*(가\s*)?없|실시간.{0,12}(못|없|어렵|않)|(앱|사이트|증권사|포털|검색).{0,14}(확인|보시|보는|찾아\s*보)|"
+                            r"보여\s*(드릴|줄|드리지)\s*(수\s*(가\s*)?없|못)|음성으로.{0,10}(없|어렵|못)|"
+                            r"(폰|휴대폰|핸드폰|PC|컴퓨터|화면).{0,12}(확인|보시|보는|보세요|보시는)")
 LIVE_Q = re.compile(r"환율|주가|주식|시세|가격|금리|유가|코스피|코스닥|나스닥|비트코인|날씨|기온|몇\s*도|상장|IPO")
 # a listing claim from memory ("엔트로픽은 비상장이라"): live 2026-11-22 it was stale, ANT had listed on Nasdaq
 LISTING = re.compile(r"비상장|상장\s*(전|안|되지|않|된|됐|했|돼)|상장사|기업\s*공개|IPO")
@@ -1478,7 +1487,8 @@ LOOKUP_S = 8.0  # the lookup itself; past this, it is said that it failed
 ROUTE_SYSTEM = ("너는 음성 비서의 조회 판단기야. 사용자의 마지막 말에 답하려면 아래 읽기 도구로 지금 데이터를 봐야 하는지 정해. "
                 "필요 없으면 NONE 한 단어만 출력해. 필요하면 다른 말 없이 JSON 배열 하나만 출력해: "
                 "[{\"name\": 도구, \"args\": {…}}, …]. 여러 대상(여러 종목, 여러 도시처럼)을 함께 물으면 대상마다 하나씩 넣어"
-                "(최대 6개). 잡담, 감정, 농담, 게임, 상식, 계산, 비서 자신에 대한 질문은 NONE. 확실하지 않으면 NONE.\n도구:\n")
+                "(최대 6개). '차트 보여줘', '띄워줘'처럼 화면에 보여 달라는 것도 조회야(앱이 결과를 카드로 보여 줘). "
+                "잡담, 감정, 농담, 게임, 상식, 계산, 비서 자신에 대한 질문은 NONE. 확실하지 않으면 NONE.\n도구:\n")
 ROUTE_MAX = 6
 # the user's own things ("내가 가진 주식", "내 포트폴리오"): what they are is in memory, so it is read before the domain
 # tools (live 2026-11-23: "내 주식 얼마나 올랐어?" quoted one stock, or said nothing was saved, with the holdings in memory)
@@ -5710,7 +5720,7 @@ if __name__ == "__main__":
         assert claude_calls and said == ["코스피는 오늘 올랐어요."], (said, claude_calls)  # not a schedule: may hand over
         assert SCHEDULE_TURN.search("오늘 할 일 뭐 있어?") and SCHEDULE_TURN.search("내일 회의 지워 줘")
 
-        def stock_refusal_check():
+        def stock_refusal_check(refusal="오빠, 증권사 앱에서 바로 확인하는 게 제일 빠를 거야. 혹시 오늘 하루는 어땠어?"):
             """Live 2026-11-23 (Mac, typed, 서아, local): "오늘 애플 주식 차트 보…" got "증권사 앱에서 확인하는 게 빠를 거야"
             with no lookup. A live-data question always looks it up, the refusal is never said, the stock card is sent."""
             calls, events, prompts = [], [], []
@@ -5726,7 +5736,7 @@ if __name__ == "__main__":
                 if "[도구 결과]" in messages[-1]["content"]:
                     yield "오빠, 애플은 지금 271.5달러야. 오늘 0.8% 올랐어."
                 else:  # refuses every time, even after the tool nudge: the server looks it up itself
-                    yield "오빠, 증권사 앱에서 바로 확인하는 게 제일 빠를 거야. 혹시 오늘 하루는 어땠어?"
+                    yield refusal
 
             async def on_event(ev):
                 events.append(ev)
@@ -5756,7 +5766,16 @@ if __name__ == "__main__":
         assert not any("증권사" in x for x in said) and any("271.5" in x for x in said), said
         assert [e["card"]["kind"] for e in events if e.get("type") == "card"] == ["stock"], events
         assert "주가, 일정처럼 도구가 있는 건 꼭 도구로" in prompts[0] and "최신 정보처럼" not in prompts[0]
+        said, calls, events, prompts = stock_refusal_check(
+            "네, 정훈님. 애플 주식 차트는 음성으로 보여드릴 수 없어요. 대신 현재 애플 주가와 등락률은 바로 알려드릴 수 있어요.")
+        assert calls and calls[0][0] == "stock_quote" and not any("보여드릴 수 없" in x for x in said), (calls, said)
+        assert [e["card"]["kind"] for e in events if e.get("type") == "card"] == ["stock"], events
         assert REFUSED_LOOKUP.search("시세 정보를 드리기 어렵습니다.") and not REFUSED_LOOKUP.search("오늘 0.8% 올랐어.")
+        for refusal in ("애플 주식 차트는 음성으로 보여드릴 수 없어요.", "차트 이미지나 그래프가 필요하시다면, 폰이나 PC에서 직접 "
+                        "확인하시는 게 가장 정확하답니다."):  # live 2026-11-23 (아젤, local, typed "오늘 애플 주식 차트 보여줘")
+            assert REFUSED_LOOKUP.search(refusal), refusal
+        assert "카드로 떠" in system_prompt("아젤") and "보여 줄 수 없다" in local_prompt(system_prompt("아젤"))
+        assert "차트 보여줘" in ROUTE_SYSTEM
         assert not SCHEDULE_TURN.search("오늘 날씨 어때?") and ROUTE_TAG not in no_handover(NUDGE)
         after, heard = stall_check(held=True)
         assert after is not None and after < END_STALL_S + 0.6 and len(heard) == 1 and heard[0] > 3.4, (after, heard)
