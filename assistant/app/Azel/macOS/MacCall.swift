@@ -190,14 +190,28 @@ final class MacCall: ObservableObject {
     /// The listener's recording of what followed the name; sent before the live mic.
     private var pendingUtterance: String?
 
-    /// Sends the waiting utterance, then opens the live mic.
-    private func sendUtterance(_ id: String) {
+    /// Waits for the listener's recording (wake) and for the listener to close its mic, then starts the
+    /// engine off the main thread. Two processes on the mic made voice processing block main for 3 s and
+    /// rebuild over and over (2026-11-23). The utterance goes out once audio is up, ahead of the live mic.
+    private func startAudio(utterance id: String?) {
+        let call = connectedAt
         Task { [weak self] in
-            let got = await AzelFiles.takeUtterance(id)
-            guard let self, self.inCall else { return }
-            self.client.releaseMic(first: got.data, cutoff: got.at)
-            self.client.markTiming(got.data == nil ? "utterance_none" : "utterance_sent")
-            if let d = got.data { Log.call.notice("wake utterance \(d.count / 32) ms") }
+            let got: (data: Data?, at: Double?) = if let id { await AzelFiles.takeUtterance(id) } else { (nil, nil) }
+            let released = await AzelFiles.listenerReleased()
+            guard let self, self.inCall, self.connectedAt == call else { return }
+            if !released { Log.call.notice("listener still holds the mic; starting anyway") }
+            self.client.markTiming("listener_off")
+            self.client.startAudio { [weak self] error in
+                guard let self else { return }
+                if let error { return self.end(error: error.localizedDescription, keepPanel: true) }
+                AzelFiles.micLive.create()
+                if id != nil {
+                    self.client.releaseMic(first: got.data, cutoff: got.at)
+                    self.client.markTiming(got.data == nil ? "utterance_none" : "utterance_sent")
+                    if let d = got.data { Log.call.notice("wake utterance \(d.count / 32) ms") }
+                }
+                if self.pttCall || self.talking { self.client.cue(.wake, listening: false) }
+            }
         }
     }
 
@@ -331,7 +345,9 @@ final class MacCall: ObservableObject {
         UserDefaults.standard.set(outputUID, forKey: "outputDevice")
         applyDevices()
         guard inCall else { return }
-        do { try client.restartAudio() } catch { end(error: error.localizedDescription, keepPanel: true) }
+        client.restartAudioInBackground { [weak self] in
+            self?.end(error: CallClient.StartError.audio.localizedDescription, keepPanel: true)
+        }
     }
 
     private static var micDenied: String { "\(AssistantName.josa(AssistantName.current, "이", "가")) 말을 들으려면 마이크를 허용해 주세요. 시스템 설정 → 개인정보 보호 및 보안 → 마이크에서 Azel을 켜 주세요." }
@@ -346,11 +362,11 @@ final class MacCall: ObservableObject {
             if pendingUtterance != nil { client.holdMic() }   // live frames wait (not dropped) behind the utterance
             let wantSecret = BrainModeChoice.shared.takeSecretForCall()
             secret = wantSecret
-            try client.start(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
+            try client.open(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
             connectedAt = Date()
-            AzelFiles.micLive.create()
-            if let id = pendingUtterance { pendingUtterance = nil; sendUtterance(id) }
-            if pttCall || talking { client.cue(.wake, listening: false) }
+            let id = pendingUtterance
+            pendingUtterance = nil
+            startAudio(utterance: id)
         } catch {
             end(error: error.localizedDescription, keepPanel: true)
         }

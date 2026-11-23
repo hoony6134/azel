@@ -157,6 +157,47 @@ final class AudioIO {
     nonisolated(unsafe) static var hardware = !Config.isTestHost
     private var fakeRunning = false
 
+    #if os(macOS)
+    /// macOS runs the engine's start, restart and teardown here, never on main: voice-processing setup
+    /// blocks 0.8–3 s and teardown ~0.3 s, which froze the call panel (2026-11-23). Serial, so a stop
+    /// and the next start keep their order.
+    private let engineQueue = DispatchQueue(label: "xyz.scian.biseo.audio-engine", qos: .userInitiated)
+    private let generationLock = NSLock()
+    private var generation = 0   // bumped by stop(): a start queued before it is cancelled
+
+    private var currentGeneration: Int { generationLock.lock(); defer { generationLock.unlock() }; return generation }
+
+    struct Cancelled: Error {}
+
+    /// start() on the engine queue; `done` on main: nil = running, `Cancelled` = a stop() came first.
+    func startInBackground(_ done: @escaping (Error?) -> Void) {
+        let gen = currentGeneration
+        engineQueue.async { [self] in
+            var failure: Error?
+            if gen != currentGeneration { failure = Cancelled() } else {
+                do { try start() } catch { failure = error }
+            }
+            DispatchQueue.main.async { done(failure) }
+        }
+    }
+
+    /// The route or device changed: stop and start again on the engine queue; `done` on main.
+    func restartInBackground(_ done: @escaping (Error?) -> Void) {
+        let gen = currentGeneration
+        engineQueue.async { [self] in
+            var failure: Error?
+            if gen != currentGeneration { failure = Cancelled() } else {
+                stopEngine()
+                do { try start() } catch { failure = error }
+            }
+            DispatchQueue.main.async { done(failure) }
+        }
+    }
+
+    /// Waits for queued engine work (tests).
+    func drainEngineQueue() { engineQueue.sync {} }
+    #endif
+
     /// iOS: call after CallKit activated the audio session.
     func start() throws {
         started = true   // from here on stop() has something to undo, even if start throws
@@ -274,10 +315,23 @@ final class AudioIO {
     var voiceProcessingOn: Bool { Self.hardware ? engine.inputNode.isVoiceProcessingEnabled : fakeRunning }
 
     /// Idempotent. Taps and the ducking timer go first, then the players and the engine.
+    /// macOS with real hardware: returns at once, the teardown runs on the engine queue after any
+    /// start still in flight (which this cancels if it has not begun).
     func stop() {
-        duckTimer?.cancel(); duckTimer = nil
         // Always drop what is scheduled, even when the engine already stopped (iOS didDeactivate),
         // so an old reply can't resume when the engine starts again.
+        speechLock.lock(); speechEnd = 0; scheduledSamples = 0; pausedAt = nil; speechLock.unlock()
+        #if os(macOS)
+        generationLock.lock(); generation += 1; generationLock.unlock()
+        // Hardware: async, the hang-up returns at once. Fake (tests): sync, still ordered after a queued start.
+        if Self.hardware { engineQueue.async { [self] in stopEngine() } } else { engineQueue.sync { stopEngine() } }
+        #else
+        stopEngine()
+        #endif
+    }
+
+    private func stopEngine() {
+        duckTimer?.cancel(); duckTimer = nil
         defer {
             player.stop()
             cuePlayer.stop()

@@ -32,6 +32,34 @@ final class EngineLifecycleTests: XCTestCase {
             XCTAssertFalse(audio.isRunning)
         }
     }
+
+    /// The engine starts off the main thread (2026-11-23: 0.8–3 s main-thread stall at call start);
+    /// a stop() before a queued start cancels it instead of leaving the mic on.
+    func testBackgroundStartReportsOnMainAndStopCancels() {
+        let audio = AudioIO()
+        let up = expectation(description: "up")
+        audio.startInBackground { error in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertNil(error)
+            up.fulfill()
+        }
+        wait(for: [up], timeout: 2)
+        XCTAssertTrue(audio.isRunning)
+        let restarted = expectation(description: "restarted")
+        audio.restartInBackground { error in XCTAssertNil(error); restarted.fulfill() }
+        wait(for: [restarted], timeout: 2)
+        XCTAssertTrue(audio.isRunning)
+        audio.stop()
+        audio.drainEngineQueue()
+        XCTAssertFalse(audio.isRunning)
+        // A start queued and then stopped: cancelled whichever runs first on the queue, never left running.
+        let ended = expectation(description: "ended")
+        audio.startInBackground { _ in ended.fulfill() }
+        audio.stop()
+        wait(for: [ended], timeout: 2)
+        audio.drainEngineQueue()
+        XCTAssertFalse(audio.isRunning)
+    }
     #endif
 
     func testDuckingRampsDownFastAndBackSlowly() {

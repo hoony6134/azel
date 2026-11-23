@@ -106,6 +106,38 @@ final class CallClient {
     /// iOS: call only once the audio session is active. If this throws `.audio` the socket is open: call `stop()`.
     func start(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil, secret: Bool = false, locked: Bool = false,
                resume: String? = nil) throws {
+        try open(session: session, callID: callID, intent: intent, persona: persona, mode: mode, secret: secret, locked: locked, resume: resume)
+        guard let task = socket else { return }
+        defer { markTiming("audio_up") }   // engine and voice processing running (synchronous, on this thread)
+        do { try audio.start() } catch {
+            Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
+            throw StartError.audio
+        }
+        audioUp(task)
+    }
+
+    #if os(macOS)
+    /// After `open(...)`: the engine starts on AudioIO's queue and the main thread stays free. `done` runs
+    /// on main once audio is up (nil) or failed (`.audio`; the socket is open: call `stop()`). Never called
+    /// when the call was stopped meanwhile.
+    func startAudio(_ done: @escaping (Error?) -> Void) {
+        guard let task = socket else { return }
+        audio.startInBackground { [weak self] error in
+            guard let self, task === self.socket, !(error is AudioIO.Cancelled) else { return }
+            if let error {
+                Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
+                return done(StartError.audio)
+            }
+            markTiming("audio_up")
+            audioUp(task)
+            done(nil)
+        }
+    }
+    #endif
+
+    /// The socket and the mic path, without audio: `start` (or macOS `startAudio`) follows.
+    func open(session: String, callID: String? = nil, intent: String? = nil, persona: String? = nil, mode: String? = nil, secret: Bool = false, locked: Bool = false,
+              resume: String? = nil) throws {
         guard let token = Config.token else { throw StartError.notConfigured }
         let task = URLSession.shared.webSocketTask(with: try Self.request(voiceURL: Config.voiceURL, token: token,
                                                                          session: session, callID: callID, intent: intent, persona: persona, mode: mode, secret: secret, locked: locked,
@@ -130,11 +162,10 @@ final class CallClient {
             }
             if action != .drop { recorder?.mic(data, silent: action == .silence) }
         }
-        defer { markTiming("audio_up") }   // engine and voice processing running (synchronous, on this thread)
-        do { try audio.start() } catch {
-            Log.call.error("audio start failed: \(error.localizedDescription, privacy: .public)")
-            throw StartError.audio
-        }
+    }
+
+    /// Audio is up: read the socket, run the heartbeat and the silent-mic check.
+    private func audioUp(_ task: URLSessionWebSocketTask) {
         receive(task, call: beginCall())
         pulseTimer?.invalidate()
         wasPlaying = false
@@ -417,8 +448,25 @@ final class CallClient {
     /// The route changed under the engine: restart it once (a restart can itself post a change).
     private func routeChanged() {
         guard socket != nil, routeGate.shouldRestart(now: ProcessInfo.processInfo.systemUptime) else { return }
+        #if os(macOS)
+        restartAudioInBackground { [weak self] in self?.onWarning?("오디오 장치를 바꾸지 못했어요") }
+        #else
         do { try restartAudio() } catch { onWarning?("오디오 장치를 바꾸지 못했어요") }
+        #endif
     }
+
+    #if os(macOS)
+    /// macOS: the restart runs on AudioIO's queue; `failed` on main, only while this call is still up.
+    func restartAudioInBackground(failed: @escaping () -> Void) {
+        guard let task = socket else { return }
+        routeGate.restarted(now: ProcessInfo.processInfo.systemUptime)
+        audio.restartInBackground { [weak self] error in
+            guard let self, task === self.socket, !(error is AudioIO.Cancelled) else { return }
+            if error != nil { return failed() }
+            if held { audio.pause() }
+        }
+    }
+    #endif
 
     /// iOS: CallKit gave the audio session back (after a hold or interruption); macOS: device change.
     func restartAudio() throws {

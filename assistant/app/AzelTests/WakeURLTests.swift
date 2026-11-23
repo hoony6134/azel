@@ -69,6 +69,27 @@ final class WakeURLTests: XCTestCase {
         let got = await AzelFiles.takeUtterance("late", appear: 0.3, partLimit: 3)
         XCTAssertEqual(got.data?.count, 640)
     }
+
+    /// Voice processing starts only once the listener closed its stream (2026-11-23: 3 s main-thread
+    /// stall while both held the mic); a leftover marker delays a call by `limit`, never forever.
+    func testWaitsForTheListenerToReleaseTheMic() async throws {
+        let none = await AzelFiles.listenerReleased(limit: 0.2)
+        XCTAssertTrue(none, "no listener: no wait")
+        AzelFiles.listenerMic.create()
+        Task {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            AzelFiles.listenerMic.remove()                                  // the listener closed its stream
+        }
+        let t0 = Date()
+        let released = await AzelFiles.listenerReleased(limit: 2)
+        XCTAssertTrue(released)
+        XCTAssertGreaterThan(Date().timeIntervalSince(t0), 0.25, "waited for the release, not a fixed sleep")
+        AzelFiles.listenerMic.create()
+        let stuck = await AzelFiles.listenerReleased(limit: 0.2)
+        XCTAssertFalse(stuck, "a leftover marker gives up at the limit")
+        AzelFiles.clearMarkers()
+        XCTAssertTrue(AzelFiles.listenerMic.exists, "the listener's marker is the listener's to remove")
+    }
 }
 #endif
 

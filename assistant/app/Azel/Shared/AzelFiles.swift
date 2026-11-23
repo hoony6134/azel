@@ -6,6 +6,7 @@ import Foundation
 /// - `in-call`: a call is up (the listener stays deaf);
 /// - `mic-live`: the call's mic is capturing (the listener may let go of the mic);
 /// - `enrolling`: the wake-clip recorder is open (no wake detection);
+/// - `listener-mic` (the listener's): its input stream is open; it closes it during a call or enrollment;
 /// - `wake-utterance-<id>.pcm`: what the user said right after the name, PCM16LE mono 16 kHz.
 enum AzelFiles {
     static var folder: URL = {
@@ -29,6 +30,20 @@ enum AzelFiles {
     }
 
     static let inCall = Marker(name: "in-call"), micLive = Marker(name: "mic-live"), enrolling = Marker(name: "enrolling")
+
+    static let listenerMic = Marker(name: "listener-mic")
+
+    /// Waits until the listener has closed its input stream (it does on the next 160 ms frame after
+    /// `in-call` appears, or after it finished recording the utterance), at most `limit`. false = still
+    /// marked: a crashed listener's leftover or an old listener; start anyway.
+    static func listenerReleased(limit: TimeInterval = 1.5) async -> Bool {
+        let start = Date()
+        while listenerMic.exists {
+            if Date().timeIntervalSince(start) >= limit { return false }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return true
+    }
 
     /// App launch and quit: nothing of ours is running.
     static func clearMarkers() { [inCall, micLive, enrolling].forEach { $0.remove() } }
