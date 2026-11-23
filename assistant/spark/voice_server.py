@@ -514,6 +514,7 @@ def local_now():
     return "local" in (CALL_MODE.get(), (CALL_LIVE.get() or {}).get("mode"))
 CALL_TURN: contextvars.ContextVar = contextvars.ContextVar("call_turn", default="")  # one id per user turn, for the gateway
 CALL_CARDS: contextvars.ContextVar = contextvars.ContextVar("call_cards", default=None)  # (send, kinds sent) this turn
+CALL_EVENTS: contextvars.ContextVar = contextvars.ContextVar("call_events", default=None)  # the call's on_event
 CARD_MAX = 32_000  # bytes of JSON; a bigger card is dropped (cards-contract.md)
 MODE_TYPES = ("ask", "tool_call", "schedule", "task")
 LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
@@ -989,7 +990,7 @@ async def gateway_tool(name, args, on_say=None):
     return clip_tool(str(msg.get("result") or msg.get("message") or ""), name)
 
 
-async def gateway_tool_msg(name, args, on_say=None):
+async def gateway_tool_msg(name, args, on_say=None, on_output=None):
     """One gateway tool over the link: the whole tool_result frame (result for a model; spoken and needs for the
     fast path, ACTIONS.md §2). A tool_progress frame ("앱에서 허용해 주세요") is spoken as it arrives."""
     lk = links.pick(personal=True, need_claude=False)
@@ -1004,6 +1005,8 @@ async def gateway_tool_msg(name, args, on_say=None):
             msg = await asyncio.wait_for(q.get(), max(0.1, end - time.monotonic()))
             if msg.get("type") == "tool_progress" and on_say and isinstance(msg.get("say"), str):
                 await on_say(msg["say"][:120])
+            if msg.get("type") == "tool_progress" and on_output and isinstance(msg.get("output"), str):
+                await on_output(msg["output"])  # a command's streamed output, for the app's tool detail
             elif msg.get("type") in ("tool_result", "error"):
                 await relay_card(msg.get("card"))  # as soon as the data is here, before any sentence about it
                 return msg
@@ -1011,7 +1014,7 @@ async def gateway_tool_msg(name, args, on_say=None):
         links.queues.pop(rid, None)
 
 
-async def run_tool(raw, session, on_say=None):
+async def _run_tool(raw, session, on_say=None, meta=None, on_output=None):
     """Run one '[TOOL] {...}' line from Qwen: brain tools over the brain link, the gateway's tools (devices,
     call_user, create_task) over a gateway link, scheduled calls via a gateway."""
     call = raw.strip().removeprefix(TOOL_TAG).strip()
@@ -1026,9 +1029,11 @@ async def run_tool(raw, session, on_say=None):
         return await game_tool(CALL_ORIGIN.get() or session, args)
     if name in {t["name"] for t in gw_tools["defs"]} and name not in links.brain_tools():
         try:
-            msg = await gateway_tool_msg(name, args, on_say)
+            msg = await gateway_tool_msg(name, args, on_say, on_output)
         except (RuntimeError, asyncio.TimeoutError):
             return "지금은 그 도구를 쓸 수 없어요."
+        if meta is not None:
+            meta["msg"] = msg
         needs = msg.get("needs") if isinstance(msg.get("needs"), dict) else None
         if needs and needs.get("kind") == "confirm" and isinstance(needs.get("args"), dict):
             pending_confirm[session] = (time.time(), name, needs["args"])  # a read-back: the next turn's yes resends it
@@ -1041,6 +1046,91 @@ async def run_tool(raw, session, on_say=None):
         return clip_tool(str(reply.get("result", "")), name)
     except (RuntimeError, asyncio.TimeoutError):
         return "지금은 그 도구를 쓸 수 없어요."
+
+
+TOOL_FAILED = ("도구 호출 형식이 틀렸어요.", "지금은 그 도구를 쓸 수 없어요.", "없는 도구예요")
+COMMAND_ARGS = ("command", "cmd", "script")  # a command tool's command line: shown as is, not as JSON
+OUTPUT_EVERY_S = 0.5  # tool_output chunks: at most two a second per call
+
+
+async def run_tool(raw, session, on_say=None):
+    """_run_tool, shown to the app (tool-activity-contract.md): tool_start with the input, tool_output chunks while a
+    command streams, tool_end with the output, exit code and duration. Everything redacted and clipped."""
+    emit = CALL_EVENTS.get()
+    call = raw.strip().removeprefix(TOOL_TAG).strip()
+    try:
+        data = json.loads(call[call.index("{"):call.rindex("}") + 1])
+        name, args = str(data.get("name", "")), data.get("args") if isinstance(data.get("args"), dict) else {}
+    except ValueError:
+        emit = None  # not a tool call: nothing to show
+    if not emit:
+        return await _run_tool(raw, session, on_say)
+    cid, t0, meta, label_kind = uuid.uuid4().hex[:12], time.perf_counter(), {}, tool_activity(name)
+    cmd = next((args[k] for k in COMMAND_ARGS if isinstance(args.get(k), str)), None)
+    host = name.split("__", 1)[0] if "__" in name else next((str(args[k]) for k in ("host", "device") if args.get(k)), "")
+    base = {"type": "activity", "call_id": cid, "tool": name, "kind": label_kind[1], "route": "qwen"}
+    await emit({**base, "phase": "tool_start", "label": label_kind[0], **({"host": host[:64]} if host else {}),
+                "input": clip_head(redact(cmd if cmd is not None else json.dumps(args, ensure_ascii=False, separators=(",", ":"))))})
+    pending, last = [""], [0.0]
+
+    async def on_output(chunk):  # shortcut: a secret split across two chunks may escape redaction; the gateway redacts first
+        pending[0] += chunk
+        if time.monotonic() - last[0] >= OUTPUT_EVERY_S:
+            last[0] = time.monotonic()
+            text, pending[0] = pending[0], ""
+            await emit({**base, "phase": "tool_output", "chunk": clip_tail(redact(text), 2048)[0]})
+    text, ok = "", False
+    try:
+        text = await _run_tool(raw, session, on_say, meta, on_output)
+        msg = meta.get("msg") or {}
+        ok = not msg.get("is_error") and not text.startswith(TOOL_FAILED)
+        return text
+    finally:  # also when the lookup's wait cancels it: the app never keeps a spinner for a call that ended
+        msg = meta.get("msg") or {}
+        out, cut = clip_tail(redact(msg["output"] if isinstance(msg.get("output"), str) else text), 8192)
+        extra = {k: v for k, v in (("exit_code", msg.get("exit_code")), ("task_id", msg.get("task_id")),
+                                  ("host", msg.get("host"))) if v is not None}
+        end = {**base, "phase": "tool_end", "label": label_kind[0], "ok": ok,
+               "duration_ms": round((time.perf_counter() - t0) * 1000), "output": out,
+               **({"truncated": True} if cut else {}),
+               **({"exit_code": extra["exit_code"]} if isinstance(extra.get("exit_code"), int) else {}),
+               **({"task_id": str(extra["task_id"])[:64]} if extra.get("task_id") else {}),
+               **({"host": str(extra["host"])[:64]} if extra.get("host") else {})}
+        try:
+            await emit(end)
+        except Exception:  # noqa: BLE001  the call may be gone; the tool's own result still returns
+            pass
+
+
+# Secrets in a tool's input or output, before the app shows them (the gateway redacts at the source too)
+REDACT = [
+    (re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+|basic\s+|token\s+)?[^\s\"',;]+"), r"\1«redacted»"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer «redacted»"),
+    (re.compile(r"(?i)\b([\w-]*(?:token|secret|passwd|password|api[_-]?key|apikey|access[_-]?key|private[_-]?key|\bkey)[\w-]*)"
+                r"(\s*[:=]\s*\"?|\"\s*:\s*\")([^\s\"',;&]+)"), r"\1\2«redacted»"),
+    (re.compile(r"(https?://[^\s?\"'<>]+)\?[^\s\"'<>]+"), r"\1?«redacted»"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}"
+                r"|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"), "«redacted»"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"), "«redacted»"),
+]
+
+
+def redact(text):
+    for pat, rep_ in REDACT:
+        text = pat.sub(rep_, text)
+    return text
+
+
+def clip_head(text, n=2048):
+    """At most n bytes of UTF-8, from the start ("…" when cut)."""
+    b = text.encode()
+    return text if len(b) <= n else b[:n - 3].decode(errors="ignore") + "…"
+
+
+def clip_tail(text, n=8192):
+    """(the last n bytes of UTF-8, cut?)."""
+    b = text.encode()
+    return (text, False) if len(b) <= n else (b[-n:].decode(errors="ignore"), True)
 
 
 async def recall(text, timings):
@@ -1826,10 +1916,30 @@ KINDS = {"calendar", "mail", "memory", "schedule", "server", "files", "web", "te
 
 
 def client_activity(ev):
-    """The app-facing activity event: phase, label, tool name and kind only (the gateway never sends arguments)."""
+    """The app-facing activity event for Claude's tools: phase, label, tool, kind, and the detail fields of
+    tool-activity-contract.md when the gateway sends them (typed, clipped and redacted again here)."""
     kind = ev.get("kind") if ev.get("kind") in KINDS else "generic"
-    return {"type": "activity", "phase": str(ev.get("phase", "")), "label": str(ev.get("label", "")),
-            "tool": str(ev.get("tool", "")), "kind": kind, "route": "claude"}
+    out = {"type": "activity", "phase": str(ev.get("phase", "")), "label": str(ev.get("label", "")),
+           "tool": str(ev.get("tool", "")), "kind": kind, "route": "claude"}
+    if isinstance(ev.get("call_id"), str) and re.fullmatch(r"[\w-]{1,40}", ev["call_id"]):
+        out["call_id"] = ev["call_id"]
+    for k in ("host", "task_id"):
+        if isinstance(ev.get(k), str) and ev[k]:
+            out[k] = ev[k][:64]
+    if isinstance(ev.get("input"), str):
+        out["input"] = clip_head(redact(ev["input"]))
+    if isinstance(ev.get("chunk"), str):
+        out["chunk"] = clip_tail(redact(ev["chunk"]), 2048)[0]
+    if isinstance(ev.get("output"), str):
+        out["output"], cut = clip_tail(redact(ev["output"]))
+        if cut or ev.get("truncated") is True:
+            out["truncated"] = True
+    if isinstance(ev.get("ok"), bool):
+        out["ok"] = ev["ok"]
+    for k in ("exit_code", "duration_ms"):
+        if isinstance(ev.get(k), int) and not isinstance(ev.get(k), bool):
+            out[k] = ev[k]
+    return out
 
 
 async def claude_stream(text, session, model, task, personal=False, context="", timeout=180, on_event=None):
@@ -2342,6 +2452,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     bare = strip_vocative(text, name)
     CALL_TURN.set(uuid.uuid4().hex[:12])
     CALL_CARDS.set((on_event, set()) if on_event else None)
+    CALL_EVENTS.set(on_event)
     confirm = pending_confirm.pop(session, None)  # asked last turn: this turn answers it, yes or not
     confirm = confirm if confirm and time.time() - confirm[0] < CONFIRM_TTL_S and (
         YES.search(bare) or CONFIRM_YES.fullmatch(bare)) else None
@@ -2504,10 +2615,6 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                 """Run a tool line. A read-only lookup gets an ack past LOOKUP_SLOW_S and gives up at LOOKUP_S (None);
                 an action tool keeps its own wait (an approval can take minutes)."""
                 name = (re.search(r'"name"\s*:\s*"([\w-]+)"', line) or [None, ""])[1]
-                if on_event:  # the call's activity (it showed [] for every Qwen-path lookup, live 2026-11-23)
-                    label, kind = tool_activity(name)
-                    await on_event({"type": "activity", "phase": "tool_start", "tool": name, "label": label,
-                                    "kind": kind, "route": "qwen"})
                 infra = [t["name"] for t in gw_defs if t["name"] in INFRA_READ]
                 if name in INFRA_READ and len(infra) > 1:  # a server question reads the whole picture, not one part
                     job = asyncio.create_task(infra_read(infra, session))
@@ -4118,7 +4225,7 @@ if __name__ == "__main__":
         async def agenda_check(ask, fail=False):  # the schedule fast path: one agenda read (both sources) before Claude
             calls, contexts = [], []
 
-            async def fake_gw_tool(name, args, on_say=None):
+            async def fake_gw_tool(name, args, on_say=None, on_output=None):
                 calls.append((name, args))
                 if fail:
                     raise RuntimeError("down")
@@ -4164,7 +4271,7 @@ if __name__ == "__main__":
                 yield ("네, 정훈님. 오늘 일정 알려드릴게요. 오전에 수업이 있어요. 밤 8시부터 정기회의가 있어요." if len(llm_calls) == 1
                        else "네, 정훈님. 오늘 일정 안내해 드릴게요. 오전에 수업이 있고, 밤 8시부터 정기회의가 있어요.")
 
-            async def fake_gw_tool(name, args, on_say=None):
+            async def fake_gw_tool(name, args, on_say=None, on_output=None):
                 return "일정 (KST)\n- 09:00~10:00 수업\n- 20:00~22:00 정기회의"
 
             async def no_route(*a, **k):
@@ -5404,7 +5511,7 @@ if __name__ == "__main__":
             """Qwen calls calendar_write, the gateway reads back and waits; the next turn answers. Gateway frames out."""
             frames, rounds = [], []
 
-            async def fake_msg(name, args, on_say=None):
+            async def fake_msg(name, args, on_say=None, on_output=None):
                 frames.append((name, dict(args), CALL_TURN.get()))
                 if args.get("confirm") == "ab12cd34":
                     return {"type": "tool_result", "result": "일정을 지웠어요.", "spoken": "일정을 지웠어요."}
@@ -5484,6 +5591,49 @@ if __name__ == "__main__":
                 links.pick = real_pick
             return got
         got = asyncio.run(cards_check())
+        class CmdLink:
+            async def send(self, obj):
+                q = links.queues[obj["id"]][0]
+                q.put_nowait({"type": "tool_progress", "output": "building... token=abc123secret\n"})
+                q.put_nowait({"type": "tool_progress", "output": "step 2\n"})  # within 0.5 s: held, not sent alone
+                q.put_nowait({"type": "tool_result", "result": "빌드 실패", "is_error": True, "exit_code": 2,
+                              "task_id": "t-9", "output": "가" * 4000 + "\nAuthorization: Bearer abcdefghijklmnop\nfail"})
+
+        async def tool_detail_check():
+            """A device command, as the app's tool detail sees it: input, a streamed chunk, then the end."""
+            got, real_pick, real_defs = [], links.pick, dict(gw_tools)
+            async def sink(ev):
+                got.append(ev)
+            links.pick = lambda **k: CmdLink()
+            gw_tools.update(defs=[{"name": "macbook__run_command"}])
+            try:
+                CALL_EVENTS.set(sink)
+                text = await run_tool(TOOL_TAG + ' {"name": "macbook__run_command", "args": {"command": '
+                                      '"curl -H \'Authorization: Bearer sk-abcdefghijklmnopqrstu\' https://x.io/a?key=1 && make"}}', "s")
+                CALL_EVENTS.set(None)
+                plain = await run_tool(TOOL_TAG + ' {"name": "macbook__run_command", "args": {"command": "ls"}}', "s")
+            finally:
+                links.pick = real_pick
+                gw_tools.clear()
+                gw_tools.update(real_defs)
+            return text, plain, got
+        text, plain, tgot = asyncio.run(tool_detail_check())
+        assert text == plain == "빌드 실패" and [e["phase"] for e in tgot] == ["tool_start", "tool_output", "tool_end"], tgot
+        start, chunk, end = tgot
+        assert start["host"] == "macbook" and start["input"].startswith("curl -H 'Authorization: «redacted»") and \
+            "sk-" not in start["input"] and "key=1" not in start["input"] and start["input"].endswith("&& make"), start
+        assert chunk["chunk"] == "building... token=«redacted»\n" and chunk["call_id"] == start["call_id"] == end["call_id"]
+        assert end["ok"] is False and end["exit_code"] == 2 and end["task_id"] == "t-9" and end["truncated"] is True
+        assert end["output"].endswith("Authorization: «redacted»\nfail") and len(end["output"].encode()) <= 8192
+        assert isinstance(end["duration_ms"], int) and end["route"] == "qwen"
+        ca = client_activity({"phase": "tool_end", "tool": "Bash", "call_id": "toolu_01", "input": "echo $PASSWORD=hunter22",
+                              "output": "x" * 9000, "ok": True, "exit_code": 0, "duration_ms": 12, "task_id": "t1",
+                              "args": {"secret": "no"}})
+        assert ca["call_id"] == "toolu_01" and ca["truncated"] is True and len(ca["output"]) == 8192 and ca["exit_code"] == 0
+        assert "hunter22" not in ca["input"] and "args" not in ca and ca["ok"] is True and ca["route"] == "claude"
+        assert redact("뭐야? 오늘 주가는?") == "뭐야? 오늘 주가는?"  # a question mark in text is not a URL query
+        assert redact("-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----") == "«redacted»"
+        assert clip_head("가" * 1000) .endswith("…") and len(clip_head("가" * 1000).encode()) <= 2048
         INFRA_CARDS = {"infra_health": {"kind": "infra", "title": "서버 상태", "hosts": [{"name": "vd-spark", "up": True, "cpu_pct": 12}]},
                        "infra_status": {"kind": "infra", "title": "서비스 상태", "down": ["nemoclaw"]},
                        "infra_alerts": {"kind": "infra", "title": "경보", "hosts": []}}
@@ -6162,14 +6312,14 @@ if __name__ == "__main__":
             # "네, 엔트로픽 주가 찾아볼게요." and nothing else: not the end of the turn. Qwen is told to call the tool now;
             # the promise is said only as the filler while it does. Twice in a row: the lookup is done for it.
             ann, ran = [], []
-            saved_tools, saved_run = dict(gw_tools), run_tool
+            saved_tools, saved_run = dict(gw_tools), _run_tool
 
-            async def fake_run_tool(raw, session, on_say=None):
+            async def fake_run_tool(raw, session, on_say=None, meta=None, on_output=None):
                 ran.append(json.loads(raw[len(TOOL_TAG):]))
                 return "앤트로픽은 비상장 회사라 주가가 없어요(네이버 기준)."
             gw_tools.update(at=time.time(), defs=[{"name": "web_search", "read_only": True, "description": "검색"},
                                                   {"name": "weather", "read_only": True, "description": "날씨"}])
-            globals()["run_tool"] = fake_run_tool
+            globals()["_run_tool"] = fake_run_tool
 
             def announcer(then):
                 async def llm(messages, max_tokens=600):
@@ -6228,17 +6378,17 @@ if __name__ == "__main__":
             span = agenda_range(ask, datetime.now(KST))
             fetched_calls, saved_gw_tool = [], gateway_tool
 
-            async def gw_agenda(name, args, on_say=None):
+            async def gw_agenda(name, args, on_say=None, on_output=None):
                 fetched_calls.append((name, args))
                 if prefetch_down:
                     raise RuntimeError("down")
                 return "일정 (구글 캘린더와 Gistra를 합친 것, KST)\n- 10:30~11:45 수업 컴파일러"
             globals()["gateway_tool"] = gw_agenda
 
-            async def agenda_run_tool(raw, session, on_say=None):
+            async def agenda_run_tool(raw, session, on_say=None, meta=None, on_output=None):
                 ran.append(json.loads(raw[len(TOOL_TAG):]))
                 return "일정 (구글 캘린더와 Gistra를 합친 것, KST)\n- 10:30~11:45 수업 컴파일러"
-            globals()["run_tool"] = agenda_run_tool
+            globals()["_run_tool"] = agenda_run_tool
 
             async def local_run(text):
                 CALL_MODE.set("local")
@@ -6338,14 +6488,14 @@ if __name__ == "__main__":
             said = asyncio.run(lrun("너 나 좋아해?", "tf2"))  # routed NONE: Qwen's own first answer, held then released
             assert [x for x, *_ in said] == ["저도 대표님 좋아해요."] and ran == [] and len(ann) == 1, said
 
-            async def slow_tool(raw, session, on_say=None):
+            async def slow_tool(raw, session, on_say=None, meta=None, on_output=None):
                 ran.append(json.loads(raw[len(TOOL_TAG):]))
                 await asyncio.sleep(5)
-            globals()["run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = slow_tool, (0.05, 0.3)
+            globals()["_run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = slow_tool, (0.05, 0.3)
             ran.clear(), ann.clear()
             said = asyncio.run(lrun("서버 괜찮아?", "tf3"))
             assert [x for x, *_ in said] == [LOOKUP_ACK, LOOKUP_SLOW] and ann == [], said  # never silent, never a guess
-            globals()["run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = fake_run_tool, (1.2, 8.0)
+            globals()["_run_tool"], (LOOKUP_SLOW_S, LOOKUP_S) = fake_run_tool, (1.2, 8.0)
             route_lookup = no_route
             # live 2026-11-23 03:14: "확인해 봤는데 모두 정상" with no tool while NemoClaw was down. A server question
             # reads all three infra tools; the answer sees the down service; a checked result with no tool is never said
@@ -6355,11 +6505,11 @@ if __name__ == "__main__":
             canned = {"infra_health": "deneb CPU 12%", "infra_status": "멈춤: Vuja De claw (NemoClaw) http, vd-spark, 03:02부터",
                       "infra_alerts": "경보 없음"}
 
-            async def infra_tool(raw, session, on_say=None):
+            async def infra_tool(raw, session, on_say=None, meta=None, on_output=None):
                 d = json.loads(raw[len(TOOL_TAG):])
                 ran.append(d)
                 return canned[d["name"]]
-            globals()["run_tool"], route_lookup = infra_tool, route_infra
+            globals()["_run_tool"], route_lookup = infra_tool, route_infra
             ran.clear(), ann.clear()
             events = []
 
@@ -6403,14 +6553,14 @@ if __name__ == "__main__":
             quotes = {"AAPL": "애플 342.56달러, -1.90%", "NVDA": "엔비디아 125.53달러, -14.01%", "005930": "삼성전자 180,900원, -8.13%",
                       "000660": "SK하이닉스 412,000원, -5.20%", "토스": "상장된 종목을 찾지 못했어요."}
 
-            async def own_tool(raw, session, on_say=None):
+            async def own_tool(raw, session, on_say=None, meta=None, on_output=None):
                 d = json.loads(raw[len(TOOL_TAG):])
                 ran.append(d)
                 return hold if d["name"] == "memory_recall" else quotes[d["args"]["query"]]
 
             async def route_holdings(text, recent, tools):
                 return [{"name": "stock_quote", "args": {"query": q}} for q in quotes] if "[기억에서 찾은 것]" in text else None
-            globals()["run_tool"], route_lookup = own_tool, route_holdings
+            globals()["_run_tool"], route_lookup = own_tool, route_holdings
             ran.clear(), ann.clear()
             globals()["llm_stream"] = announcer(["애플 1.9%, 엔비디아 14.01%, 삼성전자 8.13%, SK하이닉스 5.2% 내렸고, 토스는 시세가 없어요."])
             said = [x for x, *_ in asyncio.run(lrun("내가 갖고 있는 주식 현황 이용해가지고 어떤 주식이 얼마만큼 올랐는지 떨어졌는지 알려줘.",
@@ -6423,17 +6573,17 @@ if __name__ == "__main__":
                                                   {"name": "stock_quote", "read_only": True, "description": "주가"},
                                                   {"name": "portfolio", "read_only": True, "description": "보유 종목 시세"}])
 
-            async def pf_tool(raw, session, on_say=None):
+            async def pf_tool(raw, session, on_say=None, meta=None, on_output=None):
                 d = json.loads(raw[len(TOOL_TAG):])
                 ran.append(d)
                 return "애플 342.56달러 -1.90%, 엔비디아 125.53달러 -14.01% (11월 21일)"
-            globals()["run_tool"], route_lookup = pf_tool, route_holdings
+            globals()["_run_tool"], route_lookup = pf_tool, route_holdings
             ran.clear(), ann.clear()
             globals()["llm_stream"] = announcer(["애플은 1.9%, 엔비디아는 14.01% 내렸어요."])
             said = [x for x, *_ in asyncio.run(lrun("내가 가진 주식 얼마나 올랐어?", "tf10"))]
             assert ran == [{"name": "portfolio", "args": {}}] and said == [LOOKUP_ACK, "애플은 1.9%, 엔비디아는 14.01% 내렸어요."], \
                 (ran, said)
-            globals()["run_tool"], route_lookup = fake_run_tool, no_route
+            globals()["_run_tool"], route_lookup = fake_run_tool, no_route
             # the call as it went: no tools at all, and Qwen only promised. Held, and the turn says it could not look
             gw_tools.update(at=time.time(), defs=[])
             ann.clear()
@@ -6441,7 +6591,7 @@ if __name__ == "__main__":
             said = [x for x, *_ in asyncio.run(lrun("야 지금 서버 뭐 죽은 것 같은데 한번 확인해봐", "tf4"))]
             assert not any("확인해 볼게요" in x for x in said) and said[-1] == LOOKUP_FAILED, said
             gw_tools.clear(), gw_tools.update(saved_tools)
-            globals()["run_tool"] = saved_run
+            globals()["_run_tool"] = saved_run
             globals()["llm_stream"] = fake_llm
             prompts.clear()
             t = time.perf_counter()
