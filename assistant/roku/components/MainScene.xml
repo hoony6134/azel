@@ -17,6 +17,7 @@
         </Group>
         <Group id="detail" visible="false" translation="[972,318]" />
         <DetailPage id="page" visible="false" />
+        <StockPage id="stockPage" visible="false" />
         <Group id="ambientG" visible="false">
             <Rectangle id="ambientBg" width="1920" height="1080" color="0x080B0CFF" />
             <Group id="ambBase" translation="[240,320]" />

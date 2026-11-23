@@ -663,3 +663,80 @@ class Cache:
             if self.value is None or time.monotonic() - self.at >= ttl:
                 self.value, self.at = await make(), time.monotonic()
             return self.value
+
+
+# ---------- GET /v1/tv?detail=stock&symbol=…&range=…: one holding's chart page ----------
+STOCK_RANGES = {"1d": ("1d", "5m", 30), "7d": ("7d", "30m", 300), "1mo": ("1mo", "1h", 300),
+                "3mo": ("3mo", "1d", 600), "1y": ("1y", "1d", 600)}  # Yahoo range, interval, cache seconds
+STOCK_SYMBOL = re.compile(r"^\^?[A-Za-z0-9][A-Za-z0-9.=\-]{0,11}$")
+MAX_POINTS = 200
+
+
+def downsample(points, n=MAX_POINTS):
+    """At most n points, evenly spread, always keeping the first and the last."""
+    if len(points) <= n:
+        return points
+    return [points[round(i * (len(points) - 1) / (n - 1))] for i in range(n)]
+
+
+def market_state(meta, now):
+    """open | pre | post | closed from the chart meta's trading periods (pre and post exist for US stocks only)."""
+    cur = meta.get("currentTradingPeriod") or {}
+    for state in ("regular", "pre", "post"):
+        p = cur.get(state) or {}
+        if p.get("start") is not None and p["start"] <= now < p["end"]:
+            return "open" if state == "regular" else state
+    return "closed"
+
+
+def chart_points(res):
+    ts = res.get("timestamp") or []
+    close = (((res.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+    return [[t, round(c, 4)] for t, c in zip(ts, close) if c is not None]
+
+
+async def build_stock(d, symbol, rng, now=None):
+    """One holding's page: the quote (price, change against the previous close, day high/low, volume, market state) and
+    `points` [[unix, close] …, ≤ 200] for the range. The day figures always come from the 1d chart, so the header agrees
+    across ranges; `base` is what the line is colored against (the previous close on 1d, else the range's first close).
+    A KRX code is tried as .KS then .KQ. LookupError when the provider knows no such symbol."""
+    now = now or time.time()
+    yrange, interval, _ = STOCK_RANGES[rng]
+    cands = [f"{symbol}.KS", f"{symbol}.KQ"] if re.fullmatch(r"\d{6}", symbol) else [symbol]
+    for sym in cands:
+        try:
+            res = (await d["chart"](sym, "1d", "5m"))["chart"]["result"][0]
+            break
+        except (KeyError, IndexError, TypeError, ValueError, LookupError):
+            continue
+    else:
+        raise LookupError(symbol)
+    meta = res["meta"]
+    series = res if rng == "1d" else (await d["chart"](sym, yrange, interval))["chart"]["result"][0]
+    pts = chart_points(series)
+    price = meta.get("regularMarketPrice")
+    prev = meta.get("chartPreviousClose") if meta.get("chartPreviousClose") is not None else meta.get("previousClose")
+    index = symbol.startswith("^")
+    base = prev if rng == "1d" else (pts[0][1] if pts else prev)
+    return {"at": iso(now), "symbol": symbol, "name": meta.get("longName") or meta.get("shortName") or symbol, "range": rng,
+            "currency": "index" if index else meta.get("currency"), "index": index, "state": market_state(meta, now),
+            "price": price, "prev": prev, "change": price - prev if price is not None and prev else None,
+            "pct": round((price - prev) / prev * 100, 2) if price is not None and prev else None,
+            "high": None if index else meta.get("regularMarketDayHigh"), "low": None if index else meta.get("regularMarketDayLow"),
+            "volume": None if index else meta.get("regularMarketVolume"), "base": base, "points": downsample(pts)}
+
+
+class KeyCache:
+    """Cache per key with its own ttl, at most `cap` keys (the oldest goes first)."""
+
+    def __init__(self, cap=64):
+        self.items, self.cap, self.lock = {}, cap, asyncio.Lock()
+
+    async def get(self, key, make, ttl):
+        async with self.lock:
+            hit = self.items.get(key)
+            if hit is None or time.monotonic() - hit[0] >= ttl:
+                if len(self.items) >= self.cap:
+                    self.items.pop(min(self.items, key=lambda k: self.items[k][0]))
+                hit = self.items[key] = (time.monotonic(), await make())
+            return hit[1]

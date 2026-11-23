@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- One holding's page (opened with OK on a 내 종목 card): name, price, change in Korean colors (red up, blue down), a line
+     chart with a 1일/7일/30일/3개월/1년 selector and, on 1일, a dashed previous-close line and a refresh every 45 s.
+     Data: GET /v1/tv?detail=stock&symbol=…&range=…  The page owns its fetches; Back sets `closed`. -->
+<component name="StockPage" extends="Group">
+    <interface>
+        <field id="symbol" type="string" />
+        <field id="title" type="string" />
+        <field id="baseUrl" type="string" />
+        <field id="token" type="string" />
+        <field id="open" type="boolean" alwaysNotify="true" onChange="onOpen" />
+        <field id="closed" type="boolean" alwaysNotify="true" />
+    </interface>
+    <script type="text/brightscript" uri="pkg:/components/Common.brs" />
+    <script type="text/brightscript" uri="pkg:/components/Model.brs" />
+    <script type="text/brightscript" uri="pkg:/components/StockPage.brs" />
+    <children>
+        <Timer id="live" duration="45" repeat="true" />
+    </children>
+</component>

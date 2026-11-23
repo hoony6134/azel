@@ -733,6 +733,11 @@ device that created them.
   `없음` under a header is an empty section, and a line no parser understands is kept as a plain item or note.
   Approvals are a count and the oldest time only, never a command. `tint` is the primary persona's `color` (a tint name
   or `#rrggbb`).
+  **`?detail=stock&symbol=<code>&range=1d|7d|1mo|3mo|1y`** (the Roku stock page, same auth): one holding's quote and chart.
+  `{at, symbol, name, range, currency ("index" for ^GSPC…), index, state: open|closed|pre|post, price, prev, change, pct,
+  high, low, volume (null for an index), base (the line's baseline: previous close on 1d, else the first close), points:
+  [[unix, close] …, ≤ 200]}`. Yahoo chart data; a six-digit KRX code is tried as `.KS` then `.KQ`. Cached 30 s (1d) or
+  5–10 min (other ranges). 400 for a bad symbol or range, 404 for an unknown symbol, 502 when Yahoo is unreachable.
   **Auth**: the gateway token, or the TV token in `~/.config/biseo/tv_token` (0600, ≥ 32 characters; read on every
   request, so deleting or rotating it revokes at once; ignored unless 0600). The TV token opens **only** `GET /v1/tv`
   (anything else → 401).

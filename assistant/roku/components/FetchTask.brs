@@ -151,6 +151,7 @@ end function
 
 ' Preview data for the detail screens (server address "demo").
 function demoDetail(path as String) as Object
+    if Instr(1, path, "detail=stock") > 0 then return demoStock(path)
     if Instr(1, path, "tasks") > 0
         return {
             active: [{goal: "블로그 초안 정리", status: "running", device: "macbook", engine: "Claude", started: "2026-11-23T02:40:00+09:00", step: "맥북에서 작업 진행 중", steps: 4}
@@ -171,4 +172,24 @@ function demoDetail(path as String) as Object
                 {name: "Vuja De claw (NemoClaw)", type: "http", state: "down", uptime: 2.85, ms: invalid, last_down: invalid}]}]
         alerts: []
     }
+end function
+
+' A made-up day (or longer) for the stock page preview: a gentle wave that ends below the previous close.
+function demoStock(path as String) as Object
+    now = CreateObject("roDateTime").AsSeconds()
+    n = 78
+    gap = 300
+    if Instr(1, path, "range=7d") > 0 then gap = 7200
+    if Instr(1, path, "range=1mo") > 0 then gap = 14400
+    if Instr(1, path, "range=3mo") > 0 then gap = 43200
+    if Instr(1, path, "range=1y") > 0 then gap = 172800
+    pts = []
+    for i = 0 to n - 1
+        v = 183100 + 5200 * Sin(i / 7) - i * 150 + 2500 * Sin(i / 2.3)
+        pts.Push([now - (n - 1 - i) * gap, Int(v)])
+    end for
+    base = 183100
+    if gap > 300 then base = pts[0][1]
+    return {at: Left(CreateObject("roDateTime").ToISOString(), 19) + "+00:00", symbol: "005930", name: "삼성전자", range: "1d", currency: "KRW", index: false, state: "open"
+        price: 172700, prev: 183100, change: -10400, pct: -5.68, high: 178500, low: 171500, volume: 11268621, base: base, points: pts}
 end function

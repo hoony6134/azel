@@ -2629,7 +2629,7 @@ async def probe(url, token=False):
 
 tv_cache, tv_cache2 = tv.Cache(), tv.Cache()
 tv_detail_cache = {"infra": tv.Cache(), "tasks": tv.Cache()}
-tv_weather_cache, tv_quote_cache = tv.Cache(), tv.Cache()
+tv_weather_cache, tv_quote_cache, tv_stock_cache = tv.Cache(), tv.Cache(), tv.KeyCache()
 TV_WEATHER_S, TV_QUOTE_S = 600, 300  # the TV polls every minute; KMA, Naver and Yahoo are asked at most this often
 
 
@@ -2767,18 +2767,28 @@ def tv_deps():
             "google_ok": lambda: google_status() == "connected", "calendar": calendar,
             "infra_raw": lambda n, extra=None: cyg.call(n, {}, raw=True, extra=extra), "persona2": persona2, "overnight": overnight,
             "calendar_rows": calendar_rows, "query": cyg.query,
-            "weather": lambda: tv_weather_cache.get(tv_weather, TV_WEATHER_S),
+            "chart": stock_quotes.yahoo_chart, "weather": lambda: tv_weather_cache.get(tv_weather, TV_WEATHER_S),
             "holdings": lambda: tv_quote_cache.get(tv_holdings, TV_QUOTE_S)}
 
 
 @app.get("/v1/tv")
-async def tv_get(v: int = 1, detail: str | None = None):
+async def tv_get(v: int = 1, detail: str | None = None, symbol: str = "", range: str = "1d"):
     """The Roku dashboard's one read-only JSON (tv.py): v1 by default, `?v=2` the structured shape, `?detail=infra|tasks`
-    a detail screen's data. The TV token (~/.config/biseo/tv_token) opens only this path."""
+    a detail screen's data, `?detail=stock&symbol=005930&range=1d|7d|1mo|3mo|1y` one holding's chart. The TV token (~/.config/biseo/tv_token) opens only this path."""
     full_only()
+    if detail == "stock":
+        if not tv.STOCK_SYMBOL.fullmatch(symbol) or range not in tv.STOCK_RANGES:
+            raise HTTPException(400, "symbol: a ticker or code; range: 1d, 7d, 1mo, 3mo or 1y")
+        try:
+            return await tv_stock_cache.get((symbol.upper(), range), lambda: tv.build_stock(tv_deps(), symbol.upper(), range),
+                                            tv.STOCK_RANGES[range][2])
+        except LookupError:
+            raise HTTPException(404, "no such symbol")
+        except httpx.HTTPError:
+            raise HTTPException(502, "quote provider unreachable")
     if detail is not None:
         if detail not in tv_detail_cache:
-            raise HTTPException(400, "detail: infra or tasks")
+            raise HTTPException(400, "detail: infra, tasks or stock")
         make = tv.build_infra_detail if detail == "infra" else tv.build_tasks_detail
         return await tv_detail_cache[detail].get(lambda: make(tv_deps()))
     if v == 1:

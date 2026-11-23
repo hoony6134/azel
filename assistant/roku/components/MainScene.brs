@@ -34,6 +34,8 @@ sub init()
     m.page = m.top.findNode("page")
     m.page.observeField("closed", "closePage")
     m.page.observeField("refresh", "fetchPage")
+    m.stockPage = m.top.findNode("stockPage")
+    m.stockPage.observeField("closed", "closeStock")
     m.ambientG = m.top.findNode("ambientG")
     m.ambBase = m.top.findNode("ambBase")
     m.errorG = m.top.findNode("errorG")
@@ -422,6 +424,7 @@ sub hideAllModes()
     m.rowsClip.visible = false
     m.detail.visible = false
     m.page.visible = false
+    m.stockPage.visible = false
     m.ambientG.visible = false
     m.errorG.visible = false
     m.settings.visible = false
@@ -812,6 +815,9 @@ sub onSelected()
             openPage("infra", name)
         else if title = "Azel 작업"
             openPage("tasks", "")
+        else if title = "내 종목"
+            k = m.model.sections[f[0]].cards[f[1]]
+            if k.ticker <> "" and k.status <> "unlisted" then openStock(k.ticker, k.name) else showDetail(f[0], f[1])
         else
             showDetail(f[0], f[1])
         end if
@@ -831,6 +837,25 @@ sub openPage(kind as String, focusName as String)
     m.page.visible = true
     m.page.setFocus(true)
     fetchPage()
+end sub
+
+' 내 종목 → one holding's page; it fetches and refreshes itself, Back returns to the dashboard row where OK was pressed
+sub openStock(symbol as String, title as String)
+    m.mode = "page"
+    m.strip.visible = false
+    m.rowsClip.visible = false
+    m.detail.visible = false
+    m.stockPage.symbol = symbol
+    m.stockPage.title = title
+    m.stockPage.baseUrl = m.url
+    m.stockPage.token = m.token
+    m.stockPage.visible = true
+    m.stockPage.open = true
+end sub
+
+sub closeStock()
+    m.stockPage.visible = false
+    showDash()
 end sub
 
 sub fetchPage()
