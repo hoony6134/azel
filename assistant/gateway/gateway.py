@@ -21,6 +21,7 @@ import re
 import shlex
 import tempfile
 import time
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -767,7 +768,7 @@ OWN_LABELS = {"memory_recall": "기억 찾는 중", "people_lookup": "사람 찾
               "web_fetch": "웹페이지 읽는 중", "call_user": "전화 예약 중", "schedule_list": "예약 확인 중",
               "schedule_cancel": "예약 취소 중", "schedule_update": "예약 바꾸는 중", "schedule_create": "예약하는 중",
               "create_task": "작업 맡기는 중", "task_status": "작업 확인 중", "task_cancel": "작업 멈추는 중",
-              "approval_status": "승인 확인 중", "agenda": "일정 확인 중", "calendar_events": "캘린더 확인 중", "gmail_search": "메일 찾는 중",
+              "approval_status": "승인 확인 중", "agenda": "일정 확인 중", "calendar_write": "캘린더 확인 중", "calendar_events": "캘린더 확인 중", "gmail_search": "메일 찾는 중",
               "gmail_read": "메일 읽는 중", "music_play": "음악 트는 중", "music_control": "음악 조작 중",
               "home_scene": "집 기기 조작 중"}
 GENERIC = ("도구 준비 중", "generic")
@@ -1144,6 +1145,8 @@ async def ask_stream(text, session, model=None, path=None, task=None):
         yield {"type": "error", "code": "budget", "message": "이번 달 유료 사용 한도를 다 썼습니다."}
         return
     token = requester_ctx.set(requester_id("ask", session))  # this ask's daemon calls carry it; reset below
+    ttoken = turn_ctx.set(secrets.token_hex(6))  # one user turn: calendar_write's yes must come in a later one
+    last_turn[requester_ctx.get()] = turn_ctx.get()  # claude -p's MCP calls arrive outside this context
     # the API and NIM paths call create_task/call_user in this context: their tasks and calls continue this call,
     # as claude -p's do through X-Azel-Origin (the same rule: the ask's session is the origin)
     otoken = origin_ctx.set(session if ORIGIN_RE.fullmatch(session or "") and not is_secret(session) else "")
@@ -1171,6 +1174,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     finally:
         try:
             requester_ctx.reset(token)  # never leaks into later work in the same task
+            turn_ctx.reset(ttoken)
             origin_ctx.reset(otoken)
         except ValueError:
             pass  # the generator was finalized from another context (garbage collected): nothing to undo
@@ -3486,6 +3490,8 @@ ALWAYS_NO = "항상 허용은 조회용 명령(ls, cat, git status, 앱이나 �
 task_approvals: dict[str, set] = {}  # task id -> approval ids created while it ran (only those resume it)
 REQUESTER_RE = re.compile(r"(ask|task):[A-Za-z0-9_:.-]{1,100}")
 requester_ctx: contextvars.ContextVar = contextvars.ContextVar("requester", default="")  # API/NIM paths' daemon calls
+turn_ctx: contextvars.ContextVar = contextvars.ContextVar("turn", default="")  # the user turn a tool call answers
+last_turn: dict = {}  # requester -> its ask's current turn (claude -p's MCP calls; bounded by sessions)
 
 
 def requester_id(kind, key):
@@ -4983,6 +4989,8 @@ bridge = tools_bridge.Bridge(
     agenda=lambda f, t: agenda_text(f, t), weather=lambda place, when: weather_now(place, when), stock_quote=lambda q: quote_now(q), holdings_update=lambda add, remove: holdings_update(add, remove),
     portfolio=lambda: tv_quote_cache.get(tv_holdings, TV_QUOTE_S), web_search=lambda q, n: web_search(q, n), web_fetch=lambda url: web.fetch(url), cygnus_write=lambda name, args: cygnus_write(name, args),
     google=lambda: google_tools.bridge(HOME) if MODE == "full" else ([], None),  # never on a limited gateway
+    gcal=lambda: google_tools.Calendar(HOME) if MODE == "full" and google_tools.status(HOME) == "connected" else None,
+    turn=lambda: turn_ctx.get(),
     spotify=lambda: spotify.bridge(HOME) if MODE == "full" else ([], None))
 
 
@@ -5211,6 +5219,7 @@ async def mcp_server(request: Request):
         origin_ctx.set(origin)  # claude -p's create_task/call_user: the call it runs in (never from the external token)
     if scope == "full" and REQUESTER_RE.fullmatch(req := request.headers.get("x-azel-requester", "")):
         requester_ctx.set(req)
+        turn_ctx.set(last_turn.get(req, ""))
     out = await tools_bridge.mcp_handle(bridge, msg, None if scope == "external" else current_persona.get(), scope=scope)
     return Response(status_code=202) if out is None else JSONResponse(out)
 
@@ -5225,6 +5234,7 @@ async def serve_tool(m):
 
         async def progress(say):
             await link_send({"id": m["id"], "type": "tool_progress", "say": say})
+        turn_ctx.set(str(m.get("turn") or "")[:64])  # the voice server's id for the user turn, when it sends one
         r = await bridge.run(str(m.get("name", "")), m.get("args") or {}, current_persona.get(), caller="qwen",
                              surface="voice", on_progress=progress)
         # result: what Qwen reads; spoken and needs: what the voice fast path says and holds (ACTIONS.md §2)
