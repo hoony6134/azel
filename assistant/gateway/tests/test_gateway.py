@@ -1804,3 +1804,25 @@ def test_state_retries_an_idempotent_request_once_on_a_dropped_connection(gw):
     with pytest.raises(g.StateDown):  # a POST may already have run: it is not sent again
         asyncio.run(st.call("POST", "/v1/x", {}))
     assert seen == ["POST"]
+
+
+def test_tools_frame_flags_read_only(gw, monkeypatch):
+    """The voice link's tools frame marks each tool read_only (lookups) or not (actions); a device tool is an action."""
+    g, _, _ = gw
+    sent = []
+
+    async def capture(obj):
+        sent.append(obj)
+        return True
+
+    async def tools(caller="api"):
+        return [{"name": n, "description": "", "input_schema": {"type": "object"}} for n in (
+            "agenda", "calendar_write", "web_search", "remember", "gistra_today", "infra_health", "calendar_events",
+            "spotify_play", "spotify_now_playing", "mac__run_command")], {}
+    monkeypatch.setattr(g, "link_send", capture)
+    monkeypatch.setattr(g.bridge, "tools", tools)
+    asyncio.run(g.serve_tool({"id": "t", "type": "tools_list"}))
+    flags = {t["name"]: t["read_only"] for t in sent[-1]["tools"]}
+    assert flags == {"agenda": True, "calendar_write": False, "web_search": True, "remember": False, "gistra_today": True,
+                     "infra_health": True, "calendar_events": True, "spotify_play": False, "spotify_now_playing": True,
+                     "mac__run_command": False}
