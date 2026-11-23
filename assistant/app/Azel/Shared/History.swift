@@ -126,9 +126,11 @@ private extension KeyedDecodingContainer {
 enum HistoryAPI {
     static let pageSize = 20
 
-    static func page(before: Double? = nil, query: String? = nil, persona: String? = nil, limit: Int = pageSize) async throws -> [HistoryItem] {
+    /// `kind`: "chat" lists chat threads (a gateway that doesn't filter returns everything; callers filter).
+    static func page(before: Double? = nil, query: String? = nil, persona: String? = nil, kind: String? = nil, limit: Int = pageSize) async throws -> [HistoryItem] {
         var c = URLComponents()
         c.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let kind { c.queryItems?.append(URLQueryItem(name: "kind", value: kind)) }
         if let before { c.queryItems?.append(URLQueryItem(name: "before", value: String(before))) }
         if let query, !query.isEmpty { c.queryItems?.append(URLQueryItem(name: "q", value: query)) }
         if let persona { c.queryItems?.append(URLQueryItem(name: "persona", value: persona)) }

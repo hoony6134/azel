@@ -340,6 +340,7 @@ struct MainWindow: View {
                 NavigationSplitView {
                     List(selection: $section) {
                         Label("홈", systemImage: "circle.circle").tag("home")
+                        Label("채팅", systemImage: "bubble.left.and.text.bubble.right").tag("chat")
                         Label("기록", systemImage: "clock").tag("history")
                         Label("승인", systemImage: "checkmark.shield").tag("approvals").badge(approvals.pending.count)
                         Label("설정", systemImage: "gearshape").tag("settings")
@@ -352,6 +353,7 @@ struct MainWindow: View {
                     Group {
                         switch section {
                         case "approvals": ApprovalsScreen(model: model)
+                        case "chat": ChatScreen(embedded: true)   // no split view nested in this one either
                         case "history": HistoryPane(history: history)   // no split view nested in this one
                         case "settings": SettingsScreen(model: model, history: history) { MacSettingsCard(wake: wake) }
                         default: MacHome(model: model, history: history, schedule: schedule) { section = "history" }

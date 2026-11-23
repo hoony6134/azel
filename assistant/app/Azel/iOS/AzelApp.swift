@@ -85,6 +85,8 @@ struct RootView: View {
         TabView(selection: $tab) {
             NavigationStack { HomeView(model: model, history: history, schedule: schedule, tab: $tab) }
                 .tabItem { Label("홈", systemImage: "circle.circle") }.tag(0)
+            ChatScreen()   // its own split view: threads | chat (side by side on iPad)
+                .tabItem { Label("채팅", systemImage: "bubble.left.and.text.bubble.right") }.tag(4)
             NavigationStack {
                 HistoryList(model: history, onCall: { CallManager.shared.startCall() })
                     .navigationTitle("기록")
