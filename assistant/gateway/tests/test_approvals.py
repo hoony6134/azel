@@ -81,7 +81,7 @@ def test_always_rule_auto_approves_and_can_be_revoked(agw):
     r = c.post(f"/v1/approvals/{aid}", json={"decision": "always"}).json()
     rules = c.get("/v1/approvals/rules").json()
     assert r["status"] == "approved" and rules == [{**rules[0], "device": "macbook", "command": CMD["command"], "cwd": "/Users/jh"}]
-    assert c.post("/v1/approvals", json={**CMD, "cwd": "/Users/jh/other"}).json()["status"] == "pending"  # cwd too
+    assert c.post("/v1/approvals", json={**CMD, "cwd": "/Users/jh/other"}).json()["status"] == "approved"  # any cwd (read-only rules)
     n = len(pushes)
     again = c.post("/v1/approvals", json=CMD).json()
     assert again["status"] == "approved" and again["rule_id"] == rules[0]["id"] and len(pushes) == n  # no tap needed

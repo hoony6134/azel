@@ -122,7 +122,7 @@ DEFAULTS = {
                   "deadline_check": {"enabled": True, "time": "20:00"}, "server_alerts": True,
                   "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120,
                                  "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}},
-    "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
+    "default_device": "macbook", "device_fallback": ["albireo", "vd-spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
@@ -376,6 +376,12 @@ class State:
             self.warned = time.monotonic()
             print(f"warning: ruchba is slow ({why}): tool calls use cached settings and devices for now", flush=True)
 
+    async def settle(self, key, make, wait=1.5):
+        """make() in the background (as background()), waiting at most `wait` s for it: a quick ruchba answers as
+        before, a slow one never holds the caller (the app's timeout, a daemon's 10 s)."""
+        self.background(key, make)
+        await asyncio.wait({self.bg[key]}, timeout=wait)
+
     def background(self, key, make):
         """Run make() once in the background (never two for one key); its errors are dropped."""
         t = self.bg.get(key)
@@ -542,8 +548,15 @@ if MODE == "full":
 
 
 def with_static(rows):
-    """Shared device rows plus this gateway's static ones (a static row wins over a row with the same id)."""
-    return [d for d in rows if d["id"] not in static_devices] + list(static_devices.values())
+    """Shared device rows plus this gateway's static ones (a static row wins over a row with the same id or url), one
+    row per daemon url: one physical host never shows twice (the app listed "spark" twice)."""
+    urls = {d.get("url") for d in static_devices.values()}
+    out, seen = [], set()
+    for d in [*static_devices.values(), *[d for d in rows if d["id"] not in static_devices and d.get("url") not in urls]]:
+        if d.get("url") not in seen:
+            seen.add(d.get("url"))
+            out.append(d)
+    return sorted(out, key=lambda d: d["id"])
 
 
 async def static_prober():
@@ -556,7 +569,9 @@ async def static_prober():
 
 HM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 # Settings saved before devices were named in English; read as their ids.
-OLD_DEVICE_NAMES = {"맥북": "macbook", "알비레오": "albireo", "기에나": "gienah", "데네브": "deneb", "스파크": "spark"}
+OLD_DEVICE_NAMES = {"맥북": "macbook", "알비레오": "albireo", "기에나": "gienah", "데네브": "deneb", "스파크": "vd-spark",
+                    "spark": "vd-spark"}
+DEVICE_ALIASES = {"spark": "vd-spark"}  # the old id: settings, task rows and spoken requests still resolve
 
 
 def migrate_proactive(p):
@@ -719,7 +734,10 @@ async def post_call_facts(log_id, persona_id):
 
 
 async def push_tokens():
-    return await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
+    """Stored tokens, newest first, with ones registered here but not yet stored in front."""
+    rows = await state.get("/v1/state/push_tokens", [], persist="push_tokens.json")
+    fresh = [{**r} for r in reversed(list(push_pending.values()))]
+    return fresh + [r for r in rows if r.get("token") not in push_pending]
 
 
 async def take_lease(name, ttl_s, priority=100, holder=None):
@@ -1334,7 +1352,7 @@ async def send_alert_push(title, body, category=None, **extra):
 async def push_task_activity(t, approval=None):
     """Update a task's Live Activity by push (the app is asleep while the phone is locked): its status, and the
     approval's buttons. The content-state matches TaskActivityAttributes.ContentState key for key."""
-    rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+    rows = {**(await state.get("/v1/state/kv/activity-tokens") or {}), **activity_pending}
     cfg, row = apns_config(), rows.get(t["id"])
     if not cfg or not row:
         return {"sent": 0}
@@ -2741,17 +2759,41 @@ async def usage():
                 "equivalent_usd": round(sum(r["cost_usd"] for r in cc), 4), "quota": quota_view()}}}
 
 
-async def probe(url, token=False):
+async def probe(url, token=False, timeout=3):
     """Reachability only. The token goes along only when asked (a trusted daemon); health routes need none."""
     t = time.perf_counter()
     headers = {"Accept": "text/event-stream"} | ({"Authorization": f"Bearer {device_tokens.get(url, TOKEN)}"} if token else {})
     try:
         # Headers only: an MCP endpoint may answer GET with a stream that never ends.
-        async with httpx.AsyncClient(timeout=3) as c, c.stream("GET", url, headers=headers) as r:
+        async with httpx.AsyncClient(timeout=timeout) as c, c.stream("GET", url, headers=headers) as r:
             ok = r.status_code < 500
         return {"ok": ok, "ms": round((time.perf_counter() - t) * 1000)}
     except httpx.HTTPError:
         return {"ok": False, "ms": None}
+
+
+DEVICE_PROBE_S, DEVICE_SLOW_MS, DEVICE_PROBE_TTL_S = 8, 2000, 30
+device_probes: dict = {}  # url -> (monotonic, {ok, ms, status, latency_ms})
+
+
+async def probe_device(url, token):
+    """The user's rule (2026-11-23): "ok" answered within 2 s, "slow" answered later, "down" no answer in 8 s or a
+    connection error. Judged by the answer only, never by last_seen."""
+    p = await probe(url, token, timeout=DEVICE_PROBE_S)
+    status = "down" if not p["ok"] else "slow" if p["ms"] > DEVICE_SLOW_MS else "ok"
+    out = {**p, "status": status, "latency_ms": p["ms"]}
+    device_probes[url] = (time.monotonic(), out)
+    return out
+
+
+async def device_probe(url, token):
+    """The last probe at once (refreshed in the background after 30 s), so /v1/status stays fast; the first waits."""
+    hit = device_probes.get(url)
+    if hit is None:
+        return await probe_device(url, token)
+    if time.monotonic() - hit[0] > DEVICE_PROBE_TTL_S:
+        state.background(("probe", url), lambda: probe_device(url, token))
+    return hit[1]
 
 
 tv_cache, tv_cache2 = tv.Cache(), tv.Cache()
@@ -2942,7 +2984,7 @@ async def tv_get(v: int = 1, detail: str | None = None, symbol: str = "", range:
 async def status():
     devs = with_static(await state.get("/v1/state/devices", list(local_devices.values())))
     probes = await asyncio.gather(probe(f"{VOICE_URL}/health"), probe(f"{TTS_URL}/health"),
-                                  probe(f"{STATE_URL}/health"), *[probe(d["url"], trusted(d)) for d in devs])
+                                  probe(f"{STATE_URL}/health"), *[device_probe(d["url"], trusted(d)) for d in devs])
     return {"spark": probes[0], "tts": probes[1], "state": probes[2],
             "gateway": {"ok": True, "ms": 0, "device": DEVICE, "mode": MODE, "link": link["ws"] is not None},
             "google": google_status(),  # connected | expired (the app shows "Google 다시 연결") | none
@@ -2960,10 +3002,8 @@ async def register(body: dict):
         raise HTTPException(400, "id must be an ASCII slug")
     row = {"name": body["name"], "url": body["url"], "harness": body.get("harness", []), "gateway": DEVICE}
     local_devices[body["id"]] = {"id": body["id"], **row, "last_seen": time.time(), "writer": MODE}
-    try:
-        await state.call("PUT", f"/v1/state/devices/{body['id']}", row)
-    except StateDown:
-        pass  # still usable from this gateway via local_devices
+    # answered now; ruchba in the background (a daemon's 10 s timeout and a 2 s relayed RTT made it fail)
+    await state.settle(("device", body["id"]), lambda: state.call("PUT", f"/v1/state/devices/{body['id']}", row))
     return {"ok": True}
 
 
@@ -3535,10 +3575,8 @@ async def push_register(body: dict):
         if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Fa-f]{16,200}", tok)
                 and isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{12}", tid)):
             raise HTTPException(400, "activity_token (hex) and task_id required")
-        rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
-        rows = {k: v for k, v in rows.items() if time.time() - v.get("at", 0) < 86400}  # a day at most
-        rows[tid] = {"token": tok, "env": body.get("env", "sandbox"), "at": time.time()}
-        await state.call("PUT", "/v1/state/kv/activity-tokens", rows)
+        activity_pending[tid] = {"token": tok, "env": body.get("env", "sandbox"), "at": time.time()}
+        await state.settle(("push-flush",), flush_push)  # at most 1.5 s: a 2 s relayed ruchba timed the app out
         return {"ok": True}
     if not (body.get("voip_token") or body.get("alert_token")):
         raise HTTPException(400, "voip_token and/or alert_token required")  # macOS: alert only
@@ -3547,15 +3585,47 @@ async def push_register(body: dict):
             continue
         if not (isinstance(tok, str) and re.fullmatch(r"[0-9A-Za-z_-]{3,200}", tok)):
             raise HTTPException(400, f"{kind}_token: a device token")
-        await state.call("PUT", f"/v1/state/push_tokens/{quote(tok, safe='')}",
-                         {"bundle_id": APP_BUNDLE, "env": body.get("env", "sandbox"),
-                          **({"kind": "alert"} if kind == "alert" else {})})
-    rows = await state.call("GET", "/v1/state/push_tokens") or []  # newest first
-    for kind in ("voip", "alert"):  # at most MAX_PUSH_TOKENS per kind: the oldest go
-        for old in [r for r in rows if r.get("kind", "voip") == kind][MAX_PUSH_TOKENS:]:
-            await state.call("DELETE", f"/v1/state/push_tokens/{quote(old['token'], safe='')}")
-    await push_tokens()  # refresh the restart-proof copy
+    for kind, tok in (("voip", body.get("voip_token")), ("alert", body.get("alert_token"))):
+        if tok:  # pushes use it at once (push_tokens merges these); ruchba gets it in the background, in order
+            push_pending[tok] = {"token": tok, "bundle_id": APP_BUNDLE, "env": body.get("env", "sandbox"),
+                                 **({"kind": "alert"} if kind == "alert" else {})}
+    await state.settle(("push-flush",), flush_push)
     return {"ok": True}
+
+
+push_pending: dict = {}  # token -> row, registered here but not yet on ruchba (newest last)
+activity_pending: dict = {}  # task id -> Live Activity token row, likewise
+PUSH_RETRY_S = (2, 5, 10, 30, 60)
+
+
+async def flush_push():
+    """The one background writer for push registrations: idempotent PUTs, then the per-kind prune, retried while
+    ruchba is slow or down; a row stays in the pending map (and so in use) until it is stored."""
+    for wait in (0, *PUSH_RETRY_S, *(60,) * 30):
+        await asyncio.sleep(wait)
+        try:
+            for tok, row in list(push_pending.items()):
+                await state.call("PUT", f"/v1/state/push_tokens/{quote(tok, safe='')}",
+                                 {k: v for k, v in row.items() if k != "token"})
+                if push_pending.get(tok) is row:
+                    del push_pending[tok]
+            rows = await state.call("GET", "/v1/state/push_tokens") or []  # newest first
+            for kind in ("voip", "alert"):  # at most MAX_PUSH_TOKENS per kind: the oldest go
+                for old in [r for r in rows if r.get("kind", "voip") == kind][MAX_PUSH_TOKENS:]:
+                    await state.call("DELETE", f"/v1/state/push_tokens/{quote(old['token'], safe='')}")
+            if activity_pending:
+                rows = await state.call("GET", "/v1/state/kv/activity-tokens") or {}
+                sent = dict(activity_pending)
+                rows = {k: v for k, v in {**rows, **sent}.items() if time.time() - v.get("at", 0) < 86400}  # a day
+                await state.call("PUT", "/v1/state/kv/activity-tokens", rows)
+                for k, v in sent.items():
+                    if activity_pending.get(k) is v:
+                        del activity_pending[k]
+            await push_tokens()  # refresh the restart-proof copy
+            if not push_pending and not activity_pending:
+                return
+        except (StateDown, HTTPException) as e:
+            print("push register: ruchba write waits:", type(e).__name__, flush=True)
 
 
 @app.post("/v1/calls")
@@ -3665,6 +3735,32 @@ def is_sudo(command):
     return bool(t) and os.path.basename(t[0]).lower() == "sudo"
 
 
+STATUS_KO = {"approved": "허용된", "used": "실행된", "rejected": "거절된", "expired": "만료된"}
+
+
+def norm_command(command):
+    """A command as a rule sees it: its words, whitespace and quoting normalized."""
+    try:
+        return " ".join(shlex.split(str(command)))
+    except ValueError:
+        return " ".join(str(command).split())
+
+
+def rule_key(r):
+    """Rules match on (device, command), not cwd: the daemon's resolved directory differs between calls, so a rule
+    stored with one never matched the next ask and "항상 허용" was asked and saved again (user report 2026-11-23)."""
+    return (r.get("device"), norm_command(r.get("command") or ""))
+
+
+def dedupe_rules(rules):
+    seen, out = set(), []
+    for r in rules:
+        if rule_key(r) not in seen:
+            seen.add(rule_key(r))
+            out.append(r)
+    return out
+
+
 def always_ok(command):
     """True when an approval of `command` may become an "always" rule."""
     try:
@@ -3749,9 +3845,9 @@ async def create_approval(body: dict):
     if requester and requester.get("task_id"):
         task_approvals.setdefault(requester["task_id"], set()).add(aid)
     sudo = is_sudo(row["command"])  # from the command itself, whatever the caller says: only a tap approves it
-    rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
+    rules = await state.get("/v1/state/kv/approval-rules") or []  # cached: a slow ruchba never stalls the daemon
     rule = None if requester and requester.get("task_id") or sudo else next(  # a task's commands always need a tap
-        (r for r in rules if (r["device"], r["command"], r.get("cwd")) == (row["device"], row["command"], row["cwd"])), None)
+        (r for r in rules if rule_key(r) == rule_key(row)), None)
     meta = {"expires_at": now + APPROVAL_TTL_S, "requester": requester, "decision": None,
             **({"in_roots": body["in_roots"]} if isinstance(body.get("in_roots"), bool) else {}),  # daemon's say (resolved paths)
             **({"sudo": True} if sudo else {})}
@@ -3994,16 +4090,18 @@ async def list_approvals():
 
 @app.get("/v1/approvals/rules")
 async def approval_rules():
-    return await state.call("GET", "/v1/state/kv/approval-rules") or []
+    return dedupe_rules(await state.call("GET", "/v1/state/kv/approval-rules") or [])  # older duplicates shown once
 
 
 @app.delete("/v1/approvals/rules/{rid}")
 async def approval_rule_delete(rid: str):
     rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-    keep = [r for r in rules if r["id"] != rid]
-    if len(keep) == len(rules):
+    gone = next((r for r in rules if r["id"] == rid), None)
+    if gone is None:
         raise HTTPException(404, "no such rule")
+    keep = [r for r in rules if rule_key(r) != rule_key(gone)]  # its older duplicates go with it
     await state.call("PUT", "/v1/state/kv/approval-rules", keep)
+    state.cache.pop(("/v1/state/kv/approval-rules", ()), None)
     return {"deleted": rid}
 
 
@@ -4031,10 +4129,10 @@ async def decide(aid: str, body: dict):
     decision = body.get("decision") or ("once" if body.get("approve") else "deny")
     if decision not in DECISIONS:
         raise HTTPException(400, f"decision: one of {list(DECISIONS)}")
-    row = await state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}")
+    row, meta = await asyncio.gather(state.call("GET", f"/v1/state/approvals/{quote(aid, safe='')}"),
+                                     approval_meta(aid))  # at once: each is a round trip to ruchba
     if row is None:
-        raise HTTPException(404, "no such approval")
-    meta = await approval_meta(aid)
+        raise HTTPException(404, "승인 요청을 찾지 못했어요. 만료됐거나 지워진 요청이에요.")
     view = approval_view(row, meta)
     if view["status"] != "pending":
         # a second tap (two devices, a double tap, a retry) with the decision already made is not a failure: the
@@ -4042,7 +4140,7 @@ async def decide(aid: str, body: dict):
         same = (view["status"] in ("approved", "used") and decision != "deny") or (view["status"] == "rejected" and decision == "deny")
         if same:
             return {"id": aid, "status": view["status"], "decision": meta.get("decision") or decision, "already": True}
-        raise HTTPException(409, f"approval is {view['status']}")
+        raise HTTPException(409, f"이미 {STATUS_KO.get(view['status'], view['status'])} 요청이에요.")
     secret = decision == "always" and is_secret((meta.get("requester") or {}).get("session"))
     sudo = is_sudo(row.get("command") or "")
     forced = decision == "always" and (secret or sudo or not always_ok(row["command"]))
@@ -4051,9 +4149,12 @@ async def decide(aid: str, body: dict):
     out = await state.call("POST", f"/v1/state/approvals/{quote(aid, safe='')}", {"approve": decision != "deny"})
     if decision == "always":
         rules = await state.call("GET", "/v1/state/kv/approval-rules") or []
-        rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "cwd": row["cwd"],
-                "created": time.time()}
-        await state.call("PUT", "/v1/state/kv/approval-rules", [rule, *rules][:200])
+        rule = next((r for r in rules if rule_key(r) == rule_key(row)), None)  # one rule per (device, command)
+        if rule is None:
+            rule = {"id": uuid.uuid4().hex[:10], "device": row["device"], "command": row["command"], "cwd": row["cwd"],
+                    "created": time.time()}
+            await state.call("PUT", "/v1/state/kv/approval-rules", dedupe_rules([rule, *rules])[:200])
+            state.cache.pop(("/v1/state/kv/approval-rules", ()), None)  # the next check reads the new rule
         meta["rule_id"] = rule["id"]
     meta["decision"] = decision
     if (tid := (meta.get("requester") or {}).get("task_id")) and tid in task_live:
@@ -4142,7 +4243,7 @@ def check_task(body):
     for name, v, top in (("budget_usd", budget, 50), ("max_minutes", minutes, 240)):
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= top:
             raise HTTPException(400, f"{name}: a number above 0, at most {top}")
-    device = body.get("device")
+    device = DEVICE_ALIASES.get(body.get("device"), body.get("device"))
     if device is not None and not (isinstance(device, str) and re.fullmatch(r"[a-z0-9_-]{1,32}", device)):
         raise HTTPException(400, "device: a device id")
     persona = body.get("persona")
@@ -4979,7 +5080,9 @@ def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
             "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
             "origin_session", "notified_at", "parent_task", "when", "scheduled_for", "auto_approve", "reported")
-    return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
+    view = {k: t.get(k) for k in keep}
+    view["device"] = DEVICE_ALIASES.get(view["device"], view["device"])  # old rows say "spark"
+    return {**view, **({"steps": t["steps"]} if steps else {})}
 
 
 @app.post("/v1/tasks")
@@ -5050,6 +5153,7 @@ async def task_cancel(tid):
 
 
 DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크",
+               "vd-spark": "스파크",
                "core": "코어"}
 
 

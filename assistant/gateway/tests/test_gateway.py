@@ -497,7 +497,7 @@ def test_device_prompt_fallback(gw):
     assert "없어" in g.device_prompt(s, [])
     g.fake.db["settings"] = {"default_device": "맥북", "device_fallback": ["알비레오", "스파크"]}  # saved before
     s = c.get("/v1/settings").json()
-    assert s["default_device"] == "macbook" and s["device_fallback"] == ["albireo", "spark"]
+    assert s["default_device"] == "macbook" and s["device_fallback"] == ["albireo", "vd-spark"]
 
 def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
@@ -585,7 +585,7 @@ def test_limited_writer_cannot_steer_full_gateways(gw, monkeypatch):
     assert "mcp__macbook" in args and "mcp__evil" not in args  # never handed to claude -p, never gets the token
     probed = []
 
-    async def fake_probe(url, token=False):
+    async def fake_probe(url, token=False, timeout=3):
         probed.append((url, token))
         return {"ok": True, "ms": 1}
     monkeypatch.setattr(g, "probe", fake_probe)
@@ -1937,3 +1937,56 @@ def test_a_secondary_without_voice_runs_no_link_and_no_scheduler(tmp_path, monke
     with TestClient(g.app, headers={"Authorization": "Bearer t0k"}) as c:
         assert c.get("/v1/devices").status_code == 200
     assert not g.VOICE_ON and ran == []
+
+
+def test_push_register_answers_fast_when_ruchba_is_slow(gw, monkeypatch):
+    """A 2 s relayed ruchba timed the app's push registration out: it answers within ~1.5 s, the token is used for
+    pushes at once, and it lands on ruchba in the background."""
+    g, c, _ = gw
+    real = g.state.call
+
+    async def slow(method, path, body=None, **params):
+        if "push_tokens" in path or "devices/" in path:
+            await asyncio.sleep(3)
+        return await real(method, path, body, **params)
+    monkeypatch.setattr(g.state, "call", slow)
+    t0 = time.monotonic()
+    assert c.post("/v1/push/register", json={"voip_token": "slowtok", "bundle_id": "xyz.scian.biseo"}).json() == {"ok": True}
+    assert c.post("/v1/devices/register", json={"id": "albireo", "name": "albireo", "url": "http://a/mcp"}).json() == {"ok": True}
+    assert time.monotonic() - t0 < 4  # two requests, each at most ~1.5 s
+    assert c.portal.call(g.push_tokens)[0]["token"] == "slowtok"  # pushes reach the new token before the flush
+    end = time.monotonic() + 15
+    while "slowtok" not in g.fake.db["push"] and time.monotonic() < end:
+        time.sleep(0.2)
+    assert "slowtok" in g.fake.db["push"] and not g.push_pending
+
+
+def test_device_status_is_ok_slow_or_down_by_the_answer(gw, monkeypatch):
+    """/v1/status devices[]: ok within 2 s, slow when it answers later, down on no answer; cached 30 s."""
+    g, c, _ = gw
+    calls = []
+
+    async def probe(url, token=False, timeout=3):
+        calls.append((url, timeout))
+        return {"ok": "dead" not in url, "ms": 2500 if "slow" in url else 40 if "dead" not in url else None}
+    monkeypatch.setattr(g, "probe", probe)
+    out = {u: asyncio.run(g.probe_device(u, False)) for u in ("http://fast/mcp", "http://slow/mcp", "http://dead/mcp")}
+    assert [out[u]["status"] for u in out] == ["ok", "slow", "down"]
+    assert out["http://slow/mcp"]["latency_ms"] == 2500 and all(t == g.DEVICE_PROBE_S for _, t in calls)
+    n = len(calls)
+    assert asyncio.run(g.device_probe("http://fast/mcp", False))["status"] == "ok" and len(calls) == n  # cached
+
+
+def test_vd_spark_is_one_device_and_spark_still_resolves(gw, monkeypatch):
+    """The app listed "spark" twice: static and shared rows for one url collapse to one, the id is vd-spark, and
+    "spark"/"스파크" still resolve (settings, task device)."""
+    g, c, _ = gw
+    g.static_devices.clear()
+    g.static_devices["vd-spark"] = {"id": "vd-spark", "name": "vd-spark", "url": "http://100.64.0.11:8893/mcp",
+                                     "limited": True, "static": True, "last_seen": time.time()}
+    rows = [{"id": "spark", "name": "spark", "url": "http://100.64.0.11:8893/mcp", "last_seen": time.time()},
+            {"id": "albireo", "name": "albireo", "url": "http://a/mcp", "last_seen": time.time()}]
+    assert [d["id"] for d in g.with_static(rows)] == ["albireo", "vd-spark"]
+    c.put("/v1/settings", json={"device_fallback": ["albireo", "스파크"]})
+    assert c.get("/v1/settings").json()["device_fallback"] == ["albireo", "vd-spark"]
+    assert g.task_view({"device": "spark"}, steps=False)["device"] == "vd-spark"
