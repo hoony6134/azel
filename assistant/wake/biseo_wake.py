@@ -67,7 +67,11 @@ DEFAULTS = {
     "utterance_dir": "~/Library/Application Support/Azel",  # wake-utterance-<id>.pcm goes here
     "utterance_wait_s": 2,  # give up this long after the wake word if nobody speaks
     "utterance_max_s": 10,
-    "utterance_preroll_ms": 160,  # audio kept from before the first voiced frame (the wake word's tail edge)
+    "utterance_preroll_ms": 160,
+    # The pause that ends a one-breath command. The turn's own silence_ms (600) cut "오늘 아침 | 컴파일러 프로젝트
+    # 관련 일정 삭제해" after "오늘 아침" (2026-11-23), and what followed fell into the ~0.9 s before the app's mic
+    # was up. Korean commands pause mid-sentence; the trailing silence is trimmed off the recording anyway.
+    "utterance_silence_ms": 1100,  # audio kept from before the first voiced frame (the wake word's tail edge)
     "enrolling_path": "~/Library/Application Support/Azel/enrolling",  # the app's wake-clip recording screen
     "enrolling_stale_s": 1800,
     # Exists while this listener's input stream is open. The app waits for it to go before starting voice
@@ -244,7 +248,7 @@ class Listener:
         c = self.cfg
         keep = max(1, -(-c["utterance_preroll_ms"] * SR // 1000 // FRAME))
         wait, cap = int(c["utterance_wait_s"] / FRAME_S), int(c["utterance_max_s"] / FRAME_S)
-        end = int(c["silence_ms"] / 1000 / FRAME_S + 0.999)
+        end = int(c["utterance_silence_ms"] / 1000 / FRAME_S + 0.999)
         pre, speech, silent = list(ring[-keep:]), [], 0
         self.vad.reset()
         for n, frame in enumerate(frames, 1):
@@ -264,6 +268,8 @@ class Listener:
                 pre = (pre + [frame])[-keep:]
             if live:
                 break
+        if silent > 1:  # keep one quiet frame: the pause that ended it would end the server's turn too (500 ms)
+            speech = speech[:len(speech) - (silent - 1)]
         return np.concatenate(speech) if speech else np.zeros(0, dtype=np.int16)
 
     def utterance_paths(self, uid):
