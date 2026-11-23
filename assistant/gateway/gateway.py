@@ -68,6 +68,9 @@ PRIORITY = int(os.environ.get("BISEO_PRIORITY", "10"))  # lower = preferred by t
 INSTANCE = f"{DEVICE}-{uuid.uuid4().hex[:6]}"  # lease holder: a restarted process is a new holder
 # A gateway without a Claude login or API key (e.g. an always-on deneb that only fires scheduled calls).
 CLAUDE_OK = os.environ.get("BISEO_NO_CLAUDE", "") not in ("1", "true", "yes")
+# "api": this gateway reaches Claude only through the Messages API (asks and tasks on agent_loop), never the claude CLI
+# (no Node on a 1 GB host like deneb): the shared claude_path setting can't turn the CLI back on here.
+API_ONLY = os.environ.get("BISEO_CLAUDE_PATH", "") == "api"
 # Scheduled calls fire on one gateway: the scheduler lease goes to the lowest value among live gateways.
 SCHED_PRIORITY = int(os.environ.get("BISEO_SCHEDULER_PRIORITY", os.environ.get("BISEO_PRIORITY", "10")))
 STATE_URL = os.environ.get("BISEO_STATE_URL", "http://100.64.0.10:8894")
@@ -82,7 +85,7 @@ KST = timezone(timedelta(hours=9))
 DEVICE_FRESH_S = 150
 MAX_TOOL_TURNS = 8
 # One warm `claude` per voice session (claude_warm.py); one-shot jobs (briefings, checkpoints, brain) stay cold.
-WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no")
+WARM = os.environ.get("BISEO_WARM_CLAUDE", "1") not in ("0", "false", "no") and not API_ONLY
 COLD_SESSIONS = ("briefing-", "deadline-", "checkpoint-", "brain-")
 warm_pool = Pool()
 call_warm_keys: dict[str, str] = {}  # call_log id -> its warm process key, closed when the call ends
@@ -803,8 +806,8 @@ def resolve(settings, model, path, task, text=""):
     path = path or td.get("path") or settings["claude_path"]
     if path == "auto":  # a key on disk never switches a full gateway off claude.ai's connectors: "api" is opt-in
         path = "claude_code" if MODE == "full" else "api"
-    if MODE == "limited":
-        path = "api"  # never `claude -p` (no OAuth login, no claude.ai connectors) on a team machine
+    if MODE == "limited" or API_ONLY:
+        path = "api"  # never `claude -p` (no OAuth login, no claude.ai connectors) on a team machine or an API-only one
     if model not in MODELS:
         raise HTTPException(400, f"model must be one of {sorted(MODELS)} or auto")
     return model, path
@@ -1236,7 +1239,7 @@ async def ask_stream(text, session, model=None, path=None, task=None):
     if mode == "claude_api" or (mode == "claude_code" and MODE == "limited"):
         path = "api"
     elif mode == "claude_code":
-        path = "claude_code"
+        path = "api" if API_ONLY else "claude_code"
     if mode != "auto" and model == "nim":
         model = settings["default_model"] if settings["default_model"] in MODELS else "sonnet"
     # Only paid paths are held to the budget: a spent API budget must not stop subscription (claude_code) asks.
@@ -2524,7 +2527,7 @@ async def lifespan(app):
         if static_devices:
             tasks.append(asyncio.create_task(static_prober()))
         tasks.append(asyncio.create_task(fail_orphan_tasks_safe()))
-        if CLAUDE_OK:
+        if CLAUDE_OK and not API_ONLY:  # claude.ai connector discovery runs the claude CLI
             tasks.append(asyncio.create_task(discovery.refresh()))
         if OLD_DB.exists() and not MIGRATED.exists():
             tasks.append(asyncio.create_task(migrate_once()))
@@ -4247,6 +4250,13 @@ async def task_backend_for(spec, settings):
         return "qwen", None  # never a paid or Claude backend in local mode, not even as a fallback
     want = {"claude_api": "claude_api", "claude_code": "claude_code"}.get(mode) or spec["backend"] or \
         settings.get("task_backend", "claude_api")
+    if API_ONLY:  # no claude CLI here: the API, else Qwen (device-local Claude Code goes through that device's daemon)
+        why = "이 게이트웨이에는 Claude Code가 없어 API로 했어요." if want == "claude_code" else None
+        if not API_KEY:
+            return "qwen", "API 키가 없어 로컬 모델로 했어요."
+        if "api" in settings["budget_paths"] and await month_cost(settings) >= settings["monthly_budget_usd"]:
+            return "qwen", "API 예산을 다 써서 로컬 모델로 했어요."
+        return "claude_api", why
     if want == "claude_code" or not CLAUDE_OK:
         return want, None
     if MAIL_CAL.search(spec["goal"]) and google_status() != "connected":
@@ -4506,7 +4516,7 @@ async def run_task(t):
                     await run_task_api(t)
                     return
                 except ApiAuth:  # 401/403 mid-run: the same goal on claude_code, recorded
-                    if not CLAUDE_OK:
+                    if not CLAUDE_OK or API_ONLY:
                         raise TaskLimit("error", "API 키가 맞지 않아요.")
                     t.update(backend="claude_code", fallback_reason="API 키가 맞지 않아 Claude Code로 했어요.")
                     task_step(t, "fallback", reason="auth")
