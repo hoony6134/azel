@@ -64,18 +64,9 @@ DEFAULTS = {
     "app_check_s": 2,  # how often the app-running check runs
     "utterance": True,  # one-breath commands: capture what follows the wake word and hand it to the app
     "mic_live_path": "~/Library/Application Support/Azel/mic-live",  # the app is capturing: the listener's capture ends
-    "utterance_dir": "~/Library/Application Support/Azel",  # wake-utterance-<id>.pcm goes here
-    "utterance_wait_s": 2,  # give up this long after the wake word if nobody speaks
-    "utterance_max_s": 10,
-    "utterance_preroll_ms": 160,
-    # The pause that ends a one-breath command. The turn's own silence_ms (600) cut "오늘 아침 | 컴파일러 프로젝트
-    # 관련 일정 삭제해" after "오늘 아침" (2026-11-23), and what followed fell into the ~0.9 s before the app's mic
-    # was up. Korean commands pause mid-sentence; the trailing silence is trimmed off the recording anyway.
-    "utterance_silence_ms": 1100,
-    # After the command the listener keeps recording until the app's mic is live (mic-live), at most this long,
-    # and hands that tail over in wake-utterance-<id>.tail: the ~0.9 s the app's voice processing takes to start
-    # was a hole where words were lost (2026-11-23). Only the listener reads the mic until then.
-    "bridge_max_s": 4,  # audio kept from before the first voiced frame (the wake word's tail edge)
+    "utterance_dir": "~/Library/Application Support/Azel",  # wake-stream-<id>.pcm goes here
+    # A wake streams what follows to the app live until its own mic is live; this only caps a stuck hand-off.
+    "stream_max_s": 15,
     "enrolling_path": "~/Library/Application Support/Azel/enrolling",  # the app's wake-clip recording screen
     "enrolling_stale_s": 1800,
     # Exists while this listener's input stream is open. The app waits for it to go before starting voice
@@ -202,11 +193,14 @@ class Listener:
                  "request": False, "transcript": None}
         if self.cfg["save_audio"]:
             entry["audio"] = str(self.save_clip(np.concatenate(self.ring)))
-        ring, self.ring = self.ring, []
+        self.ring = []
         session = f"wake-{int(time.time())}"
         one_breath = use_app(self.cfg) and self.cfg["utterance"]
+        uid = f"{int(time.time())}-{secrets.token_hex(3)}" if one_breath else None
+        if uid and not self.begin_stream(uid):
+            uid = None  # no file to hand over: the app just listens itself
         if one_breath:
-            self.ack_async()
+            self.ack_async(self.stream_paths(uid)[3] if uid else None)
         elif self.ack:
             self.play(*self.ack)
         else:
@@ -214,16 +208,13 @@ class Listener:
         if use_app(self.cfg):
             persona = primary_persona(self.cfg, self.http)
             entry["handoff"], entry["persona"] = "app", persona
-            uid = f"{int(time.time())}-{secrets.token_hex(3)}" if one_breath else None
-            if uid and not self.begin_utterance(uid):  # the .part file tells the app a capture is under way
-                uid = None  # no file to hand over: the app just listens itself
+            # `utterance=` names the live stream (the app reads wake-stream-<id>.pcm as it grows)
             url = f"azel://wake?persona={quote(persona)}" + (f"&utterance={uid}" if uid else "")
             opened = self.open_url(url)
             if uid:
-                pcm = self.capture_utterance(frames, ring)  # always written, empty when nobody spoke: the app waits for it
-                entry["utterance"], entry["utterance_s"] = uid, round(len(pcm) / SR, 2)
-                self.write_utterance(uid, pcm)
-                self.bridge(uid, frames)
+                secs, probs = self.stream(uid, frames)
+                entry["utterance"], entry["stream_s"] = uid, round(secs, 2)
+                entry["vad"] = self.vad_summary(probs, self.cfg["vad_threshold"])
             if opened:
                 self.deaf_until = self.clock() + self.cfg["handoff_ignore_s"]
             else:  # no headless fallback in app mode: the app answers, or nobody does
@@ -245,92 +236,60 @@ class Listener:
             self.log(entry)
             self.oww.reset()
 
-    def capture_utterance(self, frames, ring) -> np.ndarray:
-        """What is said right after the wake word, from the raw frames (the app's call-file ends it, so no live()).
-
-        Ends on the app's in-call file (its mic is live), end of speech, the cap, or no speech within
-        utterance_wait_s. Returns int16 samples; empty when nobody spoke."""
-        c = self.cfg
-        keep = max(1, -(-c["utterance_preroll_ms"] * SR // 1000 // FRAME))
-        wait, cap = int(c["utterance_wait_s"] / FRAME_S), int(c["utterance_max_s"] / FRAME_S)
-        end = int(c["utterance_silence_ms"] / 1000 / FRAME_S + 0.999)
-        pre, speech, silent = list(ring[-keep:]), [], 0
-        self.vad.reset()
-        for n, frame in enumerate(frames, 1):
-            live = Path(c["mic_live_path"]).expanduser().exists()  # the app hears the rest itself; keep this frame, then stop
-            voiced = any(self.vad(frame[i:i + VAD_CHUNK].tobytes()) >= c["vad_threshold"]
-                         for i in range(0, FRAME, VAD_CHUNK))
-            if speech:
-                speech.append(frame)
-                silent = 0 if voiced else silent + 1
-                if silent >= end or len(speech) >= cap:
-                    break
-            elif voiced:
-                speech = pre + [frame]
-            elif n >= wait:
-                break
-            else:
-                pre = (pre + [frame])[-keep:]
-            if live:
-                break
-        if silent > 1:  # keep one quiet frame: the pause that ended it would end the server's turn too (500 ms)
-            speech = speech[:len(speech) - (silent - 1)]
-        return np.concatenate(speech) if speech else np.zeros(0, dtype=np.int16)
-
-    def bridge(self, uid, frames):
-        """Keep recording after the command until the app's mic is live (or bridge_max_s), then hand the tail
-        over as wake-utterance-<uid>.tail (its .part exists meanwhile so the app knows one is coming)."""
-        d, _, final = self.utterance_paths(uid)
-        part, tail = final.with_suffix(".tail.part"), final.with_suffix(".tail")
-        live = Path(self.cfg["mic_live_path"]).expanduser()
-        out, cap = [], int(self.cfg["bridge_max_s"] / FRAME_S)
-        try:
-            part.touch(mode=0o600)
-        except OSError:
-            return
-        if not live.exists():  # the capture may already have ended on mic-live: then there is nothing to bridge
-            for n, frame in enumerate(frames, 1):
-                out.append(frame)
-                if live.exists() or n >= cap:
-                    break
-        pcm = np.concatenate(out) if out else np.zeros(0, dtype=np.int16)
-        try:
-            with open(part, "wb") as f:
-                f.write(pcm.astype("<i2").tobytes())
-            os.replace(part, tail)
-        except OSError as e:
-            print(f"bridge tail failed ({type(e).__name__}: {e})", flush=True)
-
-    def utterance_paths(self, uid):
+    def stream_paths(self, uid):
         d = Path(self.cfg["utterance_dir"]).expanduser()
-        return d, d / f"wake-utterance-{uid}.pcm.part", d / f"wake-utterance-{uid}.pcm"
+        return d, d / f"wake-stream-{uid}.pcm", d / f"wake-stream-{uid}.done", d / f"wake-stream-{uid}.acked"
 
-    def begin_utterance(self, uid) -> bool:
-        """Create wake-utterance-<uid>.pcm.part; False (logged) if the folder or file can't be made."""
-        d, part, _ = self.utterance_paths(uid)
+    def begin_stream(self, uid) -> bool:
+        """Create the empty wake-stream-<uid>.pcm (0600) before the app is opened; sweep leftovers of a crashed app.
+        False (logged) if the folder or file can't be made: the app then just listens itself."""
+        d, pcm, _, _ = self.stream_paths(uid)
         try:
             d.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.close(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            for old in [*d.glob("wake-stream-*"), *d.glob("wake-utterance-*")]:  # the app deletes what it read
+                try:
+                    if self.wall() - old.stat().st_mtime > 3600:
+                        old.unlink()
+                except OSError:
+                    pass
+            os.close(os.open(pcm, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
             return True
         except OSError as e:
-            print(f"utterance file failed ({type(e).__name__}: {e}); handing over without it", flush=True)
+            print(f"stream file failed ({type(e).__name__}: {e}); handing over without it", flush=True)
             return False
 
-    def write_utterance(self, uid, pcm) -> Path:
-        """wake-utterance-<uid>.pcm (16 kHz mono int16 LE, 0600), renamed from .pcm.part so an existing .pcm is complete."""
-        d, tmp, final = self.utterance_paths(uid)
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for old in d.glob("wake-utterance-*"):  # the app deletes what it read; this is for a crashed app
-            try:
-                if self.wall() - old.stat().st_mtime > 3600:
-                    old.unlink()
-            except OSError:
-                pass
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(pcm.astype("<i2").tobytes())
-        os.replace(tmp, final)
-        return final
+    def stream(self, uid, frames):
+        """Everything heard from the wake on, appended frame by frame to wake-stream-<uid>.pcm as it arrives (the app
+        forwards it live, so the server hears one natural utterance), until the app's own mic is live (mic-live, that
+        frame included) or stream_max_s; then wake-stream-<uid>.done. Replaces the recorded command and its bridge
+        (2026-11-23: a ~10 s wait for the recording, a burst the server split into turns, the end-of-speech guess).
+        Returns (seconds streamed, Silero speech probability per frame) for the log."""
+        _, pcm, done, _ = self.stream_paths(uid)
+        live = Path(self.cfg["mic_live_path"]).expanduser()
+        cap, n, probs = int(self.cfg["stream_max_s"] / FRAME_S), 0, []
+        self.vad.reset()
+        try:
+            with open(pcm, "ab", buffering=0) as f:
+                for n, frame in enumerate(frames, 1):
+                    f.write(frame.astype("<i2").tobytes())
+                    probs.append(max(self.vad(frame[i:i + VAD_CHUNK].tobytes()) for i in range(0, FRAME, VAD_CHUNK)))
+                    if live.exists() or n >= cap:
+                        break
+        except OSError as e:
+            print(f"stream write failed ({type(e).__name__}: {e})", flush=True)
+        try:
+            done.touch(mode=0o600)
+        except OSError:
+            pass
+        return n * FRAME_S, probs
+
+    @staticmethod
+    def vad_summary(probs, threshold):
+        """Per second: the highest speech probability, and the share of frames over the threshold (why a capture ran
+        long: room noise keeps it voiced, or the user keeps talking)."""
+        per = max(1, round(1 / FRAME_S))
+        return {"max_per_s": [round(float(max(probs[i:i + per])), 2) for i in range(0, len(probs), per)],
+                "voiced": round(sum(p >= threshold for p in probs) / len(probs), 2) if probs else 0.0}
 
     def record(self, frames):
         """One utterance via Silero VAD, or None if nobody starts talking within followup_s."""
@@ -391,13 +350,23 @@ class Listener:
         p.write_bytes(to_wav(pcm))
         return p
 
-    def ack_async(self):
+    def ack_async(self, acked=None):
         """'네?' (or the system beep) the moment the wake word is heard, without waiting for it and without flushing
-        the mic: the command is already being said, and it is captured right after. The ack may be heard in it."""
-        if self.ack:
-            self.spawn(self._play, *self.ack)
-        else:
-            self.spawn(lambda: subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], check=False))
+        the mic: the command is already being said and streamed. `acked` is touched once it has played: the app
+        starts its voice processing only then (the 3 s stall of 2026-11-23 coincided with this sound)."""
+        def run():
+            try:
+                if self.ack:
+                    self._play(*self.ack)
+                else:
+                    subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], check=False)
+            finally:
+                if acked:
+                    try:
+                        acked.touch(mode=0o600)
+                    except OSError:
+                        pass
+        self.spawn(run)
 
     def beep(self):
         subprocess.run(["afplay", "/System/Library/Sounds/Tink.aiff"], check=False)
@@ -546,7 +515,7 @@ class Mic:
         peak = 0
         with self.stream:
             for n in itertools.count(1):
-                try:  # a stalled stream (another app reconfiguring the device) must not hang the bridge
+                try:  # a stalled stream (another app reconfiguring the device) must not hang the stream to the app
                     frame = self.q.get(timeout=1)
                 except queue.Empty:
                     frame = np.zeros(FRAME, dtype=np.int16)

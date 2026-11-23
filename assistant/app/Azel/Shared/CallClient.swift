@@ -562,10 +562,10 @@ final class CallClient {
 
     /// Sends the listener's recording, then the held frames after its end, then lets the live mic
     /// through, in that order (live frames wait on the lock meanwhile).
-    func releaseMic(first: Data?, cutoff: Double?) {
+    func releaseMic(first: Data? = nil, cutoff: Double?) {
         micHoldLock.lock(); defer { micHoldLock.unlock() }
         if let first { sendUserAudio(first) }
-        let rest = Self.seam(micHold ?? [], cutoff: first == nil ? nil : cutoff)
+        let rest = Self.seam(micHold ?? [], cutoff: cutoff)
         if Self.micAction(muted: muted, held: held) == .send { rest.forEach { sendUserAudio($0) } }
         micHold = nil
     }
