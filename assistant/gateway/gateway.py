@@ -441,7 +441,8 @@ class State:
             else:
                 await fetch()
         except StateDown as e:
-            print("state down, using cache:", path, e, flush=True)
+            if str(e) != "slow":  # slow was already warned about once
+                print("state down, using cache:", path, e, flush=True)
         return self.cache.get(key, default)
 
 
@@ -1047,16 +1048,40 @@ async def mcp(url, method, params):
     return msg["result"]
 
 
+DEVICE_LIST_TTL_S = 60  # a daemon's tool list is reused this long (it changes only with a daemon deploy)
+DEVICE_LIST_WAIT_S = 2  # a tool list request waits at most this for daemons not listed yet; the rest join later
+DEVICE_LIST_TIMEOUT_S = 10
+device_lists: dict = {}  # daemon url -> (monotonic, its MCP tools)
+device_listing: dict = {}  # daemon url -> the refresh in flight
+
+
+async def list_device(d):
+    try:
+        listed = (await asyncio.wait_for(mcp(d["url"], "tools/list", {}), DEVICE_LIST_TIMEOUT_S))["tools"]
+        device_lists[d["url"]] = (time.monotonic(), listed)
+    except Exception as e:  # noqa: BLE001  an unreachable daemon keeps its last list (or none)
+        print("tools/list failed:", d["id"], type(e).__name__, flush=True)
+
+
 async def device_tools(devices):
-    """Messages API tool definitions for the daemons' MCP tools, plus where each one runs."""
+    """Messages API tool definitions for the daemons' MCP tools, plus where each one runs. Lists are cached and
+    refreshed in the background: a daemon behind a slow relay (2 s RTT) used to hold up the voice server's 3 s
+    tools_list, which then had no tools at all."""
+    jobs = []
+    for d in devices:
+        hit = device_lists.get(d["url"])
+        if hit and time.monotonic() - hit[0] < DEVICE_LIST_TTL_S:
+            continue
+        job = device_listing.get(d["url"])
+        if job is None or job.done() or job.get_loop().is_closed():
+            job = device_listing[d["url"]] = asyncio.get_running_loop().create_task(list_device(d))
+        if hit is None:
+            jobs.append(job)  # never listed: worth a short wait; a stale list is used as it is
+    if jobs:
+        await asyncio.wait(jobs, timeout=DEVICE_LIST_WAIT_S)
     tools, where = [], {}
     for d in devices:
-        try:
-            listed = (await mcp(d["url"], "tools/list", {}))["tools"]
-        except Exception as e:
-            print("tools/list failed:", d["id"], type(e).__name__, flush=True)
-            continue
-        for t in listed:
+        for t in (device_lists.get(d["url"]) or (0, []))[1]:
             if t["name"] == "delegate" and d["id"] in NO_DELEGATE:
                 continue
             name = f"{d['id']}__{t['name']}"[:64]
@@ -5349,7 +5374,10 @@ async def serve_tool(m):
     current_persona.set(m.get("persona") if isinstance(m.get("persona"), str) else None)
     try:
         if m["type"] == "tools_list":
+            t0 = time.monotonic()
             defs = (await bridge.tools("qwen"))[0]  # read_only only on this frame: the Messages API rejects extra keys
+            if time.monotonic() - t0 > 2:  # the voice server waits 3 s for this list
+                print(f"warning: tools_list took {time.monotonic() - t0:.1f} s", flush=True)
             await link_send({"id": m["id"], "type": "tools",
                              "tools": [{**t, "read_only": tools_bridge.read_only(t["name"])} for t in defs]})
             return

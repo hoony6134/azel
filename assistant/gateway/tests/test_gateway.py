@@ -1875,3 +1875,24 @@ def test_tool_answer_does_not_wait_for_the_audit(gw):
         return r, took
     r, took = asyncio.run(go())
     assert took < B.AUDIT_WAIT_S + 0.2 and written and written[0][-1]["action"] == "nope_tool_x"
+
+
+def test_a_slow_daemon_does_not_hold_up_the_tool_list(gw, monkeypatch):
+    """A daemon behind a slow relay: the list answers within DEVICE_LIST_WAIT_S without it, and has it once it came."""
+    g, _, _ = gw
+    monkeypatch.setattr(g, "DEVICE_LIST_WAIT_S", 0.05)
+
+    async def mcp(url, method, params):
+        await asyncio.sleep(0.3 if "slow" in url else 0)
+        return {"tools": [{"name": "list_dir", "description": "", "inputSchema": {"type": "object"}}]}
+    monkeypatch.setattr(g, "mcp", mcp)
+    devs = [{"id": "fast", "name": "fast", "url": "http://fast/mcp"}, {"id": "slow", "name": "slow", "url": "http://slow/mcp"}]
+
+    async def go():
+        t0 = time.monotonic()
+        first = [t["name"] for t in (await g.device_tools(devs))[0]]
+        took = time.monotonic() - t0
+        await asyncio.sleep(0.4)
+        return first, took, [t["name"] for t in (await g.device_tools(devs))[0]]
+    first, took, later = asyncio.run(go())
+    assert first == ["fast__list_dir"] and took < 0.2 and later == ["fast__list_dir", "slow__list_dir"]
