@@ -387,7 +387,18 @@ def test_preroll_keeps_the_frame_before_speech_starts(tmp_path):
     lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
     lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 40)]))
     pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
-    assert len(pcm) == 9 * FRAME and (pcm[:FRAME] == WAKE).all()  # wake frame + 4 speech + 4 silence
+    assert len(pcm) == 6 * FRAME and (pcm[:FRAME] == WAKE).all()  # wake frame + 4 speech + 1 quiet frame (tail trimmed)
+
+
+def test_a_short_pause_mid_command_does_not_end_the_recording(tmp_path):
+    """"오늘 아침 | 컴파일러 프로젝트 관련 일정 삭제해" (2026-11-23): an 0.8 s pause mid-command was the end; now
+    only a pause of utterance_silence_ms is, and its silence is trimmed so it can't end the server's turn early."""
+    opened = []
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: opened.append(u) or True)
+    lis.run(frames(clock, [(WAKE, 1), (SPEECH, 4), (SIL, 5), (SPEECH, 6), (SIL, 40)]))
+    pcm = np.frombuffer((tmp_path / "azel" / f"wake-utterance-{uid_of(opened[0])}.pcm").read_bytes(), "<i2")
+    assert (pcm == SPEECH).sum() == 10 * FRAME, "both halves"
+    assert (pcm[-2 * FRAME:] == SPEECH).sum() >= FRAME, "at most one quiet frame after the last word"
 
 
 def test_utterance_file_is_empty_when_nobody_speaks(tmp_path):
