@@ -1896,3 +1896,27 @@ def test_a_slow_daemon_does_not_hold_up_the_tool_list(gw, monkeypatch):
         return first, took, [t["name"] for t in (await g.device_tools(devs))[0]]
     first, took, later = asyncio.run(go())
     assert first == ["fast__list_dir"] and took < 0.2 and later == ["fast__list_dir", "slow__list_dir"]
+
+
+def test_api_only_gateway_never_runs_the_claude_cli(tmp_path, monkeypatch):
+    """BISEO_CLAUDE_PATH=api (deneb): asks take the API whatever the shared claude_path says, tasks never become
+    claude_code, and with no key or no budget they fall back to Qwen rather than the CLI."""
+    private(tmp_path / "anthropic_api_key", "sk-test\n")
+    g = start(tmp_path, monkeypatch, BISEO_CLAUDE_PATH="api")
+    assert g.API_ONLY and not g.WARM
+    assert g.resolve(g.DEFAULTS, None, None, "chat", "안녕")[1] == "api"
+    assert g.resolve(g.DEFAULTS, None, "claude_code", "chat", "안녕")[1] == "api"
+    settings = {**g.DEFAULTS, "task_backend": "claude_api"}
+
+    async def cost(s):
+        return 0.0
+    monkeypatch.setattr(g, "month_cost", cost)
+
+    async def mode(s=None):
+        return "auto"
+    monkeypatch.setattr(g, "brain_mode", mode)
+    run = lambda spec: asyncio.run(g.task_backend_for(spec, settings))  # noqa: E731
+    assert run({"backend": "claude_code", "goal": "레포 고쳐 줘"})[0] == "claude_api"
+    assert run({"backend": None, "goal": "메일 정리해 줘"}) == ("claude_api", None)
+    monkeypatch.setattr(g, "API_KEY", "")
+    assert run({"backend": None, "goal": "조사해 줘"})[0] == "qwen"
