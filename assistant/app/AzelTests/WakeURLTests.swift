@@ -120,6 +120,14 @@ final class ListeningGlowTests: XCTestCase {
 
 #if os(macOS)
 final class WakeIntentTests: XCTestCase {
+    /// A recorded command must not open as intent=wake: the server's 2 s noisy-VAD guard swallowed it.
+    @MainActor func testRecordedCommandSkipsTheWakeGuard() {
+        XCTAssertNil(MacCall.callIntent(MacCall.wakeIntent, recorded: true))
+        XCTAssertEqual(MacCall.callIntent(MacCall.wakeIntent, recorded: false), MacCall.wakeIntent, "only the name: keep the guard")
+        XCTAssertEqual(MacCall.callIntent("briefing", recorded: true), "briefing")
+        XCTAssertNil(MacCall.callIntent(nil, recorded: false))
+    }
+
     func testWakeCallsSayIntentWake() throws {
         let req = try CallClient.request(voiceURL: "wss://azel.example", token: "t", session: "mac-1", callID: nil, intent: MacCall.wakeIntent, persona: "azel")
         let items = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!.queryItems!

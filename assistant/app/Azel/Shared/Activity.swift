@@ -60,6 +60,9 @@ struct ThinkingCues {
     private var paused = false
     /// Tools started and not yet ended; they keep the turn open.
     private(set) var tools = 0
+    /// The server said it listens for the user: never a wait (no heartbeat, no thinking orb) until it
+    /// thinks or speaks again, whatever arrives late (a background tool, a drained queue, a resume).
+    private var listening = false
 
     var active: Bool { since != nil }
 
@@ -68,7 +71,7 @@ struct ThinkingCues {
     func waiting(now: Double) -> Bool { since.map { now - $0 >= Self.pulseAfter } ?? false }
 
     private mutating func waitFrom(_ now: Double) {
-        guard since == nil, turnOpen, !playing, !paused else { return }
+        guard since == nil, turnOpen, !playing, !paused, !listening else { return }
         since = now
         lastPulse = nil
     }
@@ -82,6 +85,7 @@ struct ThinkingCues {
         case "state":
             switch value {
             case "thinking":
+                listening = false
                 turnOpen = true
                 guard !thinkingPhase else { return nil }
                 thinkingPhase = true
@@ -89,11 +93,13 @@ struct ThinkingCues {
                 waitFrom(now)
                 return .ack
             case "speaking":
+                listening = false
                 // Audio is on its way: the wait ends here and starts again only when the queue runs dry.
                 thinkingPhase = false
                 since = nil
             default:
                 endTurn()   // listening and the like
+                listening = value == "listening"
             }
         case "interrupt", "error", "turn_done", "hangup", "end":
             endTurn()
@@ -105,7 +111,9 @@ struct ThinkingCues {
             waitFrom(now)
         case "activity" where phase == "tool_start":
             tools += 1
-            turnOpen = true   // a running tool is always a wait, before or after the first audio
+            // A running tool is a wait, before or after the first audio, but not once the server listens
+            // (a background step after the reply must not tick over the user's turn).
+            if !listening { turnOpen = true }
             waitFrom(now)
         case "activity" where phase == "tool_end":
             tools = max(0, tools - 1)

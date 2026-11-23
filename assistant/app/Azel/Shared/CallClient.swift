@@ -287,6 +287,9 @@ final class CallClient {
                 audio.duck(event.type == "duck")   // the same, but quieter instead of silent (`?duck=1`)
             default: break
             }
+            if Self.loggedEvents.contains(event.type) {   // the order, never the words
+                Log.call.notice("event \(event.type, privacy: .public) \(event.value ?? "", privacy: .public) \(event.phase ?? "", privacy: .public)")
+            }
             karaokeLock.lock(); karaoke.apply(type: event.type, text: event.text); karaokeLock.unlock()
             recorder?.note(event)
             DispatchQueue.main.async {
@@ -396,8 +399,9 @@ final class CallClient {
     /// A felt wait inside the turn (a tool, a mid-reply gap, ThinkingCues' own threshold) shows thinking.
     static func displayState(server: String, playing: Bool, waiting: Bool = false) -> String {
         if playing { return server == "listening" || server.isEmpty ? "speaking" : server }
-        return waiting ? "thinking" : server
+        return waiting && server != "listening" ? "thinking" : server   // never thinking while it listens
     }
+    static let loggedEvents: Set<String> = ["state", "activity", "transcript", "turn_done", "interrupt", "pause", "resume", "duck", "unduck", "hangup", "end", "error"]
     /// ThinkingCues' wait crossed (or left) its 1 s threshold (main queue): the UI shows thinking.
     var onWaiting: ((Bool) -> Void)?
     private var wasWaiting = false

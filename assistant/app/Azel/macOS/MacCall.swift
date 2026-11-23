@@ -197,12 +197,17 @@ final class MacCall: ObservableObject {
     /// Waits for the listener's recording (wake) and for the listener to close its mic, then starts the
     /// engine off the main thread. Two processes on the mic made voice processing block main for 3 s and
     /// rebuild over and over (2026-11-23). The utterance goes out once audio is up, ahead of the live mic.
-    private func startAudio(utterance id: String?) {
+    private func startAudio(utterance id: String?, mode: String?, secret: Bool) {
         let call = connectedAt
         Task { [weak self] in
             let got: (data: Data?, at: Double?) = if let id { await AzelFiles.takeUtterance(id) } else { (nil, nil) }
             let released = await AzelFiles.listenerReleased()
             guard let self, self.inCall, self.connectedAt == call else { return }
+            // The socket opens once the recording is known (see callIntent); its handshake overlaps the engine start.
+            do {
+                try self.client.open(session: self.activeSession, intent: Self.callIntent(self.activeIntent, recorded: got.data != nil),
+                                     persona: self.activePersona?.id, mode: mode, secret: secret)
+            } catch { return self.end(error: error.localizedDescription, keepPanel: true) }
             if !released { Log.call.notice("listener still holds the mic; starting anyway") }
             self.client.markTiming("listener_off")
             self.client.startAudio { [weak self] error in
@@ -360,20 +365,23 @@ final class MacCall: ObservableObject {
         client.markTiming("mic_ok")
         inCall = true
         applyDevices()
-        do {
-            let mode = BrainModeChoice.shared.takeForCall()
-            brainMode = mode
-            if pendingUtterance != nil { client.holdMic() }   // live frames wait (not dropped) behind the utterance
-            let wantSecret = BrainModeChoice.shared.takeSecretForCall()
-            secret = wantSecret
-            try client.open(session: activeSession, intent: activeIntent, persona: activePersona?.id, mode: mode, secret: wantSecret)
-            connectedAt = Date()
-            let id = pendingUtterance
-            pendingUtterance = nil
-            startAudio(utterance: id)
-        } catch {
-            end(error: error.localizedDescription, keepPanel: true)
-        }
+        let mode = BrainModeChoice.shared.takeForCall()
+        brainMode = mode
+        let wantSecret = BrainModeChoice.shared.takeSecretForCall()
+        secret = wantSecret
+        let id = pendingUtterance
+        pendingUtterance = nil
+        if id != nil { client.holdMic() }   // live frames wait (not dropped) behind the utterance
+        connectedAt = Date()
+        startAudio(utterance: id, mode: mode, secret: wantSecret)
+    }
+
+    /// A wake call whose command the listener already recorded is not opened as `intent=wake`: that
+    /// intent gives its first 2 s noisy-mode VAD (against room tone and the wake word's tail), and the
+    /// recording, sent at ~2 s, fell inside it, so short commands were never heard (2026-11-23: 0.96,
+    /// 1.12 and 1.28 s ignored; 2.4 and 3.5 s, which outlast the window, answered).
+    nonisolated static func callIntent(_ intent: String?, recorded: Bool) -> String? {
+        recorded && intent == wakeIntent ? nil : intent
     }
 
     private func handle(_ event: CallEvent) {

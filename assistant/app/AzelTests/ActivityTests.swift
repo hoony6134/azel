@@ -222,6 +222,32 @@ final class MidReplyHeartbeatTests: XCTestCase {
         XCTAssertFalse(t.waiting(now: 5.1))
     }
 
+    /// Never a wait while the server listens (2026-11-23 Mac call: 생각 중 and the heartbeat while the
+    /// user was meant to talk). A full turn, then everything that can arrive after `listening`.
+    func testNothingWaitsWhileTheServerListens() {
+        var t = ThinkingCues()
+        _ = t.event("state", value: "thinking", now: 0)
+        _ = t.event("transcript", value: nil, now: 0.2)
+        _ = t.event("activity", value: nil, now: 0.5, phase: "tool_start")
+        _ = t.event("activity", value: nil, now: 1.5, phase: "tool_end")
+        _ = t.event("state", value: "speaking", now: 2)
+        t.audioArrived(); t.playback(true, now: 2)
+        _ = t.event("state", value: "listening", now: 4)        // the server moves on before the audio ends
+        _ = t.event("turn_done", value: nil, now: 4)
+        t.playback(false, now: 5)                                // the queue drains after listening
+        _ = t.event("activity", value: nil, now: 5.5, phase: "tool_start")   // a background step
+        _ = t.event("activity", value: nil, now: 6, phase: "tool_end")
+        _ = t.event("resume", value: nil, now: 6.5)
+        _ = t.event("unduck", value: nil, now: 7)
+        for now in stride(from: 5.0, through: 15, by: 0.1) {
+            XCTAssertNil(t.tick(now: now), "no heartbeat while listening (\(now))")
+            XCTAssertFalse(t.waiting(now: now))
+        }
+        XCTAssertEqual(CallClient.displayState(server: "listening", playing: false, waiting: true), "listening")
+        XCTAssertEqual(t.event("state", value: "thinking", now: 20), .ack, "the next turn waits again")
+        XCTAssertEqual(t.tick(now: 21), .pulse)
+    }
+
     func testFeltWaitsShowThinkingButPlayingAudioWins() {
         XCTAssertEqual(CallClient.displayState(server: "speaking", playing: false, waiting: true), "thinking", "mid-reply gap")
         XCTAssertEqual(CallClient.displayState(server: "speaking", playing: true, waiting: true), "speaking")
