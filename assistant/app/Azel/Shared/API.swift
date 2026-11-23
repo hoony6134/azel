@@ -195,8 +195,10 @@ enum GatewayError: LocalizedError {
 
     /// 400 and 422 carry an explanation for the user; other codes stay codes (404 = missing
     /// endpoint, 409 = busy, 401/403 = token, 5xx = unreachable).
-    static func from(status code: Int, body: Data) -> GatewayError {
+    static func from(status code: Int, body: Data, explain: Set<Int> = []) -> GatewayError {
         if code == 400 || code == 422, let m = message(in: body) { return .rejected(m) }
+        // FastAPI's own "Not Found" means a missing route: that stays a code (callers test .http(404)).
+        if explain.contains(code), let m = message(in: body), m != "Not Found" { return .rejected(m) }
         // Action errors (ACTIONS.md §2: 404/409/429/503 with {detail, …result}) carry a Korean message too.
         if (400..<600).contains(code), ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["error"] is [String: Any],
            let m = message(in: body) { return .rejected(m) }
@@ -205,7 +207,8 @@ enum GatewayError: LocalizedError {
 }
 
 enum Gateway {
-    static func send(_ method: String, _ path: String, json: Any? = nil, timeout: TimeInterval = 15) async throws -> Data {
+    /// `explain`: statuses whose server `detail` is shown to the user (e.g. approvals: 404 unknown, 409 already decided).
+    static func send(_ method: String, _ path: String, json: Any? = nil, timeout: TimeInterval = 15, explain: Set<Int> = []) async throws -> Data {
         guard let url = URL(string: Config.gatewayURL + path) else { throw URLError(.badURL) }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
@@ -216,7 +219,7 @@ enum Gateway {
         }
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(code) else { throw GatewayError.from(status: code, body: data) }
+        guard (200..<300).contains(code) else { throw GatewayError.from(status: code, body: data, explain: explain) }
         return data
     }
 
