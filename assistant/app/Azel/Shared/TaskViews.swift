@@ -293,7 +293,7 @@ struct TaskCreateView: View {
     }
 }
 
-private extension View {
+extension View {
     func taskSheetSize() -> some View {
         #if os(macOS)
         frame(width: 560, height: 640)

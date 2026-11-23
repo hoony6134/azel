@@ -4,6 +4,8 @@ import Foundation
 struct Activity: Equatable, Codable {
     var label: String
     var glyph: String
+    /// The tool run behind this step (`call_id`), for its detail view.
+    var callId: String? = nil
 
     /// §13.2: the event's `kind` first; for missing/unknown kinds, a substring match on `tool`.
     static func glyph(kind: String?, tool: String?) -> String {
@@ -182,11 +184,11 @@ struct ActivityLog: Equatable {
                 hadActivity = true
                 startLabel = e.label
                 speaking = false
-                current = Activity(label: e.label ?? "", glyph: glyph)
+                current = Activity(label: e.label ?? "", glyph: glyph, callId: e.call_id)
             case "tool_end":
                 hadActivity = true
                 let label = Activity.doneLabel(end: e.label, start: startLabel ?? current?.label)
-                if !label.isEmpty { done.append(Activity(label: label, glyph: Activity.glyph(kind: e.kind, tool: e.tool))) }
+                if !label.isEmpty { done.append(Activity(label: label, glyph: Activity.glyph(kind: e.kind, tool: e.tool), callId: e.call_id ?? current?.callId)) }
                 done = Array(done.suffix(Self.maxDone))
                 current = nil
                 startLabel = nil

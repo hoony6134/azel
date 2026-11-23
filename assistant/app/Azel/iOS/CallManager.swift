@@ -31,6 +31,9 @@ final class CallManager: NSObject, ObservableObject {
     @Published var error: String?
     /// What the assistant is doing this turn (DESIGN §13) and the jar's surge/pulse moments.
     @Published private(set) var activity = ActivityLog()
+    /// This call's tool runs (command, host, input, live output) for the detail sheet.
+    let runs = ToolRunStore()
+    @Published var runTarget: ToolRunTarget?
     @Published private(set) var surgeAt: Date?
     @Published private(set) var pulseAt: Date?
     /// The thinking pulse's visual twin: a shimmer across the orb.
@@ -228,6 +231,7 @@ final class CallManager: NSObject, ObservableObject {
         state = ""
         log = CallLog()
         activity = ActivityLog()
+        runs.reset(); runTarget = nil
         muted = false
         held = false
         recording = false
@@ -297,6 +301,7 @@ final class CallManager: NSObject, ObservableObject {
         if event.type == "text_rejected" { error = CallLog.rejection(event.reason) }
         if let c = CallContext.from(event: event) { callContext = c; return }
         if let cue = activity.apply(event) { client.cue(cue, listening: state == "listening" || state.isEmpty) }
+        runs.apply(event)
         switch event.type {
         case "state": state = event.value ?? ""
         case "activity" where event.phase == "tool_start":

@@ -415,7 +415,14 @@ struct MacHome: View {
                         .frame(width: call.inCall ? 320 : 200, height: call.inCall ? 320 : 200)
                         .animation(Theme.enter, value: call.inCall)
                     if call.inCall {
-                        if !call.activity.isEmpty { ActivityRow(activity: call.activity) }
+                        if !call.activity.isEmpty || !call.runs.runs.isEmpty {
+                            Button { call.runTarget = call.activity.tapTarget(call.runs) } label: {
+                                if call.activity.isEmpty { Label("실행한 도구 \(call.runs.runs.count)개", systemImage: "terminal").font(.footnote).foregroundStyle(Theme.text3) }
+                                else { ActivityRow(activity: call.activity) }
+                            }
+                            .buttonStyle(.plain).accessibilityHint("실행 내용 보기")
+                            .toolRuns(call.runs, target: $call.runTarget)
+                        }
                         if UserDefaults.standard.string(forKey: "noiseMode") == "noisy" && jarState == .speaking {
                             Label("시끄러운 곳 모드 · 구를 누르면 말을 끊어요", systemImage: "hand.tap").font(.footnote).foregroundStyle(Theme.text3)
                         }
