@@ -122,3 +122,27 @@ def test_known_names_and_holdings_win_and_etfs_never_win_a_name():
     assert asyncio.run(go("SK hynix"))["code"] == "000660"
     assert asyncio.run(go("QQQ"))["symbol"] == "QQQ"  # its own ticker
     assert asyncio.run(go("SK hynix 2x ETF"))["symbol"] == "SKHX"  # asked for an ETF
+
+
+@pytest.mark.parametrize("asked,sym,name", [
+    ("S&P500", "^GSPC", "S&P 500"), ("^GSPC", "^GSPC", "S&P 500"), ("에스앤피 500 지수", "^GSPC", "S&P 500"),
+    ("나스닥", "^IXIC", "나스닥 종합"), ("나스닥 종합", "^IXIC", "나스닥 종합"), ("^ixic", "^IXIC", "나스닥 종합"),
+    ("다우", "^DJI", "다우존스"), ("^DJI", "^DJI", "다우존스"),
+    ("코스피", "^KS11", "코스피"), ("^KS11", "^KS11", "코스피"), ("코스닥 지수", "^KQ11", "코스닥"), ("^KQ11", "^KQ11", "코스닥")])
+def test_indices_by_name_or_ticker_are_points(asked, sym, name, monkeypatch):
+    """"나스닥" was a 102-dollar fund and S&P 500 "6,910.39달러": an index resolves before any search and is points."""
+    seen = []
+
+    async def price(symbol, c):
+        seen.append(symbol)
+        return {"name": symbol, "price": 6910.39, "currency": "USD", "change": 12.5, "pct": 0.18, "at": None,
+                "source": "야후 파이낸스"}
+    monkeypatch.setattr(quote, "yahoo_price", price)
+
+    async def no_search(*a, **k):
+        raise AssertionError("an index never searches")
+    monkeypatch.setattr(quote, "naver_find", no_search)
+    monkeypatch.setattr(quote, "yahoo_find", no_search)
+    r = asyncio.run(quote.quote(asked))
+    assert seen == [sym] and r["data"]["symbol"] == sym and r["data"]["currency"] == "index"
+    assert f"{name} 지수는 6,910.39포인트예요" in r["spoken"] and "달러" not in r["spoken"], r["spoken"]
