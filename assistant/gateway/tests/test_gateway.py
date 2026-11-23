@@ -1999,3 +1999,29 @@ def test_vd_spark_is_one_device_and_spark_still_resolves(gw, monkeypatch):
     c.put("/v1/settings", json={"device_fallback": ["albireo", "스파크"]})
     assert c.get("/v1/settings").json()["device_fallback"] == ["albireo", "vd-spark"]
     assert g.task_view({"device": "spark"}, steps=False)["device"] == "vd-spark"
+
+
+def test_kind_labels_are_added_once(gw, monkeypatch):
+    """"아젤 · 알림: 알림: 회의": the gateway prefixed the label and the app prefixed it again. The label leaves the
+    gateway bare (the app adds "알림: "/"작업: " once), and the gateway's own caller line never doubles one."""
+    g, c, _ = gw
+    for raw in ("알림: 알림: 회의", "알림:회의", "작업 완료: 작업: 회의", "전화: 회의", " 알림 ： 회의 ", "회의"):
+        assert g.bare_label(raw) == "회의", raw
+    assert g.call_label("reminder", "알림: 회의") == "알림: 회의"
+    assert g.call_label("task", "작업 완료: 보고서") == "작업 완료: 보고서"
+    pushed, linked = [], []
+
+    async def push(payload):
+        pushed.append(payload)
+        return {"sent": 1}
+
+    async def link(obj):
+        linked.append(obj)
+        return True
+    monkeypatch.setattr(g, "send_voip_push", push)
+    monkeypatch.setattr(g, "link_send", link)
+    for reason, kind, label in (("reminder", "schedule", "알림: 알림: 약 먹기"), ("task", "task", "작업: 리서치"),
+                                ("user_request", "user_request", "전화: 확인")):
+        c.portal.call(lambda: g.place_call(reason, opening="여보세요", context={"kind": kind, "label": label}))
+    assert [p["context"]["label"] for p in pushed] == ["약 먹기", "리서치", "확인"]
+    assert [m["context"]["label"] for m in linked if m.get("type") == "call"] == ["약 먹기", "리서치", "확인"]
