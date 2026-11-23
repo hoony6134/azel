@@ -20,6 +20,24 @@ struct RunningTasksCard: View {
 
     var body: some View {
         Card("작업", trailing: AnyView(Button("모두 보기") { showAll = true }.font(.subheadline).tint(Theme.celadon))) {
+            // Finished results (overnight ones too) right here, not only under "모두 보기".
+            ForEach(tasks.tasks.filter { $0.isRecentResult() }.prefix(2)) { t in
+                Button { detail = t } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(t.goal).foregroundStyle(Theme.text).lineLimit(1)
+                            Spacer()
+                            TaskBadgeView(status: t.status)
+                        }
+                        Text(ChatSession.plain(t.result ?? "").replacingOccurrences(of: "\n", with: " "))
+                            .font(.footnote).foregroundStyle(Theme.text2).lineLimit(2)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .combine)
+                .accessibilityHint("결과 보기")
+            }
             if tasks.active.isEmpty {
                 Text(tasks.status == .ok ? "진행 중인 작업이 없어요" : "").foregroundStyle(Theme.text2)
             }
@@ -174,8 +192,12 @@ struct TaskDetailView: View {
                     Card("실패 이유") { Text(e).foregroundStyle(Theme.text).textSelection(.enabled) }
                 }
                 if let r = t.result, !r.isEmpty {
-                    Card("결과") { Text(r).foregroundStyle(Theme.text).textSelection(.enabled) }
+                    Card("결과") { ChatMarkdownView(text: r) }   // markdown, as the brain writes it
+                    if !t.paths.isEmpty {
+                        Card("파일") { ForEach(t.paths, id: \.self) { TaskPathRow(path: $0) } }
+                    }
                 }
+                if let line = TaskDetailView.timing(t) { Label(line, systemImage: "clock").font(.footnote).foregroundStyle(Theme.text3) }
                 if let c = t.cost { Text("비용 \(c, format: .currency(code: "USD"))").font(.footnote.monospacedDigit()).foregroundStyle(Theme.text3) }
                 if let message { Text(message).font(.footnote).foregroundStyle(Theme.danger) }
                 if t.isActive || t.isScheduled {
@@ -300,5 +322,48 @@ extension View {
         #else
         self
         #endif
+    }
+}
+
+extension TaskDetailView {
+    /// "시작 23:10 · 끝 23:42 · 32분".
+    nonisolated static func timing(_ t: AgentTask) -> String? {
+        guard let start = t.started ?? t.created_at else { return nil }
+        var parts = ["시작 " + start.formatted(date: .abbreviated, time: .shortened)]
+        if let end = t.finished {
+            parts.append("끝 " + end.formatted(date: .omitted, time: .shortened))
+            let m = Int(end.timeIntervalSince(start) / 60)
+            parts.append(m < 1 ? "1분 미만" : m < 60 ? "\(m)분" : "\(m / 60)시간 \(m % 60)분")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// A file a task mentions: copy its path; on the Mac, reveal it when it is on this Mac.
+struct TaskPathRow: View {
+    let path: String
+    @State private var copied = false
+    var body: some View {
+        HStack(spacing: Theme.s) {
+            Image(systemName: "doc").foregroundStyle(Theme.text3)
+            Text(path).font(.footnote.monospaced()).foregroundStyle(Theme.text).lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+            Spacer()
+            #if os(macOS)
+            if FileManager.default.fileExists(atPath: (path as NSString).expandingTildeInPath) {
+                Button("Finder에서 보기") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: (path as NSString).expandingTildeInPath)]) }
+                    .font(.caption).buttonStyle(.borderless)
+            }
+            #endif
+            Button(copied ? "복사됨" : "복사") {
+                #if os(macOS)
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(path, forType: .string)
+                #else
+                UIPasteboard.general.string = path
+                #endif
+                copied = true
+            }
+            .font(.caption).buttonStyle(.borderless)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
