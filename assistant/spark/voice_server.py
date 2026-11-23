@@ -1097,6 +1097,8 @@ async def run_tool(raw, session, on_say=None):
                **({"task_id": str(extra["task_id"])[:64]} if extra.get("task_id") else {}),
                **({"host": str(extra["host"])[:64]} if extra.get("host") else {})}
         try:
+            if pending[0]:  # what streamed after the last chunk: the app appends chunks, so nothing may be left out
+                await emit({**base, "phase": "tool_output", "chunk": clip_tail(redact(pending[0]), 2048)[0]})
             await emit(end)
         except Exception:  # noqa: BLE001  the call may be gone; the tool's own result still returns
             pass
@@ -5618,8 +5620,10 @@ if __name__ == "__main__":
                 gw_tools.update(real_defs)
             return text, plain, got
         text, plain, tgot = asyncio.run(tool_detail_check())
-        assert text == plain == "빌드 실패" and [e["phase"] for e in tgot] == ["tool_start", "tool_output", "tool_end"], tgot
-        start, chunk, end = tgot
+        assert text == plain == "빌드 실패" and [e["phase"] for e in tgot] == \
+            ["tool_start", "tool_output", "tool_output", "tool_end"], tgot
+        start, chunk, rest, end = tgot
+        assert rest["chunk"] == "step 2\n"  # held by the throttle, flushed before the end: chunks are append-only
         assert start["host"] == "macbook" and start["input"].startswith("curl -H 'Authorization: «redacted»") and \
             "sk-" not in start["input"] and "key=1" not in start["input"] and start["input"].endswith("&& make"), start
         assert chunk["chunk"] == "building... token=«redacted»\n" and chunk["call_id"] == start["call_id"] == end["call_id"]
