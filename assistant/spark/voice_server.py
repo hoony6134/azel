@@ -1296,6 +1296,7 @@ ANNOUNCE = re.compile(r"(찾아|알아|확인해|검색해|살펴|조회해|점�
 # "잠깐만요." alone in small talk is not a promise: only a lookup verb with what is looked up, or any of these words
 # when the user's turn asked for current info or their schedule (user decision: minimal guards on no-tool chat).
 LOOKUP_VERB = re.compile(r"확인|찾아|알아보|알아봐|검색|조회|점검|살펴")
+AGENDA_WORDS = re.compile(r"일정|캘린더|스케줄|수업|마감|과제|할\s*일|브리핑")  # what the agenda prefetch already holds
 LOOKUP_OBJ = re.compile(r"일정|캘린더|스케줄|수업|마감|과제|할\s*일|날씨|기온|주가|주식|환율|시세|가격|뉴스|브리핑|상태")
 
 
@@ -1502,7 +1503,7 @@ LOOKUP_TOOL = re.compile(r"task_status|schedule_list|overnight_list|list_jobs|jo
 DANGLING = re.compile(r"(그리고|그런데|근데|그러니까|그래서|그러면|또는|아니면|이랑|랑|하고|이고|거나|는데|은데|인데|니까|지만|에서|한테|에게|에다|에는)[\s.,…]*$")
 DANGLING_WAIT_S = 1.3
 # "오늘 일정 브리핑해 드릴게요.", "알려 드릴게요": an announcement with no content in it
-INTRO_ANNOUNCE = re.compile(r"(브리핑|알려|말씀|정리|설명|확인해|읽어)\s*(해\s*)?드릴게요[.!~]*$|(브리핑|알려|정리|설명)\s*(해\s*)?드리겠습니다[.!~]*$")
+INTRO_ANNOUNCE = re.compile(r"(브리핑|알려|말씀|정리|설명|안내|확인해|읽어)\s*(해\s*)?드릴게요[.!~]*$|(브리핑|알려|정리|설명)\s*(해\s*)?드리겠습니다[.!~]*$")
 ASKS_ENGLISH = re.compile(r"영어|english|번역|translate", re.I)
 
 
@@ -2244,18 +2245,29 @@ def recent_context(hist, n=6):
 title_gap: dict[str, int] = {}  # history key -> replies since the user's title was last said
 
 
+ACK_OPEN = re.compile(r"^\s*(?:네네|넵|네|예|알겠습니다|알겠어요|좋아요)\s*[,.!~]+\s*")
+
+
 class Address:
     """The user's title (호칭): the call's first reply starts with it when the model left it out. Nothing else is
     rewritten: the model's own vocatives stay as it said them (user decision 2026-11-22, fewer filters)."""
 
     def __init__(self, title, hkey, first_reply):
-        self.title, self.hkey, self.started, self.named = title, hkey, False, False
+        self.title, self.hkey, self.started, self.named, self.acked = title, hkey, False, False, False
         self.due = bool(title) and first_reply
 
     def __call__(self, s):
         """'' for a sentence that was only the title again ("네, 대표님."): the title at most once per reply (live
-        2026-11-23: "네, 대표님" opened and ended every other sentence)."""
+        2026-11-23: "네, 대표님" opened and ended every other sentence). One ack per reply: past the first sentence
+        (or the lookup ack) a sentence never opens with "네," again, nor with the title (live 2026-11-23: a re-asked
+        model began over with "네, 정훈님. 오늘 일정 안내해 드릴게요." mid-reply)."""
         first, self.started = not self.started, True
+        if not first or self.acked:
+            s = ACK_OPEN.sub("", s)
+            if not first and self.title:
+                s = re.sub(rf"^\s*{re.escape(self.title)}\s*[,.!~]+\s*", "", s)
+            if not re.search(r"[가-힣A-Za-z0-9]", s):
+                return ""
         t = self.title
         if not t:
             return s
@@ -2469,7 +2481,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     return  # "바로 도구를 불러서 찾아볼게요": our nudge parroted, never said
                 promise = is_promise(s, wants_lookup) or (future(s) and bool(LOOKUP_VERB.search(s))) or \
                     (requested and wanted and future(s))
-                if promise and (looked or not lookup_turn):
+                if promise and (looked or not lookup_turn or fetched["agenda"] and (AGENDA_WORDS.search(s) or not LOOKUP_OBJ.search(s))):
                     return  # after the result, or in chat with nothing to look up ("내일 다시 확인해 드릴게요"): dropped
                 if promise:
                     announced.append(s)  # held: a promise is never spoken before its result exists
@@ -2722,10 +2734,12 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     def repeat(x):
         """A sentence this reply already said (a re-asked or restarted model began again: "네, 수능! … 네, 수능!"),
         or a second announcement ("일정 알려드릴게요" again after a re-ask, live 2026-11-23)."""
+        if x == LOOKUP_ACK:
+            address.acked = True  # the answer after it does not say "네," again
         if x is None or x in FILLERS:
             return False
         if INTRO_ANNOUNCE.search(x):
-            if "\0announce" in uttered:
+            if uttered:  # "오늘 일정 안내해 드릴게요." after content: the reply started over
                 return True
             uttered.add("\0announce")
         k = re.sub(r"[\W_]+", "", x)
@@ -4064,6 +4078,46 @@ if __name__ == "__main__":
         assert "치과 (구글 캘린더)" in contexts[0] and "고정 정기회의" in contexts[0] and said == ["내일은 치과와 정기회의가 있어요."]
         calls, contexts, said = asyncio.run(agenda_check("내일 일정 알려줘", fail=True))
         assert calls and "치과" not in contexts[0] and said, (calls, said)  # agenda down: Claude still answers (its own tools)
+        # one ack per turn (live 2026-11-23, "오늘 일정 알려줘"): the agenda came prefetched, Qwen opened with a promise,
+        # the promise counted as a lookup still owed, the nudge made it start over with "네, 정훈님. … 안내해 드릴게요."
+        a = Address("정훈님", "one", False)
+        assert [a(x) for x in ("오전에 수업이 있어요.", "네, 정훈님. 오늘 일정 안내해 드릴게요.", "네, 밤에 회의가 있어요.")] == \
+            ["오전에 수업이 있어요.", "오늘 일정 안내해 드릴게요.", "밤에 회의가 있어요."]
+        a = Address("정훈님", "ack", False)
+        a.acked = True  # after LOOKUP_ACK ("네, 바로 볼게요."): the answer keeps the title, not a second "네,"
+        assert a("네, 정훈님. 내일 광주는 흐려요.") == "정훈님. 내일 광주는 흐려요."
+
+        async def one_ack_check():
+            llm_calls = []
+
+            async def restarting_llm(messages, max_tokens=600):
+                llm_calls.append(messages)
+                yield ("네, 정훈님. 오늘 일정 알려드릴게요. 오전에 수업이 있어요. 밤 8시부터 정기회의가 있어요." if len(llm_calls) == 1
+                       else "네, 정훈님. 오늘 일정 안내해 드릴게요. 오전에 수업이 있고, 밤 8시부터 정기회의가 있어요.")
+
+            async def fake_gw_tool(name, args, on_say=None):
+                return "일정 (KST)\n- 09:00~10:00 수업\n- 20:00~22:00 정기회의"
+
+            async def no_route(*a, **k):
+                return []
+            saved = llm_stream, gateway_tool, tts, route_lookup, dict(gw_tools), links.settings
+            globals().update(llm_stream=restarting_llm, gateway_tool=fake_gw_tool, tts=lambda s: asyncio.sleep(0, (b"", 24000)),
+                             route_lookup=no_route)
+            gw_tools.update(at=time.time(), defs=[{"name": "agenda", "description": "일정"}])
+            links.settings = {"user_title": "정훈님", "brain_mode": "local"}  # live: answered on Qwen
+            history.pop("azel:oneack", None)
+            try:
+                said = [s async for s, *_ in respond("오늘 일정 알려줘", "oneack", time.perf_counter(), {})]
+            finally:
+                globals().update(llm_stream=saved[0], gateway_tool=saved[1], tts=saved[2], route_lookup=saved[3])
+                gw_tools.clear()
+                gw_tools.update(saved[4])
+                links.settings = saved[5]
+            return said, llm_calls
+        said, llm_calls = asyncio.run(one_ack_check())
+        assert len(llm_calls) == 1, (said, len(llm_calls))  # the prefetched agenda answered: no nudge, no second answer
+        assert sum(bool(re.match(r"\s*(정훈님\s*,\s*)?네\b", x)) for x in said) <= 1 and \
+            sum(x.count("정훈님") for x in said) <= 1 and not any("알려드릴게요" in x or "안내해" in x for x in said), said
         assert asyncio.run(agenda_prefetch("오늘 광주 날씨 어때?", ("agenda",), {})) == ""  # not a schedule question
         assert asyncio.run(agenda_prefetch("내일 일정", ("web_search",), {})) == ""  # an older gateway without agenda
         mon = late_night.day_for(0, now) - timedelta(days=late_night.day_for(0, now).weekday())
