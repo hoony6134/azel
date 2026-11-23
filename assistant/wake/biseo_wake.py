@@ -2,8 +2,9 @@
 
 wake word (openWakeWord) -> "네?" -> hand the call to the Azel app (azel://wake).
 The mic is open only while the Azel app process runs: quit the app and the stream is released (no mic indicator),
-start it again and listening resumes. While the app is in a call (its in-call file exists) the mic is ignored,
-so its own voice can't wake it. handoff = "headless" keeps the old always-on flow on the Mac itself:
+start it again and listening resumes. While the app is in a call or enrolling (its in-call or enrolling file
+exists) the stream is closed too, so its own voice can't wake it and its voice processing has the mic alone;
+the listener-mic file exists exactly while the stream is open. handoff = "headless" keeps the old always-on flow on the Mac itself:
 record with Silero VAD -> POST /v1/turn -> play the streamed reply -> 6 s follow-up window -> back to wake.
 
 usage:
@@ -69,6 +70,10 @@ DEFAULTS = {
     "utterance_preroll_ms": 160,  # audio kept from before the first voiced frame (the wake word's tail edge)
     "enrolling_path": "~/Library/Application Support/Azel/enrolling",  # the app's wake-clip recording screen
     "enrolling_stale_s": 1800,
+    # Exists while this listener's input stream is open. The app waits for it to go before starting voice
+    # processing: two processes on the mic made its engine start block for 3 s and rebuild (2026-11-23).
+    "listener_mic_path": "~/Library/Application Support/Azel/listener-mic",
+    "busy_check_s": 0.25,  # how often a released mic checks whether the app's call or enrollment ended
 }
 
 
@@ -130,10 +135,31 @@ class Listener:
     def enrolling(self):
         return self.fresh("enrolling_path", "enrolling_stale_s")
 
+    def busy(self):
+        """The app is in a call or recording wake clips: it uses the mic itself."""
+        return self.in_call() or self.enrolling()
+
+    def hold_mic(self, on):
+        """The listener-mic marker: present exactly while the input stream is open."""
+        path = Path(self.cfg["listener_mic_path"]).expanduser()
+        try:
+            if on:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{os.getpid()}\n")
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"listener-mic marker failed ({type(e).__name__}: {e})", flush=True)
+
     def live(self, frames):
-        """Frames that arrive outside the mute window, the post-handoff deaf window, an app call and enrollment."""
+        """Frames that arrive outside the mute window, the post-handoff deaf window, an app call and enrollment.
+        App mode ends at a call or enrollment, so supervise() closes the stream and the app has the mic alone."""
         for f in frames:
-            busy = self.in_call() or self.enrolling()
+            busy = self.busy()
+            if busy and use_app(self.cfg):
+                self.oww.reset()
+                self.was_in_call = False
+                return
             if self.was_in_call and not busy:
                 self.oww.reset()  # forget what the call put into the detector's buffer
             self.was_in_call = busy
@@ -379,13 +405,20 @@ def supervise(cfg, listener, open_mic, running=app_running, sleep=time.sleep, st
         if not up:
             sleep(cfg["app_check_s"])
             continue
-        mic = open_mic()
-        frames = iter(mic)
-        listener.flush = mic.flush
+        if listener.busy():  # the app has the mic (a call, enrollment): stay closed until it is done
+            sleep(cfg["busy_check_s"])
+            continue
+        listener.hold_mic(True)
         try:
-            listener.run(gated(frames, cfg, running, listener.clock))
+            mic = open_mic()
+            frames = iter(mic)
+            listener.flush = mic.flush
+            try:
+                listener.run(gated(frames, cfg, running, listener.clock))
+            finally:
+                frames.close()  # stops and closes the input stream
         finally:
-            frames.close()  # stops and closes the input stream
+            listener.hold_mic(False)  # only after the stream is closed: the app waits on this
             listener.flush = lambda: None
             listener.oww.reset()
             listener.ring = []

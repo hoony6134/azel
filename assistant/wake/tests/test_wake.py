@@ -65,7 +65,8 @@ def make(tmp_path, handler=None, wall=None, open_url=None, **cfg):
                         headers={"Authorization": "Bearer t"})
     c = bw.DEFAULTS | {"log_path": str(tmp_path / "wake.jsonl"), "handoff": "headless",
                        "in_call_path": str(tmp_path / "in-call"), "enrolling_path": str(tmp_path / "enrolling"),
-                       "utterance_dir": str(tmp_path / "azel"), "mic_live_path": str(tmp_path / "mic-live")} | cfg
+                       "utterance_dir": str(tmp_path / "azel"), "mic_live_path": str(tmp_path / "mic-live"),
+                       "listener_mic_path": str(tmp_path / "listener-mic")} | cfg
     extra = {k: v for k, v in {"wall": wall, "open_url": open_url}.items() if v} | {"spawn": lambda f, *a: f(*a)}
     lis = Listener(c, FakeOww(), FakeVad(), http, play, ack=(np.zeros(8000, np.int16), 16000),
                    flush=lambda: flushed.append(1), clock=clock, **extra)
@@ -487,3 +488,31 @@ def test_without_a_fetched_ack_the_system_beep_plays_in_one_breath_mode(tmp_path
     lis.ack = None
     lis.run(frames(clock, [(WAKE, 1), (SIL, 40)]))
     assert played == [] and ran == [["afplay", "/System/Library/Sounds/Tink.aiff"]]
+
+
+def test_supervise_releases_the_mic_for_a_call_and_marks_it_only_while_open(tmp_path):
+    lis, clock, *_ = make(tmp_path, handoff="app", open_url=lambda u: True)
+    marker, call = tmp_path / "listener-mic", tmp_path / "in-call"
+    seen, mics, slept = [], [], []
+
+    def open_mic():
+        seen.append(marker.exists())  # marked before the stream opens
+
+        def gen():
+            yield from frames(clock, [(SIL, 3)])
+            call.write_text("")  # the app's call starts
+            yield from frames(clock, [(SIL, 40)])  # must not be pulled: the stream closes on the next frame
+        m = FakeMic(gen())
+        mics.append(m)
+        return m
+
+    def sleep(s):
+        slept.append((s, marker.exists()))
+        if len(slept) == 3:
+            call.unlink()  # the call ends: the listener opens the mic again
+
+    n = []
+    bw.supervise(lis.cfg, lis, open_mic, running=lambda c: True, sleep=sleep, stop=lambda: n.append(1) or len(n) > 6)
+    assert seen == [True, True] and all(m.closed for m in mics)
+    assert slept[:3] == [(lis.cfg["busy_check_s"], False)] * 3  # released (marker gone) for the whole call
+    assert not marker.exists()
