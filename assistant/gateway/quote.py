@@ -79,6 +79,8 @@ async def yahoo_find(q, c, kinds=KINDS):
     except (httpx.HTTPError, ValueError):
         return None
     stocks = [x for x in quotes if x.get("quoteType") in kinds]
+    if not re.search(r"etf", q, re.I):  # a name query is a company: an ETF wins only by its own ticker or when asked
+        stocks = [x for x in stocks if x.get("quoteType") == "EQUITY" or str(x.get("symbol", "")).lower() == q.lower()]
     exact = [x for x in stocks if q.lower() in (str(x.get("shortname", "")).lower(), str(x.get("symbol", "")).lower())]
     best = (exact or stocks or [None])[0]  # "Kakao" is Kakao, not KakaoPay listed first
     if not best:
@@ -228,16 +230,27 @@ async def fx(query, c):
     return {"spoken": out, "data": {**p, "rate": rate, "per": per, "at": None}}
 
 
-async def quote(query, client=None, search=None):
+def known_hit(q, holdings=()):
+    """A name the user holds ("에스오에스랩 (464080)") or a well-known KRX one: its exact code, before any search."""
+    key = re.sub(r"\s+", "", q).lower()
+    for entry in holdings or ():
+        m = HOLDING.match(str(entry).strip())
+        if m and m["name"] and re.sub(r"\s+", "", m["name"]).lower() == key:
+            tick = m["tick"]
+            return {"name": m["name"], "code": tick} if re.fullmatch(r"\d{6}", tick) else {"name": m["name"], "ticker": tick}
+    return known_kr(q)
+
+
+async def quote(query, client=None, search=None, holdings=()):
     """{"spoken", "data"} for a company name, ticker or code, or an exchange rate ("달러 환율"). LookupError when no
-    listed stock matches."""
+    listed stock matches. `holdings`: the user's "이름 (CODE)" entries, which resolve first."""
     q = clean(query) or str(query)
     c = client or httpx.AsyncClient(timeout=TIMEOUT_S, headers=UA, follow_redirects=True)
     try:
         if rate := await fx(str(query), c):
             return rate
-        hit = None
-        if re.search(r"[가-힣]", q):
+        hit = known_hit(q, holdings)
+        if not hit and re.search(r"[가-힣]", q):
             hit = await naver_find(q, c)
         if not hit:
             hit = await yahoo_find(q, c)

@@ -40,7 +40,7 @@ def client(seen):
 
 @pytest.mark.parametrize("asked,said,hosts", [
     ("삼성전자 주가 지금 알려줘", "네이버 증권 기준 11월 20일 삼성전자 주가는 180,900원이에요. 전날보다 8.13% 내렸어요.",
-     ["ac.stock.naver.com", "polling.finance.naver.com"]),
+     ["polling.finance.naver.com"]),  # a well-known name: its code without a search
     ("Kakao", "네이버 증권 기준 11월 20일 카카오 주가는 30,650원이에요. 전날보다 3.92% 내렸어요.",
      ["query2.finance.yahoo.com", "polling.finance.naver.com"]),
     ("Anthropic", "야후 파이낸스 기준 11월 21일 Anthropic, PBC 주가는 88.91달러예요. 전날보다 8.50% 내렸어요.",
@@ -99,3 +99,26 @@ def test_naver_autocomplete_down_uses_known_names(monkeypatch):
     a, b, none = asyncio.run(go())
     assert a == {"name": "SK하이닉스", "code": "000660"} and b["code"] == "005930" and none is None
     assert hits == ["ac.stock.naver.com"]  # tried once, then skipped
+
+
+def test_known_names_and_holdings_win_and_etfs_never_win_a_name():
+    """SK하이닉스 is 000660 (it once became a Yahoo 'SK hynix 2x' ETF); a held name is its saved code; an ETF wins only
+    by its own ticker or when the user says ETF."""
+    Q = quote
+    assert Q.known_hit("SK하이닉스") == {"name": "SK하이닉스", "code": "000660"}
+    assert Q.known_hit("에스오에스랩", ["애플 (AAPL)", "에스오에스랩 (464080)"]) == {"name": "에스오에스랩", "code": "464080"}
+    assert Q.known_hit("애플", ["애플 (AAPL)"]) == {"name": "애플", "ticker": "AAPL"}
+    assert Q.known_hit("토스", ["토스"]) is None
+    quotes = [{"symbol": "SKHX", "shortname": "Corgi SK hynix 2x Daily ETF", "quoteType": "ETF"},
+              {"symbol": "000660.KS", "shortname": "SK hynix", "quoteType": "EQUITY"},
+              {"symbol": "QQQ", "shortname": "Invesco QQQ", "quoteType": "ETF"}]
+
+    def handler(req):
+        return httpx.Response(200, json={"quotes": quotes})
+
+    async def go(q):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await Q.yahoo_find(q, c)
+    assert asyncio.run(go("SK hynix"))["code"] == "000660"
+    assert asyncio.run(go("QQQ"))["symbol"] == "QQQ"  # its own ticker
+    assert asyncio.run(go("SK hynix 2x ETF"))["symbol"] == "SKHX"  # asked for an ETF
