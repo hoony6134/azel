@@ -339,16 +339,49 @@ class StateDown(Exception):
     """ruchba unreachable: callers fall back to the cache (read-only) or refuse with 503."""
 
 
+STATE_WAIT_S = 1.5  # a read with a fallback (cache, the local settings copy) waits no longer than this on ruchba
+STATE_SLOW_S = 1.5  # a ruchba answer slower than this (or a timeout) means "slow": reads use their fallback for a while
+STATE_SLOW_HOLD_S = 30
+STATE_WARN_S = 600  # one "ruchba slow" warning per 10 min
+
+
 class State:
     def __init__(self, url):
         # ruchba's uvicorn drops idle connections after 5 s, httpx kept them 5 s too: a request on a just-closed one
-        # failed with "Server disconnected without sending a response" (it failed a running task, 2026-11-22)
-        self.client = httpx.AsyncClient(base_url=url, timeout=5, headers={"Authorization": f"Bearer {STATE_TOKEN}"},
-                                        limits=httpx.Limits(keepalive_expiry=2))
+        # failed with "Server disconnected without sending a response" (it failed a running task, 2026-11-22).
+        # A relayed tailnet path (campus network, DERP) has a 2 s RTT: connecting alone is 2 s, so the timeouts allow
+        # ~3 round trips and a connection is kept 4 s (still under ruchba's 5 s).
+        self.client = httpx.AsyncClient(base_url=url, timeout=httpx.Timeout(10, connect=7),
+                                        headers={"Authorization": f"Bearer {STATE_TOKEN}"},
+                                        limits=httpx.Limits(keepalive_expiry=4))
         self.cache: dict = {}
+        self.slow_until = 0.0
+        self.warned = 0.0
+        self.bg: dict = {}  # background refreshes by key: one at a time each
+
+    def slow(self):
+        return time.monotonic() < self.slow_until
+
+    def mark_slow(self, why):
+        self.slow_until = time.monotonic() + STATE_SLOW_HOLD_S
+        if time.monotonic() - self.warned > STATE_WARN_S or not self.warned:
+            self.warned = time.monotonic()
+            print(f"warning: ruchba is slow ({why}): tool calls use cached settings and devices for now", flush=True)
+
+    def background(self, key, make):
+        """Run make() once in the background (never two for one key); its errors are dropped."""
+        t = self.bg.get(key)
+        if t is None or t.done():
+            async def run():
+                try:
+                    await make()
+                except Exception:  # noqa: BLE001  a refresh that fails waits for the next one
+                    pass
+            self.bg[key] = asyncio.get_running_loop().create_task(run())
 
     async def call(self, method, path, body=None, **params):
         """JSON result, None on 404, HTTPException on other 4xx, StateDown when unreachable."""
+        start = time.monotonic()
         for attempt in (1, 2):
             try:
                 r = await self.client.request(method, path, json=body, params=params or None)
@@ -357,7 +390,14 @@ class State:
                 if attempt == 2 or method not in ("GET", "PUT", "DELETE"):  # POST may have run: never sent twice
                     raise StateDown(type(e).__name__) from e
             except httpx.HTTPError as e:
+                if isinstance(e, httpx.TimeoutException):
+                    self.mark_slow(type(e).__name__)
                 raise StateDown(type(e).__name__) from e
+        took = time.monotonic() - start
+        if took > STATE_SLOW_S:
+            self.mark_slow(f"{took * 1000:.0f} ms for {method} {path.split('?')[0][:40]}")
+        else:
+            self.slow_until = 0.0
         if r.status_code >= 500:
             raise StateDown(f"HTTP {r.status_code}")
         if r.status_code == 404:
@@ -366,18 +406,42 @@ class State:
             raise HTTPException(r.status_code, r.json().get("detail", "state error"))
         return r.json()
 
+    async def quick(self, method, path, refresh=None, **params):
+        """A read that has a fallback: while ruchba is slow, the fallback at once (and `refresh` in the background);
+        else ruchba, at most STATE_WAIT_S. StateDown when it fails (the caller falls back)."""
+        if self.slow():
+            if refresh:
+                self.background(("quick", path), refresh)
+            raise StateDown("slow")
+        try:
+            return await asyncio.wait_for(self.call(method, path, **params), STATE_WAIT_S)
+        except asyncio.TimeoutError:
+            self.mark_slow(f"no answer in {STATE_WAIT_S} s for {path.split('?')[0][:40]}")
+            if refresh:
+                self.background(("quick", path), refresh)
+            raise StateDown("slow")
+
     async def get(self, path, default=None, persist=None, **params):
-        """GET with a last-good cache, so reads keep working while ruchba is down. `persist`: also keep the
+        """GET with a last-good cache, so reads keep working while ruchba is down or slow. `persist`: also keep the
         last good answer in that file under HOME, so it survives a restart during an outage."""
         key = (path, tuple(sorted(params.items())))
-        try:
-            self.cache[key] = await self.call("GET", path, **params)
+        if key not in self.cache and persist and (HOME / persist).exists():
+            self.cache[key] = json.loads((HOME / persist).read_text())
+
+        def keep(v):
+            self.cache[key] = v
             if persist:
-                write_private(HOME / persist, json.dumps(self.cache[key], ensure_ascii=False))
+                write_private(HOME / persist, json.dumps(v, ensure_ascii=False))
+
+        async def fetch():
+            keep(await self.call("GET", path, **params))
+        try:
+            if key in self.cache:  # a fallback exists: never wait long for ruchba
+                keep(await self.quick("GET", path, fetch, **params))
+            else:
+                await fetch()
         except StateDown as e:
             print("state down, using cache:", path, e, flush=True)
-            if key not in self.cache and persist and (HOME / persist).exists():
-                self.cache[key] = json.loads((HOME / persist).read_text())
         return self.cache.get(key, default)
 
 
@@ -523,8 +587,9 @@ def check_proactive(p):
 
 async def load_settings():
     s = copy.deepcopy(DEFAULTS)
-    try:
-        doc = await state.call("GET", "/v1/state/settings") or {}
+    try:  # the local copy is the fallback: a slow ruchba never holds up a tool call (it refreshes in the background)
+        doc = await (state.quick("GET", "/v1/state/settings", refresh_settings_copy) if SETTINGS_PATH.exists()
+                     else state.call("GET", "/v1/state/settings")) or {}
         local = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
         if not doc and local and MODE == "full":  # first start against an empty ruchba: seed it from old settings
             doc = await state.call("PUT", "/v1/state/settings", local)
@@ -546,6 +611,12 @@ async def load_settings():
 def settings_view(s):
     """Settings as the app sees them: plus `providers.nim.has_key` (only whether the key exists)."""
     return {**s, "providers": {**s["providers"], "nim": nim.view(s["providers"]["nim"], HOME)}}
+
+
+async def refresh_settings_copy():
+    doc = await state.call("GET", "/v1/state/settings")
+    if doc:
+        write_settings_copy(doc)
 
 
 def write_settings_copy(doc):
