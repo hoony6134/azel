@@ -410,9 +410,13 @@ final class CallClient {
     /// 300 ms, then drop. Main thread.
     func cue(_ cue: Cue, listening: Bool, waited: Double = 0) {
         let now = ProcessInfo.processInfo.systemUptime
-        switch gate.decide(cue, now: now, listening: listening, userLoudAt: audio.levels.micLoudAt, waited: waited, enabled: Earcon.enabled) {
+        let loudAt = cue == .pulse ? audio.levels.micSpeechAt : audio.levels.micLoudAt
+        let decision = gate.decide(cue, now: now, listening: listening, userLoudAt: loudAt, waited: waited, enabled: Earcon.enabled)
+        if cue == .pulse || cue == .ack {
+            Log.call.notice("cue \(String(describing: cue), privacy: .public) \(String(describing: decision), privacy: .public): peak \(Earcon.spec(cue).peakDB, privacy: .public) dB, mic \(self.audio.levels.mic, privacy: .public), engine \(self.audio.isRunning, privacy: .public)")
+        }
+        switch decision {
         case .play:
-            if cue == .ack { Log.call.notice("cue ack: engine \(self.audio.isRunning, privacy: .public)") }
             audio.playCue(cue)
             onCuePlayed?(cue)
         case .drop: break

@@ -68,11 +68,14 @@ final class Levels: @unchecked Sendable {
 
     init(mic: Float = 0, out: Float = 0) { _mic = mic; _out = out }
     private let lock = NSLock()
-    private var _mic: Float = 0, _out: Float = 0, _loudAt: Double = -.infinity
+    private var _mic: Float = 0, _out: Float = 0, _loudAt: Double = -.infinity, _speechAt: Double = -.infinity
     var mic: Float { lock.lock(); defer { lock.unlock() }; return _mic }
     var out: Float { lock.lock(); defer { lock.unlock() }; return _out }
     /// Last time (monotonic seconds) the mic level was above 0.25: the user is talking.
     var micLoudAt: Double { lock.lock(); defer { lock.unlock() }; return _loudAt }
+    /// Last time the mic was above 0.5 (−28 dBFS): clearly speech. The heartbeat waits only for this;
+    /// at 0.25 the Mac's voice-processing AGC lifted room tone over the bar and every pulse was dropped (2026-11-23).
+    var micSpeechAt: Double { lock.lock(); defer { lock.unlock() }; return _speechAt }
 
     /// RMS → 0…1: −50 dBFS → 0, −6 dBFS → 1.
     static func level(rms: Float) -> Float { max(0, min(1, (20 * log10(max(rms, 1e-5)) + 50) / 44)) }
@@ -92,10 +95,13 @@ final class Levels: @unchecked Sendable {
 
     func update(mic buffer: AVAudioPCMBuffer) {
         update(\._mic, buffer)
-        if mic > 0.25 { lock.lock(); _loudAt = ProcessInfo.processInfo.systemUptime; lock.unlock() }
+        let m = mic
+        if m > 0.25 {
+            lock.lock(); _loudAt = ProcessInfo.processInfo.systemUptime; if m > 0.5 { _speechAt = _loudAt }; lock.unlock()
+        }
     }
     func update(out buffer: AVAudioPCMBuffer) { update(\._out, buffer) }
-    func reset() { lock.lock(); _mic = 0; _out = 0; _loudAt = -.infinity; lock.unlock() }
+    func reset() { lock.lock(); _mic = 0; _out = 0; _loudAt = -.infinity; _speechAt = -.infinity; lock.unlock() }
 
     private func update(_ key: ReferenceWritableKeyPath<Levels, Float>, _ buffer: AVAudioPCMBuffer) {
         let target = Self.level(rms: Self.rms(buffer))

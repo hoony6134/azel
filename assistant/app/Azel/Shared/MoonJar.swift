@@ -139,6 +139,18 @@ enum JarPath {
 
     /// Shimmer progress 0…1 if one is running at `t`. One per 10 s slot, starting at a pseudo-random
     /// offset of 0–2 s, so consecutive shimmers are 8–12 s apart and never overlap.
+    /// Glow opacity per state from the smoothed sound level (Levels: 40 ms attack, 180 ms release), so each
+    /// 두근, word and syllable shows on the orb. Reduce Motion: one gentle fixed glow.
+    static func glowStrength(_ s: JarState, level: Double, calm: Bool) -> Double {
+        if calm { return 0.55 }
+        switch s {
+        case .speaking: return 0.4 + 0.5 * level
+        case .listening: return 0.35 + 0.55 * level
+        case .thinking: return 0.45 + 0.9 * level   // the heartbeat cue is the only output while thinking
+        default: return 0.55
+        }
+    }
+
     static func shimmer(at t: Double) -> Double? {
         let slot = (t / 10).rounded(.down)
         let r = (sin(slot * 12.9898) * 43_758.5453).truncatingRemainder(dividingBy: 1)
@@ -182,7 +194,14 @@ struct MoonJar: View {
     /// Idle runs at 30 fps and only while on screen in an active app; call states keep 60 fps.
     private var interval: Double { state == .idle || state == .offline ? 1 / 30 : 1 / 60 }
     private var isPaused: Bool {
-        if paused || !visible || phase == .background { return true }
+        if paused || !visible { return true }
+        #if os(macOS)
+        // The wake/hotkey panel shows without activating the app, so scenePhase isn't .active: pausing on it
+        // froze the panel's orb on its listening frame while the label said 생각 중 (2026-11-23).
+        if state != .idle && state != .offline { return false }
+        #else
+        if phase == .background { return true }
+        #endif
         return (state == .idle || state == .offline) && phase != .active
     }
 
@@ -213,7 +232,8 @@ struct MoonJar: View {
         let t = now.timeIntervalSinceReferenceDate
         return Canvas { ctx, _ in
                 let mix = JarPath.smoothstep(now.timeIntervalSince(changedAt) / 0.45)
-                let level = Double(state == .speaking ? levels.out : levels.mic)
+                // The glow follows the sound: the reply while speaking, the heartbeat cue while thinking, the mic otherwise.
+                let level = Double(state == .speaking || state == .thinking ? levels.out : levels.mic)
                 let R = min(frame.width, frame.height) * 0.34
                 let center = CGPoint(x: frame.midX, y: frame.minY + frame.height * (state == .speaking ? 0.44 : 0.5))
                 var ctx = ctx
@@ -265,13 +285,8 @@ struct MoonJar: View {
         let box = path.boundingRect
         // 1. soft glow
         if let glow = s.glow(tint) {
-            var strength = 0.55
-            switch s {
-            case .idle: strength = JarPath.idleGlow(t, calm: calm).opacity
-            case .thinking: strength = 0.6 + 0.4 * (0.5 + 0.5 * sin(t * 2 * .pi / 1.4))
-            case .speaking: strength = 0.4 + 0.5 * level
-            default: break
-            }
+            var strength = JarPath.glowStrength(s, level: level, calm: calm)
+            if s == .idle { strength = JarPath.idleGlow(t, calm: calm).opacity }
             strength += boost.1
             ctx.drawLayer { g in
                 let radius = s == .speaking ? R * (0.3 + 0.5 * level) : s == .idle ? R * JarPath.idleGlow(t, calm: calm).radius : 28

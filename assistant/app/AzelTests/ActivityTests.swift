@@ -206,6 +206,14 @@ final class MidReplyHeartbeatTests: XCTestCase {
         XCTAssertNil(f.event("activity", value: nil, now: 0.3, phase: "tool_start"), "no second ack right after thinking")
     }
 
+    /// The glow tracks the sound in every call state (each 두근 while thinking), and is fixed under Reduce Motion.
+    func testGlowFollowsTheLevel() {
+        for s in [JarState.listening, .thinking, .speaking] {
+            XCTAssertGreaterThan(JarPath.glowStrength(s, level: 0.8, calm: false), JarPath.glowStrength(s, level: 0.1, calm: false) + 0.2, "\(s)")
+            XCTAssertEqual(JarPath.glowStrength(s, level: 0.8, calm: true), JarPath.glowStrength(s, level: 0, calm: true), "\(s) calm: fixed")
+        }
+    }
+
     func testAToolRunningMidReplyIsAWait() {
         var t = replying()
         XCTAssertNil(t.event("activity", value: nil, now: 4, phase: "tool_start"))
