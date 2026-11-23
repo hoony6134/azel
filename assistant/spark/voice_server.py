@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import uuid
 from collections import defaultdict, deque
 from datetime import date as Date, datetime, timedelta, timezone
@@ -51,6 +52,11 @@ END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
 # ends a turn has to arrive as frames; a one-breath command sent as one block, then no live frames, waited ~17 s for
 # them (Mac, live 2026-11-23). Live audio comes every ~100 ms, so this never cuts a healthy stream.
 END_STALL_S = float(os.environ.get("END_STALL_MS", "800")) / 1000
+# A held recording (the Mac's one-breath command) comes faster than real time: one long message, or 100 ms chunks back
+# to back. Its pauses are not the end of the turn (live 2026-11-23: "오늘 아침 … 일정 삭제해" was cut at a 0.5 s pause
+# and the rest dropped piece by piece); the turn ends on live quiet after it, or on the stall.
+BURST_S = 0.3  # one message longer than this is not live audio
+BURST_GAP = 0.5  # a message that came sooner than half the previous one's length after it: still the burst
 KST = timezone(timedelta(hours=9))
 MAX_UPLOAD = 16000 * 2 * 60  # one minute of 16 kHz PCM16
 ROUTE_TAG = "[CLAUDE]"
@@ -394,6 +400,7 @@ PLANS_ASK = (r"해야 ?(할|될|하는|되는) ?(일|거|것)|할 ?(거|것|게)
 PERSONAL = re.compile(r"일정(?!한)|캘린더|스케줄|회의|약속|메일|편지함|기억|메모리|연락처|전화번호|과제|수업|시험|성적|마감"
                       r"|할 ?일|브리핑|지스트라|GISTRA|플래닛|Planit|지난번|저번에|예전에 (내가|우리)|" + PLANS_ASK, re.I)
 NO_PERSONAL = "개인 비서 기능은 지금 쓸 수 없어요."
+TURN_FAILED = "잠깐 문제가 생겼어요. 다시 말씀해 주세요."  # an unexpected error in a turn: never the exception's own text
 # "오늘 일정", "내일 뭐 있어", "이번 주 일정": the gateway's agenda tool (Google Calendar and Gistra merged) is read
 # once before any model runs, so every path answers from both, not from whichever one tool the model picks.
 AGENDA_ASK = re.compile(r"일정(?!한)|스케줄|캘린더|약속|브리핑|" + PLANS_ASK)
@@ -492,6 +499,7 @@ CALL_ORIGIN: contextvars.ContextVar = contextvars.ContextVar("call_origin", defa
 # /v1/call?mode=, else the shared setting; the app can switch it mid-call. Link requests carry it to the gateway.
 BRAIN_MODES = ("auto", "local", "claude_api", "claude_code")
 CALL_MODE: contextvars.ContextVar = contextvars.ContextVar("call_mode", default="")
+CALL_TURN: contextvars.ContextVar = contextvars.ContextVar("call_turn", default="")  # one id per user turn, for the gateway
 MODE_TYPES = ("ask", "tool_call", "schedule", "task")
 LOCAL_LINE = "로컬 모드라서 그건 못 해요. Claude로 바꿀까요?"
 ORIGIN_TYPES = ("tool_call", "schedule", "task")
@@ -965,7 +973,8 @@ async def gateway_tool_msg(name, args, on_say=None):
     links.queues[rid] = (q, lk)
     try:
         await lk.send({"type": "tool_call", "id": rid, "name": name, "args": args,
-                       "persona": (CALL_PERSONA.get() or {}).get("id")})
+                       "persona": (CALL_PERSONA.get() or {}).get("id"),
+                       **({"turn": CALL_TURN.get()} if CALL_TURN.get() else {})})  # a confirm never counts in its own turn
         end = time.monotonic() + GW_TOOL_WAIT_S
         while True:
             msg = await asyncio.wait_for(q.get(), max(0.1, end - time.monotonic()))
@@ -990,9 +999,13 @@ async def run_tool(raw, session, on_say=None):
         return await schedule_reply("", "list", session)
     if name in {t["name"] for t in gw_tools["defs"]} and name not in links.brain_tools():
         try:
-            return await gateway_tool(name, args, on_say)
+            msg = await gateway_tool_msg(name, args, on_say)
         except (RuntimeError, asyncio.TimeoutError):
             return "지금은 그 도구를 쓸 수 없어요."
+        needs = msg.get("needs") if isinstance(msg.get("needs"), dict) else None
+        if needs and needs.get("kind") == "confirm" and isinstance(needs.get("args"), dict):
+            pending_confirm[session] = (time.time(), name, needs["args"])  # a read-back: the next turn's yes resends it
+        return clip_tool(str(msg.get("result") or msg.get("message") or ""), name)
     if name not in links.brain_tools():
         return f"없는 도구예요: {name[:40]}"
     try:
@@ -1358,7 +1371,7 @@ RECHECK = {"action": "방금 '{s}'라고 했는데, 이번 대화에서 그 일�
 # whether the words need data from a read-only tool. If so the tool runs first and Qwen answers from its result, so a
 # lookup no longer depends on Qwen choosing to call one mid-answer. Action tools keep the [TOOL] path.
 # shortcut: the read-only set is named here (the gateway's tool list carries no read_only flag); add it there if this drifts
-READ_ONLY = re.compile(r"^(infra_|phone_|gistra_|planit_get|planit_search|calendar_|gmail_)|^(agenda|weather|stock_quote|portfolio|"
+READ_ONLY = re.compile(r"^(infra_|phone_|gistra_|planit_get|planit_search|calendar_(?!write)|gmail_)|^(agenda|weather|stock_quote|portfolio|"
                        r"memory_recall|memory_list|people_lookup|web_search|web_fetch|recent_calls|schedule_list|"
                        r"task_status|overnight_list|approval_status)$")
 ROUTE_S = 4.0  # the decision (~0.8 s alone, slower beside Qwen's own answer on the shared GPU); then as before
@@ -1429,7 +1442,7 @@ async def route_lookup(text, recent, tools):
     r = await client.post(LLM_URL, json=body)
     r.raise_for_status()
     out = re.sub(r"(?s)<think>.*?</think>", "", r.json()["choices"][0]["message"].get("content") or "").strip()
-    line = native_call(out) if NATIVE_TAG in out else out
+    line = (native_call(out) or "") if NATIVE_TAG in out else out  # unparsable markup: no pick (None.find, live 2026-11-23)
     try:
         start = min(i for i in (line.find("["), line.find("{")) if i >= 0)
         got = json.loads(line[start:max(line.rfind("]"), line.rfind("}")) + 1])
@@ -1492,9 +1505,9 @@ ACTION_CLAIM = re.compile(r"전화(를)? ?(드릴게요|드릴께요|걸게요|�
                           r"실행했|열었(어요|습니다)|보냈(어요|습니다)|취소했|"
                           r"(기억|저장|추가|등록|메모|삭제|재시작|재시동|시동|다시 ?시작|접속|실행)\S*?\s*(했|해 ?(두|놨|드렸)|두었|뒀|놨|드렸|됐)|"
                           r"(시도|재시작|재시동|시동|접속|실행|처리)\S*?\s*(해\s*)?(볼게요|드릴게요|할게요|하겠습니다|보겠습니다)")
-TOOL_REFUSED = re.compile(r"이미 통화 중|다 걸었어요|없는 도구|쓸 수 없어요|틀렸어요|실패|거절|만료|허용되지 않아|할 수 없어요|없어요\.?$")
+TOOL_REFUSED = re.compile(r"아무것도 바꾸지 않았|이미 통화 중|다 걸었어요|없는 도구|쓸 수 없어요|틀렸어요|실패|거절|만료|허용되지 않아|할 수 없어요|없어요\.?$")
 ASK_WHEN = "몇 분 뒤에 걸어 드릴까요?"
-ACTION_TOOLS = {"call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo", "remember", "forget"}
+ACTION_TOOLS = {"calendar_write", "call_user", "create_task", "schedule_cancel", "run_command", "delegate", "add_todo", "done_todo", "remember", "forget"}
 CLAIM_FALLBACK = "그건 제가 직접 처리하지 못했어요. 어떻게 할지 다시 말씀해 주시겠어요?"
 LOOKUP_TOOL = re.compile(r"task_status|schedule_list|overnight_list|list_jobs|job_status$")
 
@@ -1916,6 +1929,11 @@ SCHED_CANCEL = re.compile(r"(예약|알람|모닝 ?콜|깨우는 거|전화).{0,
 SCHED_WAKE = re.compile(r"깨워|모닝 ?콜|알람.{0,10}(맞춰|설정|해\s*줘|부탁)")
 SCHED_CALL = re.compile(r"(전화|콜)\s*(해|걸어|주)|(예약|알람).{0,10}(해\s*줘|잡아|걸어|맞춰)")
 OTHER_TARGET = re.compile(r"(\S+)(한테|에게|께)")
+# A gateway tool that read back what it would change ("…일정을 지울까요?") and waits: only a clear yes in the very next
+# turn resends its args ({confirm: id}); any other answer drops it (the id expires after 120 s on the gateway too).
+pending_confirm: dict[str, tuple[float, str, dict]] = {}
+CONFIRM_TTL_S = 120
+CONFIRM_YES = re.compile(r"\s*((응|어|네|예|그래)[\s,]*)?(지워|삭제해|추가해|넣어|바꿔|변경해|해)\s*(줘|주세요|줄래)?[.!~]*\s*")
 pending_schedule: dict[str, tuple[float, dict]] = {}  # session -> (asked at, partial request) after "몇 시에…?"
 
 
@@ -2299,14 +2317,18 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
     history_sig[hkey] = sig
     prior = list(hist)  # earlier turns only: this utterance is added to history below and sent once, as the last turn
     bare = strip_vocative(text, name)
-    auto = auto_intent(bare, hkey)
-    sched = None if auto else schedule_intent(bare, session)
-    job = None if sched or auto else task_intent(bare)
+    CALL_TURN.set(uuid.uuid4().hex[:12])
+    confirm = pending_confirm.pop(session, None)  # asked last turn: this turn answers it, yes or not
+    confirm = confirm if confirm and time.time() - confirm[0] < CONFIRM_TTL_S and (
+        YES.search(bare) or CONFIRM_YES.fullmatch(bare)) else None
+    auto = None if confirm else auto_intent(bare, hkey)
+    sched = None if auto or confirm else schedule_intent(bare, session)
+    job = None if sched or auto or confirm else task_intent(bare)
     ctx = links.context_for(session)  # '' without a brain: the old prompt and routing
     gw_names = tuple(t["name"] for t in gw_tools["defs"])
     # The gateway's memory and people tools answer personal questions too: Qwen looks first, Claude only after
     local = bool(ctx) or "memory_recall" in gw_names
-    to_claude, model = (False, None) if sched or job or auto else pre_route(
+    to_claude, model = (False, None) if sched or job or auto or confirm else pre_route(
         bare, settings, local=local, tools=(tuple(links.brain_tools()) if ctx else ()) + gw_names)
     offline = (CALL_MODE.get() or settings.get("brain_mode") or "auto") == "local" or bool(CLAUDE_NO.search(bare))
     play = "" if sched or job or auto else (await play_note(hkey, bare) or activity_note(bare))  # Qwen plays, no hand-over
@@ -2378,6 +2400,15 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
 
     async def produce():
         try:
+            if confirm:  # "응" to the read-back: the same call with its confirm id, and the gateway's own words
+                try:
+                    msg = await gateway_tool_msg(confirm[1], confirm[2])
+                    done = str(msg.get("spoken") or msg.get("result") or msg.get("message") or "")
+                except (RuntimeError, asyncio.TimeoutError):
+                    done = "지금은 그 도구를 쓸 수 없어요."
+                for s in split_ready(done[:300] or "지금은 그 도구를 쓸 수 없어요.", final=True)[0]:
+                    await sentences.put(s)
+                return
             if sched:  # handled here and by a full gateway; neither Qwen's answer nor Claude
                 for s in split_ready(await schedule_reply(bare, sched, session), final=True)[0]:
                     await sentences.put(s)
@@ -2528,7 +2559,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                     picks = portfolio or (None if mine else
                                           await asyncio.wait_for(route_lookup(request_text, prior, ro_tools), ROUTE_S))
                     timings["route_ms"] = ms(t_route)
-                except (asyncio.TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError):
+                except Exception:  # noqa: BLE001  the router only advises: any failure means undecided
                     picks = None  # undecided: the turn goes on as before
                 if picks or mine:
                     if pump_task:
@@ -2544,7 +2575,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                                 picks = await asyncio.wait_for(route_lookup(
                                     f"{request_text}\n\n[기억에서 찾은 것]\n{got[1][:1500]}\n(기억에 나온 대상마다 하나씩 조회해.)",
                                     prior, ro_tools), ROUTE_S)
-                            except (asyncio.TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError):
+                            except Exception:  # noqa: BLE001  advice only
                                 picks = None
                             picks = [p for p in picks or [] if p["name"] != "memory_recall"]
                     if picks and (got := await lookups(picks)):
@@ -2657,7 +2688,7 @@ async def respond(text, session, t0, timings, on_event=None, kept=None, speak=Tr
                         try:  # the same decision as tool-first, now with Qwen's own words as the hint it needs data
                             routed = await asyncio.wait_for(route_lookup(request_text, prior, ro_tools), ROUTE_S) \
                                 if ro_tools else None
-                        except (asyncio.TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError):
+                        except Exception:  # noqa: BLE001  advice only
                             routed = None
                         if routed:
                             if (got := await lookups(routed)) is None:
@@ -2932,6 +2963,7 @@ class Turn:
         self.pending = b""
         self.ring, self.speech, self.silent, self.voiced = [], [], 0, 0
         self.floor, self.last_voiced_s = None, 0.0
+        self.hold = False  # inside a held recording: its own pauses never end the turn (set per message by the caller)
 
     def set_mode(self, mode):
         m = VAD_MODES.get(mode, VAD_MODES["normal"])
@@ -2968,7 +3000,7 @@ class Turn:
             self.speech.append(frame)
             self.silent = 0 if voiced else self.silent + 1
             self.voiced += voiced
-            if self.silent >= self.end_frames:
+            if self.silent >= self.end_frames and not self.hold:
                 audio = np.frombuffer(b"".join(self.speech), dtype=np.int16).astype(np.float32) / 32768
                 self.speech, self.ring = [], []
                 self.last_voiced_s = self.voiced * self.FRAME / 16000
@@ -3495,8 +3527,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
             if kept:
                 keep_heard(kept["hist"], kept["entry"], heard, short)
             raise
-        except Exception as e:  # keep the call alive on a failed turn
-            await send({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        except Exception as e:  # keep the call alive on a failed turn; the user never sees a Python error
+            print("turn failed:", type(e).__name__, "".join(traceback.format_tb(e.__traceback__)), flush=True)
+            await send({"type": "error", "message": TURN_FAILED})
         finally:
             if text:  # turns with an empty transcript are not history
                 await log({"event": "turn", "log_id": log_id, "user": text, **turn,
@@ -3590,7 +3623,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     current["task"] = spawn(answer(audio, timings={"turn": d} if d else None))
 
         await send({"type": "state", "value": "listening"})
-        last_audio = time.monotonic()
+        last_audio, last_len = time.monotonic(), 0.0
         while True:
             try:  # mid-speech, no audio from the client for END_STALL_S ends the turn (control messages don't count)
                 left = END_STALL_S - (time.monotonic() - last_audio)
@@ -3644,7 +3677,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     CALL_MODE.set(v)  # from the next reply on
                     await send({"type": "mode", "value": v})
                 continue
-            last_audio = time.monotonic()
+            data, now = msg.get("bytes") or b"", time.monotonic()
+            vad_turn.hold = len(data) / 32000 > BURST_S or now - last_audio < BURST_GAP * last_len
+            last_audio, last_len = now, len(data) / 32000
             vad_turn.set_mode("noisy" if time.monotonic() < wake_guard_until else links.settings.get("noise_mode", "normal"))
             diag.frame(time.monotonic(), len(msg.get("bytes") or b""))  # before the VAD: a stall then the closing frames
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -4449,7 +4484,7 @@ if __name__ == "__main__":
             with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
                     f"/v1/call?session=wg{intent}&intent={intent}", headers={"Authorization": "Bearer app-tok"}) as w:
                 w.send_bytes(blip)
-                time.sleep(0.4)
+                time.sleep(END_STALL_S + 0.4)  # one 1.3 s message is a held recording: it ends on the stall
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.1)
             return heard
@@ -5166,9 +5201,52 @@ if __name__ == "__main__":
         games.clear()
         (k1, early), (k2, held) = played_check()
         assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
-        def stall_check():
+        def failed_turn_check():
+            """The error frame of a turn whose reply raised: what the app shows the user."""
+            import threading
+            from fastapi.testclient import TestClient
+            got = {}
+
+            class LoudVad:
+                def __call__(self, frame):
+                    return float(np.abs(np.frombuffer(frame, np.int16)).mean() > 1000)
+
+            async def stt(audio):
+                return "그거 지워"
+
+            async def broken_llm(messages, max_tokens=600):
+                raise AttributeError("'NoneType' object has no attribute 'find'")
+                yield ""
+            saved = {k: globals()[k] for k in ("SileroVoiceActivityDetector", "transcribe", "llm_stream", "check_token")}
+            globals().update(SileroVoiceActivityDetector=lambda: LoudVad(), transcribe=stt, llm_stream=broken_llm,
+                             check_token=lambda got, labels=("client",): "client")
+
+            def talk():
+                with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
+                        "/v1/call?client=mac&session=failed", headers={"Authorization": "Bearer t"}) as w:
+                    w.receive_text()
+                    w.send_bytes(np.zeros(4800, np.int16).tobytes())
+                    for chunk in ((np.ones(16000, np.int16) * 3000).tobytes(), np.zeros(16000, np.int16).tobytes()):
+                        for i in range(0, len(chunk), 3200):  # live pace
+                            w.send_bytes(chunk[i:i + 3200])
+                            time.sleep(0.1)
+                    t = time.monotonic()
+                    while time.monotonic() - t < 5:
+                        f = json.loads(w.receive_text())
+                        if f.get("type") == "error":
+                            got["message"] = f.get("message")
+                            break
+                    w.send_text(json.dumps({"type": "hangup"}))
+            th = threading.Thread(target=talk, daemon=True)
+            th.start()
+            th.join(10)
+            globals().update(saved)
+            return got.get("message")
+
+        def stall_check(held=False):
             """Live 2026-11-23 (Mac): a one-breath command sent as one block, then no live frames: the turn waited ~17 s
-            for the quiet that ends it. Now no audio for END_STALL_S ends it."""
+            for the quiet that ends it. Now no audio for END_STALL_S ends it. held: the block is 100 ms chunks back to
+            back with 0.8 s pauses in it ("오늘 아침 … 삭제해" was cut at the first pause): still one turn."""
             import threading
             from fastapi.testclient import TestClient
             heard, seen = [], {}
@@ -5196,7 +5274,13 @@ if __name__ == "__main__":
                     w.receive_text()
                     w.send_bytes(np.zeros(4800, np.int16).tobytes())  # room tone
                     t = time.monotonic()
-                    w.send_bytes((np.ones(32000, np.int16) * 3000).tobytes())  # 2 s of speech, nothing after it
+                    if held:
+                        rec = np.concatenate([np.ones(16000, np.int16) * 3000, np.zeros(12800, np.int16)] * 2 +
+                                             [np.ones(16000, np.int16) * 3000]).tobytes()
+                        for i in range(0, len(rec), 3200):
+                            w.send_bytes(rec[i:i + 3200])
+                    else:
+                        w.send_bytes((np.ones(32000, np.int16) * 3000).tobytes())  # 2 s of speech, nothing after it
                     while time.monotonic() - t < 5:
                         f = json.loads(w.receive_text())
                         if f.get("type") == "state" and f.get("value") == "thinking":  # the turn closed: STT starts
@@ -5210,6 +5294,87 @@ if __name__ == "__main__":
             return seen.get("after"), heard
         after, heard = stall_check()
         assert after is not None and after < END_STALL_S + 0.6 and heard and heard[0] > 1.9, (after, heard)
+        # live 2026-11-23: the router answered with tool-call markup native_call could not read (None), and None.find
+        # reached the app as "AttributeError: 'NoneType' object has no attribute 'find'"
+        assert native_call(NATIVE_TAG + "calendar_write 지워</tool_call>") is None
+
+        class RouterSays:
+            def __init__(self, content):
+                self.content = content
+
+            async def post(self, url, json=None):
+                content = self.content
+
+                class R:
+                    def raise_for_status(self):
+                        pass
+
+                    def json(self):
+                        return {"choices": [{"message": {"content": content}}]}
+                return R()
+        saved_client = client
+        try:
+            for out in (NATIVE_TAG + "calendar_write 지워</tool_call>", NATIVE_TAG + '["agenda"]</tool_call>'):
+                globals()["client"] = RouterSays(out)
+                assert asyncio.run(route_lookup("어떤 컴파일러 프로젝트 일정이 미리 알림 캘린더에 있는데 그거 지워", [],
+                                                [{"name": "agenda", "description": "일정"}])) is None, out
+        finally:
+            globals()["client"] = saved_client
+        assert failed_turn_check() == TURN_FAILED  # any other error: a short Korean line, never the exception
+        # calendar_write changes things: never read-only, so never offered to the tool-first router (live 2026-11-23)
+        assert not READ_ONLY.search("calendar_write") and READ_ONLY.search("calendar_list") and action_tool("calendar_write")
+
+        async def confirm_check(answer):
+            """Qwen calls calendar_write, the gateway reads back and waits; the next turn answers. Gateway frames out."""
+            frames, rounds = [], []
+
+            async def fake_msg(name, args, on_say=None):
+                frames.append((name, dict(args), CALL_TURN.get()))
+                if args.get("confirm") == "ab12cd34":
+                    return {"type": "tool_result", "result": "일정을 지웠어요.", "spoken": "일정을 지웠어요."}
+                q = "오늘 오전 9시 '컴파일러 프로젝트' 일정을 '미리 알림' 캘린더에서 지울까요?"
+                return {"type": "tool_result", "is_error": True, "spoken": q,
+                        "result": f"아직 아무것도 바꾸지 않았어요(pending_id=ab12cd34). 사용자에게 \"{q}\"라고 묻고 이번 답은 끝내.",
+                        "needs": {"kind": "confirm", "question": q, "args": {"confirm": "ab12cd34"}}}
+
+            async def qwen(messages, max_tokens=600):
+                rounds.append(messages)
+                if "[도구 결과]" in messages[-1]["content"]:
+                    yield "오늘 오전 9시 '컴파일러 프로젝트' 일정을 '미리 알림' 캘린더에서 지울까요?"
+                else:
+                    yield TOOL_TAG + ' {"name": "calendar_write", "args": {"op": "delete", "match": "컴파일러 프로젝트"}}'
+            saved = gateway_tool_msg, llm_stream, tts, route_lookup, dict(gw_tools), links.settings
+            globals().update(gateway_tool_msg=fake_msg, llm_stream=qwen, tts=lambda s: asyncio.sleep(0, (b"", 24000)),
+                             route_lookup=lambda *a, **k: asyncio.sleep(0, []))
+            gw_tools.update(at=time.time(), defs=[{"name": "calendar_write", "description": "캘린더 바꾸기"}])
+            links.settings = {"brain_mode": "local"}
+            history.pop("azel:cal", None)
+            pending_confirm.pop("cal", None)
+            try:
+                first = [s async for s, *_ in respond("컴파일러 프로젝트 일정 미리 알림 캘린더에 있는데 그거 지워", "cal",
+                                                      time.perf_counter(), {})]
+                second = [s async for s, *_ in respond(answer, "cal", time.perf_counter(), {})]
+            finally:
+                globals().update(gateway_tool_msg=saved[0], llm_stream=saved[1], tts=saved[2], route_lookup=saved[3])
+                gw_tools.clear()
+                gw_tools.update(saved[4])
+                links.settings = saved[5]
+            return first, second, frames
+        first, second, frames = asyncio.run(confirm_check("응"))
+        assert any("지울까요" in x for x in first) and not any("지웠어요" in x for x in first), first  # asked, not done
+        assert [f[1] for f in frames] == [{"op": "delete", "match": "컴파일러 프로젝트"}, {"confirm": "ab12cd34"}], frames
+        assert frames[0][2] and frames[1][2] and frames[0][2] != frames[1][2]  # each turn its own id for the gateway
+        assert second == ["일정을 지웠어요."], second
+        first, second, frames = asyncio.run(confirm_check("아니 잠깐만"))
+        assert not any("confirm" in f[1] for f in frames), frames  # anything but yes: the confirm id is never sent
+        after, heard = stall_check(held=True)
+        assert after is not None and after < END_STALL_S + 0.6 and len(heard) == 1 and heard[0] > 3.4, (after, heard)
+        t = Turn(lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000))
+        speech, pause = (np.ones(16000, np.int16) * 3000).tobytes(), np.zeros(12800, np.int16).tobytes()
+        t.hold = True
+        assert [k for k, _ in t.feed(speech + pause + speech + pause)] == ["start"]  # the recording's pauses: no end
+        t.hold = False
+        assert [k for k, _ in t.feed(np.zeros(1600, np.int16).tobytes())] == ["end"]  # live quiet after it ends it
         states, stays, midway, leftover, slogs, brain_evs, prompts = secret_check()
         assert stays is True and midway is True and leftover == [], leftover
         assert all(f["secret"] is True for f in states[:3]) and states[3]["secret"] is False and states[-1]["secret"] is True
