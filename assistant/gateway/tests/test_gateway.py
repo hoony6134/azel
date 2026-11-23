@@ -497,7 +497,7 @@ def test_device_prompt_fallback(gw):
     assert "없어" in g.device_prompt(s, [])
     g.fake.db["settings"] = {"default_device": "맥북", "device_fallback": ["알비레오", "스파크"]}  # saved before
     s = c.get("/v1/settings").json()
-    assert s["default_device"] == "macbook" and s["device_fallback"] == ["albireo", "spark"]
+    assert s["default_device"] == "macbook" and s["device_fallback"] == ["albireo", "vd-spark"]
 
 def test_deadline_call_only_when_due(gw, monkeypatch):
     g, _, _ = gw
@@ -1975,3 +1975,18 @@ def test_device_status_is_ok_slow_or_down_by_the_answer(gw, monkeypatch):
     assert out["http://slow/mcp"]["latency_ms"] == 2500 and all(t == g.DEVICE_PROBE_S for _, t in calls)
     n = len(calls)
     assert asyncio.run(g.device_probe("http://fast/mcp", False))["status"] == "ok" and len(calls) == n  # cached
+
+
+def test_vd_spark_is_one_device_and_spark_still_resolves(gw, monkeypatch):
+    """The app listed "spark" twice: static and shared rows for one url collapse to one, the id is vd-spark, and
+    "spark"/"스파크" still resolve (settings, task device)."""
+    g, c, _ = gw
+    g.static_devices.clear()
+    g.static_devices["vd-spark"] = {"id": "vd-spark", "name": "vd-spark", "url": "http://100.64.0.11:8893/mcp",
+                                     "limited": True, "static": True, "last_seen": time.time()}
+    rows = [{"id": "spark", "name": "spark", "url": "http://100.64.0.11:8893/mcp", "last_seen": time.time()},
+            {"id": "albireo", "name": "albireo", "url": "http://a/mcp", "last_seen": time.time()}]
+    assert [d["id"] for d in g.with_static(rows)] == ["albireo", "vd-spark"]
+    c.put("/v1/settings", json={"device_fallback": ["albireo", "스파크"]})
+    assert c.get("/v1/settings").json()["device_fallback"] == ["albireo", "vd-spark"]
+    assert g.task_view({"device": "spark"}, steps=False)["device"] == "vd-spark"

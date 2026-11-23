@@ -122,7 +122,7 @@ DEFAULTS = {
                   "deadline_check": {"enabled": True, "time": "20:00"}, "server_alerts": True,
                   "autonomous": {"enabled": False, "max_per_day": 3, "min_gap_minutes": 120,
                                  "window": ["08:00", "23:00"], "checkpoints": ["08:30", "13:00", "18:00"]}},
-    "default_device": "macbook", "device_fallback": ["albireo", "spark"],  # device ids (display names also match)
+    "default_device": "macbook", "device_fallback": ["albireo", "vd-spark"],  # device ids (display names also match)
     "assistant_name": "아젤",
     "user_title": "",  # how the assistant addresses the user ("" = naturally, no fixed title); a persona may override
     # 밤새 맡기는 일: tasks queued with when=overnight run one at a time inside this window; the morning briefing reports
@@ -548,8 +548,15 @@ if MODE == "full":
 
 
 def with_static(rows):
-    """Shared device rows plus this gateway's static ones (a static row wins over a row with the same id)."""
-    return [d for d in rows if d["id"] not in static_devices] + list(static_devices.values())
+    """Shared device rows plus this gateway's static ones (a static row wins over a row with the same id or url), one
+    row per daemon url: one physical host never shows twice (the app listed "spark" twice)."""
+    urls = {d.get("url") for d in static_devices.values()}
+    out, seen = [], set()
+    for d in [*static_devices.values(), *[d for d in rows if d["id"] not in static_devices and d.get("url") not in urls]]:
+        if d.get("url") not in seen:
+            seen.add(d.get("url"))
+            out.append(d)
+    return sorted(out, key=lambda d: d["id"])
 
 
 async def static_prober():
@@ -562,7 +569,9 @@ async def static_prober():
 
 HM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
 # Settings saved before devices were named in English; read as their ids.
-OLD_DEVICE_NAMES = {"맥북": "macbook", "알비레오": "albireo", "기에나": "gienah", "데네브": "deneb", "스파크": "spark"}
+OLD_DEVICE_NAMES = {"맥북": "macbook", "알비레오": "albireo", "기에나": "gienah", "데네브": "deneb", "스파크": "vd-spark",
+                    "spark": "vd-spark"}
+DEVICE_ALIASES = {"spark": "vd-spark"}  # the old id: settings, task rows and spoken requests still resolve
 
 
 def migrate_proactive(p):
@@ -4234,7 +4243,7 @@ def check_task(body):
     for name, v, top in (("budget_usd", budget, 50), ("max_minutes", minutes, 240)):
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= top:
             raise HTTPException(400, f"{name}: a number above 0, at most {top}")
-    device = body.get("device")
+    device = DEVICE_ALIASES.get(body.get("device"), body.get("device"))
     if device is not None and not (isinstance(device, str) and re.fullmatch(r"[a-z0-9_-]{1,32}", device)):
         raise HTTPException(400, "device: a device id")
     persona = body.get("persona")
@@ -5071,7 +5080,9 @@ def task_view(t, steps=True):
     keep = ("id", "goal", "status", "device", "persona", "notify", "backend", "fallback_reason", "budget_usd",
             "max_minutes", "created", "started", "finished", "result", "error", "cost_usd", "owner", "note",
             "origin_session", "notified_at", "parent_task", "when", "scheduled_for", "auto_approve", "reported")
-    return {**{k: t.get(k) for k in keep}, **({"steps": t["steps"]} if steps else {})}
+    view = {k: t.get(k) for k in keep}
+    view["device"] = DEVICE_ALIASES.get(view["device"], view["device"])  # old rows say "spark"
+    return {**view, **({"steps": t["steps"]} if steps else {})}
 
 
 @app.post("/v1/tasks")
@@ -5142,6 +5153,7 @@ async def task_cancel(tid):
 
 
 DEVICE_WORD = {"macbook": "맥북", "albireo": "알비레오", "gienah": "기에나", "deneb": "데네브", "spark": "스파크",
+               "vd-spark": "스파크",
                "core": "코어"}
 
 
