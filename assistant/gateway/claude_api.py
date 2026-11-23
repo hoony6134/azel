@@ -10,6 +10,7 @@ end (anything volatile, like the clock, goes into the user message). Haiku by de
 multi-step work.
 """
 import asyncio
+import time
 import json
 
 import httpx
@@ -61,8 +62,11 @@ async def ask(api_key, model, system, text, tools, run_tool, client=None):
                 break
             calls = [b for b in m["content"] if b["type"] == "tool_use"]
             for b in calls:
-                yield "tool", b["name"]
+                yield "tool_call", b  # name, id and input (the app's activity detail)
+            t0 = time.monotonic()
             results = await asyncio.gather(*[_result(b, run_tool) for b in calls])
+            for res in results:
+                yield "tool_done", {**res, "duration_ms": round((time.monotonic() - t0) * 1000)}
             messages += [{"role": "assistant", "content": m["content"]},  # unchanged, thinking blocks included
                          {"role": "user", "content": list(results)}]  # every result in one message
     finally:
