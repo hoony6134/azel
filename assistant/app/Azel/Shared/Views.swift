@@ -148,7 +148,7 @@ struct SetupFlow: View {
         do {
             let s: ServerStatus = try await Gateway.get("/v1/status")
             checks = [Check(id: "게이트웨이", ok: true, reason: nil), Check(id: "토큰", ok: true, reason: nil),
-                      Check(id: "spark", ok: s.spark.ok, reason: s.spark.ok ? nil : "음성 서버가 응답하지 않아요")]
+                      Check(id: "음성 서버", ok: s.spark.ok, reason: s.spark.ok ? nil : "음성 서버가 응답하지 않아요")]
         } catch GatewayError.http(let code) where code == 401 || code == 403 {
             checks = [Check(id: "게이트웨이", ok: true, reason: nil), Check(id: "토큰", ok: false, reason: "토큰이 맞지 않아요")]
         } catch {

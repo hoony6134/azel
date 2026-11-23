@@ -21,7 +21,7 @@ final class AppModel: ObservableObject {
         Task { await refresh() }
     }
 
-    /// Spark and gateway both answered.
+    /// The voice server (/v1/status `spark`) and the gateway both answered.
     var online: Bool { status.map { $0.spark.ok && $0.gateway.ok } ?? false }
 
     func refresh() async {
