@@ -538,10 +538,12 @@ struct CallPanelView: View {
                 .accessibilityAction(named: "말 끊기") { call.interrupt() }
             VStack(alignment: .leading, spacing: 2) {
                 let user = call.lines.last { $0.mine }?.text
-                let reply = call.lines.last { !$0.mine }
+                // Only this turn's reply: once the user spoke again the previous answer gives way to 생각 중
+                // (2026-11-23: the panel kept the old reply and looked like it was still listening).
+                let reply = call.lines.last.flatMap { $0.mine ? nil : $0 }
                 if let error = call.error {
                     Text(error).font(.footnote).foregroundStyle(Theme.danger).lineLimit(2)
-                } else if reply == nil && user == nil {
+                } else if reply == nil && (user == nil || jarState == .thinking) {   // mid-reply the orb and activity line show it
                     Label(jarState.spokenLabel, systemImage: jarState.symbol).font(.headline).foregroundStyle(jarState.color)
                 }
                 if let current = call.activity.current {
@@ -650,7 +652,6 @@ struct PanelReply: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var following = true
     @State private var paragraph = ""
-    @State private var monitor: Any?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -676,21 +677,20 @@ struct PanelReply: View {
                         else { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("seg-\(current)", anchor: .center) } }
                     }
                 }
+                Color.clear.frame(height: 1).id(FollowScroll.bottomID)
             }
             .frame(maxHeight: 56)
+            // Growing text and height changes too; a scroll by hand stops it until the user is back at the bottom.
+            .followScroll(proxy, following: $following, trigger: reply.text.count, animated: !reduceMotion) {
+                let k = call.karaoke(stepped: reduceMotion)
+                if call.playing, let cur = k.current, k.texts.joined(separator: " ") == reply.text { return ("seg-\(cur)", .center) }
+                return (FollowScroll.bottomID, .bottom)
+            }
         }
         .onChange(of: reply.text.prefix(24)) { _, start in
             // A new reply paragraph: follow again.
             if String(start) != paragraph { paragraph = String(start); following = true }
         }
-        .onAppear {
-            // Trackpad or wheel scrolling over the panel pauses auto-follow until the next reply.
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-                if event.window is CallPanel { following = false }
-                return event
-            }
-        }
-        .onDisappear { if let monitor { NSEvent.removeMonitor(monitor) } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(reply.text)
     }

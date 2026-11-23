@@ -378,6 +378,7 @@ struct MacHome: View {
     var showAll: () -> Void
     @ObservedObject private var call = MacCall.shared
     @State private var openItem: HistoryItem?
+    @State private var following = true
 
     private var jarState: JarState {
         call.inCall ? JarState(callState: call.displayState, inCall: true, held: call.held) : (model.statusError == nil ? .idle : .offline)
@@ -472,7 +473,7 @@ struct MacHome: View {
                             if k.texts.joined(separator: " ") == line.text {
                                 KaraokeText(text: line.text, heard: k.spoken, color: line.interrupted ? Theme.text3 : Theme.text)
                                     .onChange(of: k.current) { _, cur in
-                                        guard let cur else { return }
+                                        guard following, let cur else { return }
                                         withAnimation(Theme.caption) { proxy.scrollTo(line.id, anchor: KaraokeText.follow(k.texts, current: cur)) }
                                     }
                             } else {
@@ -489,17 +490,25 @@ struct MacHome: View {
                     .textSelection(.enabled)
                     .id(line.id)
             }
+            Color.clear.frame(height: 1).id(FollowScroll.bottomID)
         }
         .animation(Theme.caption, value: call.lines)
         }
         .frame(maxHeight: 280)  // a long reply scrolls here instead of pushing the dock off the window
-        .onChange(of: call.lines.last?.id) {
-            guard let last = call.lines.last else { return }
-            withAnimation(Theme.caption) { proxy.scrollTo(last.id, anchor: last.mine ? .bottom : .top) }
-        }
+        .followScroll(proxy, following: $following, trigger: call.lines.last?.id) { captionTarget }
+        .onChange(of: call.lines.last?.id) { if call.lines.last?.mine == true { following = true } }   // the user spoke: a new turn
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("대화 내용")
+    }
+
+    /// The sentence being heard while a reply plays, otherwise the bottom.
+    private var captionTarget: (id: AnyHashable, anchor: UnitPoint) {
+        if let last = call.lines.last, !last.mine, call.playing {
+            let k = call.karaoke(stepped: reduceMotion)
+            if let cur = k.current, k.texts.joined(separator: " ") == last.text { return (last.id, KaraokeText.follow(k.texts, current: cur)) }
+        }
+        return (FollowScroll.bottomID, .bottom)
     }
 
     /// Same dock as iPhone minus speaker and route picker (DESIGN §8.3); device menu instead.

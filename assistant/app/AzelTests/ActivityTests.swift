@@ -192,6 +192,20 @@ final class MidReplyHeartbeatTests: XCTestCase {
         XCTAssertEqual(t.tick(now: 11), .pulse)
     }
 
+    /// Mid-reply, nothing playing, a tool starts: the ack at once and the thinking look at once.
+    func testAToolStartingInADryGapAcksAtOnce() {
+        var t = replying()
+        t.playback(false, now: 5)                          // the queue ran dry
+        XCTAssertEqual(t.event("activity", value: nil, now: 5.2, phase: "tool_start"), .ack)
+        XCTAssertTrue(t.waiting(now: 5.25), "a running tool shows thinking without the 1 s delay")
+        XCTAssertNil(t.event("activity", value: nil, now: 5.4, phase: "tool_start"), "one ack per wait")
+        var p = replying()                                  // audio still playing: no ack over the reply
+        XCTAssertNil(p.event("activity", value: nil, now: 4, phase: "tool_start"))
+        var f = ThinkingCues()
+        XCTAssertEqual(f.event("state", value: "thinking", now: 0), .ack)
+        XCTAssertNil(f.event("activity", value: nil, now: 0.3, phase: "tool_start"), "no second ack right after thinking")
+    }
+
     func testAToolRunningMidReplyIsAWait() {
         var t = replying()
         XCTAssertNil(t.event("activity", value: nil, now: 4, phase: "tool_start"))

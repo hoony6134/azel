@@ -129,6 +129,15 @@ struct CallScreen: View {
         .padding(.top, Theme.s)
     }
 
+    /// The sentence being heard while a reply plays, otherwise the bottom.
+    private var captionTarget: (id: AnyHashable, anchor: UnitPoint) {
+        if let last = call.lines.last, !last.mine, call.playing {
+            let k = call.karaoke(stepped: reduceMotion)
+            if let cur = k.current, k.texts.joined(separator: " ") == last.text { return (last.id, KaraokeText.follow(k.texts, current: cur)) }
+        }
+        return (FollowScroll.bottomID, .bottom)
+    }
+
     /// Last user line in text2, the reply paragraph large; older turns dim and scroll up.
     private var captions: some View {
         ScrollViewReader { proxy in
@@ -165,6 +174,7 @@ struct CallScreen: View {
                             .id(line.id)
                             .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 6)))
                     }
+                    Color.clear.frame(height: 1).id(FollowScroll.bottomID)
                 }
                 .padding(.vertical, Theme.m)
                 .animation(Theme.caption, value: call.lines)
@@ -172,13 +182,8 @@ struct CallScreen: View {
             .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.18)], startPoint: .top, endPoint: .bottom))
             .background(Theme.bg.opacity(0.55).blur(radius: 20))
             .frame(maxHeight: UIScreen.main.bounds.height * 0.3)
-            .simultaneousGesture(DragGesture().onChanged { _ in following = false })  // the user scrolls: stop following
-            .onChange(of: call.lines.last?.id) {
-                // A new line: follow again. The user's line: the bottom. A reply: its start, then the sentence heard.
-                following = true
-                guard let last = call.lines.last else { return }
-                withAnimation(Theme.caption) { proxy.scrollTo(last.id, anchor: last.mine ? .bottom : .top) }
-            }
+            .followScroll(proxy, following: $following, trigger: call.lines.last?.id) { captionTarget }
+            .onChange(of: call.lines.last?.id) { if call.lines.last?.mine == true { following = true } }   // the user spoke: a new turn
             .contentShape(Rectangle())
             .onTapGesture { showTranscript = true }
             .accessibilityElement(children: .contain)

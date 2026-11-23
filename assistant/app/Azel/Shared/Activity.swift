@@ -63,16 +63,20 @@ struct ThinkingCues {
     /// The server said it listens for the user: never a wait (no heartbeat, no thinking orb) until it
     /// thinks or speaks again, whatever arrives late (a background tool, a drained queue, a resume).
     private var listening = false
+    /// This wait already had its ack (thinking's, or a tool's): one per wait.
+    private var acked = false
 
     var active: Bool { since != nil }
 
     /// A wait long enough to be felt (the heartbeat's own threshold): the UI shows thinking for it, so
     /// the orb and the sound agree, and sub-second gaps between sentences don't flicker.
-    func waiting(now: Double) -> Bool { since.map { now - $0 >= Self.pulseAfter } ?? false }
+    /// A running tool shows at once (its ack just played); other waits after the heartbeat's 1 s.
+    func waiting(now: Double) -> Bool { since.map { tools > 0 || now - $0 >= Self.pulseAfter } ?? false }
 
     private mutating func waitFrom(_ now: Double) {
         guard since == nil, turnOpen, !playing, !paused, !listening else { return }
         since = now
+        acked = false
         lastPulse = nil
     }
 
@@ -91,6 +95,7 @@ struct ThinkingCues {
                 thinkingPhase = true
                 since = nil
                 waitFrom(now)
+                acked = true
                 return .ack
             case "speaking":
                 listening = false
@@ -110,11 +115,17 @@ struct ThinkingCues {
             paused = false
             waitFrom(now)
         case "activity" where phase == "tool_start":
-            tools += 1
             // A running tool is a wait, before or after the first audio, but not once the server listens
             // (a background step after the reply must not tick over the user's turn).
-            if !listening { turnOpen = true }
+            guard !listening else { return nil }
+            tools += 1
+            turnOpen = true
+            // Mid-reply with nothing playing: say so at once ("들었어요"), not a second later with the
+            // heartbeat; once per wait, and not right after the thinking ack.
             waitFrom(now)
+            let ack = !playing && !paused && since != nil && !acked
+            if ack { acked = true }
+            return ack ? .ack : nil
         case "activity" where phase == "tool_end":
             tools = max(0, tools - 1)
         default: break
