@@ -469,13 +469,15 @@ struct SettingsScreen<Extra: View>: View {
 
     // Usage
     private var usageCard: some View {
-        let cost = (usage["cost_usd"] as? NSNumber)?.doubleValue ?? 0
+        let u = UsageSummary(usage)
+        let cost = u.budgetCost
         let budget = (usage["budget_usd"] as? NSNumber)?.doubleValue ?? settings?.monthly_budget_usd ?? 0
         let warn = Double(settings?.budget_warn_pct ?? 80) / 100
         let frac = budget > 0 ? cost / budget : 0
         let barColor = frac >= 1 ? Theme.danger : frac >= warn ? Theme.amber : Theme.celadon
         let calls = (usage["calls"] as? NSNumber).map { " · 통화 \($0.intValue)회" } ?? ""
         return Card("사용량", trailing: AnyView(Text(monthLabel + calls).font(.subheadline.monospacedDigit()).foregroundStyle(Theme.text2))) {
+            Text("API 예산 사용").font(.subheadline).foregroundStyle(Theme.text2)
             HStack(alignment: .firstTextBaseline, spacing: Theme.xs) {
                 Text(cost, format: .currency(code: "USD")).font(.title.monospacedDigit()).foregroundStyle(Theme.text)
                 if budget > 0 { Text("/ \(budget, format: .currency(code: "USD").precision(.fractionLength(0)))").foregroundStyle(Theme.text2) }
@@ -494,9 +496,25 @@ struct SettingsScreen<Extra: View>: View {
                 .accessibilityValue("\(Int(budget))달러 중 \(Int(cost))달러, \(Int(frac * 100))퍼센트")
             }
             SectionNote(status: usageStatus) { Task { await load() } }
-            breakdown(usage["by_model"])
-            if usage["by_path"] is [String: Any] {
-                DisclosureGroup("경로별 보기", isExpanded: $showPaths) { breakdown(usage["by_path"]) }
+            // The budget counts only the paid paths; the subscription (Claude Code) is listed apart and never in
+            // the total, and per-model numbers mix both, so they sit in their own labelled group (2026-11-23).
+            ForEach(u.budgetByPath, id: \.name) { r in
+                HStack {
+                    Text(r.name).foregroundStyle(Theme.text)
+                    Spacer()
+                    Text(String(format: "$%.2f", r.usd)).font(.body.monospacedDigit()).foregroundStyle(Theme.text2)
+                }
+            }
+            if let sub = u.subscription {
+                HStack {
+                    Text("구독 (Claude Code)").foregroundStyle(Theme.text)
+                    Spacer()
+                    Text("\(sub.turns)회 · 환산 \(String(format: "$%.2f", sub.equivalentUSD))").font(.body.monospacedDigit()).foregroundStyle(Theme.text2)
+                }
+                Text("구독은 예산에 포함되지 않아요").font(.caption).foregroundStyle(Theme.text3)
+            }
+            if usage["by_model"] is [String: Any] {
+                DisclosureGroup(u.subscription == nil ? "모델별 보기" : "모델별 (구독 포함 전체)", isExpanded: $showPaths) { breakdown(usage["by_model"]) }
                     .font(.subheadline).tint(Theme.celadon)
             }
         }
@@ -539,7 +557,7 @@ struct SettingsScreen<Extra: View>: View {
         Card("상태", trailing: AnyView(Button("새로고침") { Task { await model.refresh() } }.font(.subheadline).tint(Theme.celadon))) {
             if let s = model.status {
                 statusRow("음성 서버", s.spark.ok ? .ok : .down, s.spark.ms)   // top-level "spark" is the voice server, not a device
-                statusRow("게이트웨이", s.gateway.ok ? .ok : .down, s.gateway.ms)
+                statusRow(s.gateway.device.map { "게이트웨이 · \(DeviceID.normalize($0))" } ?? "게이트웨이", s.gateway.ok ? .ok : .down, s.gateway.ms)
                 ForEach(s.devices, id: \.name) { statusRow(DeviceID.normalize($0.name), $0.health, $0.latency) }
             } else if let e = model.statusError {
                 Text(FriendlyError.describe(e).title).foregroundStyle(Theme.danger)
@@ -1082,5 +1100,28 @@ struct NIMRow: View {
         defer { sending = false }
         do { try await NIMAPI.putKey(value); keySaved = true; message = nil }
         catch { message = "키를 등록하지 못했어요: " + FriendlyError.describe(error).title }
+    }
+}
+
+/// `GET /v1/usage` read for the 사용량 card: the budget part (`paid`: the budget paths only), its paths, and the
+/// subscription apart. An older gateway without `paid` falls back to `cost_usd` and `by_path` minus claude_code.
+struct UsageSummary {
+    struct Row { let name: String; let usd: Double }
+    struct Subscription { let turns: Int; let equivalentUSD: Double }
+    let budgetCost: Double
+    let budgetByPath: [Row]
+    let subscription: Subscription?
+
+    static let pathNames = ["api": "Claude API", "nim": "NIM", "claude_code": "Claude Code"]
+
+    init(_ u: [String: Any]) {
+        let paid = u["paid"] as? [String: Any]
+        let num = { (v: Any?) in (v as? NSNumber)?.doubleValue }
+        budgetCost = num(paid?["cost_usd"]) ?? num(u["cost_usd"]) ?? 0
+        let byPath = (paid?["by_path"] as? [String: Any]) ?? ((u["by_path"] as? [String: Any]) ?? [:]).filter { $0.key != "claude_code" }
+        budgetByPath = byPath.compactMap { k, v in num(v).map { Row(name: Self.pathNames[k] ?? k, usd: $0) } }
+            .filter { $0.usd > 0 }.sorted { $0.usd > $1.usd }
+        let cc = (u["subscription"] as? [String: Any])?["claude_code"] as? [String: Any]
+        subscription = cc.map { Subscription(turns: (cc?["turns"] as? NSNumber)?.intValue ?? 0, equivalentUSD: num($0["equivalent_usd"]) ?? 0) }
     }
 }

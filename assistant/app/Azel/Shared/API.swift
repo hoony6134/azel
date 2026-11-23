@@ -139,7 +139,11 @@ struct AppSettings: Codable, Equatable {
 }
 
 struct ServerStatus: Decodable {
-    struct Health: Decodable { var ok: Bool; var ms: Double? }
+    struct Health: Decodable {
+        var ok: Bool; var ms: Double?
+        /// The gateway's own entry names the machine that answered (deneb, the Mac …).
+        var device: String?
+    }
     struct Device: Decodable {
         var name: String; var ok: Bool; var ms: Double?
         /// When the gateway decides itself: ok | slow | down, and the probe time.
