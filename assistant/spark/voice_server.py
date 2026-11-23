@@ -51,6 +51,11 @@ END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "500"))
 # ends a turn has to arrive as frames; a one-breath command sent as one block, then no live frames, waited ~17 s for
 # them (Mac, live 2026-11-23). Live audio comes every ~100 ms, so this never cuts a healthy stream.
 END_STALL_S = float(os.environ.get("END_STALL_MS", "800")) / 1000
+# A held recording (the Mac's one-breath command) comes faster than real time: one long message, or 100 ms chunks back
+# to back. Its pauses are not the end of the turn (live 2026-11-23: "오늘 아침 … 일정 삭제해" was cut at a 0.5 s pause
+# and the rest dropped piece by piece); the turn ends on live quiet after it, or on the stall.
+BURST_S = 0.3  # one message longer than this is not live audio
+BURST_GAP = 0.5  # a message that came sooner than half the previous one's length after it: still the burst
 KST = timezone(timedelta(hours=9))
 MAX_UPLOAD = 16000 * 2 * 60  # one minute of 16 kHz PCM16
 ROUTE_TAG = "[CLAUDE]"
@@ -2932,6 +2937,7 @@ class Turn:
         self.pending = b""
         self.ring, self.speech, self.silent, self.voiced = [], [], 0, 0
         self.floor, self.last_voiced_s = None, 0.0
+        self.hold = False  # inside a held recording: its own pauses never end the turn (set per message by the caller)
 
     def set_mode(self, mode):
         m = VAD_MODES.get(mode, VAD_MODES["normal"])
@@ -2968,7 +2974,7 @@ class Turn:
             self.speech.append(frame)
             self.silent = 0 if voiced else self.silent + 1
             self.voiced += voiced
-            if self.silent >= self.end_frames:
+            if self.silent >= self.end_frames and not self.hold:
                 audio = np.frombuffer(b"".join(self.speech), dtype=np.int16).astype(np.float32) / 32768
                 self.speech, self.ring = [], []
                 self.last_voiced_s = self.voiced * self.FRAME / 16000
@@ -3590,7 +3596,7 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     current["task"] = spawn(answer(audio, timings={"turn": d} if d else None))
 
         await send({"type": "state", "value": "listening"})
-        last_audio = time.monotonic()
+        last_audio, last_len = time.monotonic(), 0.0
         while True:
             try:  # mid-speech, no audio from the client for END_STALL_S ends the turn (control messages don't count)
                 left = END_STALL_S - (time.monotonic() - last_audio)
@@ -3644,7 +3650,9 @@ async def call(ws: WebSocket, token: str = "", session: str = "", call_id: str =
                     CALL_MODE.set(v)  # from the next reply on
                     await send({"type": "mode", "value": v})
                 continue
-            last_audio = time.monotonic()
+            data, now = msg.get("bytes") or b"", time.monotonic()
+            vad_turn.hold = len(data) / 32000 > BURST_S or now - last_audio < BURST_GAP * last_len
+            last_audio, last_len = now, len(data) / 32000
             vad_turn.set_mode("noisy" if time.monotonic() < wake_guard_until else links.settings.get("noise_mode", "normal"))
             diag.frame(time.monotonic(), len(msg.get("bytes") or b""))  # before the VAD: a stall then the closing frames
             for kind, audio in vad_turn.feed(msg.get("bytes") or b""):
@@ -4449,7 +4457,7 @@ if __name__ == "__main__":
             with TestClient(app, client=("100.64.0.8", 1)).websocket_connect(
                     f"/v1/call?session=wg{intent}&intent={intent}", headers={"Authorization": "Bearer app-tok"}) as w:
                 w.send_bytes(blip)
-                time.sleep(0.4)
+                time.sleep(END_STALL_S + 0.4)  # one 1.3 s message is a held recording: it ends on the stall
                 w.send_text(json.dumps({"type": "hangup"}))
             time.sleep(0.1)
             return heard
@@ -5166,9 +5174,10 @@ if __name__ == "__main__":
         games.clear()
         (k1, early), (k2, held) = played_check()
         assert k1 == k2 == "turn_done" and early < 0.8 and held >= 1.0 + PLAYED_WAIT_S - 0.2, (early, held)
-        def stall_check():
+        def stall_check(held=False):
             """Live 2026-11-23 (Mac): a one-breath command sent as one block, then no live frames: the turn waited ~17 s
-            for the quiet that ends it. Now no audio for END_STALL_S ends it."""
+            for the quiet that ends it. Now no audio for END_STALL_S ends it. held: the block is 100 ms chunks back to
+            back with 0.8 s pauses in it ("오늘 아침 … 삭제해" was cut at the first pause): still one turn."""
             import threading
             from fastapi.testclient import TestClient
             heard, seen = [], {}
@@ -5196,7 +5205,13 @@ if __name__ == "__main__":
                     w.receive_text()
                     w.send_bytes(np.zeros(4800, np.int16).tobytes())  # room tone
                     t = time.monotonic()
-                    w.send_bytes((np.ones(32000, np.int16) * 3000).tobytes())  # 2 s of speech, nothing after it
+                    if held:
+                        rec = np.concatenate([np.ones(16000, np.int16) * 3000, np.zeros(12800, np.int16)] * 2 +
+                                             [np.ones(16000, np.int16) * 3000]).tobytes()
+                        for i in range(0, len(rec), 3200):
+                            w.send_bytes(rec[i:i + 3200])
+                    else:
+                        w.send_bytes((np.ones(32000, np.int16) * 3000).tobytes())  # 2 s of speech, nothing after it
                     while time.monotonic() - t < 5:
                         f = json.loads(w.receive_text())
                         if f.get("type") == "state" and f.get("value") == "thinking":  # the turn closed: STT starts
@@ -5210,6 +5225,14 @@ if __name__ == "__main__":
             return seen.get("after"), heard
         after, heard = stall_check()
         assert after is not None and after < END_STALL_S + 0.6 and heard and heard[0] > 1.9, (after, heard)
+        after, heard = stall_check(held=True)
+        assert after is not None and after < END_STALL_S + 0.6 and len(heard) == 1 and heard[0] > 3.4, (after, heard)
+        t = Turn(lambda f: float(np.abs(np.frombuffer(f, np.int16)).mean() > 1000))
+        speech, pause = (np.ones(16000, np.int16) * 3000).tobytes(), np.zeros(12800, np.int16).tobytes()
+        t.hold = True
+        assert [k for k, _ in t.feed(speech + pause + speech + pause)] == ["start"]  # the recording's pauses: no end
+        t.hold = False
+        assert [k for k, _ in t.feed(np.zeros(1600, np.int16).tobytes())] == ["end"]  # live quiet after it ends it
         states, stays, midway, leftover, slogs, brain_evs, prompts = secret_check()
         assert stays is True and midway is True and leftover == [], leftover
         assert all(f["secret"] is True for f in states[:3]) and states[3]["secret"] is False and states[-1]["secret"] is True
